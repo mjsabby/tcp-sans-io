@@ -1,0 +1,5 @@
+Cargo.lock
+target/
+bindings/csharp/bin
+bindings/csharp/obj
+*.pyc

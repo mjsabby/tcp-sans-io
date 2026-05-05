@@ -1,0 +1,145 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: rust (build + loopback tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update --component clippy
+          rustup default stable
+
+      - name: cargo build --release
+        run: cargo build --release --lib --verbose
+
+      - name: cargo test --release (loopback + conformance + properties)
+        run: cargo test --release --lib --verbose
+
+      - name: cargo clippy
+        run: cargo clippy --release --lib --no-deps -- -D warnings
+
+      - name: Upload cdylib + header
+        uses: actions/upload-artifact@v4
+        with:
+          name: cdylib-linux
+          path: |
+            target/release/libtcp_sans_io.so
+            include/tcp_sans_io.h
+          if-no-files-found: error
+          retention-days: 7
+
+  python:
+    name: python integration (3.13)
+    needs: rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: cdylib-linux
+          path: .
+
+      - name: Verify cdylib present
+        run: ls -l target/release/libtcp_sans_io.so
+
+      - name: Run integration tests
+        run: python -m unittest discover -s bindings/python -v
+
+  csharp:
+    name: c# integration (.NET 10)
+    needs: rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: cdylib-linux
+          path: .
+
+      - name: Verify cdylib present
+        run: ls -l target/release/libtcp_sans_io.so
+
+      - name: Run integration tests
+        run: dotnet run --project bindings/csharp/TcpSansIo.IntegrationTest.csproj -c Release
+
+  gvisor:
+    name: gvisor netstack interop
+    needs: rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          check-latest: true
+          cache-dependency-path: bindings/gvisor/go.sum
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: cdylib-linux
+          path: .
+
+      - name: Verify cdylib present
+        run: ls -l target/release/libtcp_sans_io.so
+
+      - name: go test (cgo + gVisor netstack)
+        working-directory: bindings/gvisor
+        run: go test -v -count=1 -timeout=1800s ./...
+
+  gvisor-tun:
+    name: gvisor binding — real Linux kernel via TUN
+    needs: rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          check-latest: true
+          cache-dependency-path: bindings/gvisor/go.sum
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: cdylib-linux
+          path: .
+
+      - name: Verify cdylib present
+        run: ls -l target/release/libtcp_sans_io.so
+
+      # The TUN tests need CAP_NET_ADMIN to create /dev/net/tun and run ip(8).
+      # GHA runners give passwordless sudo on ubuntu-latest. We invoke the
+      # individual tests directly (the rest of the suite already ran in the
+      # `gvisor` job). Both the client-mode (cdylib dials) and server-mode
+      # (cdylib LISTENs, kernel dials) variants run here. The server-mode
+      # test moves 1 GiB each direction, so the timeout has to fit a
+      # comfortable margin around its 10-minute internal deadline.
+      - name: go test TestAgainstLinuxKernelTUN + TestServerAgainstLinuxKernelTUN (sudo)
+        working-directory: bindings/gvisor
+        run: |
+          go test -c -o gvisor.test ./...
+          sudo -E ./gvisor.test -test.v -test.timeout=900s -test.run='^Test(Server)?AgainstLinuxKernelTUN$'

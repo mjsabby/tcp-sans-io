@@ -1,0 +1,40 @@
+[package]
+name = "tcp-sans-io"
+version = "0.1.0"
+edition = "2021"
+description = "Client-only sans-I/O user-space TCP stack with C ABI for WireGuard front-ends"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "tcp_sans_io"
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[features]
+# When enabled, the host binary supplies its own #[panic_handler]. Useful when
+# this crate is linked into a larger no_std project that already defines one.
+host_panic_handler = []
+
+[profile.release]
+panic = "abort"
+lto = "fat"
+codegen-units = 1
+opt-level = 3
+strip = true
+overflow-checks = false
+
+[profile.dev]
+panic = "abort"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unused_must_use = "deny"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "warn"
+
+[dev-dependencies]
+proptest = "1"
