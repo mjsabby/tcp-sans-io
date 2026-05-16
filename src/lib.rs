@@ -62,7 +62,15 @@ pub use tcb::{Endpoint, Tcb, TcbConfig};
 pub const MSS: u16 = 1460;
 
 /// Per-direction ring buffer capacity (must be a power of two).
-pub const BUF_CAP: usize = 65_536;
+///
+/// Sized for high-bandwidth-delay-product paths: 1 MiB lets a connection
+/// fill ~80 ms × 100 Mbit/s before the receive window throttles the
+/// sender, vs. ~5 ms × 100 Mbit/s with the legacy 64 KiB. Memory cost
+/// is `2 * BUF_CAP` (send + receive) per connection — ~2 MiB.
+///
+/// Hosts that hold many idle connections may wish to override this; the
+/// constant is the only knob.
+pub const BUF_CAP: usize = 1_048_576;
 
 /// Single-hole out-of-order reassembly buffer capacity, in bytes.
 ///

@@ -1,0 +1,28 @@
+# PRR fast retransmit (RFC 6937): pure dup-ACKs trigger fast recovery.
+# Under PRR, cwnd is NOT collapsed to 1*MSS (that was Tahoe); instead
+# ssthresh = max(FlightSize/2, 2*MSS) and a per-ACK snd_credit paces
+# the retransmission.
+#
+# NB: this script uses wscale=0 on the peer side to keep the post-
+# handshake window comparison straightforward. With WS negotiated, the
+# SYN-ACK window is unscaled (RFC 7323 §2.3) but post-handshake windows
+# are scaled — the first dup-ACK then differs from the cached snd_wnd
+# and gets ignored by the "window unchanged" dup-ACK filter. That's
+# correct behaviour but makes scripted dup-ACK timing brittle.
+
+--connect 10.0.0.1:49152 10.0.0.2:80
++0 > SEW 0:0(0) win 65535 <mss 1460, wscale 5, sackOK, TS val * ecr 0>
++.005 < S. 0:0(0) ack 1 win 32768 <mss 1460, wscale 0, sackOK, TS val 1 ecr *>
++0 > . 1:1(0) ack 1 win 32768 <TS val * ecr 1>
+
+# Push one MSS of data (effective MSS after TS option = 1448 bytes).
+--send 1448
++0 > P. 1:1449(1448) ack 1 win 32768 <TS val * ecr 1>
+
+# Three pure dup-ACKs at ack=1 with unchanged window fire fast retransmit.
++.005 < . 1:1(0) ack 1 win 32768 <TS val 2 ecr *>
++.001 < . 1:1(0) ack 1 win 32768 <TS val 3 ecr *>
++.001 < . 1:1(0) ack 1 win 32768 <TS val 4 ecr *>
+
+# PRR retransmits one segment under the initial snd_credit=MSS budget.
++0 > P. 1:1449(1448) ack 1 win 32768 <TS val * ecr 4>

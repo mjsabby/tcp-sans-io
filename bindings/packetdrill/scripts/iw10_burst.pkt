@@ -1,0 +1,31 @@
+# IW=10 (RFC 6928): after the handshake, the first send should be allowed
+# to emit up to 10 segments without waiting for ACKs.
+#
+# We push a 14_600-byte burst (10 * MSS_payload_with_TS = 10 * 1460
+# ... but TS option costs 12 bytes per segment, so effective payload is
+# 1448) and verify that our extract loop pulls 11 segments out before
+# stalling. (We push 14_600 so the math is round; 14_600 / 1448 = 10.08
+# segments.)
+
+--connect 10.0.0.1:49152 10.0.0.2:80
++0 > SEW 0:0(0) win 65535 <mss 1460, wscale 5, sackOK, TS val * ecr 0>
++.005 < S. 0:0(0) ack 1 win 32768 <mss 1460, wscale 7, sackOK, TS val 1 ecr *>
++0 > . 1:1(0) ack 1 win 32768 <TS val * ecr 1>
+
+# Push 14_600 bytes of application data.
+--send 14600
+
+# IW=10 with effective payload 1448 lets us emit 10 full segments
+# (14_480 bytes) without an ACK. The 11th segment carries the remaining
+# 120 bytes. All segments are PSH+ACK (small writes set PSH).
++0 > P. 1:1449(1448) ack 1 <TS val * ecr 1>
++0 > P. 1449:2897(1448) ack 1 <TS val * ecr 1>
++0 > P. 2897:4345(1448) ack 1 <TS val * ecr 1>
++0 > P. 4345:5793(1448) ack 1 <TS val * ecr 1>
++0 > P. 5793:7241(1448) ack 1 <TS val * ecr 1>
++0 > P. 7241:8689(1448) ack 1 <TS val * ecr 1>
++0 > P. 8689:10137(1448) ack 1 <TS val * ecr 1>
++0 > P. 10137:11585(1448) ack 1 <TS val * ecr 1>
++0 > P. 11585:13033(1448) ack 1 <TS val * ecr 1>
++0 > P. 13033:14481(1448) ack 1 <TS val * ecr 1>
++0 > P. 14481:14601(120) ack 1 <TS val * ecr 1>

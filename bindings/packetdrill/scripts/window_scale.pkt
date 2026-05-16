@@ -1,0 +1,18 @@
+# Window Scale negotiation: when peer offers wscale=N, our subsequent
+# outbound windows are shifted by our advertised wscale.
+#
+# With BUF_CAP=1 MiB and LOCAL_WS_SHIFT=5, an empty receive ring (full
+# 1 MiB free) advertises win = 1 MiB / 32 = 32_768 in the wire field.
+
+--connect 10.0.0.1:49152 10.0.0.2:80
+
++0 > SEW 0:0(0) win 65535 <mss 1460, wscale 5, sackOK, TS val * ecr 0>
+
+# Peer offers wscale=7 → both sides have WS negotiated.
++.005 < S. 0:0(0) ack 1 win 32768 <mss 1460, wscale 7, sackOK, TS val 1 ecr *>
+
+# Third ACK: our outbound window field is BUF_CAP >> rcv_wscale (=5).
+# 1_048_576 >> 5 = 32_768.
++0 > . 1:1(0) ack 1 win 32768 <TS val * ecr 1>
+
+--expect_state ESTABLISHED

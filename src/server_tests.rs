@@ -81,6 +81,7 @@ fn build_in_from(
         ts,
         sack_permitted,
         sack: None,
+        ..TcpOptions::NONE
     };
     let n = wire::emit(
         &mut buf,
@@ -95,6 +96,7 @@ fn build_in_from(
         &opts,
         payload,
         0,
+        wire::ecn::NOT_ECT,
     )
     .expect("emit peer packet");
     buf.truncate(n);
@@ -137,6 +139,7 @@ struct ParsedOut {
     flags: u8,
     window: u16,
     mss: Option<u16>,
+    wscale: Option<u8>,
     ts: Option<(u32, u32)>,
     sack_permitted: bool,
     payload: Vec<u8>,
@@ -154,6 +157,7 @@ impl ParsedOut {
             flags: s.flags,
             window: s.window,
             mss: s.options.mss,
+            wscale: s.options.wscale,
             ts: s.options.ts,
             sack_permitted: s.options.sack_permitted,
             payload: s.payload.to_vec(),
@@ -449,6 +453,7 @@ fn listen_rejects_packet_with_wrong_local_ip() {
         &opts,
         &[],
         0,
+        wire::ecn::NOT_ECT,
     )
     .expect("emit");
     buf.truncate(n);
@@ -533,9 +538,11 @@ fn syn_rcvd_off_path_rst_with_wrong_seq_is_dropped() {
     assert_eq!(s.state(), State::SynRcvd);
 
     // Off-path RST with a SEQ outside our receive window. Must be ignored.
+    // BUF_CAP is up to 1 MiB, so we offset well beyond that to ensure
+    // the RST seq sits outside even a fully-open receive window.
     let rst = build_in(
         flags::RST,
-        CLIENT_ISS.wrapping_add(0x10_0000), // far outside window
+        CLIENT_ISS.wrapping_add(0x0200_0000), // 32 MiB out — well outside any RFC-permitted window
         SERVER_ISS.wrapping_add(1),
         PEER_WIN,
         None,
@@ -850,4 +857,163 @@ fn listen_recycles_after_clean_close() {
     // documented behaviour — pin it.
     s.inject_packet(&rst).expect("inject RST");
     assert_eq!(s.state(), State::Closed);
+}
+
+// ---------------------------------------------------------------------------
+// RFC 7323 §2 — Window Scale option, passive-open side
+// ---------------------------------------------------------------------------
+
+/// Variant of `build_in` that includes a Window Scale option.
+#[allow(clippy::too_many_arguments)]
+fn build_in_ws(
+    flag_bits: u8,
+    seq: u32,
+    ack: u32,
+    win: u16,
+    mss: Option<u16>,
+    wscale: Option<u8>,
+    ts: Option<(u32, u32)>,
+    sack_permitted: bool,
+    payload: &[u8],
+) -> Vec<u8> {
+    let mut buf = vec![0u8; MAX_PACKET];
+    let opts = TcpOptions {
+        mss,
+        wscale,
+        ts,
+        sack_permitted,
+        sack: None,
+    };
+    let n = wire::emit(
+        &mut buf,
+        CLIENT_IP,
+        SERVER_IP,
+        CLIENT_PORT,
+        SERVER_PORT,
+        seq,
+        ack,
+        flag_bits,
+        win,
+        &opts,
+        payload,
+        0,
+        wire::ecn::NOT_ECT,
+    )
+    .expect("emit");
+    buf.truncate(n);
+    buf
+}
+
+/// Passive open with peer offering WS=8: our SYN-ACK MUST echo a WS
+/// option. The post-handshake third ACK's window is then interpreted
+/// scaled (window << 8).
+#[test]
+fn passive_handshake_negotiates_window_scale() {
+    let mut s = make_listener();
+    s.set_now(0);
+    s.listen().expect("listen");
+
+    let peer_ws = 8u8;
+    let third_ack_win = 1000u16;
+
+    // Client SYN with WS=8.
+    let syn = build_in_ws(
+        flags::SYN,
+        CLIENT_ISS,
+        0,
+        PEER_WIN,
+        Some(1460),
+        Some(peer_ws),
+        Some((42, 0)),
+        true,
+        &[],
+    );
+    s.set_now(1);
+    s.inject_packet(&syn).expect("inject SYN");
+    assert_eq!(s.state(), State::SynRcvd);
+
+    // SYN-ACK must include WS option (echoing back is mandatory per
+    // RFC 7323 §2.2 — without it, scaling is disabled both ways). The
+    // exact shift is implementation-defined; we just assert it's present.
+    let synack = pop(&mut s);
+    assert_eq!(synack.flags, flags::SYN | flags::ACK);
+    let our_ws = synack
+        .wscale
+        .expect("SYN-ACK must echo our local WS shift");
+    assert!(our_ws >= 1, "shift ≥ 1 required to fit our BUF_CAP");
+    // SYN-ACK window itself is NEVER scaled (RFC 7323 §2.3).
+    assert_eq!(
+        synack.window,
+        u16::MAX,
+        "SYN-ACK window field must be unscaled (raw saturated)",
+    );
+
+    // Client final ACK with window=1000 — post-handshake, so this gets
+    // scaled by peer_ws=8. Effective peer window: 1000 << 8 = 256_000.
+    let ack = build_in_ws(
+        flags::ACK,
+        CLIENT_ISS.wrapping_add(1),
+        SERVER_ISS.wrapping_add(1),
+        third_ack_win,
+        None,
+        None,
+        Some((43, 0)),
+        false,
+        &[],
+    );
+    s.set_now(2);
+    s.inject_packet(&ack).expect("inject ACK");
+    assert_eq!(s.state(), State::Established);
+
+    let snap = s.debug_snapshot();
+    let expected = (third_ack_win as u32) << peer_ws;
+    assert_eq!(
+        snap.snd_wnd, expected,
+        "third ACK window must apply WS shift: {} << {} = {}",
+        third_ack_win, peer_ws, expected,
+    );
+}
+
+/// Passive open with a peer that does NOT offer WS: we MUST omit WS in
+/// our SYN-ACK and treat the peer's windows as raw 16-bit values.
+#[test]
+fn passive_handshake_without_ws_disables_scaling() {
+    let mut s = make_listener();
+    s.set_now(0);
+    s.listen().expect("listen");
+
+    let syn = build_in(
+        flags::SYN,
+        CLIENT_ISS,
+        0,
+        PEER_WIN,
+        Some(1460),
+        Some((42, 0)),
+        true,
+        &[],
+    );
+    s.set_now(1);
+    s.inject_packet(&syn).expect("inject SYN");
+
+    let synack = pop(&mut s);
+    assert_eq!(
+        synack.wscale, None,
+        "SYN-ACK must omit WS when peer didn't offer it",
+    );
+
+    // Third ACK with window=1000 — interpreted RAW (no shift).
+    let ack = build_in(
+        flags::ACK,
+        CLIENT_ISS.wrapping_add(1),
+        SERVER_ISS.wrapping_add(1),
+        1000,
+        None,
+        Some((43, 0)),
+        false,
+        &[],
+    );
+    s.set_now(2);
+    s.inject_packet(&ack).expect("inject ACK");
+    let snap = s.debug_snapshot();
+    assert_eq!(snap.snd_wnd, 1000, "no WS → window is raw");
 }

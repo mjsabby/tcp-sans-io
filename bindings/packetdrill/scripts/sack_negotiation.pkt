@@ -1,0 +1,12 @@
+# SACK negotiation: both sides offer SACK_PERMITTED in their SYNs.
+
+--connect 10.0.0.1:49152 10.0.0.2:80
+
+# Our SYN carries sackOK.
++0 > SEW 0:0(0) win 65535 <mss 1460, wscale 5, sackOK, TS val * ecr 0>
+
+# Peer SYN-ACK with sackOK echoed back.
++.005 < S. 0:0(0) ack 1 win 32768 <mss 1460, wscale 7, sackOK, TS val 1 ecr *>
+
++0 > . 1:1(0) ack 1 <TS val * ecr 1>
+--expect_state ESTABLISHED

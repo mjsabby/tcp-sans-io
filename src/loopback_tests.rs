@@ -124,6 +124,7 @@ impl TestPeer {
             opts,
             payload,
             self.ip_id,
+            wire::ecn::NOT_ECT,
         )
         .expect("peer emit");
         self.ip_id = self.ip_id.wrapping_add(1);
@@ -580,6 +581,7 @@ fn rejects_ip_fragment() {
         &TcpOptions::NONE,
         &[],
         0,
+        wire::ecn::NOT_ECT,
     )
     .expect("emit");
     buf.truncate(n);
@@ -622,8 +624,11 @@ fn ones_complement_csum(data: &[u8]) -> u16 {
 // Harder tests
 // ===========================================================================
 
-/// Three duplicate ACKs of `snd_una` should fire a Tahoe loss event:
-/// `cwnd → 1 MSS`, `snd_nxt → snd_una`, immediate retransmit.
+/// Three duplicate ACKs of `snd_una` should fire a fast-retransmit loss
+/// event under PRR (RFC 6937): `ssthresh = max(FlightSize/2, 2*MSS)`,
+/// `snd_nxt → snd_una`, immediate retransmit of one MSS. (Cwnd is NOT
+/// collapsed to 1*MSS — that was the old Tahoe behavior, replaced by
+/// PRR-SSRB pacing.)
 #[test]
 fn three_dup_acks_trigger_tahoe_fast_retransmit() {
     let mut client = make_client();

@@ -1,0 +1,19 @@
+# Bidirectional data: peer sends, we recv; we send, peer ACKs.
+# Verifies the runner's --recv pattern verification works.
+
+--connect 10.0.0.1:49152 10.0.0.2:80
++0 > SEW 0:0(0) win 65535 <mss 1460, wscale 5, sackOK, TS val * ecr 0>
++.005 < S. 0:0(0) ack 1 win 32768 <mss 1460, wscale 7, sackOK, TS val 1 ecr *>
++0 > . 1:1(0) ack 1 <TS val * ecr 1>
+--expect_state ESTABLISHED
+
+# Peer sends us 100 bytes of the deterministic 0..255 pattern starting
+# at relative seq 1 (peer's seq space). The byte at peer-relative seq 1
+# in the runner's data generator is byte 1 of the pattern, etc.
++.005 < P. 1:101(100) ack 1 win 32768 <TS val 2 ecr *>
+
+# Application reads them; the runner verifies the pattern.
+--recv 100
+
+# We delay-ACK the inbound segment (40ms timer). Skip to it firing.
++.04 > . 1:1(0) ack 101 <TS val * ecr 2>

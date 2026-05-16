@@ -1,0 +1,23 @@
+# Basic 3-way handshake with all the options we negotiate.
+#
+# Verifies:
+#  - SYN carries SYN+ECE+CWR flags (ECN-Setup, RFC 3168)
+#  - SYN options: MSS=1460, wscale=5, sackOK, TS val ecr 0
+#  - SYN-ACK from peer with ECE confirms ECN
+#  - Our third ACK echoes peer's TSval
+
+--connect 10.0.0.1:49152 10.0.0.2:80
+
+# Our SYN: ECN-Setup flags + full option set, seq=0 (relative), ack=0.
+# TS val captured as $cli_ts for later echo verification.
++0 > SEW 0:0(0) win 65535 <mss 1460, wscale 5, sackOK, TS val $cli_ts ecr 0>
+
+# Peer's SYN-ACK 5ms later: confirms ECN (ECE without CWR), echoes our
+# TSval, advertises its own window scale and sackOK.
++.005 < SE. 0:0(0) ack 1 win 32768 <mss 1460, wscale 7, sackOK, TS val 1000 ecr $cli_ts>
+
+# Our third ACK: pure ACK, echoes peer's TSval=1000, ECT(0) marked at IP
+# layer (ECN is now negotiated and SYN-ACK was confirming).
++0 > . 1:1(0) ack 1 ecn ECT0 <nop,nop,TS val * ecr 1000>
+
+--expect_state ESTABLISHED

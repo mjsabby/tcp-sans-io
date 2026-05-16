@@ -85,6 +85,18 @@ const COOKIE_TIME_BUCKET_MS: u64 = 64_000;
 /// table maps to the largest entry, anything below to the smallest.
 const COOKIE_MSS_TABLE: [u16; 8] = [536, 1300, 1440, 1452, 1460, 1480, 9000, 65495];
 
+/// Window Scale shift count (RFC 7323 §2) we advertise on outbound
+/// SYN / SYN-ACK. Chosen as the minimal scale that lets us advertise the
+/// full receive ring without truncation: `BUF_CAP / 2^LOCAL_WS_SHIFT`
+/// must fit in a 16-bit window field (max 65535).
+///
+/// With `BUF_CAP = 1 MiB` we need shift ≥ 5 (1MiB >> 5 = 32_768 ≤ 65535;
+/// shift = 4 would give 65_536 which overflows u16). Picking the minimal
+/// scale matters because each shift coarsens the window granularity by
+/// 2x — at shift=5 we advertise in 32-byte units, which is fine for
+/// MSS-class transfers.
+const LOCAL_WS_SHIFT: u8 = 5;
+
 /// Compact internal-state snapshot intended only for diagnostic logging.
 /// Layout is C-compatible so it can be exposed to FFI consumers.
 #[repr(C)]
@@ -155,6 +167,33 @@ pub struct Tcb {
     // ---- Timestamps (RFC 7323) -------------------------------------------
     ts_enabled: bool,
     ts_recent: u32, // most recent peer TSval; echoed as our TSecr
+
+    // ---- Window Scale (RFC 7323 §2) --------------------------------------
+    /// Shift count we apply to peer-advertised windows on inbound segments
+    /// (i.e. peer's chosen `rcv_wscale`). Set during handshake; remains 0
+    /// if the peer didn't offer WS.
+    snd_wscale: u8,
+    /// Shift count we apply to our own advertised window on outbound
+    /// segments. Set to [`LOCAL_WS_SHIFT`] iff the peer offered WS in
+    /// the handshake (per RFC 7323 §2.2: a TCP must not send WS unless
+    /// the peer also did); otherwise 0.
+    rcv_wscale: u8,
+
+    // ---- ECN (RFC 3168) --------------------------------------------------
+    /// True iff both sides negotiated ECN during the handshake (active SYN
+    /// carried CWR+ECE, SYN-ACK carried ECE-only). Once true, all non-SYN
+    /// outbound segments carry the ECT(0) codepoint in IP TOS, and the
+    /// receiver echoes ECE on observed CE marks; the sender treats ECE as
+    /// a congestion signal (enters PRR recovery) and responds with CWR.
+    ecn_enabled: bool,
+    /// Sticky flag: the most recent inbound segment carried a CE
+    /// codepoint, so all outbound ACKs must set ECE until the peer
+    /// confirms reaction with CWR. Cleared on receiving CWR.
+    ce_observed: bool,
+    /// Sticky flag: we received an ECE-marked ACK and entered congestion
+    /// recovery in response. The next new-data segment we send must set
+    /// the CWR flag to acknowledge.
+    send_cwr_pending: bool,
 
     // ---- SACK (RFC 2018) -------------------------------------------------
     /// True iff both sides offered SACK_PERMITTED in the handshake.
@@ -258,6 +297,11 @@ impl Tcb {
             peer_mss: DEFAULT_PEER_MSS,
             ts_enabled: false,
             ts_recent: 0,
+            snd_wscale: 0,
+            rcv_wscale: 0,
+            ecn_enabled: false,
+            ce_observed: false,
+            send_cwr_pending: false,
             sack_enabled: false,
             sack_recovery_seq: None,
             send_ring: Ring::new()?,
@@ -334,24 +378,37 @@ impl Tcb {
     }
 
     /// Initiate an active open: transitions `Closed` → `SynSent`, queues a SYN
-    /// carrying MSS + Timestamps options.
+    /// carrying MSS + Window Scale + Timestamps + SACK_PERMITTED options,
+    /// and the ECN-Setup flags (CWR + ECE per RFC 3168 §6.1.1).
     pub fn connect(&mut self) -> Result<(), TcpError> {
         if self.state != State::Closed {
             return Err(TcpError::InvalidState);
         }
         self.state = State::SynSent;
         self.snd_una = self.iss;
-        // Offer Timestamps (RFC 7323) and SACK_PERMITTED (RFC 2018). The
-        // peer may decline either; both are no-ops if not echoed back in
-        // the SYN-ACK. SACK is what keeps lossy bidirectional bulk from
-        // wedging on RTO-only recovery — see `process_ack` below.
+        // Offer Window Scale (RFC 7323 §2), Timestamps (RFC 7323 §3) and
+        // SACK_PERMITTED (RFC 2018). The peer may decline any; each is a
+        // no-op if not echoed back in the SYN-ACK. SACK is what keeps lossy
+        // bidirectional bulk from wedging on RTO-only recovery — see
+        // `process_ack` below.
         let opts = TcpOptions {
             mss: Some(self.local_mss),
+            wscale: Some(LOCAL_WS_SHIFT),
             ts: Some((self.ts_val(), 0)),
             sack_permitted: true,
             sack: None,
         };
-        self.emit_segment(flags::SYN, self.iss, 0, &opts, &[])?;
+        // RFC 3168 §6.1.1: active opener sets BOTH ECE and CWR on the SYN
+        // to advertise ECN-capable. ECN is confirmed iff the SYN-ACK
+        // carries ECE without CWR. The SYN itself MUST NOT be ECT-marked
+        // — emit_segment enforces that based on the SYN flag.
+        self.emit_segment(
+            flags::SYN | flags::ECE | flags::CWR,
+            self.iss,
+            0,
+            &opts,
+            &[],
+        )?;
         self.snd_nxt = self.iss.wrapping_add(1); // SYN occupies one seq
         self.bump_snd_max();
         self.arm_rto_for(self.snd_nxt);
@@ -423,6 +480,11 @@ impl Tcb {
         self.peer_mss = DEFAULT_PEER_MSS;
         self.ts_enabled = false;
         self.ts_recent = 0;
+        self.snd_wscale = 0;
+        self.rcv_wscale = 0;
+        self.ecn_enabled = false;
+        self.ce_observed = false;
+        self.send_cwr_pending = false;
         self.sack_enabled = false;
         self.sack_recovery_seq = None;
         self.send_ring.clear();
@@ -623,11 +685,13 @@ impl Tcb {
                 self.time_wait_deadline = None;
             }
         }
-        // ---- RTO expiry → Tahoe loss event ------------------------------
+        // ---- RTO expiry → RFC 5681 §3 collapse --------------------------
+        // Note: PRR (RFC 6937 §6) explicitly does not modify RTO behavior;
+        // RTO continues to use Tahoe-style cwnd=1*MSS + slow-start re-open.
         if let Some(deadline) = self.rto_deadline {
             if self.now_ms >= deadline {
                 let flight = self.snd_nxt.wrapping_sub(self.snd_una);
-                self.cc.on_loss(flight);
+                self.cc.on_rto_loss(flight);
                 self.snd_nxt = self.snd_una;
                 // Exponential back-off, capped.
                 self.rto_ms = (self.rto_ms.saturating_mul(2)).min(RTO_MAX_MS);
@@ -640,11 +704,20 @@ impl Tcb {
                 if self.state == State::SynSent {
                     let opts = TcpOptions {
                         mss: Some(self.local_mss),
+                        wscale: Some(LOCAL_WS_SHIFT),
                         ts: Some((self.ts_val(), 0)),
                         sack_permitted: true,
                         sack: None,
                     };
-                    self.emit_segment(flags::SYN, self.iss, 0, &opts, &[])?;
+                    // ECN-Setup SYN per RFC 3168 §6.1.1 — same flags as
+                    // the initial connect() emission.
+                    self.emit_segment(
+                        flags::SYN | flags::ECE | flags::CWR,
+                        self.iss,
+                        0,
+                        &opts,
+                        &[],
+                    )?;
                     self.snd_nxt = self.iss.wrapping_add(1);
                     self.bump_snd_max();
                     self.arm_rto_for(self.snd_nxt);
@@ -761,11 +834,21 @@ impl Tcb {
             self.irs = seg.seq;
             self.rcv_nxt = seg.seq.wrapping_add(1);
             self.snd_una = seg.ack;
+            // RFC 7323 §2.3: SYN-ACK window field is NEVER scaled.
             self.snd_wnd = seg.window as u32;
 
             // Negotiate options.
             if let Some(mss) = seg.options.mss {
                 self.peer_mss = mss.max(DEFAULT_PEER_MSS);
+            }
+            // Window Scale: only honour it if the peer offered WS in
+            // their SYN-ACK. Per RFC 7323 §2.2, scaling is bidirectional
+            // and gated on both sides offering the option. We always offer
+            // it on the active SYN, so the peer's choice is the only
+            // variable; if peer omits it, both directions stay unscaled.
+            if let Some(peer_ws) = seg.options.wscale {
+                self.snd_wscale = peer_ws.min(14);
+                self.rcv_wscale = LOCAL_WS_SHIFT;
             }
             if let Some((tsval, tsecr)) = seg.options.ts {
                 self.ts_enabled = true;
@@ -779,6 +862,11 @@ impl Tcb {
             // their SYN/SYN-ACK. We always offer it, so the peer's choice
             // is the only variable. RFC 2018 §2.
             self.sack_enabled = seg.options.sack_permitted;
+            // ECN-Setup confirmation: RFC 3168 §6.1.1 says the SYN-ACK
+            // confirms ECN iff it carries ECE *without* CWR (the active
+            // opener set CWR+ECE on the SYN; a confirming server clears
+            // CWR and keeps ECE). Any other combination disables ECN.
+            self.ecn_enabled = seg.has(flags::ECE) && !seg.has(flags::CWR);
             // Fallback probe (no-TS path) is also satisfied by this ACK.
             self.process_ack_rtt(seg.ack);
             self.rto_deadline = None;
@@ -864,15 +952,29 @@ impl Tcb {
         };
         self.irs = seg.seq;
         self.rcv_nxt = seg.seq.wrapping_add(1);
+        // RFC 7323 §2.3: SYN window field is NEVER scaled.
         self.snd_wnd = seg.window as u32;
         if let Some(mss) = seg.options.mss {
             self.peer_mss = mss.max(DEFAULT_PEER_MSS);
+        }
+        // Window Scale: per RFC 7323 §2.2, we can only send WS in our
+        // SYN-ACK if the peer offered it in their SYN. If they did, record
+        // their shift count for inbound windows and enable our outbound
+        // scaling; otherwise both directions stay unscaled.
+        if let Some(peer_ws) = seg.options.wscale {
+            self.snd_wscale = peer_ws.min(14);
+            self.rcv_wscale = LOCAL_WS_SHIFT;
         }
         if let Some((tsval, _)) = seg.options.ts {
             self.ts_enabled = true;
             self.ts_recent = tsval;
         }
         self.sack_enabled = seg.options.sack_permitted;
+        // ECN-Setup negotiation (passive side, RFC 3168 §6.1.1): the
+        // peer's SYN must carry BOTH CWR and ECE; we then confirm by
+        // setting only ECE on our SYN-ACK (handled in
+        // emit_synack_from_state).
+        self.ecn_enabled = seg.has(flags::ECE) && seg.has(flags::CWR);
         self.snd_una = self.iss;
         self.snd_nxt = self.iss;
         self.snd_max = self.iss;
@@ -911,9 +1013,13 @@ impl Tcb {
         // SACK_PERMITTED here: cookies don't preserve it across the
         // half-open gap, and a peer expecting SACK on a connection that
         // doesn't actually have it just sees its SACK blocks ignored.
+        // For the same reason we omit Window Scale: the cookie has no
+        // bits to encode the peer's WS shift, so cookie-promoted
+        // connections always run unscaled.
         let ack = seg.seq.wrapping_add(1);
         let opts = TcpOptions {
             mss: Some(self.local_mss),
+            wscale: None,
             ts: seg
                 .options
                 .ts
@@ -924,7 +1030,9 @@ impl Tcb {
         let win =
             u16::try_from(self.advertised_window().min(u16::MAX as u32)).unwrap_or(u16::MAX);
         // Direct emit so we don't mutate any per-connection state — staying
-        // in LISTEN is the whole point of this path.
+        // in LISTEN is the whole point of this path. IP TOS is NOT_ECT:
+        // SYN-ACK segments MUST NOT be ECT-marked (RFC 3168 §6.1.1), and
+        // cookie-promoted connections don't negotiate ECN anyway.
         let n = wire::emit(
             &mut self.tx_buf,
             self.local.ip,
@@ -938,6 +1046,7 @@ impl Tcb {
             &opts,
             &[],
             self.ip_id,
+            wire::ecn::NOT_ECT,
         )?;
         self.ip_id = self.ip_id.wrapping_add(1);
         self.tx_len = n;
@@ -989,7 +1098,10 @@ impl Tcb {
         self.snd_una = seg.ack;
         self.snd_nxt = seg.ack;
         self.snd_max = seg.ack;
-        self.snd_wnd = seg.window as u32;
+        // Cookie path runs unscaled (snd_wscale == 0), so this is just
+        // `seg.window as u32` — but go through the helper for symmetry
+        // with the rest of the codebase.
+        self.snd_wnd = self.scale_peer_window(seg.window);
         // Inherit the third ACK's TS, if any. Cookie mode does not
         // negotiate SACK — see emit_cookie_synack for the reasoning.
         if let Some((tsval, _)) = seg.options.ts {
@@ -1004,11 +1116,19 @@ impl Tcb {
 
     /// Emit a SYN-ACK using the currently-negotiated connection state
     /// (`self.iss`, `self.rcv_nxt`, `self.peer_mss`, `self.ts_enabled`,
-    /// `self.sack_enabled`). Used by both the initial accept-SYN path and
-    /// the SYN-ACK RTO retransmit path.
+    /// `self.sack_enabled`, `self.rcv_wscale`, `self.ecn_enabled`). Used
+    /// by both the initial accept-SYN path and the SYN-ACK RTO retransmit
+    /// path.
     fn emit_synack_from_state(&mut self) -> Result<(), TcpError> {
         let opts = TcpOptions {
             mss: Some(self.local_mss),
+            // Echo WS only if peer offered it (rcv_wscale was set non-zero
+            // in accept_syn_stateful in that case). RFC 7323 §2.2.
+            wscale: if self.rcv_wscale > 0 {
+                Some(self.rcv_wscale)
+            } else {
+                None
+            },
             ts: if self.ts_enabled {
                 Some((self.ts_val(), self.ts_recent))
             } else {
@@ -1017,7 +1137,15 @@ impl Tcb {
             sack_permitted: self.sack_enabled,
             sack: None,
         };
-        self.emit_segment(flags::SYN | flags::ACK, self.iss, self.rcv_nxt, &opts, &[])
+        // RFC 3168 §6.1.1: confirming SYN-ACK carries ECE without CWR.
+        let extra_flags = if self.ecn_enabled { flags::ECE } else { 0 };
+        self.emit_segment(
+            flags::SYN | flags::ACK | extra_flags,
+            self.iss,
+            self.rcv_nxt,
+            &opts,
+            &[],
+        )
     }
 
     // ---------------------------------------------------------------------
@@ -1083,7 +1211,9 @@ impl Tcb {
 
         // Valid third ACK — transition to ESTABLISHED.
         self.snd_una = seg.ack;
-        self.snd_wnd = seg.window as u32;
+        // Third ACK is no longer a SYN segment, so peer's window field is
+        // scaled per the negotiated `snd_wscale` (0 if WS wasn't offered).
+        self.snd_wnd = self.scale_peer_window(seg.window);
         self.rto_deadline = None;
         self.rtt_probe = None;
         self.syn_rcvd_retries = 0;
@@ -1155,6 +1285,21 @@ impl Tcb {
                 if seq_ge(tsval, self.ts_recent) {
                     self.ts_recent = tsval;
                 }
+            }
+        }
+
+        // RFC 3168 §6.1.2: a CE-marked inbound segment must cause us to
+        // echo ECE on subsequent ACKs until the peer responds with CWR.
+        // RFC 3168 §6.1.3: a CWR-marked inbound segment clears our
+        // CE-sticky state. These checks are gated on ECN being negotiated
+        // — middleboxes can spuriously set ECN bits on connections that
+        // never opted in, and we must ignore them.
+        if self.ecn_enabled {
+            if seg.ecn == wire::ecn::CE {
+                self.ce_observed = true;
+            }
+            if seg.has(flags::CWR) {
+                self.ce_observed = false;
             }
         }
 
@@ -1378,6 +1523,21 @@ impl Tcb {
             return Ok(());
         }
 
+        // RFC 3168 §6.1.2: an ECE-marked ACK is a congestion signal. Enter
+        // PRR recovery (same response as a 3-dup-ACK / SACK trigger) and
+        // arm CWR on the next new-data segment. Gate on `!in_recovery` to
+        // avoid stacking multiple ECE-driven cwnd reductions within a
+        // single recovery episode.
+        if self.ecn_enabled
+            && seg.has(flags::ECE)
+            && !self.cc.in_recovery()
+            && seq_gt(self.snd_nxt, self.snd_una)
+        {
+            let flight = self.snd_nxt.wrapping_sub(self.snd_una);
+            self.cc.enter_recovery(flight, self.snd_max);
+            self.send_cwr_pending = true;
+        }
+
         if seq_le(ack, self.snd_una) {
             // Duplicate ACK regime. Two distinct fast-retransmit triggers
             // may apply, both gated on `ack == snd_una` and an unchanged
@@ -1404,7 +1564,7 @@ impl Tcb {
             // a window update by itself does not count as a dup-ACK.
             if ack == self.snd_una
                 && seq_gt(self.snd_nxt, self.snd_una)
-                && seg.window as u32 == self.snd_wnd
+                && self.scale_peer_window(seg.window) == self.snd_wnd
             {
                 let sack_trigger = self.sack_enabled
                     && seg.options.sack.is_some()
@@ -1419,7 +1579,11 @@ impl Tcb {
                 };
                 if trigger {
                     let flight = self.snd_nxt.wrapping_sub(self.snd_una);
-                    self.cc.on_loss(flight);
+                    // PRR Fast Recovery (RFC 6937): don't collapse cwnd to 1*MSS;
+                    // ssthresh = FlightSize/2 and per-ACK pacing handles the rest.
+                    // Recovery point is the high-water snd_max so a slow cumulative
+                    // ACK doesn't prematurely exit recovery.
+                    self.cc.enter_recovery(flight, self.snd_max);
                     self.snd_nxt = self.snd_una;
                     if let Some(p) = self.rtt_probe.as_mut() {
                         p.valid = false;
@@ -1437,6 +1601,10 @@ impl Tcb {
 
         let prev_una = self.snd_una;
         let acked = ack.wrapping_sub(prev_una);
+        // RFC 6937: cwnd inflation is suppressed during recovery. The PRR
+        // budget (snd_credit) takes over; on recovery exit, cwnd is reset
+        // to ssthresh. So `cc.on_ack` is intentionally a no-op while
+        // `cc.in_recovery()` is true.
         self.cc.on_ack(acked);
 
         // FIN seq accounting: if this ACK is the one that crosses fin_seq,
@@ -1462,6 +1630,14 @@ impl Tcb {
         if seq_gt(self.snd_una, self.snd_nxt) {
             self.snd_nxt = self.snd_una;
         }
+        // ---- PRR per-ACK update / recovery exit -------------------------
+        // Order matters: update DeliveredData *before* exit check so the
+        // ACK that crosses recovery_point still credits prr_delivered.
+        // `pipe` estimate: without an RFC 6675 SACK scoreboard we use
+        // post-advance `snd_nxt - snd_una`, which is conservative.
+        let pipe = self.snd_nxt.wrapping_sub(self.snd_una);
+        self.cc.on_ack_in_recovery(acked, pipe);
+        let _ = self.cc.check_exit_recovery(self.snd_una);
         // A fresh ACK ends the current SACK-driven recovery epoch, if any.
         // The next SACK-bearing dup-ACK at the new `snd_una` is then again
         // eligible to trigger fast-retransmit.
@@ -1503,7 +1679,7 @@ impl Tcb {
     }
 
     fn update_send_window(&mut self, window: u16) {
-        self.snd_wnd = window as u32;
+        self.snd_wnd = self.scale_peer_window(window);
         if self.snd_wnd > 0 {
             // Window opened — cancel persist timer.
             self.persist_deadline = None;
@@ -1545,7 +1721,10 @@ impl Tcb {
         if flight >= allowed {
             return Ok(());
         }
-        let window = allowed - flight;
+        // Per-segment send budget = min(cwnd-flight, peer_wnd-flight,
+        //                               PRR snd_credit, unsent, mss).
+        // Outside recovery, snd_credit is u32::MAX (a no-op clamp).
+        let window = core::cmp::min(allowed - flight, self.cc.snd_credit());
         let unsent = (self.send_ring.len() as u32).saturating_sub(flight);
         let mss_payload = self.effective_payload_mss();
         let payload_bytes =
@@ -1571,6 +1750,8 @@ impl Tcb {
             )?;
             self.snd_nxt = self.snd_nxt.wrapping_add(payload_bytes as u32);
             self.bump_snd_max();
+            // Account for PRR send credit consumption (no-op outside recovery).
+            self.cc.on_send(payload_bytes as u32);
             // Piggybacked ACK clears delayed-ACK state.
             self.pending_ack = false;
             self.delayed_ack_count = 0;
@@ -1581,7 +1762,9 @@ impl Tcb {
             return Ok(());
         }
 
-        // Nothing to send → maybe transmit FIN.
+        // Nothing to send → maybe transmit FIN. Outside recovery `window`
+        // is unconstrained by PRR; inside recovery the FIN consumes one
+        // sequence number and one byte of credit.
         let need_fin = matches!(
             self.state,
             State::FinWait1 | State::Closing | State::LastAck
@@ -1600,6 +1783,7 @@ impl Tcb {
             )?;
             self.snd_nxt = self.snd_nxt.wrapping_add(1);
             self.bump_snd_max();
+            self.cc.on_send(1);
             self.fin_sent = true;
             self.pending_ack = false;
             self.delayed_ack_count = 0;
@@ -1674,8 +1858,39 @@ impl Tcb {
             // timer or a subsequent ACK-clocked send will redrive us.
             return Ok(());
         }
-        let window =
-            u16::try_from(self.advertised_window().min(u16::MAX as u32)).unwrap_or(u16::MAX);
+        // RFC 7323 §2.3: the Window field in SYN segments (including
+        // SYN-ACK) is NEVER scaled. Only post-handshake segments shift
+        // by `rcv_wscale`.
+        let is_syn = (flag_bits & flags::SYN) != 0;
+        let window = self.outbound_window(is_syn);
+
+        // ---- ECN feedback bits (RFC 3168 §6) ----------------------------
+        // ECE on ACKs while we've seen a CE; CWR on the next new data
+        // segment after the sender has reacted to a peer's ECE.
+        let mut adjusted_flags = flag_bits;
+        if self.ecn_enabled && !is_syn && (flag_bits & flags::ACK) != 0 {
+            if self.ce_observed {
+                adjusted_flags |= flags::ECE;
+            }
+            // CWR is set on the FIRST new-data segment after entering
+            // recovery in response to an ECE. We approximate "new data"
+            // by checking payload.len() > 0 — pure ACKs don't trigger
+            // the peer to clear its ce_observed.
+            if self.send_cwr_pending && !payload.is_empty() {
+                adjusted_flags |= flags::CWR;
+                self.send_cwr_pending = false;
+            }
+        }
+
+        // IP-layer ECN codepoint (RFC 3168 §6.1.1):
+        //   * SYN / SYN-ACK MUST NOT be ECT-marked.
+        //   * Once ECN is negotiated, all other segments use ECT(0).
+        let ecn_codepoint = if self.ecn_enabled && !is_syn {
+            wire::ecn::ECT_0
+        } else {
+            wire::ecn::NOT_ECT
+        };
+
         let n = wire::emit(
             &mut self.tx_buf,
             self.local.ip,
@@ -1684,11 +1899,12 @@ impl Tcb {
             self.remote.port,
             seq,
             ack,
-            flag_bits,
+            adjusted_flags,
             window,
             options,
             payload,
             self.ip_id,
+            ecn_codepoint,
         )?;
         self.ip_id = self.ip_id.wrapping_add(1);
         self.tx_len = n;
@@ -1715,6 +1931,7 @@ impl Tcb {
         if self.ts_enabled {
             TcpOptions {
                 mss: None,
+                wscale: None,
                 ts: Some((self.ts_val(), self.ts_recent)),
                 sack_permitted: false,
                 sack,
@@ -1722,6 +1939,7 @@ impl Tcb {
         } else if sack.is_some() {
             TcpOptions {
                 mss: None,
+                wscale: None,
                 ts: None,
                 sack_permitted: false,
                 sack,
@@ -1735,6 +1953,30 @@ impl Tcb {
     fn ts_val(&self) -> u32 {
         // Lower 32 bits of the host clock — wraps every ~49 days.
         self.now_ms as u32
+    }
+
+    /// Apply the peer's negotiated Window Scale to the raw 16-bit window
+    /// field, yielding the true byte count of bytes the peer can accept.
+    /// Per RFC 7323 §2.3 callers must NOT use this for SYN/SYN-ACK
+    /// segments — those windows are always unscaled on the wire.
+    #[inline]
+    fn scale_peer_window(&self, w: u16) -> u32 {
+        // Shift count is bounded to 14 by both parser and negotiator,
+        // so this never overflows u32 (16 + 14 = 30 bits).
+        (w as u32) << self.snd_wscale
+    }
+
+    /// Compute the wire-format window field for an outbound segment.
+    /// `is_syn_segment` selects the unscaled form (SYN / SYN-ACK) per
+    /// RFC 7323 §2.3.
+    fn outbound_window(&self, is_syn_segment: bool) -> u16 {
+        let raw = self.advertised_window();
+        let scaled = if is_syn_segment {
+            raw
+        } else {
+            raw >> self.rcv_wscale
+        };
+        u16::try_from(scaled.min(u16::MAX as u32)).unwrap_or(u16::MAX)
     }
 
     fn effective_payload_mss(&self) -> usize {
@@ -1792,11 +2034,14 @@ impl Tcb {
     fn update_rtt_from_ts_echo(&mut self, tsecr: u32) {
         let now = self.ts_val();
         let r = now.wrapping_sub(tsecr);
-        // Sanity cap: ignore absurd samples (clock skew or wrap).
-        if r == 0 || r > 60_000 {
+        // Sanity cap on the upper end (clock skew or wrap). On the lower
+        // end we clamp r=0 to 1ms — sub-millisecond RTTs are real on
+        // loopback / LAN, and `update_rtt` already treats 1ms as the
+        // smallest meaningful sample (initial RTTVAR = R/2 = 0 otherwise).
+        if r > 60_000 {
             return;
         }
-        self.update_rtt(r);
+        self.update_rtt(r.max(1));
     }
 
     fn process_ack_rtt(&mut self, ack: u32) {

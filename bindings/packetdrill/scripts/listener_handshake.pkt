@@ -1,0 +1,18 @@
+# Passive open via --listen. Peer connects to us; we go through
+# LISTEN → SYN_RCVD → ESTABLISHED. The peer port/IP are pinned by the
+# first inbound SYN.
+
+--listen 10.0.0.1:80 iss 0x55555555 peer_iss 0xAAAA0000
+
+# Peer's SYN. Carries WS so we negotiate WS back.
++0 < SEW 0:0(0) win 32768 <mss 1460, wscale 7, sackOK, TS val 1 ecr 0>
+
+# Our SYN-ACK echoes ECE (no CWR), WS, sackOK, TS. Per RFC 7323 §2.3
+# SYN-ACK windows are NEVER scaled — they saturate at u16::MAX = 65535
+# regardless of what BUF_CAP advertises post-handshake.
++0 > SE. 0:0(0) ack 1 win 65535 <mss 1460, wscale 5, sackOK, TS val * ecr 1>
+
+# Peer's third ACK.
++.005 < . 1:1(0) ack 1 win 32768 <TS val 2 ecr *>
+
+--expect_state ESTABLISHED

@@ -1,0 +1,10 @@
+# Smallest-possible handshake. Verifies the active-open three-way handshake
+# completes and the SYN carries our required options.
+
+--connect 10.0.0.1:49152 10.0.0.2:80
+
++0 > SEW 0:0(0) win 65535 <mss 1460, wscale 5, sackOK, TS val * ecr 0>
++.005 < S. 0:0(0) ack 1 win 32768 <mss 1460, wscale 7, sackOK, TS val 1000 ecr *>
++0 > . 1:1(0) ack 1 <TS val * ecr 1000>
+
+--expect_state ESTABLISHED

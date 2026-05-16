@@ -82,11 +82,12 @@ prop_compose! {
     /// space: MSS / Timestamps / SACK_PERMITTED / one SACK block.
     fn arb_options()(
         mss in proptest::option::of(536u16..=1460u16),
+        wscale in proptest::option::of(0u8..=14u8),
         ts in proptest::option::of((any::<u32>(), any::<u32>())),
         sack_permitted in any::<bool>(),
         sack in proptest::option::of((any::<u32>(), any::<u32>())),
     ) -> TcpOptions {
-        TcpOptions { mss, ts, sack_permitted, sack }
+        TcpOptions { mss, wscale, ts, sack_permitted, sack }
     }
 }
 
@@ -117,6 +118,7 @@ proptest! {
         let n = wire::emit(
             &mut buf, src_ip, dst_ip, src_port, dst_port,
             seq, ack, flag_bits, window, &opts, &payload, ip_id,
+            wire::ecn::NOT_ECT,
         ).expect("emit valid");
 
         let parsed = wire::parse(&buf[..n]).expect("parse round-trip");
@@ -129,10 +131,12 @@ proptest! {
         prop_assert_eq!(parsed.flags, flag_bits);
         prop_assert_eq!(parsed.window, window);
         prop_assert_eq!(parsed.options.mss, opts.mss);
+        prop_assert_eq!(parsed.options.wscale, opts.wscale);
         prop_assert_eq!(parsed.options.ts, opts.ts);
         prop_assert_eq!(parsed.options.sack_permitted, opts.sack_permitted);
         prop_assert_eq!(parsed.options.sack, opts.sack);
         prop_assert_eq!(parsed.payload, payload.as_slice());
+        prop_assert_eq!(parsed.ecn, wire::ecn::NOT_ECT);
     }
 
     /// Single-bit corruption anywhere in an emitted datagram MUST cause
@@ -151,6 +155,7 @@ proptest! {
         let n = wire::emit(
             &mut buf, [10,0,0,1], [10,0,0,2], 1234, 80,
             seq, ack, flags::ACK | flags::PSH, 65535, &opts, &payload, 0,
+            wire::ecn::NOT_ECT,
         ).expect("emit");
         let len = n;
 

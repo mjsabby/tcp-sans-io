@@ -1,0 +1,24 @@
+# Passive close: peer initiates FIN first, we go through CLOSE_WAIT and
+# LAST_ACK before reaching CLOSED.
+
+--connect 10.0.0.1:49152 10.0.0.2:80
++0 > SEW 0:0(0) win 65535 <mss 1460, wscale 5, sackOK, TS val * ecr 0>
++.005 < S. 0:0(0) ack 1 win 32768 <mss 1460, wscale 7, sackOK, TS val 1 ecr *>
++0 > . 1:1(0) ack 1 <TS val * ecr 1>
+--expect_state ESTABLISHED
+
+# Peer FINs.
++.005 < F. 1:1(0) ack 1 win 32768 <TS val 2 ecr *>
+
+# We ACK peer's FIN and transition to CLOSE_WAIT.
++0 > . 1:1(0) ack 2 <TS val * ecr 2>
+--expect_state CLOSE_WAIT
+
+# Application closes locally.
+--close
++0 > F. 1:1(0) ack 2 <TS val * ecr 2>
+--expect_state LAST_ACK
+
+# Peer ACKs our FIN → CLOSED.
++.005 < . 2:2(0) ack 2 win 32768 <TS val 3 ecr *>
+--expect_state CLOSED

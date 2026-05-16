@@ -17,12 +17,41 @@ pub mod flags {
     pub const RST: u8 = 0x04;
     pub const PSH: u8 = 0x08;
     pub const ACK: u8 = 0x10;
+    // ECN flags (RFC 3168 §6.1).
+    /// Echo Congestion Experienced. Receiver-set: signals to sender that
+    /// a CE-marked segment was observed. Sender responds with CWR.
+    pub const ECE: u8 = 0x40;
+    /// Congestion Window Reduced. Sender-set: signals to receiver that
+    /// the sender has reacted to the previous ECE signal.
+    pub const CWR: u8 = 0x80;
+}
+
+/// IP-layer ECN codepoints carried in the lower 2 bits of the IPv4 TOS
+/// byte (RFC 3168 §5).
+pub mod ecn {
+    /// Not ECN-Capable Transport. Default for non-ECN connections.
+    pub const NOT_ECT: u8 = 0b00;
+    /// ECN-Capable Transport, codepoint 1 (currently used by L4S — RFC 9331).
+    pub const ECT_1: u8 = 0b01;
+    /// ECN-Capable Transport, codepoint 0. The conventional choice for
+    /// classic ECN; emitted by this stack on all data segments once ECN
+    /// is negotiated.
+    pub const ECT_0: u8 = 0b10;
+    /// Congestion Experienced. Set by a router along the path to signal
+    /// queue buildup. The receiver responds by setting TCP ECE on the
+    /// next ACK.
+    pub const CE: u8 = 0b11;
+
+    /// Mask for the 2-bit field within the IPv4 TOS byte.
+    pub const MASK: u8 = 0b11;
 }
 
 /// TCP options carried by a parsed/emitted segment.
 ///
-/// We model the four options we actually emit or react to:
+/// We model the five options we actually emit or react to:
 /// * **MSS** (RFC 9293) — handshake-only.
+/// * **Window Scale** (RFC 7323 §2) — handshake-only. Shift count in
+///   `0..=14`; values above 14 are clamped on parse per RFC §2.3.
 /// * **Timestamps** (RFC 7323) — every segment once negotiated.
 /// * **SACK_PERMITTED** (RFC 2018 §2) — handshake-only.
 /// * **SACK** (RFC 2018 §3) — single block, attached to ACKs that report
@@ -31,11 +60,13 @@ pub mod flags {
 ///   maximum that fits in the 40-byte TCP option budget alongside TS) and
 ///   keep the first.
 ///
-/// Anything else (Window Scale, MD5, …) is parsed-and-skipped and never
-/// emitted.
+/// Anything else (MD5, …) is parsed-and-skipped and never emitted.
 #[derive(Copy, Clone, Debug, Default)]
 pub struct TcpOptions {
     pub mss: Option<u16>,
+    /// Window Scale shift count (RFC 7323 §2). Valid only on SYN /
+    /// SYN-ACK; ignored elsewhere. Parser clamps to 14.
+    pub wscale: Option<u8>,
     /// (TSval, TSecr) per RFC 7323 §3.
     pub ts: Option<(u32, u32)>,
     /// SACK_PERMITTED option present (RFC 2018 §2). Valid only on SYN /
@@ -51,16 +82,20 @@ pub struct TcpOptions {
 impl TcpOptions {
     pub const NONE: Self = Self {
         mss: None,
+        wscale: None,
         ts: None,
         sack_permitted: false,
         sack: None,
     };
 
-    /// Raw byte cost of the four options without any alignment padding.
+    /// Raw byte cost of the five options without any alignment padding.
     const fn raw_len(&self) -> usize {
         let mut n = 0;
         if self.mss.is_some() {
             n += 4; // kind=2, length=4
+        }
+        if self.wscale.is_some() {
+            n += 3; // kind=3, length=3
         }
         if self.sack_permitted {
             n += 2; // kind=4, length=2
@@ -83,16 +118,23 @@ impl TcpOptions {
     }
 
     fn write(&self, out: &mut [u8]) -> Result<usize, TcpError> {
-        // Order: MSS, SACK_PERMITTED, TS, SACK. Each option is byte-aligned;
-        // the trailing pad to a 4-byte boundary is filled with NOPs (kind=1)
-        // rather than EOL so middleboxes that scan past the data offset see
-        // a syntactically valid options block.
+        // Order: MSS, WS, SACK_PERMITTED, TS, SACK. Each option is
+        // byte-aligned; the trailing pad to a 4-byte boundary is filled
+        // with NOPs (kind=1) rather than EOL so middleboxes that scan past
+        // the data offset see a syntactically valid options block.
         let mut idx = 0usize;
         if let Some(mss) = self.mss {
             put_u8(out, idx, 2)?; // kind = MSS
             put_u8(out, idx + 1, 4)?; // length
             put_u16(out, idx + 2, mss)?;
             idx += 4;
+        }
+        if let Some(ws) = self.wscale {
+            // RFC 7323 §2.3: shift_cnt MUST NOT exceed 14. Clamp.
+            put_u8(out, idx, 3)?; // kind = Window Scale
+            put_u8(out, idx + 1, 3)?; // length
+            put_u8(out, idx + 2, ws.min(14))?;
+            idx += 3;
         }
         if self.sack_permitted {
             put_u8(out, idx, 4)?; // kind = SACK_PERMITTED
@@ -139,6 +181,17 @@ impl TcpOptions {
                     }
                     o.mss = Some(u16::from_be_bytes(read2(opt_bytes, i + 2)?));
                     i += 4;
+                }
+                3 => {
+                    // Window Scale — RFC 7323 §2. Length must be exactly 3.
+                    // Per §2.3, shift counts > 14 are silently clamped.
+                    let len = *opt_bytes.get(i + 1).ok_or(TcpError::MalformedPacket)?;
+                    if len != 3 || i + 3 > opt_bytes.len() {
+                        return Err(TcpError::MalformedPacket);
+                    }
+                    let shift = *opt_bytes.get(i + 2).ok_or(TcpError::MalformedPacket)?;
+                    o.wscale = Some(shift.min(14));
+                    i += 3;
                 }
                 4 => {
                     // SACK_PERMITTED — RFC 2018 §2. Length must be exactly 2.
@@ -205,6 +258,11 @@ pub struct Segment<'a> {
     pub window: u16,
     pub options: TcpOptions,
     pub payload: &'a [u8],
+    /// IPv4 ECN codepoint (lower 2 bits of TOS): one of [`ecn::NOT_ECT`],
+    /// [`ecn::ECT_0`], [`ecn::ECT_1`], or [`ecn::CE`]. Per RFC 3168, a
+    /// receiver MUST treat `CE` as a congestion signal and echo `ECE`
+    /// back on subsequent ACKs.
+    pub ecn: u8,
 }
 
 impl<'a> Segment<'a> {
@@ -257,6 +315,9 @@ pub fn parse(packet: &[u8]) -> Result<Segment<'_>, TcpError> {
     if proto != IPPROTO_TCP {
         return Err(TcpError::NotForUs);
     }
+    // RFC 3168 §5: IP TOS byte (offset 1) lower 2 bits carry the ECN
+    // codepoint. The top 6 bits (DSCP) are ignored by this stack.
+    let ecn = *ip.get(1).ok_or(TcpError::MalformedPacket)? & ecn::MASK;
     let src_ip = read4(ip, 12)?;
     let dst_ip = read4(ip, 16)?;
 
@@ -304,10 +365,15 @@ pub fn parse(packet: &[u8]) -> Result<Segment<'_>, TcpError> {
         window,
         options,
         payload,
+        ecn,
     })
 }
 
 /// Build an IPv4+TCP datagram into `out`. Returns the number of bytes written.
+///
+/// `ecn` controls the IPv4 TOS byte's lower 2 bits — pass [`ecn::NOT_ECT`]
+/// for non-ECN traffic, [`ecn::ECT_0`] on ECN-capable data segments per
+/// RFC 3168 §5.
 #[allow(clippy::too_many_arguments)]
 pub fn emit(
     out: &mut [u8],
@@ -322,6 +388,7 @@ pub fn emit(
     options: &TcpOptions,
     payload: &[u8],
     ip_id: u16,
+    ecn: u8,
 ) -> Result<usize, TcpError> {
     let opt_len = options.encoded_len();
     if !opt_len.is_multiple_of(4) || opt_len > 40 {
@@ -340,7 +407,8 @@ pub fn emit(
         .ok_or(TcpError::BufferTooSmall)?;
     ip.fill(0);
     put_u8(ip, 0, 0x45)?; // version=4, IHL=5
-    put_u8(ip, 1, 0x00)?; // DSCP/ECN
+    // TOS byte: DSCP=0, ECN codepoint in low 2 bits (RFC 3168 §5).
+    put_u8(ip, 1, ecn & ecn::MASK)?;
     put_u16(ip, 2, total_u16)?;
     put_u16(ip, 4, ip_id)?;
     put_u16(ip, 6, 0x4000)?; // DF set, no fragment offset

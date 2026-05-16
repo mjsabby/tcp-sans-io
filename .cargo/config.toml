@@ -1,0 +1,14 @@
+# Increase the default Rust thread stack size to 8 MiB.
+#
+# `Tcb` instances embed two `BUF_CAP`-sized rings (1 MiB each by default)
+# plus a 16 KiB single-hole reassembly buffer plus the `MAX_PACKET`
+# staging area, totalling ~2 MiB per connection. The default 1 MiB Rust
+# (and Windows) thread stack overflows the moment a test or example
+# constructs a `Tcb` as a local. Production code paths route through the
+# C ABI (`tcp_init`) which writes into host-supplied heap storage, so
+# this only affects tests, examples, and pure-Rust callers.
+#
+# 8 MiB is enough for several Tcbs in flight (e.g., loopback tests that
+# instantiate both peer and client) with comfortable margin.
+[env]
+RUST_MIN_STACK = "8388608"

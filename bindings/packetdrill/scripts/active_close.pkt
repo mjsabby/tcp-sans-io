@@ -1,0 +1,22 @@
+# Active close from our side. Verifies: --close → FIN+ACK on wire,
+# peer ACKs our FIN → FIN_WAIT_2, peer's own FIN → ACK + TIME_WAIT.
+
+--connect 10.0.0.1:49152 10.0.0.2:80
++0 > SEW 0:0(0) win 65535 <mss 1460, wscale 5, sackOK, TS val * ecr 0>
++.005 < S. 0:0(0) ack 1 win 32768 <mss 1460, wscale 7, sackOK, TS val 1 ecr *>
++0 > . 1:1(0) ack 1 <TS val * ecr 1>
+--expect_state ESTABLISHED
+
+--close
++0 > F. 1:1(0) ack 1 <TS val * ecr 1>
+
+# Peer ACKs our FIN.
++.005 < . 1:1(0) ack 2 win 32768 <TS val 2 ecr *>
+--expect_state FIN_WAIT_2
+
+# Peer's FIN arrives.
++.005 < F. 1:1(0) ack 2 win 32768 <TS val 3 ecr *>
+
+# We ACK peer's FIN and go to TIME_WAIT.
++0 > . 2:2(0) ack 2 <TS val * ecr 3>
+--expect_state TIME_WAIT
