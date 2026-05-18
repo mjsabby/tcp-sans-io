@@ -1,0 +1,101 @@
+/*
+ * trace_cdylib.bt — bpftrace uprobes for the tcp-sans-io cdylib.
+ *
+ * Counts and times the public FFI entry points and prints latency
+ * histograms (log2 nanoseconds) on exit. Useful as a runtime
+ * observability tool when reasoning about CPU costs in the hot path,
+ * and as a CI sanity check (the netem benchmark should call
+ * tcp_inject_packet and tcp_extract_packet thousands of times).
+ *
+ * Usage (root or CAP_BPF):
+ *
+ *   sudo bpftrace -p <pid> bindings/bpf/scripts/trace_cdylib.bt \
+ *     ./target/release/libtcp_sans_io.so
+ *
+ * Or attach to a fresh child process:
+ *
+ *   sudo bpftrace bindings/bpf/scripts/trace_cdylib.bt \
+ *     ./target/release/libtcp_sans_io.so -c './my_program'
+ *
+ * The first non-flag argument to bpftrace must be the cdylib path so
+ * the uprobe paths below resolve correctly. We use the literal string
+ * "LIBPATH" as a placeholder that the runner script substitutes — or
+ * invoke via bindings/bpf/run.sh which takes care of this.
+ *
+ * Outputs on exit:
+ *   @count[function]          — invocation count
+ *   @ns[function]             — latency log2 histogram (nanoseconds)
+ *   @bytes_in / @bytes_out    — cumulative bytes through inject/extract
+ */
+
+BEGIN {
+    printf("attached uprobes — counting tcp_sans_io FFI calls. Ctrl-C to print + exit.\n");
+}
+
+/* ---- tcp_inject_packet -------------------------------------------- */
+uprobe:LIBPATH:tcp_inject_packet {
+    @count["inject"] = count();
+    /* arg2 is the packet length (size_t). Total ingress bytes. */
+    @bytes_in = sum(arg2);
+    @start_inject[tid] = nsecs;
+}
+uretprobe:LIBPATH:tcp_inject_packet /@start_inject[tid]/ {
+    @ns["inject"] = hist(nsecs - @start_inject[tid]);
+    delete(@start_inject, tid);
+}
+
+/* ---- tcp_extract_packet ------------------------------------------- */
+uprobe:LIBPATH:tcp_extract_packet {
+    @count["extract"] = count();
+    @start_extract[tid] = nsecs;
+}
+uretprobe:LIBPATH:tcp_extract_packet /@start_extract[tid]/ {
+    /*
+     * retval is the number of bytes written into the host buffer (or a
+     * negative error code). Only credit non-negative returns.
+     */
+    if (retval > 0) {
+        @bytes_out = sum(retval);
+    }
+    @ns["extract"] = hist(nsecs - @start_extract[tid]);
+    delete(@start_extract, tid);
+}
+
+/* ---- tcp_tick ------------------------------------------------------ */
+uprobe:LIBPATH:tcp_tick {
+    @count["tick"] = count();
+    @start_tick[tid] = nsecs;
+}
+uretprobe:LIBPATH:tcp_tick /@start_tick[tid]/ {
+    @ns["tick"] = hist(nsecs - @start_tick[tid]);
+    delete(@start_tick, tid);
+}
+
+/* ---- tcp_send (app -> stack) -------------------------------------- */
+uprobe:LIBPATH:tcp_send {
+    @count["send"] = count();
+    @start_send[tid] = nsecs;
+}
+uretprobe:LIBPATH:tcp_send /@start_send[tid]/ {
+    @ns["send"] = hist(nsecs - @start_send[tid]);
+    delete(@start_send, tid);
+}
+
+/* ---- tcp_recv (stack -> app) -------------------------------------- */
+uprobe:LIBPATH:tcp_recv {
+    @count["recv"] = count();
+    @start_recv[tid] = nsecs;
+}
+uretprobe:LIBPATH:tcp_recv /@start_recv[tid]/ {
+    @ns["recv"] = hist(nsecs - @start_recv[tid]);
+    delete(@start_recv, tid);
+}
+
+END {
+    /* Clear the per-tid latency starts so they don't appear in output. */
+    clear(@start_inject);
+    clear(@start_extract);
+    clear(@start_tick);
+    clear(@start_send);
+    clear(@start_recv);
+}

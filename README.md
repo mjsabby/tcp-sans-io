@@ -240,6 +240,8 @@ host, pass the pointer to `tcp_init`. Memory ownership stays with the host.
 | **Real Linux TUN** | Against the Linux kernel TCP stack via TUN | `bindings/gvisor/tun_test.go` |
 | **netem benchmark** | Throughput under controlled loss / delay | `bindings/netem/bench_test.go` |
 | **packetdrill-DSL runner** | Per-packet conformance scripts in packetdrill syntax | `bindings/packetdrill/*.go` + `scripts/*.pkt` |
+| **eBPF uprobe observability** | bpftrace uprobes on the cdylib's FFI entry points (counts + latency histograms); kernel-side `tcpretrans` comparison during the iperf3 baseline | `bindings/bpf/` |
+| **perf flamegraphs (CI)** | `perf record` wrapping the netem benchmark → `inferno-flamegraph` SVG; kernel-TCP iperf3 baseline through netns + veth + netem | `.github/workflows/perf-bench.yml` |
 
 ### packetdrill scripts
 
@@ -262,6 +264,39 @@ verification, and active / passive close. Example:
 ```
 
 Run all: `cd bindings/packetdrill && go test ./...`
+
+### Perf benchmarking + flamegraphs (manual or PR)
+
+`.github/workflows/perf-bench.yml` runs the netem suite under `perf
+record` and renders a CPU flamegraph SVG. Same workflow also runs a
+kernel-TCP iperf3 baseline through a veth + netem with the matching
+profile, plus the `bpftrace` uprobe trace described below.
+Artifacts (flamegraph, uprobe histograms, iperf3 JSON, kernel
+retransmit log) are uploaded for offline inspection. Trigger:
+manual via `workflow_dispatch` or by a PR touching `src/**`,
+`bindings/netem/**`, or `bindings/bpf/**`.
+
+### eBPF observability (`bindings/bpf/`)
+
+`bindings/bpf/scripts/trace_cdylib.bt` is a bpftrace template that
+attaches `uprobe` + `uretprobe` to the public FFI entry points
+(`tcp_inject_packet`, `tcp_extract_packet`, `tcp_tick`, `tcp_send`,
+`tcp_recv`) and emits invocation counts, per-function latency
+histograms (log2 nanoseconds), and cumulative byte counts.
+
+Use locally with the bundled runner:
+
+```sh
+sudo bindings/bpf/trace.sh target/release/libtcp_sans_io.so \
+    -c "./bindings/netem/netem.test -test.run=^TestNetem_LAN_NoLoss_1msDelay$"
+```
+
+The companion Go test (build tag `bpftrace`) wraps this and
+asserts the expected symbols are observed at non-zero rates,
+catching accidental `#[no_mangle]` removals. The CI workflow uses
+`bpfcc-tools`' `tcpretrans` against the kernel iperf3 baseline so
+the artifact set has apples-to-apples retransmit counts on both
+sides. See `bindings/bpf/README.md` for the full toolkit.
 
 ### Other canonical suites not (yet) integrated
 
@@ -289,6 +324,8 @@ src/
 ├── loopback_tests.rs    # End-to-end behavioral tests
 ├── conformance_tests.rs # Per-spec wire-byte assertions
 ├── property_tests.rs    # proptest fuzzing
+├── rack.rs              # RACK loss detector (RFC 8985)
+├── send_queue.rs        # Per-segment send metadata (RACK / TLP)
 └── server_tests.rs      # Passive-open + adversarial inputs
 
 bindings/
@@ -296,6 +333,10 @@ bindings/
 ├── python/              # CPython ctypes wrapper + unittest suite
 ├── gvisor/              # Go: gVisor netstack interop + real-kernel TUN test
 ├── netem/               # Go: TUN + tc-netem throughput benchmark
+├── bpf/                 # bpftrace uprobe template + Go test wrapper
+│   ├── scripts/         # trace_cdylib.bt template
+│   ├── trace.sh         # LIBPATH-substituting runner
+│   └── bpftrace_test.go # Go test (build tag: bpftrace)
 └── packetdrill/         # Go: packetdrill-DSL runner + .pkt script corpus
     ├── parser.go        # .pkt → AST
     ├── wire.go          # PacketDesc ↔ IPv4+TCP bytes

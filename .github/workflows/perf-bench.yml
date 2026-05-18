@@ -1,0 +1,362 @@
+name: perf-bench
+
+# Performance benchmark workflow.
+#
+# Runs the netem throughput suite against the cdylib, captures perf
+# flamegraphs, eBPF uprobe traces, and a kernel-TCP baseline (iperf3
+# through a separate veth+netns) so we have an apples-to-apples
+# comparison. All artifacts are uploaded for offline inspection.
+#
+# Triggers: manual (workflow_dispatch) and on PRs that touch the
+# performance-sensitive code paths.
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: "netem profile to benchmark (Baseline_NoQdisc | LAN_NoLoss_1msDelay | WAN_50msRtt_NoLoss | Lossy_1pct | HighRTT_100msEachWay | Lossy_5pct)"
+        default: "LAN_NoLoss_1msDelay"
+        type: string
+  pull_request:
+    paths:
+      - "src/**"
+      - "bindings/netem/**"
+      - "bindings/bpf/**"
+      - ".github/workflows/perf-bench.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".cargo/config.toml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: perf-bench-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  perf-bench:
+    name: perf + bpftrace + iperf3 baseline
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          check-latest: true
+
+      - name: Install perf + bpftrace + bcc-tools + iperf3
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          # Generic tools always installable; the exact-kernel package is
+          # best-effort because GitHub-hosted runners can run a kernel
+          # version whose tools package isn't yet published.
+          sudo apt-get install -y --no-install-recommends \
+            linux-tools-common linux-tools-generic \
+            bpftrace bpfcc-tools \
+            iperf3 iproute2 jq
+          sudo apt-get install -y --no-install-recommends \
+            "linux-tools-$(uname -r)" || \
+            echo "::warning::exact linux-tools-$(uname -r) unavailable; will fall back to generic"
+
+          # Locate perf (the generic package installs it under
+          # /usr/lib/linux-tools/<KVER>/) and symlink for $PATH lookup.
+          KVER=$(uname -r)
+          if ! command -v perf >/dev/null; then
+            for p in "/usr/lib/linux-tools/$KVER/perf" /usr/lib/linux-tools-*/perf; do
+              if [[ -x "$p" ]]; then
+                sudo ln -sf "$p" /usr/local/bin/perf
+                break
+              fi
+            done
+          fi
+          perf --version || echo "::warning::perf not available — flamegraph step will skip"
+
+          # Best-effort permission relaxation for perf record + uprobes.
+          sudo sysctl -w kernel.perf_event_paranoid=1 >/dev/null 2>&1 || true
+          sudo sysctl -w kernel.kptr_restrict=0 >/dev/null 2>&1 || true
+          # tracefs is normally mounted at /sys/kernel/tracing on modern
+          # Ubuntu; mount it if missing.
+          if [[ ! -d /sys/kernel/tracing/events ]]; then
+            sudo mount -t tracefs nodev /sys/kernel/tracing 2>/dev/null || true
+          fi
+
+          # bpftrace smoke test — if it can't run a trivial probe, the
+          # uprobe step below will skip with an explanatory artifact.
+          sudo bpftrace -e 'BEGIN { exit(); }' \
+            && echo "BPFTRACE_OK=1" >> "$GITHUB_ENV" \
+            || echo "::warning::bpftrace unavailable on this runner"
+
+      - name: Cache inferno binaries
+        id: cache-inferno
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/inferno-collapse-perf
+            ~/.cargo/bin/inferno-flamegraph
+          key: inferno-${{ runner.os }}-v0.12
+
+      - name: Install inferno (flamegraph renderer)
+        if: steps.cache-inferno.outputs.cache-hit != 'true'
+        run: cargo install --locked inferno --version '^0.12'
+
+      # Build with frame pointers so perf --call-graph=fp can unwind cleanly
+      # without needing libunwind / DWARF info. Slight code-size cost, no
+      # measurable throughput hit for our use case.
+      - name: Build cdylib (release + frame pointers)
+        env:
+          RUSTFLAGS: "-C force-frame-pointers=yes"
+        run: cargo build --release --lib --verbose
+
+      - name: Build netem benchmark binary
+        env:
+          CGO_LDFLAGS: "-L${{ github.workspace }}/target/release -ltcp_sans_io -Wl,-rpath,${{ github.workspace }}/target/release"
+        run: |
+          cd bindings/netem
+          go test -c -o "$RUNNER_TEMP/netem.test" ./...
+
+      - name: Determine + validate benchmark profile
+        id: profile
+        run: |
+          set -euo pipefail
+          PROFILE="${{ github.event.inputs.profile }}"
+          if [[ -z "$PROFILE" ]]; then
+            PROFILE="LAN_NoLoss_1msDelay"
+          fi
+          # Whitelist — must match a test name in bench_test.go.
+          case "$PROFILE" in
+            Baseline_NoQdisc|LAN_NoLoss_1msDelay|WAN_50msRtt_NoLoss|Lossy_1pct|HighRTT_100msEachWay|Lossy_5pct) ;;
+            *) echo "::error::unknown profile: $PROFILE"; exit 1 ;;
+          esac
+          echo "name=$PROFILE" >> "$GITHUB_OUTPUT"
+          echo "pattern=^TestNetem_${PROFILE}$" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/artifacts"
+
+      # ---------------------------------------------------------------
+      # 1. Plain throughput run (no perf overhead) — baseline.
+      # ---------------------------------------------------------------
+      - name: Run netem benchmark (plain)
+        id: plain
+        run: |
+          set -o pipefail
+          sudo -E "$RUNNER_TEMP/netem.test" \
+            -test.v -test.timeout=300s -test.count=1 \
+            -test.run='${{ steps.profile.outputs.pattern }}' \
+            2>&1 | tee "$RUNNER_TEMP/artifacts/plain-throughput.log"
+
+      # ---------------------------------------------------------------
+      # 2. Same benchmark under perf record → flamegraph.
+      # ---------------------------------------------------------------
+      - name: Run netem benchmark under perf record
+        run: |
+          set -o pipefail
+          PERF_BIN=$(command -v perf || true)
+          if [[ -z "$PERF_BIN" || ! -x "$PERF_BIN" ]]; then
+            echo "::warning::perf binary missing — skipping perf record"
+            exit 0
+          fi
+          sudo "$PERF_BIN" record \
+            -F 997 --call-graph=fp \
+            -o "$RUNNER_TEMP/perf.data" \
+            -- "$RUNNER_TEMP/netem.test" \
+              -test.v -test.timeout=300s -test.count=1 \
+              -test.run='${{ steps.profile.outputs.pattern }}' \
+            2>&1 | tee "$RUNNER_TEMP/artifacts/perf-throughput.log" || true
+          sudo chown -R "$(id -u):$(id -g)" "$RUNNER_TEMP/perf.data" 2>/dev/null || true
+
+      - name: Generate flamegraph
+        run: |
+          set -o pipefail
+          PERF_BIN=$(command -v perf || true)
+          if [[ ! -s "$RUNNER_TEMP/perf.data" ]]; then
+            echo "::warning::empty or missing perf.data — skipping flamegraph"
+            exit 0
+          fi
+          if [[ -z "$PERF_BIN" || ! -x "$PERF_BIN" ]]; then
+            echo "::warning::perf binary missing — skipping flamegraph"
+            exit 0
+          fi
+          if ! "$PERF_BIN" script -i "$RUNNER_TEMP/perf.data" \
+                | inferno-collapse-perf \
+                > "$RUNNER_TEMP/artifacts/folded.txt"; then
+            echo "::warning::perf script | collapse-perf failed — skipping flamegraph"
+            exit 0
+          fi
+          if [[ ! -s "$RUNNER_TEMP/artifacts/folded.txt" ]]; then
+            echo "::warning::folded stack output empty — skipping flamegraph"
+            exit 0
+          fi
+          inferno-flamegraph \
+            --title "tcp-sans-io ${{ steps.profile.outputs.name }}" \
+            < "$RUNNER_TEMP/artifacts/folded.txt" \
+            > "$RUNNER_TEMP/artifacts/flamegraph.svg"
+          inferno-flamegraph --reverse \
+            --title "tcp-sans-io ${{ steps.profile.outputs.name }} (reverse)" \
+            < "$RUNNER_TEMP/artifacts/folded.txt" \
+            > "$RUNNER_TEMP/artifacts/flamegraph-reverse.svg"
+
+      # ---------------------------------------------------------------
+      # 3. eBPF uprobe trace via bpftrace. The Go test honours
+      #    TCPSANSIO_BPF_PROFILE so the uprobe trace covers the same
+      #    netem profile being benchmarked.
+      # ---------------------------------------------------------------
+      - name: Run bpftrace uprobes against the cdylib
+        if: env.BPFTRACE_OK == '1'
+        env:
+          CGO_LDFLAGS: "-L${{ github.workspace }}/target/release -ltcp_sans_io -Wl,-rpath,${{ github.workspace }}/target/release"
+          TCPSANSIO_BPF_PROFILE: ${{ steps.profile.outputs.name }}
+        run: |
+          set -o pipefail
+          cd bindings/bpf
+          sudo -E env PATH=$PATH HOME=$HOME \
+              TCPSANSIO_BPF_PROFILE="$TCPSANSIO_BPF_PROFILE" \
+            go test -v -count=1 -timeout=180s -tags bpftrace \
+              -run TestBpftraceUprobes ./... \
+            2>&1 | tee "$RUNNER_TEMP/artifacts/bpftrace-test.log" || true
+          if [[ -f bpftrace_uprobes.txt ]]; then
+            sudo chown "$(id -u):$(id -g)" bpftrace_uprobes.txt 2>/dev/null || true
+            cp bpftrace_uprobes.txt "$RUNNER_TEMP/artifacts/"
+          fi
+
+      - name: Skip-marker for bpftrace
+        if: env.BPFTRACE_OK != '1'
+        run: |
+          echo "bpftrace unavailable on this runner; uprobe step skipped." \
+            > "$RUNNER_TEMP/artifacts/bpftrace_uprobes.txt"
+
+      # ---------------------------------------------------------------
+      # 4. Kernel-TCP baseline via iperf3 over a netns + veth + netem.
+      #    The netem benchmark applies netem only to the TUN device's
+      #    kernel-egress queue (one direction). We mirror that here by
+      #    applying netem only to veth-h, so the iperf baseline matches
+      #    the same asymmetric one-way profile rather than doubling it.
+      # ---------------------------------------------------------------
+      - name: iperf3 kernel baseline (same netem profile)
+        run: |
+          set -uo pipefail
+          PROF="${{ steps.profile.outputs.name }}"
+          case "$PROF" in
+            Baseline_NoQdisc)               NETEM=""                         ;;
+            LAN_NoLoss_1msDelay)            NETEM="delay 1ms"                ;;
+            WAN_50msRtt_NoLoss)             NETEM="delay 25ms"               ;;
+            Lossy_1pct)                     NETEM="loss 1% delay 5ms"        ;;
+            HighRTT_100msEachWay)           NETEM="delay 100ms"              ;;
+            Lossy_5pct)                     NETEM="loss 5% delay 5ms"        ;;
+            *)                              NETEM="delay 1ms"                ;;
+          esac
+
+          # Locate tcpretrans (bpfcc-tools ships it under either prefix
+          # depending on the distro release).
+          TCPRETRANS=""
+          for cand in /usr/sbin/tcpretrans-bpfcc /usr/share/bcc/tools/tcpretrans; do
+            if [[ -x "$cand" ]]; then TCPRETRANS="$cand"; break; fi
+          done
+          if [[ -z "$TCPRETRANS" ]]; then
+            echo "::warning::tcpretrans not available — kernel retx events not captured"
+          fi
+          RETRANS_PID=""
+
+          cleanup() {
+            if [[ -n "$RETRANS_PID" ]]; then
+              sudo kill "$RETRANS_PID" 2>/dev/null || true
+            fi
+            sudo ip netns del iperf-ns 2>/dev/null || true
+            sudo ip link del veth-h 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          sudo ip netns add iperf-ns
+          sudo ip link add veth-h type veth peer name veth-n
+          sudo ip link set veth-n netns iperf-ns
+          sudo ip addr add 10.202.1.1/30 dev veth-h
+          sudo ip link set veth-h up
+          sudo ip -n iperf-ns addr add 10.202.1.2/30 dev veth-n
+          sudo ip -n iperf-ns link set veth-n up
+          sudo ip -n iperf-ns link set lo up
+
+          # Apply netem ONLY to the host-side veth egress — mirrors the
+          # netem benchmark's one-way TUN-egress qdisc placement.
+          if [[ -n "$NETEM" ]]; then
+            sudo tc qdisc add dev veth-h root netem $NETEM
+          fi
+
+          # iperf3 server in the netns; daemonised with -1 so it exits
+          # after the first session ends.
+          sudo ip netns exec iperf-ns iperf3 -s -D -1 -p 18181 \
+            --logfile "$RUNNER_TEMP/artifacts/iperf3-server.log"
+          # Give the listener a moment to bind. 2s is comfortable even
+          # under cgo-loaded runners.
+          sleep 2
+
+          if [[ -n "$TCPRETRANS" ]]; then
+            sudo "$TCPRETRANS" > "$RUNNER_TEMP/artifacts/tcpretrans.log" 2>&1 &
+            RETRANS_PID=$!
+          fi
+
+          # 32 MiB to match the netem benchmark's per-direction size.
+          sudo iperf3 -c 10.202.1.2 -p 18181 -n 33554432 -J \
+            > "$RUNNER_TEMP/artifacts/iperf3-client.json" \
+            2> "$RUNNER_TEMP/artifacts/iperf3-client.err" || true
+
+      # ---------------------------------------------------------------
+      # 5. Render a summary into the workflow run page.
+      # ---------------------------------------------------------------
+      - name: Workflow summary
+        if: always()
+        run: |
+          {
+            echo "# perf-bench results: ${{ steps.profile.outputs.name }}"
+            echo ""
+            echo "## tcp-sans-io netem throughput"
+            echo '```'
+            grep -E "netem\[" "$RUNNER_TEMP/artifacts/plain-throughput.log" 2>/dev/null || \
+              echo "(no throughput line captured)"
+            echo '```'
+            echo ""
+            echo "## Linux kernel TCP baseline (iperf3 over veth+netem, one-way profile)"
+            if [[ -s "$RUNNER_TEMP/artifacts/iperf3-client.json" ]]; then
+              SBPS=$(jq -r '.end.sum_sent.bits_per_second // empty' \
+                "$RUNNER_TEMP/artifacts/iperf3-client.json" 2>/dev/null || echo "")
+              RETX=$(jq -r '.end.sum_sent.retransmits // empty' \
+                "$RUNNER_TEMP/artifacts/iperf3-client.json" 2>/dev/null || echo "")
+              echo "* throughput: ${SBPS:-unknown} bits/s"
+              echo "* retransmits: ${RETX:-unknown}"
+            else
+              echo "(no iperf3 output)"
+            fi
+            echo ""
+            echo "## bpftrace uprobe counts (tcp-sans-io FFI)"
+            echo '```'
+            if [[ -f "$RUNNER_TEMP/artifacts/bpftrace_uprobes.txt" ]]; then
+              grep -E "^@count|^@bytes_" "$RUNNER_TEMP/artifacts/bpftrace_uprobes.txt" \
+                || head -20 "$RUNNER_TEMP/artifacts/bpftrace_uprobes.txt"
+            else
+              echo "(no bpftrace output)"
+            fi
+            echo '```'
+            echo ""
+            echo "## Artifacts"
+            echo "Download from the workflow run page:"
+            echo "* \`flamegraph.svg\`, \`flamegraph-reverse.svg\` — CPU flamegraphs"
+            echo "* \`bpftrace_uprobes.txt\` — uprobe latency histograms"
+            echo "* \`iperf3-client.json\` — kernel TCP baseline raw output"
+            echo "* \`tcpretrans.log\` — kernel-side retransmit events during baseline"
+            echo "* \`folded.txt\` — folded perf stacks (for re-rendering)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-bench-${{ steps.profile.outputs.name }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/artifacts/
+          if-no-files-found: warn
+          retention-days: 30
