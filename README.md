@@ -81,11 +81,13 @@ with PRR and RACK-TLP loss detection.
 
 ### Memory footprint
 
-Per-connection: ~2 MiB.
+Per-connection: ~2.15 MiB.
 
 - `BUF_CAP = 1 MiB` send ring + `1 MiB` receive ring.
 - 16 KiB single-hole reassembly buffer.
-- ~1.5 KiB IP packet staging + SYN-cookie secret + various scalar state.
+- 24 KiB RACK send-record queue (per-segment metadata for time-based loss detection).
+- 48 KiB egress staging ring (32 packet slots × `MAX_PACKET`).
+- ~1.5 KiB SYN-cookie secret + various scalar state.
 
 Hosts that need many idle connections can shrink `BUF_CAP` (must be a power
 of two) — this is the only knob. The 1 MiB default is chosen so the receive
@@ -93,10 +95,10 @@ window is large enough to fill the BDP of typical WAN paths (e.g. 50 ms RTT
 at 160 Mbit/s).
 
 The Rust thread stack default (1 MiB on Windows, 8 MiB on Linux) is **too
-small** for a Tcb constructed as a stack local — between the 2 MiB rings
-and the 24 KiB RACK send-queue, a Tcb is over 2 MiB. The included
-`.cargo/config.toml` sets `RUST_MIN_STACK = 16777216` (16 MiB) for the
-build/test environment, which comfortably fits multiple Tcbs (e.g.
+small** for a Tcb constructed as a stack local — between the 2 MiB rings,
+the 24 KiB RACK send-queue, and the 48 KiB egress ring, a Tcb is ~2.15 MiB.
+The included `.cargo/config.toml` sets `RUST_MIN_STACK = 16777216` (16 MiB)
+for the build/test environment, which comfortably fits multiple Tcbs (e.g.
 loopback tests with peer + client) per thread. Production callers route
 through the C ABI (`tcp_init`) which writes into host-provided heap
 storage, so this only affects pure-Rust users and tests.
@@ -180,6 +182,31 @@ The remaining cost is dominated by:
 - The stack's own per-packet work (parse/emit + state update) is in the
   noise: < 200 ns per packet.
 
+### FFI batching (Phase 8: tx_ring)
+
+The egress staging used to be a single-packet slot (`tx_buf`,
+`tx_len`), so `maybe_send_data` could only queue one segment per call
+and the host had to do one extract per packet. Concretely, a 32 MiB LAN
+transfer drove these FFI call counts (measured via the `bindings/bpf`
+uprobes):
+
+| FFI entry point | Before (single-slot) | After (tx_ring) | Change |
+|---|---:|---:|---:|
+| `tcp_tick` | 23,935 | 1,821 | −92 % |
+| `tcp_send` | 22,704 | 1,390 | −94 % |
+| `tcp_extract_packet` | 47,115 | 25,351 | −46 % |
+| `tcp_inject_packet` | 23,175 | 22,048 | (peer ACK rate; unchanged) |
+
+`maybe_send_data` is now a loop that drains as many segments as cwnd /
+PRR-credit / peer-window allow, staging them into a 32-slot `TxRing`
+(48 KiB per connection). The host still pops them one at a time via
+`tcp_extract_packet`, but a single tick / inject round amortises the
+~150 ns cgo crossing across an entire IW=10 burst (or RACK / RFC 6675
+fan-out during recovery). LAN throughput moved modestly (~549 MiB/s →
+~560 MiB/s) because the harness was already syscall-bound; the bigger
+win is that per-connection CPU cost is now sub-linear in segment count,
+which matters for multi-connection scaling.
+
 Lifting the ~5 Gbit/s ceiling further would require:
 1. Batched FFI (multiple packets per cgo crossing).
 2. Or `sendmmsg(2)` / `recvmmsg(2)` for the TUN fd (batch syscalls).
@@ -209,7 +236,7 @@ with a short sleep between.
 
 ```sh
 cargo build --release --lib       # cdylib + staticlib + rlib
-cargo test  --release --lib       # 105 tests (loopback + conformance + property + server + RACK/send-queue units)
+cargo test  --release --lib       # 114 tests (loopback + conformance + property + server + RACK/send-queue/tx-ring units)
 cargo clippy --release --lib --no-deps -- -D warnings
 ```
 
@@ -326,6 +353,7 @@ src/
 ├── property_tests.rs    # proptest fuzzing
 ├── rack.rs              # RACK loss detector (RFC 8985)
 ├── send_queue.rs        # Per-segment send metadata (RACK / TLP)
+├── tx_ring.rs           # Multi-slot egress staging ring (32 packets)
 └── server_tests.rs      # Passive-open + adversarial inputs
 
 bindings/

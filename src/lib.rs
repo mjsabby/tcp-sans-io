@@ -56,6 +56,7 @@ pub mod scoreboard;
 pub mod send_queue;
 pub mod state;
 pub mod tcb;
+pub mod tx_ring;
 pub mod wire;
 
 pub use error::TcpError;

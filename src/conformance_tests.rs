@@ -962,17 +962,16 @@ fn sack_block_triggers_fast_retransmit_after_one_ack() {
     let peer_ts = handshake_with_ts(&mut tcb, &mut now);
 
     // Put two MSS in flight so there's a meaningful "missing" segment to
-    // SACK around.
+    // SACK around. With multi-slot egress staging, one tick may emit
+    // multiple segments back-to-back — drain the ring fully here so the
+    // post-SACK ring contains only the retransmit (the test relies on
+    // `pop` returning that retransmit as the head packet).
     let payload: ::std::vec::Vec<u8> = (0..2920).map(|i| (i & 0xFF) as u8).collect();
     let n = tcb.send(&payload).expect("send");
     assert_eq!(n, payload.len());
     tcb.set_now(now);
     tcb.tick().expect("tick");
-    let _ = pop(&mut tcb); // first MSS goes out
-    // cwnd from slow start now allows the second segment too.
-    tcb.set_now(now);
-    tcb.tick().expect("tick");
-    let _ = try_pop(&mut tcb);
+    while try_pop(&mut tcb).is_some() {}
 
     let snd_una_at_loss = tcb.debug_snapshot().snd_una;
 
