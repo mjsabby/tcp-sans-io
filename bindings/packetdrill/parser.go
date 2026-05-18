@@ -497,18 +497,22 @@ func parseOneOption(s string) (OptionDesc, error) {
 		return SackPermittedOpt{}, nil
 
 	case "sack":
-		// `sack L:R[,L:R...]` — we already split on commas above, so
-		// here we only see the FIRST block. To recover the rest, the
-		// caller would have to have grouped them. For MVP we accept
-		// exactly one block per sack option and document the limitation.
-		if len(fields) != 2 {
-			return nil, fmt.Errorf("sack requires one L:R argument")
+		// `sack L:R [L:R ...]` — space-separated blocks (up to 4).
+		// We split on whitespace so commas in the option list don't
+		// accidentally end the sack option mid-way; this also matches
+		// real packetdrill scripts that use spaces between blocks.
+		if len(fields) < 2 || len(fields) > 5 {
+			return nil, fmt.Errorf("sack requires 1..=4 L:R blocks")
 		}
-		blk, err := parseSackBlock(fields[1])
-		if err != nil {
-			return nil, err
+		var blocks []SackBlockDesc
+		for _, tok := range fields[1:] {
+			blk, err := parseSackBlock(tok)
+			if err != nil {
+				return nil, err
+			}
+			blocks = append(blocks, blk)
 		}
-		return SackOpt{Blocks: []SackBlockDesc{blk}}, nil
+		return SackOpt{Blocks: blocks}, nil
 
 	case "TS":
 		// Syntax: `TS val N ecr N`.

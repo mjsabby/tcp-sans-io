@@ -135,15 +135,22 @@ func matchOneOption(expected, observed OptionDesc, sym *SymTab, side Side) error
 			return fmt.Errorf("sack blocks: expected %d, got %d",
 				len(exp.Blocks), len(obs.Blocks))
 		}
+		// SACK blocks describe data the SENDER of this packet has
+		// RECEIVED from the OTHER side, so they live in the other
+		// side's sequence space. Resolve via the opposite side.
+		otherSide := SidePeer
+		if side == SidePeer {
+			otherSide = SideOur
+		}
 		for j := range exp.Blocks {
 			// Observed SACK blocks were decoded as absolute u32 wrapped
 			// into int64 — translate observed back to absolute and
 			// compare with resolved expected.
-			el, _, err := sym.Resolve(exp.Blocks[j].Left, SideOur)
+			el, _, err := sym.Resolve(exp.Blocks[j].Left, otherSide)
 			if err != nil {
 				return err
 			}
-			er, _, err := sym.Resolve(exp.Blocks[j].Right, SideOur)
+			er, _, err := sym.Resolve(exp.Blocks[j].Right, otherSide)
 			if err != nil {
 				return err
 			}

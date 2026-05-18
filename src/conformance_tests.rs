@@ -26,7 +26,7 @@ use std::vec;
 use std::vec::Vec;
 
 use crate::tcb::{events, Endpoint, Tcb, TcbConfig};
-use crate::wire::{self, flags, Segment, TcpOptions};
+use crate::wire::{self, flags, SackBlocks, Segment, TcpOptions};
 use crate::{State, MAX_PACKET};
 
 // ---------------------------------------------------------------------------
@@ -101,7 +101,7 @@ struct ParsedOut {
     wscale: Option<u8>,
     ts: Option<(u32, u32)>,
     sack_permitted: bool,
-    sack: Option<(u32, u32)>,
+    sack: SackBlocks,
     payload: Vec<u8>,
 }
 
@@ -140,7 +140,9 @@ fn build_in(
 }
 
 /// Build an inbound packet with arbitrary SACK options. `build_in` is
-/// the convenience wrapper for the common (no-SACK) case.
+/// the convenience wrapper for the common (no-SACK) case. The `sack`
+/// parameter accepts `Option<(u32, u32)>` for single-block convenience;
+/// use `build_in_full_multi_sack` for multi-block scenarios.
 #[allow(clippy::too_many_arguments)]
 fn build_in_full(
     flag_bits: u8,
@@ -153,6 +155,9 @@ fn build_in_full(
     sack: Option<(u32, u32)>,
     payload: &[u8],
 ) -> Vec<u8> {
+    let sb = sack
+        .map(|(l, r)| SackBlocks::one(l, r))
+        .unwrap_or(SackBlocks::EMPTY);
     build_in_full_ws(
         flag_bits,
         seq,
@@ -162,12 +167,14 @@ fn build_in_full(
         None,
         ts,
         sack_permitted,
-        sack,
+        sb,
         payload,
     )
 }
 
 /// Most general inbound packet builder — all five option shapes selectable.
+/// For multi-block SACK callers, pass `SackBlocks` directly; otherwise
+/// `SackBlocks::EMPTY` or `SackBlocks::one(l, r)`.
 #[allow(clippy::too_many_arguments)]
 fn build_in_full_ws(
     flag_bits: u8,
@@ -178,9 +185,10 @@ fn build_in_full_ws(
     wscale: Option<u8>,
     ts: Option<(u32, u32)>,
     sack_permitted: bool,
-    sack: Option<(u32, u32)>,
+    sack: impl Into<SackBlocks>,
     payload: &[u8],
 ) -> Vec<u8> {
+    let sack: SackBlocks = sack.into();
     let mut buf = vec![0u8; MAX_PACKET];
     let opts = TcpOptions {
         mss,
@@ -518,9 +526,11 @@ fn out_of_order_then_gap_fill_delivers_both_segments() {
     assert_eq!(&buf[a.len()..n], b);
 }
 
-/// Reassembly buffer is single-hole: a segment that creates a *second*
-/// hole (i.e. doesn't abut the held run) must be silently dropped, and
-/// the existing held run must remain intact.
+/// Multi-hole reassembly: previously this test asserted the single-hole
+/// constraint (a second hole gets dropped, held run preserved). With the
+/// RFC 6675 multi-hole reassembler, BOTH holes can be held simultaneously
+/// — the cumulative ACK after the in-order segment arrives covers
+/// everything, including C.
 #[test]
 fn second_hole_is_dropped_held_run_preserved() {
     let mut tcb = make_tcb();
@@ -528,9 +538,9 @@ fn second_hole_is_dropped_held_run_preserved() {
     let _ = handshake_with_ts(&mut tcb, &mut now);
 
     let a = b"AAAAAAAAAA"; // 10 bytes at PSS+1
-    let b = b"BBBBBBBBBB"; // 10 bytes at PSS+1+10 — held
-    let c = b"CCCCCCCCCC"; // 10 bytes at PSS+1+30 — second hole, dropped
-    let d = b"DDDDDDDDDD"; // 10 bytes at PSS+1+20 — would close gap to C if held
+    let b = b"BBBBBBBBBB"; // 10 bytes at PSS+1+10 — held in slot 1
+    let c = b"CCCCCCCCCC"; // 10 bytes at PSS+1+30 — held in slot 2 (multi-hole)
+    let d = b"DDDDDDDDDD"; // 10 bytes at PSS+1+20 — merges slot1 with slot2
     let seq_a = PSS.wrapping_add(1);
     let seq_b = seq_a.wrapping_add(a.len() as u32);
     let seq_c = seq_b.wrapping_add(b.len() as u32 + d.len() as u32);
@@ -551,7 +561,8 @@ fn second_hole_is_dropped_held_run_preserved() {
     .expect("inject B");
     let _ = pop(&mut tcb); // dup-ACK
 
-    // C arrives non-abutting → must be dropped.
+    // C arrives non-abutting → multi-hole reassembler accepts it as a
+    // second held run.
     now += 1;
     tcb.set_now(now);
     tcb.inject_packet(&build_in(
@@ -565,9 +576,9 @@ fn second_hole_is_dropped_held_run_preserved() {
     ))
     .expect("inject C");
     let dup_c = pop(&mut tcb).1;
-    assert_eq!(dup_c.ack, seq_a, "C non-abutting → dup-ACK only");
+    assert_eq!(dup_c.ack, seq_a, "C non-abutting → dup-ACK at rcv_nxt");
 
-    // D arrives, abutting B's tail → extends the held run.
+    // D arrives, abutting B's tail AND C's head → merges into one run.
     now += 1;
     tcb.set_now(now);
     tcb.inject_packet(&build_in(
@@ -582,7 +593,7 @@ fn second_hole_is_dropped_held_run_preserved() {
     .expect("inject D");
     let _ = pop(&mut tcb); // dup-ACK still at rcv_nxt
 
-    // A closes the gap. We expect a+b+d delivered (c was dropped).
+    // A closes the gap. With multi-hole, A+B+D+C all deliver.
     now += 1;
     tcb.set_now(now);
     tcb.inject_packet(&build_in(
@@ -598,16 +609,20 @@ fn second_hole_is_dropped_held_run_preserved() {
     let ack = pop(&mut tcb).1;
     assert_eq!(
         ack.ack,
-        seq_d.wrapping_add(d.len() as u32),
-        "cumulative ACK should cover A+B+D, not C"
+        seq_c.wrapping_add(c.len() as u32),
+        "cumulative ACK should cover A+B+D+C (multi-hole reassembly)",
     );
 
     let mut buf = [0u8; 64];
     let n = tcb.recv(&mut buf).expect("recv");
-    assert_eq!(n, a.len() + b.len() + d.len());
+    assert_eq!(n, a.len() + b.len() + d.len() + c.len());
     assert_eq!(&buf[..a.len()], a);
     assert_eq!(&buf[a.len()..a.len() + b.len()], b);
-    assert_eq!(&buf[a.len() + b.len()..n], d);
+    assert_eq!(
+        &buf[a.len() + b.len()..a.len() + b.len() + d.len()],
+        d
+    );
+    assert_eq!(&buf[a.len() + b.len() + d.len()..n], c);
 }
 
 /// Inbound packet whose TCP checksum is wrong must be silently rejected:
@@ -890,7 +905,7 @@ fn syn_offers_sack_permitted() {
         syn.sack_permitted,
         "SYN must offer SACK_PERMITTED (RFC 2018 §2)",
     );
-    assert!(syn.sack.is_none(), "SYN itself must not carry a SACK block");
+    assert!(syn.sack.is_empty(), "SYN itself must not carry a SACK block");
 }
 
 /// When the peer's SYN-ACK echoes SACK_PERMITTED, an out-of-order segment
@@ -922,7 +937,9 @@ fn out_of_order_segment_emits_sack_block_when_negotiated() {
     let (_, dup) = pop(&mut tcb);
     assert!(dup.flags & flags::ACK != 0);
     assert_eq!(dup.ack, PSS.wrapping_add(1), "ack stays at rcv_nxt");
-    let (left, right) = dup.sack.expect("dup-ACK with held OOO must carry SACK");
+    let blocks = dup.sack.as_slice();
+    assert_eq!(blocks.len(), 1, "exactly one SACK block expected");
+    let (left, right) = blocks[0];
     assert_eq!(left, oo_seq, "SACK left edge = held run start");
     assert_eq!(
         right,
@@ -977,10 +994,13 @@ fn sack_block_triggers_fast_retransmit_after_one_ack() {
     );
     tcb.set_now(now);
     tcb.inject_packet(&pkt).expect("inject SACK");
+    // Drain & inspect: the first packet should be the retransmit.
+    let retx = pop(&mut tcb).1;
     while try_pop(&mut tcb).is_some() {}
 
     let snap = tcb.debug_snapshot();
-    // PRR: ssthresh = max(flight/2, 2*MSS) = 2920 for 2*MSS flight.
+    // PRR: ssthresh = max(flight/2, 2*MSS) = 2920 (clamped to 2*MSS floor
+    // since flight is ~2*1448 = 2896 < 4*MSS).
     assert_eq!(
         snap.ssthresh, 2920,
         "ssthresh = max(flight/2, 2*MSS) at SACK-driven loss event",
@@ -990,12 +1010,24 @@ fn sack_block_triggers_fast_retransmit_after_one_ack() {
         crate::congestion::INITIAL_WINDOW,
         "PRR does NOT collapse cwnd at recovery entry",
     );
-    // One MSS-payload retransmitted under PRR initial budget (snd_credit=MSS).
-    let flight = snap.snd_nxt.wrapping_sub(snap.snd_una);
+    // RFC 6675 selective retransmit: the lost segment is retransmitted at
+    // snd_una. Unlike Tahoe / our pre-RFC-6675 code, snd_nxt is NOT
+    // rewound — retransmits travel "below" snd_nxt without disturbing it.
+    assert_eq!(
+        retx.seq, snd_una_at_loss,
+        "first retransmit must be at snd_una (the obvious hole)",
+    );
     assert!(
-        flight > 0 && flight <= 1460,
-        "PRR initial retransmit ≤ 1 MSS; got flight={}",
-        flight,
+        !retx.payload.is_empty() && retx.payload.len() <= 1460,
+        "retransmit must carry ≤ 1 MSS of payload",
+    );
+    // snd_nxt stays at its pre-loss high-water mark (2 segments × 1448 = 2896,
+    // since TS option shrinks effective payload from MSS=1460 by 12 bytes).
+    let flight_visible = snap.snd_nxt.wrapping_sub(snap.snd_una);
+    assert!(
+        flight_visible >= 2880 && flight_visible <= 2920,
+        "snd_nxt MUST NOT rewind under RFC 6675 selective retransmit (got flight={})",
+        flight_visible,
     );
 }
 
@@ -1238,10 +1270,12 @@ fn cumulative_ack_after_sack_rewind_is_accepted() {
     let snap = tcb.debug_snapshot();
     assert!(snap.ssthresh >= 2 * 1460, "ssthresh ≥ 2*MSS per PRR");
     assert_eq!(snap.snd_una, snd_una_pre_loss, "snd_una not yet advanced");
+    // Under RFC 6675 selective retransmit, snd_nxt is NOT rewound. The
+    // retransmit travels at snd_una "below" snd_nxt, and snd_nxt stays
+    // at its pre-loss high-water mark.
     assert_eq!(
-        snap.snd_nxt.wrapping_sub(snd_una_pre_loss),
-        s3.payload.len() as u32,
-        "PRR retransmits exactly one segment under initial snd_credit budget",
+        snap.snd_nxt, snd_max_pre_loss,
+        "snd_nxt MUST NOT rewind under RFC 6675 selective retransmit",
     );
 
     // The retransmit fills the peer's hole. The peer cumulatively ACKs
@@ -1520,7 +1554,7 @@ fn ws_option_round_trip() {
         wscale: Some(7),
         ts: Some((1234, 5678)),
         sack_permitted: true,
-        sack: None,
+        sack: SackBlocks::EMPTY,
     };
     let n = wire::emit(
         &mut buf,
@@ -1673,7 +1707,7 @@ fn prr_exits_recovery_with_cwnd_equal_ssthresh() {
     }
     assert!(segs.len() >= 4);
 
-    let s1 = &segs[0];
+    let _s1 = &segs[0];
     let s2 = &segs[1];
     let s3 = &segs[2];
     let s4 = &segs[3];
@@ -2079,4 +2113,197 @@ fn ece_marked_ack_triggers_congestion_response() {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// RFC 8985 — RACK-TLP loss detection
+// ---------------------------------------------------------------------------
+
+/// RACK loss detection: send 4 segments, the peer SACKs only segment #4.
+/// After RTT/4 + epsilon elapses, the RACK reorder timer fires and
+/// segments 1-3 should be marked lost and retransmitted (starting with
+/// snd_una). Pure dup-ACK detection wouldn't fire here — we only see one
+/// SACK ACK — so this is exclusively RACK's win.
+#[test]
+fn rack_reorder_timer_marks_old_unsacked_segments_lost() {
+    let mut tcb = make_tcb();
+    let mut now = 0u64;
+    let peer_ts = handshake_with_ts(&mut tcb, &mut now);
+
+    // Push 4 MSS-payload segments. IW=10 lets them all go in one burst.
+    let payload: ::std::vec::Vec<u8> = (0..(4 * 1448)).map(|i| (i & 0xFF) as u8).collect();
+    tcb.send(&payload).expect("send");
+    let mut segs = ::std::vec::Vec::new();
+    for _ in 0..16 {
+        now += 1;
+        tcb.set_now(now);
+        tcb.tick().expect("tick");
+        match try_pop(&mut tcb) {
+            Some(s) => segs.push(s),
+            None => break,
+        }
+    }
+    assert!(segs.len() >= 4, "want ≥4 segs, got {}", segs.len());
+    let s4 = &segs[3];
+    let s4_seq = s4.seq;
+    let s4_end = s4.seq.wrapping_add(s4.payload.len() as u32);
+
+    // Establish an RTT measurement: ACK seg #4 via SACK at time +50ms
+    // (so SRTT samples lands around 50ms-ish; reo_wnd becomes ~12ms).
+    now += 50;
+    let sack = build_in_full(
+        flags::ACK,
+        PSS.wrapping_add(1),
+        ISS.wrapping_add(1),
+        PEER_WIN,
+        None,
+        Some((peer_ts.wrapping_add(1), now as u32)),
+        false,
+        Some((s4_seq, s4_end)),
+        &[],
+    );
+    tcb.set_now(now);
+    tcb.inject_packet(&sack).expect("inject SACK");
+
+    // The SACK arrival triggers PRR + an immediate scoreboard-driven
+    // retransmit at snd_una (RFC 6675 initial retransmit). Drain it.
+    while try_pop(&mut tcb).is_some() {}
+
+    // Now advance time past RACK's threshold (SRTT + reo_wnd). At
+    // SRTT≈50ms, reo_wnd ≈ 12ms, so we need elapsed since segs #2/#3
+    // sends ≥ ~62ms. They were sent at time ≈ 5-10ms ago.
+    now += 200;
+    tcb.set_now(now);
+    tcb.tick().expect("tick (RACK reorder timer)");
+
+    // RACK should have queued lost ranges for segs #2 and #3 (seg #1 was
+    // already retransmitted by RFC 6675's initial-retransmit path).
+    // maybe_send_data drains one rack_lost per tick.
+    let mut rack_retx = 0;
+    for _ in 0..8 {
+        now += 1;
+        tcb.set_now(now);
+        tcb.tick().expect("tick");
+        match try_pop(&mut tcb) {
+            Some(s) => {
+                if s.flags & flags::PSH != 0
+                    && !s.payload.is_empty()
+                    && seq_lt(s.seq, s4_seq)
+                {
+                    rack_retx += 1;
+                }
+            }
+            None => break,
+        }
+    }
+    assert!(
+        rack_retx >= 1,
+        "RACK should have retransmitted at least one of segs #2/#3 (got {})",
+        rack_retx,
+    );
+}
+
+/// TLP fires PTO before RTO when there's un-ACKed data and no ACK
+/// movement. Probe = retransmit of the last in-flight segment.
+#[test]
+fn tlp_probes_before_rto_fires() {
+    let mut tcb = make_tcb();
+    let mut now = 0u64;
+    let peer_ts = handshake_with_ts(&mut tcb, &mut now);
+
+    // Establish an SRTT sample first by ACKing a small initial send.
+    // Without an RTT measurement, TLP's PTO formula uses TLP_MIN_PTO_MS=10ms.
+    let _ = peer_ts;
+
+    // Send one MSS, peer never ACKs.
+    tcb.send(&vec![0xCC; 1448]).expect("send");
+    now += 1;
+    tcb.set_now(now);
+    tcb.tick().expect("tick");
+    let (_, original) = pop(&mut tcb);
+    assert!(!original.payload.is_empty());
+    let orig_seq = original.seq;
+
+    // Advance past TLP PTO (no SRTT sample yet → uses MIN_PTO=10ms).
+    // RTO is initial_rto_ms=1000. PTO should fire well before that.
+    now += 50;
+    tcb.set_now(now);
+    tcb.tick().expect("tick");
+
+    // A probe should now be staged.
+    let probe = try_pop(&mut tcb).expect("TLP probe should have fired");
+    assert!(!probe.payload.is_empty(), "probe carries payload");
+    assert_eq!(
+        probe.seq, orig_seq,
+        "probe retransmits the last (only) in-flight segment",
+    );
+
+    // We must NOT have fired RTO yet (snapshot would show cwnd=MSS).
+    let snap = tcb.debug_snapshot();
+    assert!(
+        snap.cwnd >= crate::congestion::INITIAL_WINDOW,
+        "RTO should NOT have fired yet (cwnd={})",
+        snap.cwnd,
+    );
+}
+
+// seq_lt helper for tests
+#[inline]
+fn seq_lt(a: u32, b: u32) -> bool {
+    (a.wrapping_sub(b) as i32) < 0
+}
+
+/// Repro for the failing `rack_tail_loss_detection.pkt` packetdrill
+/// scenario: with a short ~5ms SRTT, send 4 segments at t≈5ms, SACK
+/// only #4 at t=15ms. Expect retransmit of seq #1 (NOT #4).
+#[test]
+fn rack_tail_loss_short_rtt_retransmits_first_unsacked() {
+    let mut tcb = make_tcb();
+    let mut now = 0u64;
+    let peer_ts = handshake_with_ts(&mut tcb, &mut now);
+
+    // Send 4 MSS-sized segments quickly, drain them.
+    let payload: Vec<u8> = (0..(4 * 1448)).map(|i| (i & 0xFF) as u8).collect();
+    tcb.send(&payload).expect("send");
+
+    let mut segs = Vec::new();
+    for _ in 0..16 {
+        tcb.set_now(now);
+        tcb.tick().expect("tick");
+        match try_pop(&mut tcb) {
+            Some(s) => segs.push(s),
+            None => break,
+        }
+    }
+    assert_eq!(segs.len(), 4, "want exactly 4 emitted segs");
+    let s1_seq = segs[0].seq;
+    let s4_seq = segs[3].seq;
+    let s4_end = s4_seq.wrapping_add(1448);
+
+    // SACK arrives 10ms later — only segment #4 is SACKed.
+    now += 10;
+    let sack = build_in_full(
+        flags::ACK,
+        PSS.wrapping_add(1),
+        ISS.wrapping_add(1),
+        PEER_WIN,
+        None,
+        Some((peer_ts.wrapping_add(1), now as u32)),
+        false,
+        Some((s4_seq, s4_end)),
+        &[],
+    );
+    tcb.set_now(now);
+    tcb.inject_packet(&sack).expect("inject SACK");
+
+    // Drain the immediate emit. It should be seq #1, NOT seq #4.
+    tcb.set_now(now);
+    tcb.tick().expect("tick");
+    let retx = try_pop(&mut tcb).expect("must emit a retransmit");
+    assert_eq!(
+        retx.seq, s1_seq,
+        "first retransmit must be seq #1 (snd_una), not the SACKed seq #4 \
+         (s1_seq={}, s4_seq={}, got={})",
+        s1_seq, s4_seq, retx.seq,
+    );
 }

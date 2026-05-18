@@ -1,0 +1,26 @@
+# RFC 6675 selective retransmit: when the peer SACKs a single missing
+# segment, we retransmit it at snd_una WITHOUT rewinding snd_nxt. After
+# the retransmit, snd_nxt remains at its pre-loss high-water mark and
+# the SACK scoreboard records the SACKed range.
+#
+# Verifies the new RFC 6675 path replaces the old Tahoe go-back-N
+# (rewind snd_nxt) behavior.
+
+--connect 10.0.0.1:49152 10.0.0.2:80
++0 > SEW 0:0(0) win 65535 <mss 1460, wscale 5, sackOK, TS val * ecr 0>
++.005 < S. 0:0(0) ack 1 win 32768 <mss 1460, wscale 0, sackOK, TS val 1 ecr *>
++0 > . 1:1(0) ack 1 win 32768 <TS val * ecr 1>
+
+# Push two MSS-payload-sized segments. Effective MSS after TS option = 1448.
+--send 2896
++0 > P. 1:1449(1448) ack 1 win 32768 <TS val * ecr 1>
++0 > P. 1449:2897(1448) ack 1 win 32768 <TS val * ecr 1>
+
+# Peer SACKs the second segment — the first is missing. snd_una stays
+# at 1. This is the RFC 6675 selective retransmit trigger.
++.005 < . 1:1(0) ack 1 win 32768 <sack 1449:2897, TS val 2 ecr *>
+
+# We retransmit the missing first segment at snd_una=1. Our internal
+# snd_nxt remains at 2897 (NOT rewound), so a subsequent --send would
+# emit at 2897, not at 1+1448.
++0 > P. 1:1449(1448) ack 1 win 32768 <TS val * ecr 2>

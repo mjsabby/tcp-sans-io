@@ -17,8 +17,8 @@ use crate::congestion::Tahoe;
 use crate::error::TcpError;
 use crate::ring::Ring;
 use crate::state::State;
-use crate::wire::{self, flags, Segment, TcpOptions};
-use crate::{BUF_CAP, MAX_PACKET, MSS, REASM_CAP};
+use crate::wire::{self, flags, SackBlocks, Segment, TcpOptions};
+use crate::{BUF_CAP, MAX_PACKET, MSS};
 
 /// 4-tuple endpoint identifying one side of a connection.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -65,6 +65,104 @@ const DELAYED_ACK_MS: u64 = 40;
 /// Default peer MSS when no MSS option arrived in the SYN/SYN-ACK
 /// (RFC 1122 §4.2.2.6).
 const DEFAULT_PEER_MSS: u16 = 536;
+
+/// Minimum TLP probe timeout per RFC 8985 §7.5.1. Pacifies degenerate
+/// "SRTT close to zero" cases where the formula `2*SRTT` would otherwise
+/// schedule the probe at essentially zero, racing the original packet.
+const TLP_MIN_PTO_MS: u64 = 10;
+
+/// Bounded queue of RACK-marked-lost ranges awaiting retransmission.
+/// Sorted lowest-seq first so we retransmit holes in order — matching
+/// the RFC 6675 NextSeg discipline that `rxt_seq` relies on.
+const RACK_LOST_QUEUE_CAP: usize = 32;
+
+#[derive(Copy, Clone, Debug)]
+pub struct RackLostQueue {
+    ranges: [(u32, u32); RACK_LOST_QUEUE_CAP],
+    len: usize,
+}
+
+impl RackLostQueue {
+    pub const fn new() -> Self {
+        Self {
+            ranges: [(0, 0); RACK_LOST_QUEUE_CAP],
+            len: 0,
+        }
+    }
+    pub fn clear(&mut self) {
+        self.len = 0;
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+    /// Insert `(seq_start, seq_end)` if not already covered. Maintains
+    /// ascending sort by `seq_start`. Silently drops if full or if the
+    /// range is empty after dedup.
+    pub fn insert_sorted(&mut self, seq_start: u32, seq_end: u32, una: u32) {
+        if seq_le(seq_end, seq_start) {
+            return;
+        }
+        // De-dup: drop if any existing range fully contains this.
+        for r in self.ranges.get(..self.len).unwrap_or(&[]) {
+            if seq_le(r.0, seq_start) && seq_le(seq_end, r.1) {
+                return;
+            }
+        }
+        if self.len == RACK_LOST_QUEUE_CAP {
+            return; // drop; RACK will rediscover on next scan
+        }
+        // Find insertion point (sort by seq_start - una, ascending).
+        let mut pos = self.len;
+        for i in 0..self.len {
+            let r = match self.ranges.get(i) {
+                Some(r) => *r,
+                None => continue,
+            };
+            let new_off = seq_start.wrapping_sub(una);
+            let cur_off = r.0.wrapping_sub(una);
+            if new_off < cur_off {
+                pos = i;
+                break;
+            }
+        }
+        // Shift right by 1 from pos.
+        for i in (pos..self.len).rev() {
+            if let (Some(src), Some(dst)) = (
+                self.ranges.get(i).copied(),
+                self.ranges.get_mut(i + 1),
+            ) {
+                *dst = src;
+            }
+        }
+        if let Some(slot) = self.ranges.get_mut(pos) {
+            *slot = (seq_start, seq_end);
+            self.len += 1;
+        }
+    }
+    /// Take the lowest-seq range. Returns `None` if empty.
+    pub fn take_lowest(&mut self) -> Option<(u32, u32)> {
+        if self.len == 0 {
+            return None;
+        }
+        let first = self.ranges.first().copied();
+        for i in 1..self.len {
+            if let (Some(src), Some(dst)) = (
+                self.ranges.get(i).copied(),
+                self.ranges.get_mut(i - 1),
+            ) {
+                *dst = src;
+            }
+        }
+        self.len -= 1;
+        first
+    }
+}
+
+impl Default for RackLostQueue {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Maximum number of times we will retransmit a SYN-ACK in `SYN_RCVD` before
 /// giving up and reverting to `LISTEN`. With exponential RTO back-off the
@@ -195,29 +293,65 @@ pub struct Tcb {
     /// the CWR flag to acknowledge.
     send_cwr_pending: bool,
 
-    // ---- SACK (RFC 2018) -------------------------------------------------
+    // ---- SACK (RFC 2018 + RFC 6675) -------------------------------------
     /// True iff both sides offered SACK_PERMITTED in the handshake.
     sack_enabled: bool,
-    /// `snd_una` value at which SACK-driven fast-retransmit last fired.
-    /// Used to suppress repeated triggers within a single recovery epoch:
-    /// while `snd_una` hasn't advanced past this point, additional SACK-
-    /// bearing dup-ACKs are noted but don't keep collapsing `cwnd`. RFC
-    /// 6675 §5 calls the equivalent state "the recovery-point check".
-    sack_recovery_seq: Option<u32>,
+    /// Sender-side SACK scoreboard: tracks SACKed ranges above `snd_una`
+    /// reported by the peer. Drives the RFC 6675 NextSeg() selective
+    /// retransmit algorithm.
+    sack_scoreboard: crate::scoreboard::SackScoreboard,
+    /// Cursor in the current recovery episode pointing at the next byte
+    /// we should consider retransmitting. Only valid when `cc.in_recovery()`
+    /// is true. Set to `snd_una` on recovery entry, advanced past each
+    /// retransmitted segment, never moved backward; cumulative ACK bumps
+    /// it forward if `snd_una` outruns it.
+    rxt_seq: u32,
+    /// Total bytes retransmitted in the current recovery episode that
+    /// haven't yet been cumulatively ACKed. Folded into pipe estimation
+    /// so PRR doesn't under-estimate the in-flight bytes (retransmits
+    /// don't advance `snd_nxt`, so naive `(snd_nxt - snd_una) - sacked`
+    /// would miss them). Decremented as `snd_una` advances; cleared on
+    /// recovery exit.
+    rxt_unacked: u32,
+
+    // ---- RACK-TLP (RFC 8985) --------------------------------------------
+    /// Per-transmission metadata feeding RACK + TLP. Pushed on every
+    /// emission (new data, selective retransmit, TLP probe). Pruned by
+    /// cumulative ACK and SACK absorb. Bounded ring; on overflow the
+    /// oldest entry is evicted.
+    send_queue: crate::send_queue::SendQueue,
+    /// RACK state: the most-recently delivered segment's send-ts, end-seq,
+    /// RTT sample, and reordering window. Used by `rack::detect_lost` to
+    /// classify in-flight segments as either definitely-lost, eligible-
+    /// but-too-soon (caller arms a reordering timer), or not-eligible.
+    rack: crate::rack::Rack,
+    /// RACK reordering timer. Set when a scan finds entries that are
+    /// "eligible but not yet past the threshold"; fires in `tick()` to
+    /// trigger a fresh scan independent of ACK arrivals.
+    rack_deadline: Option<u64>,
+    /// Bounded queue of RACK-marked-lost ranges waiting to be
+    /// retransmitted. Drained at top priority by `maybe_send_data`.
+    /// Ranges are clipped to `[snd_una, snd_max)` minus SACKed bytes
+    /// before being added.
+    rack_lost_queue: RackLostQueue,
+    /// TLP Probe Timeout deadline. Set whenever we emit data with
+    /// in-flight > 0; cleared on every fresh ACK; fires a tail probe
+    /// before RTO would have.
+    tlp_deadline: Option<u64>,
+    /// True iff a TLP probe has already fired in the current
+    /// "in-flight epoch" (since the last fresh ACK). Single-shot per
+    /// RFC 8985 §7.4. Reset when snd_una advances.
+    tlp_fired: bool,
 
     // ---- Buffers ---------------------------------------------------------
     send_ring: Ring<BUF_CAP>,
     recv_ring: Ring<BUF_CAP>,
 
-    // ---- Out-of-order reassembly (single-hole) ---------------------------
-    /// Bytes held ahead of `rcv_nxt`, sitting at sequence numbers
-    /// `[oo_start, oo_start + oo_len)`. Capacity is fixed at
-    /// [`REASM_CAP`]; segments that don't abut the held run are dropped
-    /// (sender will retransmit). When the gap fills, the held run is
-    /// flushed into `recv_ring` atomically.
-    oo_buf: [u8; REASM_CAP],
-    oo_start: u32,
-    oo_len: usize,
+    // ---- Out-of-order reassembly (multi-hole, RFC 6675-grade) -----------
+    /// Multi-range out-of-order buffer. Holds up to MAX_HOLES disjoint
+    /// runs; the receiver emits a SACK option carrying their edges so
+    /// an RFC 6675 sender knows which segments to selectively retransmit.
+    reasm: crate::reassembly::Reassembly,
 
     // ---- Tahoe AIMD ------------------------------------------------------
     cc: Tahoe,
@@ -303,12 +437,18 @@ impl Tcb {
             ce_observed: false,
             send_cwr_pending: false,
             sack_enabled: false,
-            sack_recovery_seq: None,
+            sack_scoreboard: crate::scoreboard::SackScoreboard::new(),
+            rxt_seq: 0,
+            rxt_unacked: 0,
+            send_queue: crate::send_queue::SendQueue::new(),
+            rack: crate::rack::Rack::new(),
+            rack_deadline: None,
+            rack_lost_queue: RackLostQueue::new(),
+            tlp_deadline: None,
+            tlp_fired: false,
             send_ring: Ring::new()?,
             recv_ring: Ring::new()?,
-            oo_buf: [0u8; REASM_CAP],
-            oo_start: 0,
-            oo_len: 0,
+            reasm: crate::reassembly::Reassembly::new(),
             cc: Tahoe::new(BUF_CAP as u32),
             now_ms: 0,
             rto_ms: cfg.initial_rto_ms.clamp(RTO_MIN_MS, RTO_MAX_MS),
@@ -362,8 +502,14 @@ impl Tcb {
             now_ms: self.now_ms,
             send_ring_len: self.send_ring.len() as u32,
             recv_ring_len: self.recv_ring.len() as u32,
-            oo_start: self.oo_start,
-            oo_len: self.oo_len as u32,
+            // For ABI compat: oo_start = first hole start (0 if none),
+            // oo_len = total bytes held across all holes.
+            oo_start: self
+                .reasm
+                .ready_slot(self.rcv_nxt.wrapping_add(1))
+                .map(|(_, s, _)| s)
+                .unwrap_or(0),
+            oo_len: self.reasm.held_bytes() as u32,
             tx_len: self.tx_len as u32,
             pending_ack: self.pending_ack,
             dup_ack_count: self.cc.dup_acks,
@@ -396,7 +542,7 @@ impl Tcb {
             wscale: Some(LOCAL_WS_SHIFT),
             ts: Some((self.ts_val(), 0)),
             sack_permitted: true,
-            sack: None,
+            sack: SackBlocks::EMPTY,
         };
         // RFC 3168 §6.1.1: active opener sets BOTH ECE and CWR on the SYN
         // to advertise ECN-capable. ECN is confirmed iff the SYN-ACK
@@ -486,11 +632,18 @@ impl Tcb {
         self.ce_observed = false;
         self.send_cwr_pending = false;
         self.sack_enabled = false;
-        self.sack_recovery_seq = None;
+        self.sack_scoreboard.clear();
+        self.rxt_seq = 0;
+        self.rxt_unacked = 0;
+        self.send_queue.clear();
+        self.rack = crate::rack::Rack::new();
+        self.rack_deadline = None;
+        self.rack_lost_queue.clear();
+        self.tlp_deadline = None;
+        self.tlp_fired = false;
         self.send_ring.clear();
         self.recv_ring.clear();
-        self.oo_start = 0;
-        self.oo_len = 0;
+        self.reasm.clear();
         self.cc = Tahoe::new(BUF_CAP as u32);
         self.rto_deadline = None;
         self.rtt_probe = None;
@@ -693,6 +846,21 @@ impl Tcb {
                 let flight = self.snd_nxt.wrapping_sub(self.snd_una);
                 self.cc.on_rto_loss(flight);
                 self.snd_nxt = self.snd_una;
+                // RTO means we've lost confidence about what's in flight;
+                // SACK information is stale. Clear scoreboard + rxt state
+                // so we don't keep skipping "previously SACKed" segments
+                // that the peer may have reneged on. Also clear RACK / TLP
+                // state per RFC 8985 §5: RTO invalidates time-based loss
+                // detection state.
+                self.sack_scoreboard.clear();
+                self.rxt_seq = self.snd_una;
+                self.rxt_unacked = 0;
+                self.send_queue.clear();
+                self.rack.reset();
+                self.rack_deadline = None;
+                self.rack_lost_queue.clear();
+                self.tlp_deadline = None;
+                self.tlp_fired = false;
                 // Exponential back-off, capped.
                 self.rto_ms = (self.rto_ms.saturating_mul(2)).min(RTO_MAX_MS);
                 // Karn: invalidate any in-flight RTT probe.
@@ -707,7 +875,7 @@ impl Tcb {
                         wscale: Some(LOCAL_WS_SHIFT),
                         ts: Some((self.ts_val(), 0)),
                         sack_permitted: true,
-                        sack: None,
+                        sack: SackBlocks::EMPTY,
                     };
                     // ECN-Setup SYN per RFC 3168 §6.1.1 — same flags as
                     // the initial connect() emission.
@@ -738,6 +906,23 @@ impl Tcb {
                         self.arm_rto_for(self.snd_nxt);
                     }
                 }
+            }
+        }
+        // ---- RACK reorder timer (RFC 8985 §6.3) -------------------------
+        // RACK might have classified some in-flight segments as
+        // "eligible-but-not-old-enough" on the last ACK. When the timer
+        // expires, rescan to discover newly-lost ranges.
+        if let Some(deadline) = self.rack_deadline {
+            if self.now_ms >= deadline {
+                self.rack_deadline = None;
+                self.run_rack_scan();
+            }
+        }
+        // ---- TLP Probe Timeout (RFC 8985 §7) ----------------------------
+        // RTO wins ties: only fire TLP if RTO hasn't fired this tick.
+        if let Some(deadline) = self.tlp_deadline {
+            if self.now_ms >= deadline {
+                self.fire_tlp_probe()?;
             }
         }
         // ---- Delayed-ACK expiry -----------------------------------------
@@ -1025,7 +1210,7 @@ impl Tcb {
                 .ts
                 .map(|(peer_tsval, _)| (self.ts_val(), peer_tsval)),
             sack_permitted: false,
-            sack: None,
+            sack: SackBlocks::EMPTY,
         };
         let win =
             u16::try_from(self.advertised_window().min(u16::MAX as u32)).unwrap_or(u16::MAX);
@@ -1135,7 +1320,7 @@ impl Tcb {
                 None
             },
             sack_permitted: self.sack_enabled,
-            sack: None,
+            sack: SackBlocks::EMPTY,
         };
         // RFC 3168 §6.1.1: confirming SYN-ACK carries ECE without CWR.
         let extra_flags = if self.ecn_enabled { flags::ECE } else { 0 };
@@ -1388,13 +1573,8 @@ impl Tcb {
         };
     }
 
-    /// Buffer an out-of-order in-window segment in the single-hole reassembly
-    /// queue. Returns `true` if any bytes were absorbed.
-    ///
-    /// We only accept payloads that abut the held run (or form the first
-    /// run): segments that would create a second hole are dropped, and
-    /// retransmission recovers them. This is a deliberate simplification —
-    /// see [`REASM_CAP`](crate::REASM_CAP).
+    /// Buffer an out-of-order in-window segment in the multi-hole
+    /// reassembler. Returns `true` if any bytes were absorbed.
     fn accept_oo_segment(&mut self, seq: u32, payload: &[u8]) -> bool {
         if payload.is_empty() {
             return false;
@@ -1403,100 +1583,34 @@ impl Tcb {
         if !seq_gt(seq, self.rcv_nxt) {
             return false;
         }
-
-        if self.oo_len == 0 {
-            // First OOO segment: clip to capacity and store.
-            let n = payload.len().min(REASM_CAP);
-            let dst = match self.oo_buf.get_mut(..n) {
-                Some(d) => d,
-                None => return false,
-            };
-            let src = match payload.get(..n) {
-                Some(s) => s,
-                None => return false,
-            };
-            dst.copy_from_slice(src);
-            self.oo_start = seq;
-            self.oo_len = n;
-            return n > 0;
-        }
-
-        let held_end = self.oo_start.wrapping_add(self.oo_len as u32);
-
-        // Append: new segment abuts (or duplicates the trailing edge of)
-        // the held run.
-        if seq == held_end {
-            let space = REASM_CAP.saturating_sub(self.oo_len);
-            let n = payload.len().min(space);
-            if n == 0 {
-                return false;
-            }
-            let off = self.oo_len;
-            let dst = match self.oo_buf.get_mut(off..off + n) {
-                Some(d) => d,
-                None => return false,
-            };
-            let src = match payload.get(..n) {
-                Some(s) => s,
-                None => return false,
-            };
-            dst.copy_from_slice(src);
-            self.oo_len += n;
-            return true;
-        }
-
-        // Prepend: new segment ends right where the held run begins.
-        let new_end = seq.wrapping_add(payload.len() as u32);
-        if new_end == self.oo_start {
-            let prepend = payload.len();
-            let new_total = prepend.saturating_add(self.oo_len).min(REASM_CAP);
-            // Held bytes we can still keep after shifting right by `prepend`.
-            let kept = new_total.saturating_sub(prepend);
-            if kept > 0 && prepend < REASM_CAP {
-                self.oo_buf.copy_within(0..kept, prepend);
-            }
-            let n = prepend.min(REASM_CAP);
-            let dst = match self.oo_buf.get_mut(..n) {
-                Some(d) => d,
-                None => return false,
-            };
-            let src = match payload.get(..n) {
-                Some(s) => s,
-                None => return false,
-            };
-            dst.copy_from_slice(src);
-            self.oo_start = seq;
-            self.oo_len = new_total;
-            return true;
-        }
-
-        // Anything else (gap or unrelated) is dropped — single-hole only.
-        false
+        self.reasm.insert(seq, payload, self.rcv_nxt) > 0
     }
 
-    /// If `rcv_nxt` now equals `oo_start`, flush the held OOO run into the
-    /// receive ring. Returns the number of bytes drained.
+    /// Drain any contiguous OOO run abutting `rcv_nxt` into the receive
+    /// ring. Returns total bytes drained (may chain across multiple
+    /// reassembly slots if merging revealed a long run). Stops if the
+    /// recv_ring fills.
     fn drain_reassembly(&mut self) -> usize {
-        if self.oo_len == 0 || self.rcv_nxt != self.oo_start {
-            return 0;
+        let mut total = 0usize;
+        while let Some((slot_idx, slot_start, slot_len)) = self.reasm.ready_slot(self.rcv_nxt) {
+            // Sanity: the ready_slot should match rcv_nxt exactly.
+            if slot_start != self.rcv_nxt {
+                break;
+            }
+            let bytes = self.reasm.slot_bytes(slot_idx);
+            let to_write = bytes.get(..slot_len).unwrap_or(bytes);
+            let written = self.recv_ring.write(to_write);
+            self.rcv_nxt = self.rcv_nxt.wrapping_add(written as u32);
+            self.reasm.commit_drain(slot_idx, written);
+            total += written;
+            if written < slot_len {
+                break; // ring full
+            }
         }
-        let src = match self.oo_buf.get(..self.oo_len) {
-            Some(s) => s,
-            None => return 0,
-        };
-        let written = self.recv_ring.write(src);
-        self.rcv_nxt = self.rcv_nxt.wrapping_add(written as u32);
-        if written < self.oo_len {
-            // Partial drain (recv_ring filled): keep the remainder.
-            self.oo_buf.copy_within(written..self.oo_len, 0);
-            self.oo_len -= written;
-            self.oo_start = self.oo_start.wrapping_add(written as u32);
-        } else {
-            self.oo_len = 0;
-            self.oo_start = 0;
+        if total > 0 {
+            self.rcv_wnd = self.advertised_window();
         }
-        self.rcv_wnd = self.advertised_window();
-        written
+        total
     }
 
     /// Bytes we can advertise as available. Held OOO bytes already consumed
@@ -1504,7 +1618,7 @@ impl Tcb {
     #[inline]
     fn advertised_window(&self) -> u32 {
         let free = self.recv_ring.free();
-        free.saturating_sub(self.oo_len) as u32
+        free.saturating_sub(self.reasm.held_bytes()) as u32
     }
 
     fn process_ack(&mut self, seg: &Segment<'_>) -> Result<(), TcpError> {
@@ -1538,6 +1652,50 @@ impl Tcb {
             self.send_cwr_pending = true;
         }
 
+        // ---- Absorb inbound SACK blocks (regardless of dup/advancing) ----
+        // RFC 6675 §5: SACK information on EVERY acceptable ACK updates the
+        // scoreboard. The scoreboard's add_range method clips invalid /
+        // out-of-window blocks defensively.
+        //
+        // Compute newly-SACKed bytes BEFORE inserting into the scoreboard,
+        // so RACK only fires on fresh delivery evidence and not on repeated
+        // SACK blocks (RFC 8985: stale SACKs must not bump RACK markers).
+        let mut newly_sacked: u32 = 0;
+        let mut latest_sack_send_ts: u64 = 0;
+        let mut latest_sack_end_seq: u32 = 0;
+        if self.sack_enabled {
+            for (l, r) in seg.options.sack.as_slice().iter().copied() {
+                let new_bytes = self.sack_scoreboard.bytes_newly_covered(
+                    l,
+                    r,
+                    self.snd_una,
+                    self.snd_max,
+                );
+                if new_bytes > 0 {
+                    newly_sacked = newly_sacked.saturating_add(new_bytes);
+                    // RACK marker: among the newly-SACKed bytes, find the
+                    // send_queue entry that contains the right edge.
+                    // That's the segment "delivered" by this SACK block.
+                    let probe_seq = r.wrapping_sub(1);
+                    if let Some(entry) = self.send_queue.find_latest_covering(probe_seq) {
+                        if entry.send_ts_ms > latest_sack_send_ts
+                            || (entry.send_ts_ms == latest_sack_send_ts
+                                && seq_gt(entry.seq_end, latest_sack_end_seq))
+                        {
+                            latest_sack_send_ts = entry.send_ts_ms;
+                            latest_sack_end_seq = entry.seq_end;
+                        }
+                    }
+                }
+                self.sack_scoreboard
+                    .add_range(l, r, self.snd_una, self.snd_max);
+            }
+            if latest_sack_send_ts > 0 {
+                self.rack
+                    .update_on_delivery(latest_sack_send_ts, latest_sack_end_seq, self.now_ms);
+            }
+        }
+
         if seq_le(ack, self.snd_una) {
             // Duplicate ACK regime. Two distinct fast-retransmit triggers
             // may apply, both gated on `ack == snd_una` and an unchanged
@@ -1551,24 +1709,24 @@ impl Tcb {
             //    our ACK schedule), and counting those would trigger a
             //    spurious fast-retransmit and collapse cwnd.
             //
-            // 2. **RFC 2018 SACK** — any ACK (pure OR piggybacked) that
-            //    carries a SACK block. The block is authoritative evidence
-            //    that data above `snd_una` was received, so a hole exists
-            //    and we should retransmit immediately. We don't need three
-            //    duplicates; one SACK ACK is enough. The repeat-suppression
-            //    flag (`sack_recovery_seq`) prevents repeated cwnd
-            //    collapses inside one recovery epoch.
+            // 2. **RFC 2018 / RFC 6675 SACK** — any ACK (pure OR
+            //    piggybacked) that carries a SACK block is authoritative
+            //    evidence that data above `snd_una` was received, so a
+            //    hole exists. We enter recovery on the first SACK-bearing
+            //    ACK (more aggressive than RFC 6675's strict IsLost
+            //    trigger). `cc.in_recovery()` then guards against
+            //    re-entering until the current recovery episode exits.
             //
             // The window-unchanged condition is implicitly enforced by
             // `update_send_window` happening after this branch returns;
             // a window update by itself does not count as a dup-ACK.
             if ack == self.snd_una
-                && seq_gt(self.snd_nxt, self.snd_una)
+                && seq_gt(self.snd_max, self.snd_una)
                 && self.scale_peer_window(seg.window) == self.snd_wnd
+                && !self.cc.in_recovery()
             {
-                let sack_trigger = self.sack_enabled
-                    && seg.options.sack.is_some()
-                    && self.sack_recovery_seq != Some(self.snd_una);
+                let sack_trigger =
+                    self.sack_enabled && !seg.options.sack.is_empty();
                 let pure_dup = seg.payload.is_empty() && !seg.has(flags::FIN);
                 let trigger = if sack_trigger {
                     true
@@ -1578,22 +1736,36 @@ impl Tcb {
                     false
                 };
                 if trigger {
-                    let flight = self.snd_nxt.wrapping_sub(self.snd_una);
-                    // PRR Fast Recovery (RFC 6937): don't collapse cwnd to 1*MSS;
-                    // ssthresh = FlightSize/2 and per-ACK pacing handles the rest.
-                    // Recovery point is the high-water snd_max so a slow cumulative
-                    // ACK doesn't prematurely exit recovery.
+                    // RFC 6937 PRR + RFC 6675 selective retransmit:
+                    // * enter_recovery captures FULL flight (snd_max -
+                    //   snd_una) so ssthresh halves the real in-flight.
+                    // * Do NOT rewind snd_nxt — the scoreboard-driven
+                    //   NextSeg() in maybe_send_data finds the right
+                    //   sequence to retransmit instead.
+                    let flight = self.snd_max.wrapping_sub(self.snd_una);
                     self.cc.enter_recovery(flight, self.snd_max);
-                    self.snd_nxt = self.snd_una;
+                    self.rxt_seq = self.snd_una;
+                    self.rxt_unacked = 0;
                     if let Some(p) = self.rtt_probe.as_mut() {
                         p.valid = false;
                     }
                     self.arm_rto_for(self.snd_una);
-                    if sack_trigger {
-                        self.sack_recovery_seq = Some(self.snd_una);
-                    }
                 }
             }
+            // ---- RACK loss detection + PRR credit on dup-ACK -----------
+            // Even on duplicate ACKs, SACK-bearing ones deliver new bytes
+            // that PRR must credit (otherwise snd_credit can stall mid-
+            // recovery) and that RACK can use for time-based loss
+            // detection independent of dup-ACK / scoreboard triggers.
+            if newly_sacked > 0 {
+                let outstanding = self.snd_max.wrapping_sub(self.snd_una);
+                let sacked = self.sack_scoreboard.sacked_bytes();
+                let pipe = outstanding
+                    .saturating_sub(sacked)
+                    .saturating_add(self.rxt_unacked);
+                self.cc.on_ack_in_recovery(newly_sacked, pipe);
+            }
+            self.run_rack_scan();
             // Even duplicate ACKs may carry a window update.
             self.update_send_window(seg.window);
             return Ok(());
@@ -1620,28 +1792,75 @@ impl Tcb {
         }
         self.send_ring.consume(payload_acked as usize);
         self.snd_una = ack;
-        // If a prior RTO or SACK-driven fast-retransmit rewound `snd_nxt`
-        // to `snd_una`, but the peer's first cumulative ACK after recovery
-        // jumps over the rewound point (because the peer had buffered our
-        // pre-rewind segments out-of-order), our `snd_nxt` could now sit
-        // **behind** the new `snd_una`. Pull it forward; the bytes between
-        // old `snd_nxt` and `snd_una` are evidently already on the wire
-        // and acknowledged, so we shouldn't re-emit them.
+        // If a prior RTO rewound `snd_nxt` to `snd_una`, but the peer's
+        // first cumulative ACK after recovery jumps over the rewound
+        // point (because the peer had buffered our pre-rewind segments
+        // out-of-order), our `snd_nxt` could now sit **behind** the new
+        // `snd_una`. Pull it forward; the bytes between old `snd_nxt`
+        // and `snd_una` are evidently already on the wire and
+        // acknowledged, so we shouldn't re-emit them.
         if seq_gt(self.snd_una, self.snd_nxt) {
             self.snd_nxt = self.snd_una;
+        }
+        // ---- Scoreboard cleanup on cumulative ACK -----------------------
+        self.sack_scoreboard.prune_below(self.snd_una);
+
+        // Also use cumulative ACK as a RACK delivery signal: the segment
+        // whose end_seq matches the new snd_una was just delivered.
+        if let Some(entry) = self.send_queue.find_latest_covering(self.snd_una.wrapping_sub(1)) {
+            self.rack
+                .update_on_delivery(entry.send_ts_ms, entry.seq_end, self.now_ms);
+        }
+        // Drop send_queue entries fully covered by cumulative ACK + SACK.
+        self.send_queue.prune(self.snd_una, &self.sack_scoreboard);
+        // Drop rack_lost_queue entries that snd_una has overtaken.
+        self.drop_acked_rack_lost();
+
+        // ---- PRR accounting + retransmit cursor maintenance -------------
+        // RFC 6675 retransmits are at the bottom of in-flight, so cumulative
+        // bytes are consumed by them first. Subtract the overlap.
+        if self.rxt_unacked > 0 {
+            let drain = core::cmp::min(acked, self.rxt_unacked);
+            self.rxt_unacked = self.rxt_unacked.saturating_sub(drain);
+        }
+        // Pull rxt_seq forward if snd_una outran it.
+        if seq_gt(self.snd_una, self.rxt_seq) {
+            self.rxt_seq = self.snd_una;
         }
         // ---- PRR per-ACK update / recovery exit -------------------------
         // Order matters: update DeliveredData *before* exit check so the
         // ACK that crosses recovery_point still credits prr_delivered.
-        // `pipe` estimate: without an RFC 6675 SACK scoreboard we use
-        // post-advance `snd_nxt - snd_una`, which is conservative.
-        let pipe = self.snd_nxt.wrapping_sub(self.snd_una);
+        // Pipe (RFC 6675 §6.1, simplified):
+        //   pipe = (snd_max - snd_una) - sacked_bytes + rxt_unacked
+        // We use snd_max (not snd_nxt) because retransmits don't advance
+        // snd_nxt; snd_max is the true high-water of bytes ever sent.
+        let outstanding = self.snd_max.wrapping_sub(self.snd_una);
+        let sacked = self.sack_scoreboard.sacked_bytes();
+        let pipe = outstanding
+            .saturating_sub(sacked)
+            .saturating_add(self.rxt_unacked);
+        // PRR's `delivered_data` is the cumulative new acked bytes for
+        // this ACK. (A stricter accounting would also add newly-SACKed
+        // bytes, but we approximate.)
         self.cc.on_ack_in_recovery(acked, pipe);
-        let _ = self.cc.check_exit_recovery(self.snd_una);
-        // A fresh ACK ends the current SACK-driven recovery epoch, if any.
-        // The next SACK-bearing dup-ACK at the new `snd_una` is then again
-        // eligible to trigger fast-retransmit.
-        self.sack_recovery_seq = None;
+        if self.cc.check_exit_recovery(self.snd_una) {
+            // Recovery is over — clean up scoreboard and rxt state.
+            self.sack_scoreboard.clear();
+            self.rxt_unacked = 0;
+            self.rack_lost_queue.clear();
+        }
+
+        // RACK loss detection on cumulative ACK: may discover holes the
+        // SACK info just confirmed are lost.
+        self.run_rack_scan();
+
+        // TLP single-shot reset: a fresh ACK that advances snd_una clears
+        // the "TLP already fired" guard so we can probe again on the next
+        // in-flight epoch.
+        if acked > 0 {
+            self.tlp_fired = false;
+        }
+        self.tlp_deadline = None; // will be re-armed on next emit if needed
 
         // RTT update: prefer Timestamps echo; fall back to per-RTO probe.
         if self.ts_enabled {
@@ -1704,6 +1923,86 @@ impl Tcb {
             return Ok(());
         }
 
+        let mss_payload = self.effective_payload_mss() as u32;
+
+        // ---- Priority 0: RACK-marked-lost retransmits -------------------
+        // RACK detects loss via time + later-delivery evidence; results
+        // queue into `rack_lost_queue` sorted lowest-seq first. Drain
+        // one entry per call (the caller will re-enter on the next tick
+        // if more remain), clipped to current snd_una/snd_max and
+        // un-SACKed bytes only.
+        if !self.rack_lost_queue.is_empty() && self.cc.in_recovery() {
+            let credit = self.cc.snd_credit();
+            if let Some((seq, end)) = self.rack_lost_queue.take_lowest() {
+                // Clip to [snd_una, snd_max).
+                let lo = if seq_lt(seq, self.snd_una) { self.snd_una } else { seq };
+                let hi = if seq_gt(end, self.snd_max) { self.snd_max } else { end };
+                if seq_lt(lo, hi) {
+                    // Find the first un-SACKed sub-range within [lo, hi).
+                    let (sub_lo, sub_hi) = self
+                        .sack_scoreboard
+                        .first_unsacked_subrange(lo, hi)
+                        .unwrap_or((lo, hi));
+                    let len = sub_hi.wrapping_sub(sub_lo);
+                    let bytes =
+                        core::cmp::min(len, core::cmp::min(credit, mss_payload)) as usize;
+                    if bytes > 0 {
+                        self.emit_data_at(sub_lo, bytes)?;
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
+        // ---- Priority 1: RFC 6675 selective retransmit during recovery ----
+        //
+        // If we're in fast recovery, send the next lost segment. Two phases:
+        //
+        // 1. **First retransmit**: on recovery entry, unconditionally
+        //    retransmit the segment at snd_una (the "obvious hole" — peer
+        //    SACKed data above it). Detected by rxt_unacked == 0 and
+        //    rxt_seq == snd_una. Skips the IsLost check, matching the
+        //    Linux / RFC 6675 §5 "first retransmit is at HighACK+1"
+        //    convention.
+        //
+        // 2. **Subsequent retransmits**: NextSeg identifies further holes
+        //    that satisfy IsLost (≥ DupThresh*MSS sacked above them).
+        //
+        // This path does NOT honour the (snd_nxt - snd_una) >= cwnd gate
+        // — that gate would block retransmits while cwnd is "full" of
+        // in-flight data the peer can't ACK because of the hole. PRR's
+        // snd_credit is the only flow control here.
+        if self.cc.in_recovery() {
+            let credit = self.cc.snd_credit();
+            // Phase 1: initial retransmit at snd_una if not yet done.
+            let initial_due = self.rxt_unacked == 0
+                && self.rxt_seq == self.snd_una
+                && seq_gt(self.snd_max, self.snd_una);
+            if initial_due {
+                let outstanding = self.snd_max.wrapping_sub(self.snd_una);
+                let bytes =
+                    core::cmp::min(outstanding, core::cmp::min(credit, mss_payload)) as usize;
+                if bytes > 0 {
+                    self.emit_data_at(self.snd_una, bytes)?;
+                    return Ok(());
+                }
+            } else if self.sack_enabled {
+                // Phase 2: NextSeg-driven selective retransmit.
+                if let Some((rxt_seq, rxt_len)) = self.sack_scoreboard.next_seg(
+                    self.rxt_seq,
+                    self.snd_max,
+                    mss_payload,
+                ) {
+                    let bytes =
+                        core::cmp::min(rxt_len, core::cmp::min(credit, mss_payload)) as usize;
+                    if bytes > 0 {
+                        self.emit_data_at(rxt_seq, bytes)?;
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
         let flight = self.snd_nxt.wrapping_sub(self.snd_una);
         let allowed = self.cc.allowed(self.snd_wnd);
 
@@ -1726,9 +2025,8 @@ impl Tcb {
         // Outside recovery, snd_credit is u32::MAX (a no-op clamp).
         let window = core::cmp::min(allowed - flight, self.cc.snd_credit());
         let unsent = (self.send_ring.len() as u32).saturating_sub(flight);
-        let mss_payload = self.effective_payload_mss();
         let payload_bytes =
-            core::cmp::min(window, core::cmp::min(unsent, mss_payload as u32)) as usize;
+            core::cmp::min(window, core::cmp::min(unsent, mss_payload)) as usize;
 
         if payload_bytes > 0 {
             // Stack-local scratch sized for the worst case (no TS).
@@ -1752,6 +2050,10 @@ impl Tcb {
             self.bump_snd_max();
             // Account for PRR send credit consumption (no-op outside recovery).
             self.cc.on_send(payload_bytes as u32);
+            // RACK: record this transmission so future ACKs can derive its
+            // send timestamp for time-based loss detection.
+            self.send_queue
+                .push(seq, payload_bytes as u32, self.now_ms, false);
             // Piggybacked ACK clears delayed-ACK state.
             self.pending_ack = false;
             self.delayed_ack_count = 0;
@@ -1759,6 +2061,8 @@ impl Tcb {
             if self.rto_deadline.is_none() {
                 self.arm_rto_for(self.snd_nxt);
             }
+            // TLP: arm whenever in-flight > 0 after this emission.
+            self.arm_tlp();
             return Ok(());
         }
 
@@ -1792,6 +2096,171 @@ impl Tcb {
                 self.arm_rto_for(self.snd_nxt);
             }
         }
+        Ok(())
+    }
+
+    /// Emit `bytes` of data from the send ring starting at sequence `seq`.
+    /// Used by the RFC 6675 selective-retransmit path. The bytes lie at
+    /// offset `(seq - snd_una)` from the head of the send ring. Updates
+    /// `rxt_seq`, `rxt_unacked`, and the PRR send credit; does NOT advance
+    /// `snd_nxt` (retransmits never do).
+    fn emit_data_at(&mut self, seq: u32, bytes: usize) -> Result<(), TcpError> {
+        let offset = seq.wrapping_sub(self.snd_una) as usize;
+        let mut tmp = [0u8; MSS as usize];
+        let slice = tmp.get_mut(..bytes).ok_or(TcpError::Overflow)?;
+        let copied = self.send_ring.peek_at(offset, slice);
+        if copied != bytes {
+            return Err(TcpError::Overflow);
+        }
+        let payload_slice = tmp.get(..bytes).ok_or(TcpError::Overflow)?;
+        let opts = self.data_options();
+        self.emit_segment(
+            flags::ACK | flags::PSH,
+            seq,
+            self.rcv_nxt,
+            &opts,
+            payload_slice,
+        )?;
+        // Account: PRR snd_credit, rxt_unacked, and the rxt cursor.
+        self.cc.on_send(bytes as u32);
+        self.rxt_unacked = self.rxt_unacked.saturating_add(bytes as u32);
+        // Only advance rxt_seq when the retransmit is at or above the
+        // cursor — RACK may queue lower-seq retransmits that NextSeg
+        // still needs to revisit.
+        let end = seq.wrapping_add(bytes as u32);
+        if seq_ge(seq, self.rxt_seq) {
+            self.rxt_seq = end;
+        }
+        // RACK bookkeeping: every transmission goes into the send_queue
+        // so RACK can later judge "was this segment sent long ago?"
+        self.send_queue.push(seq, bytes as u32, self.now_ms, true);
+        // Piggybacked ACK clears delayed-ACK state.
+        self.pending_ack = false;
+        self.delayed_ack_count = 0;
+        self.ack_deadline = None;
+        if self.rto_deadline.is_none() {
+            self.arm_rto_for(self.snd_max);
+        }
+        // TLP: re-arm whenever in-flight > 0 after this emission.
+        self.arm_tlp();
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------------
+    // RACK-TLP helpers (RFC 8985)
+    // ---------------------------------------------------------------------
+
+    /// Arm the TLP timer at `now + max(2*SRTT, TLP_MIN_PTO_MS)` iff:
+    ///  * there's data in flight,
+    ///  * TLP hasn't already fired this in-flight epoch,
+    ///  * the peer window is non-zero (persist timer is the right tool
+    ///    for zero-window probing, not TLP).
+    fn arm_tlp(&mut self) {
+        if self.tlp_fired {
+            return;
+        }
+        if seq_le(self.snd_max, self.snd_una) {
+            return;
+        }
+        if self.snd_wnd == 0 {
+            return;
+        }
+        let srtt = self.srtt_ms.max(1) as u64;
+        let pto = (2 * srtt).max(TLP_MIN_PTO_MS);
+        self.tlp_deadline = Some(self.now_ms.wrapping_add(pto));
+    }
+
+    /// Run RACK loss detection against the current send_queue. Newly
+    /// lost ranges are inserted into `rack_lost_queue`; the soonest
+    /// reorder deadline (if any) is recorded in `rack_deadline` so
+    /// `tick()` can re-run the scan when wall-clock advances enough.
+    ///
+    /// Also: the first RACK-detected loss enters PRR recovery exactly
+    /// like a SACK trigger would. This is what gives RACK its main win
+    /// on lossy-with-reordering paths.
+    fn run_rack_scan(&mut self) {
+        // Refresh reo_wnd from current SRTT estimate.
+        if self.srtt_ms > 0 {
+            self.rack.set_reo_wnd_from_srtt(self.srtt_ms);
+        }
+        let scan = crate::rack::detect_lost(&self.rack, &self.send_queue, self.now_ms);
+
+        // Enter recovery on first RACK-detected loss, if not already.
+        if !scan.lost.is_empty()
+            && !self.cc.in_recovery()
+            && seq_gt(self.snd_max, self.snd_una)
+        {
+            let flight = self.snd_max.wrapping_sub(self.snd_una);
+            self.cc.enter_recovery(flight, self.snd_max);
+            self.rxt_seq = self.snd_una;
+            self.rxt_unacked = 0;
+            if let Some(p) = self.rtt_probe.as_mut() {
+                p.valid = false;
+            }
+            self.arm_rto_for(self.snd_una);
+        }
+
+        // Queue lost ranges (sorted lowest-first inside the queue).
+        let una = self.snd_una;
+        for (l, r) in scan.lost.as_slice().iter().copied() {
+            self.rack_lost_queue.insert_sorted(l, r, una);
+        }
+
+        // Re-arm reorder timer if any entries are eligible-but-not-old-enough.
+        self.rack_deadline = scan.next_deadline;
+    }
+
+    /// Drop entries in rack_lost_queue that snd_una has overtaken.
+    fn drop_acked_rack_lost(&mut self) {
+        let una = self.snd_una;
+        let mut new_q = RackLostQueue::new();
+        for k in 0..self.rack_lost_queue.len {
+            let r = match self.rack_lost_queue.ranges.get(k) {
+                Some(r) => *r,
+                None => continue,
+            };
+            if seq_le(r.1, una) {
+                continue; // fully ACKed
+            }
+            // Clip left edge to snd_una.
+            let lo = if seq_lt(r.0, una) { una } else { r.0 };
+            new_q.insert_sorted(lo, r.1, una);
+        }
+        self.rack_lost_queue = new_q;
+    }
+
+    /// Fire a TLP probe: retransmit the highest-seq un-SACKed segment
+    /// currently in flight. If no such segment exists (everything is
+    /// SACKed or already cumulative-ACKed), the TLP is a no-op — the
+    /// next ACK will tell us so. Sets `tlp_fired` so we don't probe
+    /// again in this in-flight epoch.
+    fn fire_tlp_probe(&mut self) -> Result<(), TcpError> {
+        self.tlp_deadline = None;
+        if self.tx_len > 0 {
+            return Ok(()); // host hasn't drained — let RTO handle it
+        }
+        let entry = match self.send_queue.highest_unsacked(&self.sack_scoreboard) {
+            Some(e) => e,
+            None => {
+                self.tlp_fired = true;
+                return Ok(());
+            }
+        };
+        // Compute the actual range to probe: the entry's unsacked tail.
+        // If the entry was partially SACKed, send only the tail beyond
+        // the highest SACK that intersects it.
+        let len = entry.seq_end.wrapping_sub(entry.seq_start);
+        let mss_payload = self.effective_payload_mss() as u32;
+        let bytes = core::cmp::min(len, mss_payload) as usize;
+        if bytes == 0 {
+            self.tlp_fired = true;
+            return Ok(());
+        }
+        // Probe payload mirrors the original segment's bytes.
+        self.emit_data_at(entry.seq_start, bytes)?;
+        self.tlp_fired = true;
+        // RTO must remain armed (TLP is a probe, not a replacement for
+        // RTO). emit_data_at already calls arm_rto_for if needed.
         Ok(())
     }
 
@@ -1916,18 +2385,19 @@ impl Tcb {
     // ---------------------------------------------------------------------
 
     fn data_options(&self) -> TcpOptions {
-        // Attach a single SACK block describing the held out-of-order run,
-        // if SACK was negotiated and we have one. RFC 2018 §4: SACK blocks
-        // are sent on dup-ACKs **and** on regular ACKs while data is being
-        // held; either is fine because the peer's sender ignores SACK
-        // blocks below `snd_una` anyway.
-        let sack = if self.sack_enabled && self.oo_len > 0 {
-            let left = self.oo_start;
-            let right = self.oo_start.wrapping_add(self.oo_len as u32);
-            Some((left, right))
-        } else {
-            None
-        };
+        // Attach SACK blocks describing held out-of-order runs, if SACK was
+        // negotiated and we have any. RFC 2018 §4: SACK blocks are sent on
+        // dup-ACKs **and** on regular ACKs while data is being held; either
+        // is fine because the peer's sender ignores SACK blocks below
+        // `snd_una` anyway.
+        //
+        // With TS enabled the option budget caps us at 3 SACK blocks (TS=10
+        // + 3*8+2=26 + NOPs = 38 ≤ 40); without TS we can fit 4.
+        let mut sack = SackBlocks::EMPTY;
+        if self.sack_enabled {
+            let max_blocks = if self.ts_enabled { 3 } else { 4 };
+            self.reasm.fill_sack_blocks(&mut sack, max_blocks);
+        }
         if self.ts_enabled {
             TcpOptions {
                 mss: None,
@@ -1936,7 +2406,7 @@ impl Tcb {
                 sack_permitted: false,
                 sack,
             }
-        } else if sack.is_some() {
+        } else if !sack.is_empty() {
             TcpOptions {
                 mss: None,
                 wscale: None,
@@ -2092,6 +2562,11 @@ fn seq_ge(a: u32, b: u32) -> bool {
 #[inline]
 fn seq_le(a: u32, b: u32) -> bool {
     (a.wrapping_sub(b) as i32) <= 0
+}
+
+#[inline]
+fn seq_lt(a: u32, b: u32) -> bool {
+    (a.wrapping_sub(b) as i32) < 0
 }
 
 #[inline]

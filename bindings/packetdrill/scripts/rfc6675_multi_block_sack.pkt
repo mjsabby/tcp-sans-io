@@ -1,0 +1,39 @@
+# Multi-block SACK driving multiple selective retransmits.
+#
+# Setup: we send 5 MSS-payload segments. The peer SACKs segments #2 and
+# #4 (so #1, #3, and #5 are the gaps from the sender's perspective).
+# Under RFC 6675 with IsLost = (≥ 3 MSS sacked above seq), we should
+# retransmit segments at the gaps that satisfy IsLost.
+#
+# With wscale=0 and TS-effective MSS = 1448:
+#   seg #1 = [1, 1449)
+#   seg #2 = [1449, 2897)   ← SACKed
+#   seg #3 = [2897, 4345)
+#   seg #4 = [4345, 5793)   ← SACKed
+#   seg #5 = [5793, 7241)
+#
+# Sacked above 1 = 2*1448 = 2896 bytes. 3*MSS threshold (3*1460 = 4380)?
+# 2896 < 4380 → NOT lost. So NextSeg won't fire.
+# But our trigger logic enters recovery on the FIRST SACK-bearing ACK
+# (more aggressive than RFC 6675), and the "initial retransmit at snd_una"
+# fires unconditionally on entry.
+
+--connect 10.0.0.1:49152 10.0.0.2:80
++0 > SEW 0:0(0) win 65535 <mss 1460, wscale 5, sackOK, TS val * ecr 0>
++.005 < S. 0:0(0) ack 1 win 32768 <mss 1460, wscale 0, sackOK, TS val 1 ecr *>
++0 > . 1:1(0) ack 1 win 32768 <TS val * ecr 1>
+
+# Push 5 segments worth of data (5 * 1448 = 7240). IW=10 lets us emit
+# all in one burst.
+--send 7240
++0 > P. 1:1449(1448) ack 1 win 32768 <TS val * ecr 1>
++0 > P. 1449:2897(1448) ack 1 win 32768 <TS val * ecr 1>
++0 > P. 2897:4345(1448) ack 1 win 32768 <TS val * ecr 1>
++0 > P. 4345:5793(1448) ack 1 win 32768 <TS val * ecr 1>
++0 > P. 5793:7241(1448) ack 1 win 32768 <TS val * ecr 1>
+
+# Peer SACKs #2 and #4 in a single ACK with two blocks.
++.005 < . 1:1(0) ack 1 win 32768 <sack 1449:2897 4345:5793, TS val 2 ecr *>
+
+# Initial retransmit at snd_una=1 (the first gap).
++0 > P. 1:1449(1448) ack 1 win 32768 <TS val * ecr 2>

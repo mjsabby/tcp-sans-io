@@ -25,7 +25,7 @@ use std::vec;
 use std::vec::Vec;
 
 use crate::tcb::{events, Endpoint, Tcb, TcbConfig};
-use crate::wire::{self, flags, Segment, TcpOptions};
+use crate::wire::{self, flags, SackBlocks, Segment, TcpOptions};
 use crate::{State, MAX_PACKET};
 
 // ---------------------------------------------------------------------------
@@ -80,7 +80,6 @@ fn build_in_from(
         mss,
         ts,
         sack_permitted,
-        sack: None,
         ..TcpOptions::NONE
     };
     let n = wire::emit(
@@ -882,7 +881,7 @@ fn build_in_ws(
         wscale,
         ts,
         sack_permitted,
-        sack: None,
+        sack: SackBlocks::EMPTY,
     };
     let n = wire::emit(
         &mut buf,

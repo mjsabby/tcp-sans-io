@@ -1,0 +1,39 @@
+# Multi-hole receive reassembly: when the peer sends out-of-order data
+# with multiple gaps, our receiver buffers each disjoint run AND emits
+# multi-block SACK options reporting them all (RFC 2018 §4).
+#
+# This is the receive-side counterpart to the RFC 6675 sender — together,
+# both endpoints can recover from multi-hole loss patterns in one RTT
+# instead of waiting for retransmit-timeout per hole.
+#
+# Window math (BUF_CAP=1 MiB, LOCAL_WS_SHIFT=5):
+#   * Empty ring: advertised = 1_048_576, scaled = 32_768.
+#   * 10 bytes held: advertised = 1_048_566, scaled = 32_767 (rounded down).
+#   * 20 bytes held: advertised = 1_048_556, scaled = 32_767.
+#   * 30 bytes held: advertised = 1_048_546, scaled = 32_767.
+
+--connect 10.0.0.1:49152 10.0.0.2:80
++0 > SEW 0:0(0) win 65535 <mss 1460, wscale 5, sackOK, TS val * ecr 0>
++.005 < S. 0:0(0) ack 1 win 32768 <mss 1460, wscale 0, sackOK, TS val 1 ecr *>
++0 > . 1:1(0) ack 1 win 32768 <TS val * ecr 1>
+
+# Peer sends 3 disjoint runs out of order:
+#   A at [11, 21)    — first hole between rcv_nxt=1 and seq=11
+#   B at [31, 41)    — second hole between 21 and 31
+#   C at [51, 61)    — third hole between 41 and 51
+# Our receiver buffers all three and emits SACK blocks for them
+# (most-recently-changed first, per RFC 2018 §4). Emit order is
+# TS first then SACK (matches the wire encoder's option ordering).
+
++.005 < P. 11:21(10) ack 1 win 32768 <TS val 2 ecr *>
+# Dup-ACK at rcv_nxt=1 with 1 SACK block describing the held run.
++0 > . 1:1(0) ack 1 win 32767 <TS val * ecr 2, sack 11:21>
+
++.001 < P. 31:41(10) ack 1 win 32768 <TS val 3 ecr *>
+# Dup-ACK with 2 SACK blocks. Most-recent-first ordering: B then A.
++0 > . 1:1(0) ack 1 win 32767 <TS val * ecr 3, sack 31:41 11:21>
+
++.001 < P. 51:61(10) ack 1 win 32768 <TS val 4 ecr *>
+# Dup-ACK with 3 SACK blocks (TS option caps us at 3, not the full 4).
+# Most-recent first: C, B, A.
++0 > . 1:1(0) ack 1 win 32767 <TS val * ecr 4, sack 51:61 31:41 11:21>

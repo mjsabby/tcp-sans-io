@@ -1,0 +1,20 @@
+# RFC 8985 TLP (Tail Loss Probe): when there's un-ACKed data and no ACK
+# movement, the stack sends a probe at PTO (max(2*SRTT, 10ms)), well
+# before the RTO would fire (1000ms default).
+#
+# Setup: handshake, send one MSS, then NEVER ACK it. After ~50ms (well
+# under the 1000ms RTO), TLP fires and retransmits the segment.
+
+--connect 10.0.0.1:49152 10.0.0.2:80
++0 > SEW 0:0(0) win 65535 <mss 1460, wscale 5, sackOK, TS val * ecr 0>
++.005 < S. 0:0(0) ack 1 win 32768 <mss 1460, wscale 0, sackOK, TS val 1 ecr *>
++0 > . 1:1(0) ack 1 win 32768 <TS val * ecr 1>
+
+# Send one MSS-payload-sized segment (effective MSS = 1448 after TS option).
+--send 1448
++0 > P. 1:1449(1448) ack 1 win 32768 <TS val * ecr 1>
+
+# No ACKs come back. TLP PTO = max(2*SRTT, 10ms). SRTT is not yet
+# established (we have a SYN-ACK→ACK round trip estimate of ~5ms), so
+# PTO ≈ max(2*5, 10) = 10-20ms. Advance time and expect a probe.
++.050 > P. 1:1449(1448) ack 1 win 32768 <TS val * ecr 1>

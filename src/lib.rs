@@ -49,7 +49,11 @@ extern "C" fn rust_eh_personality() {
 pub mod congestion;
 pub mod error;
 pub mod ffi;
+pub mod rack;
+pub mod reassembly;
 pub mod ring;
+pub mod scoreboard;
+pub mod send_queue;
 pub mod state;
 pub mod tcb;
 pub mod wire;

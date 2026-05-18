@@ -154,12 +154,19 @@ func encodeOptions(opts []OptionDesc, sym *SymTab, side Side) ([]byte, error) {
 		case SackOpt:
 			length := byte(2 + 8*len(v.Blocks))
 			out = append(out, 5, length)
+			// SACK blocks describe data the SENDER of this packet has
+			// RECEIVED from the OTHER side, so they live in the other
+			// side's sequence space. Resolve via the opposite side.
+			otherSide := SidePeer
+			if side == SidePeer {
+				otherSide = SideOur
+			}
 			for _, b := range v.Blocks {
-				l, ok, err := sym.Resolve(b.Left, side)
+				l, ok, err := sym.Resolve(b.Left, otherSide)
 				if err != nil || !ok {
 					return nil, fmt.Errorf("sack left unresolved: %v", err)
 				}
-				r, ok, err := sym.Resolve(b.Right, side)
+				r, ok, err := sym.Resolve(b.Right, otherSide)
 				if err != nil || !ok {
 					return nil, fmt.Errorf("sack right unresolved: %v", err)
 				}

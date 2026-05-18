@@ -21,7 +21,7 @@ use std::vec::Vec;
 use proptest::prelude::*;
 
 use crate::ring::Ring;
-use crate::wire::{self, flags, TcpOptions};
+use crate::wire::{self, flags, SackBlocks, TcpOptions};
 use crate::MAX_PACKET;
 
 // ---------------------------------------------------------------------------
@@ -87,7 +87,13 @@ prop_compose! {
         sack_permitted in any::<bool>(),
         sack in proptest::option::of((any::<u32>(), any::<u32>())),
     ) -> TcpOptions {
-        TcpOptions { mss, wscale, ts, sack_permitted, sack }
+        TcpOptions {
+            mss,
+            wscale,
+            ts,
+            sack_permitted,
+            sack: sack.map(|(l, r)| SackBlocks::one(l, r)).unwrap_or(SackBlocks::EMPTY),
+        }
     }
 }
 

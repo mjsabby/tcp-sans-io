@@ -46,6 +46,92 @@ pub mod ecn {
     pub const MASK: u8 = 0b11;
 }
 
+/// SACK block list: up to 4 disjoint `(left_edge, right_edge)` pairs per
+/// RFC 2018 §3. The maximum useful number of blocks alongside Timestamps
+/// is 3 (TS=10b + 3×SACK=26b + 2 NOPs = 38b, fitting in the 40-byte TCP
+/// option cap). When TS is absent we can carry the full 4 (34b + NOPs).
+///
+/// Wire emission rounds down to the count that fits in `40 - other_opts`.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct SackBlocks {
+    /// Number of populated entries in `blocks` (0..=4).
+    n: u8,
+    /// First-N entries are valid; trailing slots are zero-padding.
+    blocks: [(u32, u32); 4],
+}
+
+impl SackBlocks {
+    pub const EMPTY: Self = Self {
+        n: 0,
+        blocks: [(0, 0); 4],
+    };
+
+    #[inline]
+    pub const fn one(left: u32, right: u32) -> Self {
+        let mut s = Self::EMPTY;
+        s.n = 1;
+        s.blocks[0] = (left, right);
+        s
+    }
+
+    /// Construct directly from an existing slice; clamps to 4 blocks.
+    pub fn from_slice(src: &[(u32, u32)]) -> Self {
+        let mut s = Self::EMPTY;
+        let n = core::cmp::min(src.len(), 4);
+        for i in 0..n {
+            if let Some(b) = src.get(i) {
+                if let Some(slot) = s.blocks.get_mut(i) {
+                    *slot = *b;
+                }
+            }
+        }
+        s.n = n as u8;
+        s
+    }
+
+    /// Append a block. Saturates silently at 4 (caller is responsible
+    /// for ordering / deduping).
+    pub fn push(&mut self, left: u32, right: u32) {
+        if (self.n as usize) < self.blocks.len() {
+            if let Some(slot) = self.blocks.get_mut(self.n as usize) {
+                *slot = (left, right);
+                self.n += 1;
+            }
+        }
+    }
+
+    #[inline]
+    pub const fn len(&self) -> usize {
+        self.n as usize
+    }
+
+    #[inline]
+    pub const fn is_empty(&self) -> bool {
+        self.n == 0
+    }
+
+    pub fn as_slice(&self) -> &[(u32, u32)] {
+        let n = self.n as usize;
+        self.blocks.get(..n).unwrap_or(&[])
+    }
+
+    /// Truncate to at most `max` blocks.
+    pub fn truncate(&mut self, max: usize) {
+        if (self.n as usize) > max {
+            self.n = max as u8;
+        }
+    }
+}
+
+impl From<Option<(u32, u32)>> for SackBlocks {
+    fn from(o: Option<(u32, u32)>) -> Self {
+        match o {
+            Some((l, r)) => Self::one(l, r),
+            None => Self::EMPTY,
+        }
+    }
+}
+
 /// TCP options carried by a parsed/emitted segment.
 ///
 /// We model the five options we actually emit or react to:
@@ -54,11 +140,10 @@ pub mod ecn {
 ///   `0..=14`; values above 14 are clamped on parse per RFC §2.3.
 /// * **Timestamps** (RFC 7323) — every segment once negotiated.
 /// * **SACK_PERMITTED** (RFC 2018 §2) — handshake-only.
-/// * **SACK** (RFC 2018 §3) — single block, attached to ACKs that report
-///   a held out-of-order run. Our reassembly is single-hole, so a single
-///   block always suffices; on input we accept up to four blocks (the
-///   maximum that fits in the 40-byte TCP option budget alongside TS) and
-///   keep the first.
+/// * **SACK** (RFC 2018 §3) — up to 4 blocks (RFC 2018 max). Outbound
+///   emission caps the count to whatever fits alongside other options
+///   in the 40-byte TCP option budget (typically 3 when TS is present,
+///   4 otherwise).
 ///
 /// Anything else (MD5, …) is parsed-and-skipped and never emitted.
 #[derive(Copy, Clone, Debug, Default)]
@@ -72,11 +157,8 @@ pub struct TcpOptions {
     /// SACK_PERMITTED option present (RFC 2018 §2). Valid only on SYN /
     /// SYN-ACK; ignored elsewhere.
     pub sack_permitted: bool,
-    /// First SACK block `(left_edge, right_edge)` per RFC 2018 §3, or
-    /// `None` if no SACK option was present. Inbound segments may carry
-    /// up to four blocks; we retain only the first because our single-
-    /// hole reassembler can only act on one anyway.
-    pub sack: Option<(u32, u32)>,
+    /// SACK blocks (RFC 2018 §3). Up to 4 entries; empty == option absent.
+    pub sack: SackBlocks,
 }
 
 impl TcpOptions {
@@ -85,7 +167,7 @@ impl TcpOptions {
         wscale: None,
         ts: None,
         sack_permitted: false,
-        sack: None,
+        sack: SackBlocks::EMPTY,
     };
 
     /// Raw byte cost of the five options without any alignment padding.
@@ -103,8 +185,8 @@ impl TcpOptions {
         if self.ts.is_some() {
             n += 10; // kind=8, length=10
         }
-        if self.sack.is_some() {
-            n += 10; // kind=5, length=2 + 8 (one block)
+        if !self.sack.is_empty() {
+            n += 2 + 8 * self.sack.len(); // kind=5, length=2 + 8*N
         }
         n
     }
@@ -148,12 +230,19 @@ impl TcpOptions {
             put_u32(out, idx + 6, tsecr)?;
             idx += 10;
         }
-        if let Some((left, right)) = self.sack {
+        if !self.sack.is_empty() {
+            let n = self.sack.len();
+            let length = 2 + 8 * n;
+            if length > 255 {
+                return Err(TcpError::Overflow);
+            }
             put_u8(out, idx, 5)?; // kind = SACK
-            put_u8(out, idx + 1, 10)?; // length = 2 + 8 (one block)
-            put_u32(out, idx + 2, left)?;
-            put_u32(out, idx + 6, right)?;
-            idx += 10;
+            put_u8(out, idx + 1, length as u8)?;
+            for (k, (left, right)) in self.sack.as_slice().iter().enumerate() {
+                put_u32(out, idx + 2 + k * 8, *left)?;
+                put_u32(out, idx + 6 + k * 8, *right)?;
+            }
+            idx += length;
         }
         // Pad to multiple of 4 with NOPs.
         let target = (idx + 3) & !3;
@@ -204,9 +293,9 @@ impl TcpOptions {
                 }
                 5 => {
                     // SACK — RFC 2018 §3. Length is 2 + 8*n_blocks for
-                    // n_blocks in 1..=4. We accept any conforming length
-                    // and keep only the first block: our single-hole
-                    // reassembler can't act on more than one anyway.
+                    // n_blocks in 1..=4. We keep all blocks; downstream
+                    // (the RFC 6675 scoreboard) merges them into its
+                    // sender-side state.
                     let len = *opt_bytes.get(i + 1).ok_or(TcpError::MalformedPacket)?;
                     if len < 10
                         || (len - 2) % 8 != 0
@@ -215,9 +304,15 @@ impl TcpOptions {
                     {
                         return Err(TcpError::MalformedPacket);
                     }
-                    let left = u32::from_be_bytes(read4(opt_bytes, i + 2)?);
-                    let right = u32::from_be_bytes(read4(opt_bytes, i + 6)?);
-                    o.sack = Some((left, right));
+                    let n_blocks = (len - 2) / 8;
+                    let mut sb = SackBlocks::EMPTY;
+                    for k in 0..n_blocks {
+                        let off = i + 2 + (k as usize) * 8;
+                        let left = u32::from_be_bytes(read4(opt_bytes, off)?);
+                        let right = u32::from_be_bytes(read4(opt_bytes, off + 4)?);
+                        sb.push(left, right);
+                    }
+                    o.sack = sb;
                     i += len as usize;
                 }
                 8 => {

@@ -24,8 +24,10 @@ The stack itself does no I/O. The host:
 
 ## Features (RFC matrix)
 
-The stack lands roughly at **"circa 2013-era TCP"** — equivalent in
-algorithmic feature set to Linux 3.x / FreeBSD 9-10 era stacks.
+The stack lands roughly at **"circa 2017-era Linux TCP"** — equivalent in
+algorithmic feature set to Linux 4.x stacks. The only major post-2017
+algorithm we don't ship is CUBIC; we use Reno-class congestion control
+with PRR and RACK-TLP loss detection.
 
 | Feature | RFC | Year | Status |
 |---|---|---|---|
@@ -35,26 +37,26 @@ algorithmic feature set to Linux 3.x / FreeBSD 9-10 era stacks.
 | MSS option | RFC 9293 | — | ✅ |
 | Timestamps + PAWS-lite | RFC 7323 §3 | 2014 | ✅ |
 | **Window Scale** | **RFC 7323 §2** | **2014** | ✅ added in this generation |
-| SACK_PERMITTED + SACK | RFC 2018 | 1996 | ✅ signaling |
+| SACK_PERMITTED + SACK | RFC 2018 | 1996 | ✅ multi-block, both sides |
 | Karn / RFC 6298 RTO | RFC 6298 | 2011 | ✅ |
 | Tahoe slow-start / CA | RFC 5681 | 2009 | ✅ |
 | **PRR-Reno fast recovery** | **RFC 6937** | **2013** | ✅ added in this generation |
 | **IW=10 initial window** | **RFC 6928** | **2013** | ✅ added in this generation |
+| **SACK-based selective retransmit** | **RFC 6675** | **2012** | ✅ added in this generation — scoreboard, NextSeg, multi-hole reassembly |
 | Persist (zero-window probe) | RFC 1122 §4.2.2.17 | 1989 | ✅ |
 | Delayed ACK | RFC 1122 §4.2.3.2 | 1989 | ✅ |
 | 2·MSL TIME_WAIT | RFC 793 §3.4 | 1981 | ✅ (60 s) |
 | **ECN** | **RFC 3168** | **2001** | ✅ added in this generation |
+| **RACK-TLP loss detection** | **RFC 8985 + 8298** | **2021** | ✅ added in this generation — time-based loss + Tail Loss Probe |
 
-### Deliberately deferred (post-2013 modernisations)
+### Deliberately deferred (post-2017 modernisations)
 
 | Feature | RFC | Why deferred |
 |---|---|---|
-| RFC 6675 SACK-based selective retransmit | 2012 | Requires multi-hole receive reassembly + send-side SACK scoreboard. Current single-hole + Tahoe go-back-N still recovers correctly, just less efficiently on multi-loss episodes. ~400-line follow-up. |
-| RACK-TLP loss detection | RFC 8985 + 8298 (2021) | Replaces dup-ACK-counting + RTO with time-based loss detection. Would eliminate most spurious-RTO stalls on lossy / reordering paths. ~300-line follow-up. |
 | CUBIC congestion control | RFC 9438 (2024) | We use Reno-class (PRR). CUBIC is friendlier on long-fat networks; substantial state-machine change. |
-| BBR | (Google, 2016) | Bandwidth-probing CC; orthogonal architecture. |
+| BBR | (Google, 2016) | Bandwidth-probing CC; orthogonal architecture (model-based, not loss-triggered). |
 | TFO (TCP Fast Open) | RFC 7413 | Data-in-SYN; security model is complex. |
-| DSACK | RFC 2883 | Refinement on SACK; depends on RFC 6675 landing first. |
+| DSACK | RFC 2883 | Refinement on SACK; minor incremental win on top of RFC 6675. |
 | MPTCP | RFC 8684 | Different connection model entirely. |
 
 ### Deliberately omitted (out of scope)
@@ -91,11 +93,13 @@ window is large enough to fill the BDP of typical WAN paths (e.g. 50 ms RTT
 at 160 Mbit/s).
 
 The Rust thread stack default (1 MiB on Windows, 8 MiB on Linux) is **too
-small** for a Tcb constructed as a stack local on Windows. The included
-`.cargo/config.toml` sets `RUST_MIN_STACK = 8388608` for the build/test
-environment. Production callers route through the C ABI (`tcp_init`) which
-writes into host-provided heap storage, so this only affects pure-Rust users
-and tests.
+small** for a Tcb constructed as a stack local — between the 2 MiB rings
+and the 24 KiB RACK send-queue, a Tcb is over 2 MiB. The included
+`.cargo/config.toml` sets `RUST_MIN_STACK = 16777216` (16 MiB) for the
+build/test environment, which comfortably fits multiple Tcbs (e.g.
+loopback tests with peer + client) per thread. Production callers route
+through the C ABI (`tcp_init`) which writes into host-provided heap
+storage, so this only affects pure-Rust users and tests.
 
 ## How will it perform in 2026?
 
@@ -104,13 +108,15 @@ below for real-network):
 
 | Path | How we'd do |
 |---|---|
-| LAN / datacenter, low loss | ✅ Fine. PRR + SACK signaling + WS + IW=10 give modern-class behavior. |
-| Typical Internet WAN (50 ms RTT, 0.1-1 % loss) | 🟡 Workable. Within ~2× of CUBIC for steady-state bulk; without RFC 6675 we lose throughput on multi-loss episodes. |
-| Wireless / cellular (1-5 % loss, reordering) | ⚠️ Noticeable degradation. The biggest missing piece is RACK-TLP — every loss episode that confuses dup-ACK heuristics waits a full RTO. |
-| High-BDP (transcontinental 10G) | 🟡 Capped by `BUF_CAP`: ~`1 MiB / RTT` ≈ 160 Mbit/s at 50 ms. Bump `BUF_CAP` to lift the ceiling. |
+| LAN / datacenter, low loss | ✅ Fine. PRR + RFC 6675 + WS + IW=10 give modern-class behavior. |
+| Typical Internet WAN (50 ms RTT, 0.1-1 % loss) | ✅ Workable, close to CUBIC for steady-state bulk. RFC 6675 selective retransmit handles multi-loss episodes in one RTT. RACK-TLP catches tail losses without waiting for RTO. |
+| Wireless / cellular (1-5 % loss, reordering) | ✅ RACK-TLP handles reordering-prone paths well; reo_wnd grows with SRTT. Without CUBIC the per-ACK growth is slower at very high BDPs. |
+| High-BDP (transcontinental 10G) | 🟡 Capped by `BUF_CAP`: ~`1 MiB / RTT` ≈ 160 Mbit/s at 50 ms. Bump `BUF_CAP` to lift the ceiling. CUBIC would help fill the larger pipe faster. |
 
-The single biggest remaining win is **RACK-TLP** for lossy paths. Then
-**RFC 6675 selective retransmit** for high-loss bulk. Both are tracked above.
+The remaining algorithmic gap vs. Linux 5.x/6.x is **CUBIC** as the
+default CC algorithm. PRR-Reno is adequate at moderate BDPs; CUBIC's
+bigger win shows up on long-fat networks where Reno's per-RTT cwnd
+increase paces too slowly.
 
 ## Benchmarks
 
@@ -203,7 +209,7 @@ with a short sleep between.
 
 ```sh
 cargo build --release --lib       # cdylib + staticlib + rlib
-cargo test  --release --lib       # 83 tests (loopback + conformance + property + server)
+cargo test  --release --lib       # 105 tests (loopback + conformance + property + server + RACK/send-queue units)
 cargo clippy --release --lib --no-deps -- -D warnings
 ```
 
@@ -241,10 +247,11 @@ The `bindings/packetdrill/` package is a Go-native runner for
 packetdrill-style `.pkt` scripts that drives our cdylib instead of the
 kernel's POSIX socket layer. Each `.pkt` file becomes a Go subtest.
 
-Currently 10 scripts cover handshake (active + passive), full-options
+Currently 14 scripts cover handshake (active + passive), full-options
 SYN, Window Scale negotiation, ECN-Setup, IW=10 burst, SACK negotiation,
-PRR fast retransmit, data transfer + pattern verification, and active /
-passive close. Example:
+PRR fast retransmit, RFC 6675 selective retransmit (single + multi-block
++ multi-hole), TLP probe before RTO, data transfer + pattern
+verification, and active / passive close. Example:
 
 ```
 --connect 10.0.0.1:49152 10.0.0.2:80
@@ -274,6 +281,8 @@ src/
 ├── state.rs             # RFC 9293 state machine enum
 ├── wire.rs              # IPv4 + TCP codec (parse/emit, options, checksums)
 ├── ring.rs              # Fixed-capacity SPSC byte ring
+├── reassembly.rs        # RFC 6675 multi-hole receive reassembler
+├── scoreboard.rs        # RFC 6675 sender-side SACK scoreboard + NextSeg
 ├── congestion.rs        # PRR-Reno + slow-start / CA (was Tahoe)
 ├── tcb.rs               # The state machine itself (~2 kloc)
 ├── ffi.rs               # Stable C ABI
