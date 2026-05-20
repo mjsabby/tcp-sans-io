@@ -236,7 +236,7 @@ with a short sleep between.
 
 ```sh
 cargo build --release --lib       # cdylib + staticlib + rlib
-cargo test  --release --lib       # 114 tests (loopback + conformance + property + server + RACK/send-queue/tx-ring units)
+cargo test  --release --lib       # 116 tests (loopback + conformance + property + server + RACK/send-queue/tx-ring units + smoltcp interop)
 cargo clippy --release --lib --no-deps -- -D warnings
 ```
 
@@ -264,6 +264,7 @@ host, pass the pointer to `tcp_init`. Memory ownership stays with the host.
 | **Loopback tests** | End-to-end behavioral tests via in-memory peer | `src/loopback_tests.rs` |
 | **Server / adversarial** | LISTEN/SYN_RCVD hardening (cookies, SYN flood, blind RST/ACK) | `src/server_tests.rs` |
 | **gVisor interop** | Against Google's reference netstack | `bindings/gvisor/*_test.go` |
+| **smoltcp interop** | Against smoltcp (the dominant no_std Rust TCP stack, used in embedded). In-memory channel between two userspace stacks — completely independent codebases negotiating options + sequencing data. | `src/smoltcp_interop_tests.rs` |
 | **Real Linux TUN** | Against the Linux kernel TCP stack via TUN | `bindings/gvisor/tun_test.go` |
 | **netem benchmark** | Throughput under controlled loss / delay | `bindings/netem/bench_test.go` |
 | **packetdrill-DSL runner** | Per-packet conformance scripts in packetdrill syntax | `bindings/packetdrill/*.go` + `scripts/*.pkt` |

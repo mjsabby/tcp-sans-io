@@ -109,3 +109,6 @@ mod property_tests;
 
 #[cfg(test)]
 mod server_tests;
+
+#[cfg(test)]
+mod smoltcp_interop_tests;
