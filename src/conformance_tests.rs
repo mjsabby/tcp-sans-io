@@ -2306,3 +2306,159 @@ fn rack_tail_loss_short_rtt_retransmits_first_unsacked() {
         s1_seq, s4_seq, retx.seq,
     );
 }
+
+// ---------------------------------------------------------------------------
+// Sequence-number wraparound soak.
+//
+// TCP sequence numbers are u32 (4 GiB). On a fast link that's only ~30s
+// at 1 Gbit/s — well within a single connection's lifetime. Set ISS near
+// the top of the u32 range, then drive enough bytes through to wrap
+// snd_nxt back through 0, and validate that the connection still works
+// correctly across the wrap.
+// ---------------------------------------------------------------------------
+
+/// `make_tcb_with_iss` lets the wraparound test pin ISS to a value that
+/// will wrap within a small transfer.
+fn make_tcb_with_iss(iss: u32) -> Tcb {
+    let cfg = TcbConfig {
+        local: Endpoint { ip: CLIENT_IP, port: CLIENT_PORT },
+        remote: Endpoint { ip: SERVER_IP, port: SERVER_PORT },
+        iss,
+        initial_rto_ms: INIT_RTO_MS,
+    };
+    Tcb::new(cfg).expect("tcb")
+}
+
+#[test]
+fn sequence_number_wraps_around_u32_max_during_bulk_send() {
+    // Pin ISS to u32::MAX - 32 KiB. After the SYN consumes 1, the first
+    // user byte sits at u32::MAX - 32 KiB + 1. Sending more than 32 KiB
+    // crosses u32::MAX → wraps through 0 and beyond.
+    let near_top = u32::MAX - (32 * 1024);
+    let mut tcb = make_tcb_with_iss(near_top);
+    let mut now = 0u64;
+    let peer_ts = handshake_with_ts_iss(&mut tcb, &mut now, near_top);
+
+    // Send 128 KiB — crosses the wrap point twice (well past).
+    let payload: Vec<u8> = (0..128 * 1024).map(|i| (i & 0xFF) as u8).collect();
+    let n = tcb.send(&payload).expect("send");
+    assert_eq!(n, payload.len());
+
+    // Drain emitted segments and synthesize per-segment ACKs from the
+    // peer. Verify each segment's seq is in the right relative position
+    // — i.e. monotonic in serial-number order (wrapping-aware), and
+    // every byte's identity is preserved.
+    let mut peer_ack = near_top.wrapping_add(1); // first user byte
+    let mut sent_bytes = 0usize;
+    let mut emitted_at_least_one_post_wrap = false;
+    let mut iter = 0;
+    while sent_bytes < payload.len() && iter < 1024 {
+        iter += 1;
+        now += 1;
+        tcb.set_now(now);
+        tcb.tick().expect("tick");
+        while let Some(seg) = try_pop(&mut tcb) {
+            if seg.payload.is_empty() {
+                continue;
+            }
+            let seg_seq = seg.seq;
+            // Locate this segment's offset in the original payload by
+            // its wrapping distance from the first user byte.
+            let offset = seg_seq.wrapping_sub(near_top.wrapping_add(1)) as usize;
+            assert!(
+                offset < payload.len(),
+                "segment seq {:#x} is outside payload (offset={})",
+                seg_seq,
+                offset,
+            );
+            let want = &payload[offset..offset + seg.payload.len()];
+            assert_eq!(
+                seg.payload, want,
+                "segment at offset {} has wrong bytes",
+                offset,
+            );
+
+            // ACK this segment by advancing peer_ack to seq_end.
+            let seg_end = seg_seq.wrapping_add(seg.payload.len() as u32);
+            peer_ack = seg_end;
+            sent_bytes = offset + seg.payload.len();
+
+            // Detect that we crossed the wrap point.
+            if seg_seq.wrapping_add(seg.payload.len() as u32) < seg_seq {
+                emitted_at_least_one_post_wrap = true;
+            }
+            if seg_seq < near_top {
+                emitted_at_least_one_post_wrap = true;
+            }
+        }
+        // Send the ACK to advance snd_una and open cwnd.
+        let ack_pkt = build_in_full(
+            flags::ACK,
+            PSS.wrapping_add(1),
+            peer_ack,
+            PEER_WIN,
+            None,
+            Some((peer_ts.wrapping_add(now as u32), now as u32)),
+            false,
+            None,
+            &[],
+        );
+        tcb.set_now(now);
+        tcb.inject_packet(&ack_pkt).expect("inject ACK");
+    }
+    assert_eq!(
+        sent_bytes,
+        payload.len(),
+        "did not transfer full payload across wraparound",
+    );
+    assert!(
+        emitted_at_least_one_post_wrap,
+        "snd_nxt never crossed u32::MAX (test setup wrong?)",
+    );
+
+    let snap = tcb.debug_snapshot();
+    // snd_una should have advanced past the wrap point and equal the
+    // wrapped position of the last sent byte.
+    let expected_snd_una = near_top.wrapping_add(1).wrapping_add(payload.len() as u32);
+    assert_eq!(
+        snap.snd_una, expected_snd_una,
+        "snd_una did not land at expected post-wrap position",
+    );
+}
+
+/// Same as `handshake_with_ts` but with a configurable ISS so we can
+/// pin it near `u32::MAX` for the wraparound test.
+fn handshake_with_ts_iss(tcb: &mut Tcb, now: &mut u64, iss: u32) -> u32 {
+    tcb.set_now(*now);
+    tcb.connect().expect("connect");
+
+    tcb.set_now(*now);
+    tcb.tick().expect("tick");
+    let (_, syn) = pop(tcb);
+    let syn_only = syn.flags & !(flags::ECE | flags::CWR);
+    assert_eq!(syn_only, flags::SYN);
+    assert_eq!(syn.seq, iss);
+    let (cli_tsval, _) = syn.ts.expect("SYN must offer Timestamps");
+
+    *now += 5;
+    let peer_ts = 42u32;
+    let synack = build_in_full(
+        flags::SYN | flags::ACK,
+        PSS,
+        iss.wrapping_add(1),
+        PEER_WIN,
+        Some(1460),
+        Some((peer_ts, cli_tsval)),
+        true,
+        None,
+        &[],
+    );
+    tcb.set_now(*now);
+    tcb.inject_packet(&synack).expect("inject SYN-ACK");
+
+    tcb.set_now(*now);
+    tcb.tick().expect("tick");
+    let (_, ack) = pop(tcb);
+    assert_eq!(ack.flags, flags::ACK);
+    peer_ts
+}

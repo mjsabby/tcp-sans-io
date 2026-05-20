@@ -1,0 +1,80 @@
+name: long-soak
+
+# Long-duration soak workflow. Runs the longest-running tests in the
+# suite to surface bugs that only show up under sustained operation:
+# memory leaks, 32-bit sequence-number rollover (covered by a
+# conformance test today, but still good to exercise via real
+# traffic), TSval wrap (PAWS, ~49-day rollover at 1ms tick — not
+# practically reachable but the timer-rollover code paths are still
+# good to flex), and connection-state drift.
+#
+# Triggers: weekly cron + manual workflow_dispatch. Never on PR
+# (would block the merge train for too long).
+
+on:
+  schedule:
+    # Weekly, Saturday at 03:00 UTC. Adjust if perf budget tightens.
+    - cron: "0 3 * * 6"
+  workflow_dispatch:
+    inputs:
+      transfer_mib:
+        description: "Per-direction transfer size in MiB (default 1024 = 1 GiB)"
+        default: "1024"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: long-soak-${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  long-soak:
+    name: long-duration soak (TUN + gVisor 1 GiB bidirectional)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          check-latest: true
+          cache-dependency-path: bindings/gvisor/go.sum
+
+      - name: Build cdylib (release)
+        run: cargo build --release --lib --verbose
+
+      # The existing TestServerAgainstLinuxKernelTUN in bindings/gvisor
+      # already moves 1 GiB each direction with hash verification. Run
+      # it standalone here with extended timeout so we can ALSO loop
+      # multiple iterations within a single workflow run.
+      - name: Run 1 GiB TUN soak (3 iterations × 1 GiB each direction)
+        run: |
+          set -o pipefail
+          cd bindings/gvisor
+          go test -c -o /tmp/gvisor.test ./...
+          for iter in 1 2 3; do
+            echo "=== iteration $iter ==="
+            sudo -E /tmp/gvisor.test -test.v -test.timeout=1200s \
+              -test.run='^TestServerAgainstLinuxKernelTUN$' \
+              2>&1 | tee "/tmp/iter-$iter.log"
+          done
+
+      - name: Run sequence-number wraparound conformance test
+        run: cargo test --release --lib sequence_number_wraps_around -- --nocapture
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: long-soak-logs-${{ github.run_attempt }}
+          path: /tmp/iter-*.log
+          if-no-files-found: warn
+          retention-days: 30
