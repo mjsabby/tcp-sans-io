@@ -826,3 +826,68 @@ func TestHTTP_Wrk_Load(t *testing.T) {
 		t.Fatalf("wrk reported socket errors:\n%s", out)
 	}
 }
+
+// TestTimeWait_Churn_50x stresses the LISTEN → SYN_RCVD → ESTABLISHED
+// → FIN_WAIT_1 → FIN_WAIT_2 → TIME_WAIT → (re-LISTEN) cycle by
+// firing 50 sequential HTTP requests as fast as Go's net/http will
+// drive them. Our handler responds with `Connection: close` so we're
+// always the active closer (→ TIME_WAIT), and the TimeWait→Listen
+// relaxation in Tcb::listen lets the server re-arm immediately
+// rather than waiting out 2*MSL between every request.
+//
+// Validates that:
+//   - all 50 requests complete successfully and round-trip the body
+//   - the server never gets stuck in a degenerate state
+//   - throughput is sane (≥ 5 req/s sustained)
+//
+// This is the "many short connections in succession" pattern that's
+// notoriously hard for TIME_WAIT-leaky stacks; ours collapses
+// TIME_WAIT on the next Listen() so connection turnover is bounded
+// only by the actual handshake/teardown round-trips.
+func TestTimeWait_Churn_50x(t *testing.T) {
+	s, cleanup := setupTUNAndServer(t)
+	defer cleanup()
+
+	const n = 50
+	doneCh := make(chan error, 1)
+	go func() {
+		// Serve enough time to satisfy 50 requests + slack. Worst case
+		// at ~10 req/s = 5s. Use 10s to leave headroom.
+		doneCh <- s.pumpServeForever(10 * time.Second)
+	}()
+
+	start := time.Now()
+	for i := 0; i < n; i++ {
+		u := fmt.Sprintf("http://%s:%d/echo?msg=churn-%d", httpPeerAddr, httpPort, i)
+		cmd := exec.Command("curl", "-sS", "--max-time", "5",
+			"-H", "Connection: close", u)
+		out, err := cmd.Output()
+		if err != nil {
+			t.Fatalf("curl request %d/%d: %v", i, n, err)
+		}
+		want := fmt.Sprintf("churn-%d", i)
+		if strings.TrimSpace(string(out)) != want {
+			t.Fatalf("request %d body mismatch: got %q want %q", i, strings.TrimSpace(string(out)), want)
+		}
+	}
+	elapsed := time.Since(start)
+
+	// Drain server.
+	select {
+	case err := <-doneCh:
+		if err != nil {
+			t.Fatalf("serve loop: %v", err)
+		}
+	case <-time.After(40 * time.Second):
+		t.Fatal("serve loop did not exit")
+	}
+
+	if s.handled != n {
+		t.Fatalf("expected %d requests handled, got %d", n, s.handled)
+	}
+	rps := float64(n) / elapsed.Seconds()
+	t.Logf("TIME_WAIT churn: %d sequential requests in %v (%.1f req/s)", n, elapsed.Round(time.Millisecond), rps)
+	if rps < 5 {
+		t.Fatalf("throughput too low (%.1f req/s); TIME_WAIT may be blocking re-listen", rps)
+	}
+}

@@ -17,11 +17,11 @@
 //! Under `cfg(test)` we let `std` link so we can run a loopback harness that
 //! simulates two TCBs talking through an in-memory wire.
 
-#![cfg_attr(not(test), no_std)]
+#![cfg_attr(not(any(test, feature = "std")), no_std)]
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-#[cfg(all(not(test), not(feature = "host_panic_handler")))]
+#[cfg(all(not(test), not(feature = "host_panic_handler"), not(feature = "std")))]
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
     loop {
@@ -38,7 +38,7 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
 //
 // The stub below provides that symbol. It must never run; if it ever does,
 // the unwinder is being driven on a panic-abort build, which is a bug.
-#[cfg(all(not(test), not(feature = "host_panic_handler"), target_os = "linux"))]
+#[cfg(all(not(test), not(feature = "host_panic_handler"), not(feature = "std"), target_os = "linux"))]
 #[no_mangle]
 extern "C" fn rust_eh_personality() {
     loop {

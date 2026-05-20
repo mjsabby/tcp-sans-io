@@ -1,0 +1,47 @@
+[package]
+name = "tcp-sans-io-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.tcp-sans-io]
+path = ".."
+features = ["std"]
+
+# Workspace-style: don't inherit the parent's lints / panic config so
+# the fuzz crate can use std + panic=unwind freely.
+[workspace]
+
+[profile.release]
+debug = 1
+panic = "abort"
+
+[profile.dev]
+panic = "abort"
+
+[[bin]]
+name = "wire_parse"
+path = "fuzz_targets/wire_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wire_parse_emit_roundtrip"
+path = "fuzz_targets/wire_parse_emit_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tcb_inject_sequence"
+path = "fuzz_targets/tcb_inject_sequence.rs"
+test = false
+doc = false
+bench = false
