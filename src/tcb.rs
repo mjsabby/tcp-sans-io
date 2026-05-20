@@ -582,11 +582,14 @@ impl Tcb {
     /// behaviour (no per-connection state until the third ACK), call
     /// [`Tcb::set_cookie_secret`] before the first SYN arrives.
     pub fn listen(&mut self) -> Result<(), TcpError> {
-        // We allow Listen-from-Listen (idempotent) and Listen-from-Closed.
-        // Anything else means an in-progress connection would be torn down
-        // silently — the host should call `close` first.
+        // We allow Listen-from-Listen (idempotent), Listen-from-Closed,
+        // and Listen-from-TimeWait (the latter is the
+        // SO_REUSEADDR-style "drop the 2*MSL wait and re-arm now"
+        // semantics that real servers depend on). Anything else means
+        // an in-progress connection would be torn down silently — the
+        // host should call `close` first.
         match self.state {
-            State::Closed | State::Listen => {}
+            State::Closed | State::Listen | State::TimeWait => {}
             _ => return Err(TcpError::InvalidState),
         }
         // Wildcard the remote so `inject_packet` accepts any source.

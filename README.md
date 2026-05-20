@@ -269,6 +269,7 @@ host, pass the pointer to `tcp_init`. Memory ownership stays with the host.
 | **packetdrill-DSL runner** | Per-packet conformance scripts in packetdrill syntax | `bindings/packetdrill/*.go` + `scripts/*.pkt` |
 | **eBPF uprobe observability** | bpftrace uprobes on the cdylib's FFI entry points (counts + latency histograms); kernel-side `tcpretrans` comparison during the iperf3 baseline | `bindings/bpf/` |
 | **perf flamegraphs (CI)** | `perf record` wrapping the netem benchmark → `inferno-flamegraph` SVG; kernel-TCP iperf3 baseline through netns + veth + netem | `.github/workflows/perf-bench.yml` |
+| **Real-world HTTP/curl/wrk** | cdylib hosts an HTTP/1.1 echo server through a TUN; real `curl` + `wrk` exchange messages. Covers persistent sequential connections, large bodies (1 MiB POST), slow uploaders (rate-limited curl), and load patterns (wrk -c1). | `bindings/realworld/http_test.go` |
 
 ### packetdrill scripts
 
@@ -365,6 +366,10 @@ bindings/
 │   ├── scripts/         # trace_cdylib.bt template
 │   ├── trace.sh         # LIBPATH-substituting runner
 │   └── bpftrace_test.go # Go test (build tag: bpftrace)
+├── realworld/           # Go: real HTTP/1.1 interop via curl + wrk
+│   ├── http_test.go     # Echo handler + 7 curl/wrk scenarios
+│   ├── tun.go           # TUN setup helpers
+│   └── cdylib.go        # Cgo bridge (with Listen() for passive-open)
 └── packetdrill/         # Go: packetdrill-DSL runner + .pkt script corpus
     ├── parser.go        # .pkt → AST
     ├── wire.go          # PacketDesc ↔ IPv4+TCP bytes
