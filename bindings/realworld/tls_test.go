@@ -251,6 +251,38 @@ func (c *cdylibConn) pump() {
 			if !closed && st != StateClosed && st != StateLastAck {
 				_ = c.srv.Close()
 			}
+			// Drain to a Listen-acceptable terminal state. Avoid
+			// exiting in FIN_WAIT_1 / FIN_WAIT_2 / LAST_ACK because
+			// a subsequent Listen() call would return InvalidState.
+			drainStart := time.Now()
+			for time.Since(drainStart) < 2*time.Second {
+				// extract → TUN
+				for {
+					n, err := c.srv.ExtractPacket(extractBuf[:])
+					if err != nil || n == 0 {
+						break
+					}
+					if _, werr := syscall.Write(c.tunFd, extractBuf[:n]); werr != nil {
+						break
+					}
+				}
+				// TUN → inject
+				for {
+					select {
+					case pkt := <-c.tunIn:
+						_ = c.srv.InjectPacket(pkt)
+						continue
+					default:
+					}
+					break
+				}
+				_ = c.srv.Tick()
+				st = c.srv.State()
+				if st == StateClosed || st == StateTimeWait {
+					break
+				}
+				time.Sleep(500 * time.Microsecond)
+			}
 			closed = true
 		default:
 		}
