@@ -1,0 +1,32 @@
+# TBIT-style probe: ECN CE-marked data triggers ECE on the response
+# ACK.
+#
+# RFC 3168 §6.1.2: when a receiver gets an IP packet with the CE
+# (Congestion Experienced, 0b11) codepoint, it MUST echo ECE on
+# subsequent ACKs until it observes a CWR from the sender. This is
+# the receiver-side half of ECN feedback that lets the SENDER react
+# to congestion without dropping any packet.
+#
+# Setup: full ECN-negotiated handshake (ECT(0) flowing), then a
+# CE-marked data segment arrives. We should respond with an ACK
+# carrying ECE.
+
+--connect 10.0.0.1:49152 10.0.0.2:80
++0 > SEW 0:0(0) win 65535 <mss 1460, wscale 5, sackOK, TS val * ecr 0>
++.005 < SE. 0:0(0) ack 1 win 32768 <mss 1460, wscale 0, sackOK, TS val 1 ecr *>
++0 > . 1:1(0) ack 1 ecn ECT0 <TS val * ecr 1>
+
+# Peer sends a 100-byte data segment with the CE codepoint set —
+# simulating an ECN-aware router in the path marking the packet as
+# experiencing congestion.
++.005 < P. 1:101(100) ack 1 win 32768 ecn CE <TS val 2 ecr *>
+
+# Our response ACK MUST carry ECE (in TCP flags) AND have ECT(0) at
+# the IP layer (we're a regular sender ourselves and our packets are
+# still ECN-capable). The ACK should be at rcv_nxt=101.
+#
+# Delayed-ACK fires at ~200ms by default, so we wait past that to
+# guarantee the ACK is emitted (one data segment alone wouldn't
+# trigger an immediate ACK — that requires either two segments
+# back-to-back or the delayed-ACK timer expiry).
++.250 > E. 1:1(0) ack 101 ecn ECT0 <TS val * ecr 2>

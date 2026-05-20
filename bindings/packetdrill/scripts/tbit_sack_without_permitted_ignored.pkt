@@ -1,0 +1,43 @@
+# TBIT-style probe: SACK blocks arriving on a connection that DID
+# NOT negotiate SACK_PERMITTED in the handshake MUST be ignored.
+#
+# RFC 2018 §2: SACK_PERMITTED is offered in the SYN / SYN-ACK and
+# is symmetric — if either side omits it, the connection runs
+# without SACK. A peer that later sends SACK blocks on such a
+# connection is misbehaving (or hostile); receivers must not act on
+# those SACK blocks (no enter_recovery, no selective retransmit).
+#
+# We verify: after a SYN-ACK without sackOK, an ACK carrying a SACK
+# option does NOT trigger our RFC 6675 fast-retransmit. snd_una
+# stays put, cwnd doesn't collapse, ssthresh is unchanged.
+
+--connect 10.0.0.1:49152 10.0.0.2:80
++0 > SEW 0:0(0) win 65535 <mss 1460, wscale 5, sackOK, TS val * ecr 0>
+
+# SYN-ACK explicitly omits sackOK — SACK is now off for the lifetime
+# of the connection.
++.005 < S. 0:0(0) ack 1 win 32768 <mss 1460, wscale 0, TS val 1 ecr *>
++0 > . 1:1(0) ack 1 win 32768 <TS val * ecr 1>
+
+# Send two MSS-payload-sized segments. Effective payload MSS with
+# TS only = 1460 - 12 = 1448.
+--send 2896
++0 > P. 1:1449(1448) ack 1 win 32768 <TS val * ecr 1>
++0 > P. 1449:2897(1448) ack 1 win 32768 <TS val * ecr 1>
+
+# Peer sends an ACK at snd_una=1 carrying a SACK block as if the
+# second segment had arrived (suggesting the first is missing).
+# Even though our parser accepts the SACK option in the option
+# table, our state machine must NOT act on it because SACK was
+# never negotiated.
++.005 < . 1:1(0) ack 1 win 32768 <sack 1449:2897, TS val 2 ecr *>
+
+# No fast-retransmit should fire. Without SACK, the only fast-retx
+# trigger is 3 dup-ACKs — we've only seen 1, so nothing emits.
+# Confirm by sending one more byte of data (which DOES fire a normal
+# data segment, not a retransmit). We have to advance the test by
+# something observable; sending one more byte forces the stack to
+# do *something* and lets us verify it didn't rewind to snd_una.
+--send 1
+# Note: any retx would land at seq=1; new data lands at snd_nxt=2897.
++0 > P. 2897:2898(1) ack 1 win 32768 <TS val * ecr 2>

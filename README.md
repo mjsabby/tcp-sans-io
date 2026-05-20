@@ -279,11 +279,13 @@ The `bindings/packetdrill/` package is a Go-native runner for
 packetdrill-style `.pkt` scripts that drives our cdylib instead of the
 kernel's POSIX socket layer. Each `.pkt` file becomes a Go subtest.
 
-Currently 14 scripts cover handshake (active + passive), full-options
+Currently 17 scripts cover handshake (active + passive), full-options
 SYN, Window Scale negotiation, ECN-Setup, IW=10 burst, SACK negotiation,
 PRR fast retransmit, RFC 6675 selective retransmit (single + multi-block
 + multi-hole), TLP probe before RTO, data transfer + pattern
-verification, and active / passive close. Example:
+verification, active / passive close, plus TBIT-style RFC compliance
+probes (ECN CE → ECE echo, asymmetric WSCALE drop, SACK without
+SACK_PERMITTED ignored). Example:
 
 ```
 --connect 10.0.0.1:49152 10.0.0.2:80

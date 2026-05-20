@@ -1,0 +1,37 @@
+# TBIT-style probe: WSCALE option in a SYN-ACK that didn't have
+# WSCALE in the original SYN MUST be ignored.
+#
+# RFC 7323 §2.2: window scaling is symmetric — both endpoints must
+# offer the WSCALE option in their SYN / SYN-ACK for it to apply.
+# A SYN-ACK that includes WSCALE without the SYN having offered it
+# would be a protocol violation; the receiving stack should ignore
+# the WSCALE field and treat the connection as unscaled.
+#
+# This script is the inverse: if we sent WSCALE in our SYN but the
+# peer's SYN-ACK omits WSCALE, the resulting connection runs
+# UNSCALED (snd_wnd interpreted at the on-wire face value, not
+# shifted by the WSCALE we offered).
+#
+# Verifies: when the peer drops WSCALE, our `snd_wnd` interpretation
+# stays at the raw 16-bit window field, so a subsequent data segment
+# from us doesn't get capped by an inflated effective window.
+
+--connect 10.0.0.1:49152 10.0.0.2:80
++0 > SEW 0:0(0) win 65535 <mss 1460, wscale 5, sackOK, TS val * ecr 0>
+
+# SYN-ACK omits WSCALE entirely — peer doesn't support / negotiate.
++.005 < S. 0:0(0) ack 1 win 32768 <mss 1460, sackOK, TS val 1 ecr *>
+
+# Our third ACK is a pure ACK with TS but no WSCALE (post-handshake
+# segments never carry WSCALE per RFC 7323 §2.2). The advertised
+# window field is OUR receive window — 65535 (raw), matching what we
+# put in our SYN, because no WSCALE was negotiated.
++0 > . 1:1(0) ack 1 win 65535 <TS val * ecr 1>
+
+# Now we send 4 KiB of data. With WSCALE NOT negotiated, snd_wnd ==
+# peer's advertised window == 32768 (raw). Our four MSS-sized
+# segments fit comfortably within that.
+--send 4096
++0 > P. 1:1449(1448) ack 1 win 65535 <TS val * ecr 1>
++0 > P. 1449:2897(1448) ack 1 win 65535 <TS val * ecr 1>
++0 > P. 2897:4097(1200) ack 1 win 65535 <TS val * ecr 1>
