@@ -57,6 +57,10 @@ typedef struct TcpStreamHandle TcpStreamHandle;
 uint32_t tcp_abi_version(void);
 size_t   tcp_handle_size(void);
 size_t   tcp_handle_align(void);
+/* Maximum byte size of a single IPv4+TCP datagram the stack can emit.
+ * Hosts use this to size their per-TCB extract_packet scratch buffer.
+ * Currently 1500 (IPv4 fixed 20 + TCP fixed 20 + MSS 1460). */
+size_t   tcp_max_packet(void);
 
 /* ---- Lifecycle --------------------------------------------------------- */
 int32_t tcp_init(TcpStreamHandle* storage,
@@ -69,6 +73,13 @@ int32_t tcp_destroy(TcpStreamHandle* handle);
 int32_t tcp_connect(TcpStreamHandle* handle, uint64_t now_ms);
 int32_t tcp_listen (TcpStreamHandle* handle, uint64_t now_ms);
 int32_t tcp_close  (TcpStreamHandle* handle, uint64_t now_ms);
+/* Abort the connection: queues a TCP RST+ACK in the TX ring, transitions
+ * the handle to CLOSED, drops all buffered send/recv/OOO bytes, and
+ * surfaces ConnectionReset via tcp_poll()'s ERROR flag. After calling
+ * this, drain the TX ring once with tcp_extract_packet to emit the RST,
+ * then call tcp_destroy. Idempotent on CLOSED; no wire effect in
+ * LISTEN/SYN_SENT. */
+int32_t tcp_abort  (TcpStreamHandle* handle, uint64_t now_ms);
 int32_t tcp_tick   (TcpStreamHandle* handle, uint64_t now_ms);
 
 /* Install a 16-byte secret enabling stateless SYN cookies (RFC 4987).

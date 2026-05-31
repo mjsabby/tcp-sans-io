@@ -75,7 +75,15 @@ pub const MSS: u16 = 1460;
 ///
 /// Hosts that hold many idle connections may wish to override this; the
 /// constant is the only knob.
+///
+/// The `small-buffers` Cargo feature switches this to 32 KiB, dropping
+/// per-Tcb RSS to ~150 KiB so scale harnesses can pack 10K connections
+/// into ~1.5 GiB rather than ~21 GiB. Behavior under that build is
+/// otherwise identical (handshake, congestion control, RACK, etc.).
+#[cfg(not(feature = "small-buffers"))]
 pub const BUF_CAP: usize = 1_048_576;
+#[cfg(feature = "small-buffers")]
+pub const BUF_CAP: usize = 32 * 1024;
 
 /// Single-hole out-of-order reassembly buffer capacity, in bytes.
 ///

@@ -906,6 +906,10 @@ fn build_in_ws(
 /// Passive open with peer offering WS=8: our SYN-ACK MUST echo a WS
 /// option. The post-handshake third ACK's window is then interpreted
 /// scaled (window << 8).
+///
+/// Asserts SYN-ACK window saturates at `u16::MAX`, which holds only for
+/// `BUF_CAP >= 65 KiB`; gated out of the `small-buffers` profile.
+#[cfg(not(feature = "small-buffers"))]
 #[test]
 fn passive_handshake_negotiates_window_scale() {
     let mut s = make_listener();

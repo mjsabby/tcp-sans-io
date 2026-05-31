@@ -248,8 +248,15 @@ with `src/ffi.rs`).
 - **C** — `include/tcp_sans_io.h`.
 - **C#** — `bindings/csharp/` (`TcpStream.cs`, `Native.cs`, integration test).
 - **Python** — `bindings/python/` (ctypes wrapper + unittest suite).
-- **Go** — `bindings/gvisor/` (gVisor netstack interop tests) and
-  `bindings/netem/` (real Linux kernel interop + throughput benchmark).
+- **Go** — `bindings/gvisor/` (gVisor netstack interop tests),
+  `bindings/netem/` (real Linux kernel interop + throughput benchmark),
+  `bindings/realworld/` (HTTP/1.1, HTTPS, h2spec, git clone),
+  `bindings/wgserver/` (pure-Go raw-packet driver + adversarial stress
+  suite over a userspace UDP "WG-shaped" transport — no root, no TUN,
+  cross-platform).
+- **Rust harness** — `bindings/wgserver-rs/` (standalone server binary
+  multiplexing N TCBs on a single UDP socket; depends on the parent
+  crate as an rlib).
 
 All use the host-allocated storage pattern: query
 `tcp_handle_size()` / `tcp_handle_align()`, allocate that much memory in the
@@ -274,6 +281,7 @@ host, pass the pointer to `tcp_init`. Memory ownership stays with the host.
 | **Real TLS over the cdylib** | Go's `crypto/tls.Server` wraps a custom `net.Conn` backed by the cdylib + TUN pair; real `curl --insecure` does HTTPS round-trips. Validates TCP behaviour under handshake-sensitive workloads (small writes, half-close timing, MAC-validated bulk transfer) — anything our stack mis-orders or corrupts surfaces as a TLS alert, not silent corruption. | `bindings/realworld/tls_test.go` |
 | **h2spec HTTP/2 conformance** | `h2spec` (nghttp2's official HTTP/2 conformance suite) runs all 44 generic tests against an HTTP/2 server hosted on our TCP stack via TLS + ALPN. Each test case is a fresh TCP+TLS+HTTP/2 connection — exercises the LISTEN re-arm cycle at scale plus framing-sensitive H2 traffic. All 44/44 generic tests pass. | `bindings/realworld/h2spec_test.go` |
 | **git clone over HTTPS** | Real `git clone https://…/repo.git` against a bare repository served by `http.FileServer` over the cdylib's TLS listener. Exercises chatty HTTP/1.1 traffic (many small pkt-line writes interleaved with variable-length pack/object body reads). End-to-end signal: the cloned working tree's bytes must match the source repo exactly. | `bindings/realworld/git_test.go` |
+| **Userspace UDP server stress** | A standalone Rust harness (`bindings/wgserver-rs/`) hosts N TCBs in LISTEN on a single UDP socket. A pure-Go driver (`bindings/wgserver/`) — no cgo, no kernel TUN, no root — runs adversarial scenarios (SYN flood ±cookies, blind RST/ACK, cookie forgery, bare-ACK reflection check, malformed-packet spray, wrong-IP rejection, in-window RST in SYN_RCVD, …) and a 10 000-connection functional scale test (≈ 1.5 GiB RSS with `--features small-buffers`, p99 ≈ 80 ms loopback). | `bindings/wgserver-rs/src/server.rs`, `bindings/wgserver/{scale,adversary}_test.go` |
 
 ### packetdrill scripts
 
@@ -376,6 +384,16 @@ bindings/
 │   ├── http_test.go     # Echo handler + 7 curl/wrk scenarios
 │   ├── tun.go           # TUN setup helpers
 │   └── cdylib.go        # Cgo bridge (with Listen() for passive-open)
+├── wgserver-rs/         # Rust: standalone server harness (N TCBs on one UDP socket)
+│   ├── Cargo.toml       # Workspace-style sibling crate (path = "../..")
+│   └── src/{main,server}.rs
+├── wgserver/            # Go: pure-Go driver + adversarial / scale stress suite
+│   ├── wire.go          # IPv4+TCP encode/decode + checksums (no cgo)
+│   ├── transport.go     # UDP socket + central 5-tuple demux
+│   ├── miniclient.go    # Minimal stateful TCP client (option matrix)
+│   ├── harness.go       # Spawn / wait-ready / shutdown wgserver subprocess
+│   ├── scale_test.go    # 1K + 10K connection scale tests
+│   └── adversary_test.go # SYN flood ±cookies, blind RST/ACK, forgery, malformed
 └── packetdrill/         # Go: packetdrill-DSL runner + .pkt script corpus
     ├── parser.go        # .pkt → AST
     ├── wire.go          # PacketDesc ↔ IPv4+TCP bytes

@@ -764,6 +764,76 @@ impl Tcb {
         Ok(())
     }
 
+    /// Abort the connection by emitting a TCP RST. Unlike [`Tcb::close`]
+    /// (which initiates a graceful FIN handshake), this is an immediate
+    /// teardown: a `RST+ACK` segment with `seq=snd_nxt` and
+    /// `ack=rcv_nxt` is queued in the TX ring for the caller to drain,
+    /// the TCB transitions to `CLOSED`, all buffered data is dropped,
+    /// and `ConnectionReset` is surfaced via [`Tcb::poll`]'s `ERROR`
+    /// flag.
+    ///
+    /// Intended for hosts that have detected a failure outside the TCB
+    /// (e.g. the upstream socket couldn't be reached, the proxy was
+    /// killed, a shim-side timeout fired) and need to propagate the
+    /// failure to the peer immediately rather than waiting for a
+    /// graceful FIN to drain.
+    ///
+    /// Idempotent: aborting an already-`CLOSED` TCB is a no-op. In
+    /// `LISTEN` or `SYN_SENT` there is no peer-known sequence number
+    /// the peer would honour, so this is a local-only state
+    /// transition (no wire RST). In every other state a `RST+ACK` is
+    /// queued — the `ACK` bit makes the segment unconditionally
+    /// acceptable to the peer per RFC 5961 §3.2 (in-window ACK
+    /// bypasses the bare-RST window-validation check that defeats
+    /// blind off-path RST injections).
+    ///
+    /// All protocol timers (RTO, persist, delayed ACK, TIME-WAIT,
+    /// RACK, TLP) are cleared. Send / receive / reassembly buffers
+    /// are wiped — any unsent / unread / out-of-order bytes are lost
+    /// (that is the entire point of an abort).
+    pub fn abort(&mut self) -> Result<(), TcpError> {
+        match self.state {
+            State::Closed => return Ok(()),
+            // No peer-known sequence number to RST against. SYN_SENT
+            // peers MAY have observed our SYN, but the RST we'd send
+            // (seq=iss, no ACK) is window-validated and easily
+            // dropped; treat both as local-only transitions.
+            State::Listen | State::SynSent => {
+                self.is_listener = false;
+            }
+            _ => {
+                // RFC 5961 §3.2: RST+ACK with an in-window ACK is
+                // accepted unconditionally, bypassing the
+                // bare-RST window-validation rule. We use snd_nxt
+                // for SEG.SEQ and rcv_nxt for SEG.ACK — these are
+                // the canonical "fast abort" values.
+                let _ = self.emit_segment(
+                    flags::RST | flags::ACK,
+                    self.snd_nxt,
+                    self.rcv_nxt,
+                    &TcpOptions::NONE,
+                    &[],
+                )?;
+            }
+        }
+        self.state = State::Closed;
+        self.error = Some(TcpError::ConnectionReset);
+        // Drop any unsent / unread / OOO bytes. The caller asked to
+        // abort, not to drain.
+        self.send_ring.clear();
+        self.recv_ring.clear();
+        self.reasm.clear();
+        // Clear every protocol-level timer so a subsequent `tick`
+        // call doesn't drive anything.
+        self.rto_deadline = None;
+        self.time_wait_deadline = None;
+        self.persist_deadline = None;
+        self.ack_deadline = None;
+        self.rack_deadline = None;
+        self.tlp_deadline = None;
+        Ok(())
+    }
+
     /// Aggregate event flags for the host async runtime to dispatch on.
     pub fn poll(&self) -> u32 {
         let mut ev = 0;

@@ -53,7 +53,15 @@ pub extern "C" fn tcp_handle_align() -> usize {
 /// Stable ABI version. Increment on any breaking change to this surface.
 #[no_mangle]
 pub extern "C" fn tcp_abi_version() -> u32 {
-    1
+    2
+}
+
+/// Maximum size in bytes of a single IPv4+TCP datagram the stack can
+/// emit. Hosts size their per-TCB extract buffer using this. Currently
+/// 1500 (IPv4 fixed 20 + TCP fixed 20 + MSS 1460).
+#[no_mangle]
+pub extern "C" fn tcp_max_packet() -> usize {
+    crate::MAX_PACKET
 }
 
 // ---------------------------------------------------------------------------
@@ -220,6 +228,22 @@ pub extern "C" fn tcp_close(handle: *mut TcpStreamHandle, now_ms: u64) -> i32 {
     with_handle(handle, |h| {
         h.set_now(now_ms);
         h.close()
+    })
+}
+
+/// Abort the connection by emitting a TCP RST. Unlike [`tcp_close`]
+/// (graceful FIN), this is an immediate teardown: a RST+ACK segment is
+/// queued in the TX ring, the TCB transitions to `CLOSED`, all buffered
+/// data is dropped, and the connection surfaces `ConnectionReset` via
+/// [`tcp_poll`]'s `ERROR` flag. Idempotent on already-`CLOSED` TCBs;
+/// no wire effect in `LISTEN` / `SYN_SENT`. After calling this, the
+/// caller should drain the TX ring once (via [`tcp_extract_packet`]) to
+/// emit the RST, then call [`tcp_destroy`].
+#[no_mangle]
+pub extern "C" fn tcp_abort(handle: *mut TcpStreamHandle, now_ms: u64) -> i32 {
+    with_handle(handle, |h| {
+        h.set_now(now_ms);
+        h.abort()
     })
 }
 

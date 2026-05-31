@@ -1347,6 +1347,11 @@ fn syn_offers_window_scale() {
 /// RFC 7323 §2.3: the Window field in a SYN segment is NEVER scaled.
 /// Even though we negotiate rcv_wscale=1 once the peer agrees, our SYN
 /// itself must advertise the unscaled receive window.
+///
+/// Asserts the saturated `u16::MAX` value that only holds when
+/// `BUF_CAP >= 65 KiB`; the `small-buffers` profile uses a smaller ring
+/// and so advertises a smaller (still correct) raw window.
+#[cfg(not(feature = "small-buffers"))]
 #[test]
 fn syn_window_field_is_unscaled() {
     let mut tcb = make_tcb();
@@ -1368,6 +1373,10 @@ fn syn_window_field_is_unscaled() {
 /// SYN-ACK without the WS option disables scaling in BOTH directions:
 /// outbound windows are unscaled (saturated to 65535), and inbound peer
 /// windows are read raw.
+///
+/// Saturation-to-u16::MAX assertion only holds for BUF_CAP ≥ 65 KiB;
+/// gated out of the `small-buffers` profile.
+#[cfg(not(feature = "small-buffers"))]
 #[test]
 fn syn_ack_without_ws_disables_scaling_both_directions() {
     let mut tcb = make_tcb();
@@ -2329,6 +2338,11 @@ fn make_tcb_with_iss(iss: u32) -> Tcb {
     Tcb::new(cfg).expect("tcb")
 }
 
+/// Send 128 KiB across the u32 wrap point and verify each segment.
+/// Requires the send ring to accept the entire 128 KiB in one call; the
+/// `small-buffers` profile uses a 32 KiB ring, which would need a
+/// different test driver — gated out for that profile.
+#[cfg(not(feature = "small-buffers"))]
 #[test]
 fn sequence_number_wraps_around_u32_max_during_bulk_send() {
     // Pin ISS to u32::MAX - 32 KiB. After the SYN consumes 1, the first

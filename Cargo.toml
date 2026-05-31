@@ -17,6 +17,11 @@ host_panic_handler = []
 # Disables no_std mode entirely. Useful for fuzz harnesses (libfuzzer-sys
 # pulls in std unconditionally) and any binary that's already linking std.
 std = []
+# Shrinks the per-direction ring buffer (BUF_CAP) from 1 MiB to 32 KiB
+# so that scale harnesses can pack many Tcbs into a reasonable RSS
+# (~150 KiB/Tcb vs ~2.15 MiB/Tcb). The default build is unaffected.
+# Used by bindings/wgserver-rs/ for the 10000-connection stress test.
+small-buffers = []
 
 [profile.release]
 panic = "abort"

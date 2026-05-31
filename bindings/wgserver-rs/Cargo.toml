@@ -1,0 +1,30 @@
+[package]
+name = "tcp-sans-io-wgserver"
+version = "0.1.0"
+edition = "2021"
+description = "Userspace server harness for tcp-sans-io over a UDP-encapsulated transport"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Workspace-style: don't inherit the parent's lints / panic config so this
+# binary can use std + panic=unwind + std-friendly clippy rules.
+[workspace]
+
+[[bin]]
+name = "wgserver"
+path = "src/main.rs"
+
+[dependencies]
+tcp-sans-io = { path = "../..", features = ["std"] }
+
+[features]
+# Forwarded to tcp-sans-io so the cdylib/rlib it consumes shrinks BUF_CAP
+# from 1 MiB to 32 KiB. Required for any meaningful 10000-Tcb test.
+small-buffers = ["tcp-sans-io/small-buffers"]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = false
