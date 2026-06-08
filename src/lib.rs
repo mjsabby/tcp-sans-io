@@ -56,6 +56,7 @@ pub mod rack;
 pub mod reassembly;
 pub mod ring;
 pub mod scoreboard;
+pub mod selftest;
 pub mod send_queue;
 pub mod state;
 pub mod tcb;

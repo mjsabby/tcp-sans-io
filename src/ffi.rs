@@ -64,6 +64,24 @@ pub extern "C" fn tcp_max_packet() -> usize {
     crate::MAX_PACKET
 }
 
+/// Built-in self-conformance smoke test. Drives two in-process instances
+/// of the stack through a byte-exact bidirectional bulk transfer and a
+/// clean close — no storage, transport, clock, or reference peer required.
+///
+/// Returns `0` ([`crate::selftest::result::OK`]) on success, or a negative
+/// `crate::selftest::result` code identifying the failure stage. A binding
+/// should call this once after loading the library to confirm the link /
+/// ABI / calling convention are correct and the core is healthy before
+/// wiring up a real connection.
+///
+/// Cost: runs entirely on the caller's stack (~256 KiB) for well under a
+/// millisecond; it does not touch the passed-in handle storage and takes
+/// no arguments.
+#[no_mangle]
+pub extern "C" fn tcp_selftest() -> i32 {
+    crate::selftest::self_conformance()
+}
+
 // ---------------------------------------------------------------------------
 // Lifecycle
 // ---------------------------------------------------------------------------

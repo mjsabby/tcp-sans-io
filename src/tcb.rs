@@ -2163,6 +2163,21 @@ impl<const BUF: usize> Tcb<BUF> {
     fn maybe_send_one(&mut self) -> Result<bool, TcpError> {
         let mss_payload = self.effective_payload_mss() as u32;
 
+        // ---- PRR ACK-clock deadlock guard (RFC 6675 §5) -----------------
+        // PRR's `snd_credit` paces sends during recovery, but it is only
+        // replenished by incoming ACKs. If the pipe has fully drained
+        // (`flight == 0`, i.e. `snd_nxt == snd_una`) while credit is `0`,
+        // recovery can never make progress: the lost segment at `snd_una`
+        // can't be retransmitted (the RFC 6675 retransmit is credit-clamped
+        // to 0 bytes), so no ACK arrives, so credit is never replenished —
+        // a permanent stall with data buffered and the window wide open.
+        // Exit recovery so the standard path re-sends `snd_una` and restarts
+        // the ACK clock; `cwnd` is already reduced to `ssthresh`, so the
+        // congestion response is preserved.
+        if self.cc.in_recovery() && self.snd_nxt == self.snd_una && self.cc.snd_credit() == 0 {
+            self.cc.force_exit_recovery();
+        }
+
         // ---- Priority 0: RACK-marked-lost retransmits -------------------
         // RACK detects loss via time + later-delivery evidence; results
         // queue into `rack_lost_queue` sorted lowest-seq first. Drain
@@ -3171,6 +3186,59 @@ mod retransmit_overflow_regression {
             tcb.snd_nxt,
             fin.wrapping_add(1),
             "snd_nxt advances past the FIN again",
+        );
+    }
+
+    /// Regression for the PRR ACK-clock deadlock found by the standalone
+    /// conformance harness (`bindings/conformance`) driving cdylib⇄cdylib
+    /// under combined loss+reorder+dup.
+    ///
+    /// State: ESTABLISHED, in fast recovery with `snd_credit == 0`, the pipe
+    /// fully drained (`snd_nxt == snd_una`, so `flight == 0`), but a segment
+    /// at `snd_una` is still un-ACKed (`snd_max > snd_una`) and the send ring
+    /// holds data. The RFC 6675 retransmit was credit-clamped to 0 bytes, so
+    /// the lost segment could never be resent; no ACK would arrive to
+    /// replenish PRR credit, so recovery never progressed — a permanent stall
+    /// with the window wide open. `maybe_send_one` now force-exits recovery in
+    /// this state and re-sends `snd_una` to restart the ACK clock.
+    #[test]
+    fn prr_empty_pipe_zero_credit_does_not_deadlock() {
+        let mut tcb: Tcb = Tcb::new(cfg(1000)).expect("tcb");
+        tcb.state = State::Established;
+        tcb.snd_wnd = 65_535;
+        tcb.rcv_nxt = 9_000;
+        let una = 5_000u32;
+        tcb.snd_una = una;
+        tcb.snd_nxt = una; // flight == 0: nothing newly in flight
+        tcb.snd_max = una.wrapping_add(2_000); // 2000 bytes sent-but-unacked (lost)
+        let n = tcb.send_ring.write(&[0x5A; 8_000]);
+        assert_eq!(n, 8_000, "send ring must hold the unacked + unsent data");
+
+        // Drive PRR into recovery and exhaust the send credit, mirroring the
+        // post-RTO re-entry that produced the wedge.
+        tcb.cc.enter_recovery(2_000, tcb.snd_max);
+        let c = tcb.cc.snd_credit();
+        tcb.cc.on_send(c);
+        assert_eq!(tcb.cc.snd_credit(), 0);
+        assert!(tcb.cc.in_recovery());
+        tcb.rxt_seq = una;
+        tcb.rxt_unacked = 0;
+        tcb.now_ms = 1_000;
+
+        // Before the guard this emitted nothing (deadlock).
+        tcb.tick().expect("tick");
+        let mut buf = [0u8; crate::MAX_PACKET];
+        let m = tcb.extract_packet(&mut buf).expect("extract");
+        assert!(m > 0, "stack must emit a segment to restart the ACK clock");
+        let seg = crate::wire::parse(&buf[..m]).expect("parse");
+        assert_eq!(
+            seg.seq, una,
+            "the emitted segment must start at snd_una (the lost data)",
+        );
+        assert!(!seg.payload.is_empty(), "it must carry the buffered bytes");
+        assert!(
+            !tcb.cc.in_recovery(),
+            "the empty-pipe/zero-credit recovery must have been force-exited",
         );
     }
 }

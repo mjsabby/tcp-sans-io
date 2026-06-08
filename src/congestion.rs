@@ -240,6 +240,22 @@ impl Tahoe {
         false
     }
 
+    /// Unconditionally leave fast recovery, restoring `cwnd = ssthresh` and
+    /// lifting the PRR send-credit clamp. Used as a deadlock breaker when
+    /// the pipe has drained (`flight == 0`) but PRR credit is exhausted, a
+    /// state in which recovery can otherwise never make progress because no
+    /// ACK can arrive to replenish the credit (see `maybe_send_one`). The
+    /// `ssthresh` reduction from recovery entry is retained, so the
+    /// congestion response to the loss episode is preserved.
+    pub fn force_exit_recovery(&mut self) {
+        if !self.in_recovery {
+            return;
+        }
+        self.cwnd = self.ssthresh;
+        self.in_recovery = false;
+        self.snd_credit = u32::MAX;
+    }
+
     /// Bytes the sender is currently authorised to keep in flight, given the
     /// peer's advertised window. PRR's per-ACK pacing applies on top via
     /// [`Self::snd_credit`] — the caller of `maybe_send_data` must clamp
