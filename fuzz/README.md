@@ -12,6 +12,13 @@ so those are the natural targets.
 | `wire_parse` | `wire::parse` never panics on any byte sequence. |
 | `wire_parse_emit_roundtrip` | For any successfully parsed segment, re-emitting and re-parsing produces the same observable fields (seq, ack, flags, window, MSS / WS / TS / SACK options, payload). |
 | `tcb_inject_sequence` | A fresh `Tcb` in `Listen` survives any sequence of arbitrary `inject_packet` calls + clock ticks without panicking, blowing through bounded buffers, or leaving the state machine in an unreachable state. |
+| `tcb_client_session` | Drives the **active-open send/retransmit** path (`connect` → scripted SACK-enabled handshake → `send` → fuzzer-chosen cumulative-ACK offsets, SACK blocks, and clock jumps that fire TLP/RTO). Asserts the internal `TcpError::Overflow` invariant code never escapes the API. This is the path the `tcp_tick: -9` TLP partial-ACK bug lived in. |
+
+Both `tcb_*` targets treat a returned `TcpError::Overflow` as a hard
+failure: it is an *internal* "a sequence-derived buffer offset/length
+went out of range" code that must be unreachable from any inbound packet
+or timer tick. Swallowing it (as the original `tcb_inject_sequence` did)
+is what let the TLP regression slip past fuzzing.
 
 ## Running locally
 

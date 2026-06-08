@@ -2197,17 +2197,29 @@ impl<const BUF: usize> Tcb<BUF> {
             return Ok(true);
         }
 
-        // Nothing to send → maybe transmit FIN. Outside recovery `window`
-        // is unconstrained by PRR; inside recovery the FIN consumes one
-        // sequence number and one byte of credit.
+        // Nothing more to send from the ring → (re)transmit the FIN.
+        //
+        // The FIN occupies a single sequence number immediately past all
+        // buffered data. Gating on `snd_nxt == fin_at` (rather than the old
+        // `!fin_sent`) makes this block cover BOTH the first emission and a
+        // retransmission after an RTO rewound `snd_nxt` back onto the FIN's
+        // sequence. Without it a FIN that is the sole outstanding segment
+        // would never be resent (the RTO path only re-emits SYN/SYN-ACK),
+        // stalling the close forever. A FIN still in flight has
+        // `snd_nxt == fin_seq + 1`, so it is never spuriously resent; an
+        // ACKed FIN has `snd_una > fin_seq`, so `fin_at` no longer matches.
+        let fin_at = if self.fin_sent {
+            self.fin_seq
+        } else {
+            self.snd_nxt
+        };
         let need_fin = matches!(
             self.state,
             State::FinWait1 | State::Closing | State::LastAck
-        ) && !self.fin_sent
-            && self.send_ring.is_empty()
-            && window > 0;
+        ) && self.send_ring.is_empty()
+            && window > 0
+            && self.snd_nxt == fin_at;
         if need_fin {
-            self.fin_seq = self.snd_nxt;
             let opts = self.data_options();
             let queued = self.emit_segment(
                 flags::FIN | flags::ACK,
@@ -2219,10 +2231,16 @@ impl<const BUF: usize> Tcb<BUF> {
             if !queued {
                 return Ok(false);
             }
+            if !self.fin_sent {
+                // First emission only: pin the FIN's sequence and charge
+                // one byte of (PRR) send credit. Retransmits must not
+                // re-charge or re-pin.
+                self.fin_seq = self.snd_nxt;
+                self.cc.on_send(1);
+                self.fin_sent = true;
+            }
             self.snd_nxt = self.snd_nxt.wrapping_add(1);
             self.bump_snd_max();
-            self.cc.on_send(1);
-            self.fin_sent = true;
             self.pending_ack = false;
             self.delayed_ack_count = 0;
             self.ack_deadline = None;
@@ -2245,6 +2263,23 @@ impl<const BUF: usize> Tcb<BUF> {
     /// advanced in that case).
     fn emit_data_at(&mut self, seq: u32, bytes: usize) -> Result<bool, TcpError> {
         let offset = seq.wrapping_sub(self.snd_una) as usize;
+        // Never read past the buffered data. Retransmit byte counts are
+        // derived from `snd_max`-relative spans (e.g. the RFC 6675 initial
+        // retransmit uses `snd_max - snd_una`), and `snd_max` counts the
+        // phantom FIN sequence that the send ring does not hold. When the
+        // FIN is the only thing outstanding the ring is empty, so a caller
+        // can ask to retransmit one byte with nothing buffered — or, after
+        // a wrapped offset (seq < snd_una), a byte far past the head. Clamp
+        // to what the ring actually holds; retransmitting unbuffered bytes
+        // (the FIN included — it is re-sent as a FIN, not as data) is never
+        // correct. Returning `Ok(false)` here leaves the caller's
+        // bookkeeping untouched, exactly as an egress-ring-full backoff
+        // would. This is the single choke point that makes the whole class
+        // of "sequence math used as a buffer offset" faults non-fatal.
+        let bytes = core::cmp::min(bytes, self.send_ring.len().saturating_sub(offset));
+        if bytes == 0 {
+            return Ok(false);
+        }
         let mut tmp = [0u8; MSS as usize];
         let slice = tmp.get_mut(..bytes).ok_or(TcpError::Overflow)?;
         let copied = self.send_ring.peek_at(offset, slice);
@@ -2388,10 +2423,26 @@ impl<const BUF: usize> Tcb<BUF> {
                 return Ok(());
             }
         };
-        // Compute the actual range to probe: the entry's unsacked tail.
-        // If the entry was partially SACKed, send only the tail beyond
-        // the highest SACK that intersects it.
-        let len = entry.seq_end.wrapping_sub(entry.seq_start);
+        // Clamp the probe to the still-unacked window. `prune` deliberately
+        // keeps partially cumulative-ACKed entries whole (RACK needs the
+        // original send-ts for the unacked tail), so `seq_start` can sit
+        // below `snd_una`. Probing from that raw `seq_start` would make
+        // `emit_data_at` compute a wrapped offset below the send-ring head
+        // and trip its overflow guard (`copied != bytes`), surfacing a
+        // spurious `Overflow` from `tcp_tick`. Probe `[max(seq_start,
+        // snd_una), seq_end)` instead — a valid tail probe in every case.
+        let start = if seq_lt(entry.seq_start, self.snd_una) {
+            self.snd_una
+        } else {
+            entry.seq_start
+        };
+        if seq_le(entry.seq_end, start) {
+            // Nothing unacked remains in this entry (fully ACKed since the
+            // last prune); the probe is spent for this in-flight epoch.
+            self.tlp_fired = true;
+            return Ok(());
+        }
+        let len = entry.seq_end.wrapping_sub(start);
         let mss_payload = self.effective_payload_mss() as u32;
         let bytes = core::cmp::min(len, mss_payload) as usize;
         if bytes == 0 {
@@ -2401,7 +2452,7 @@ impl<const BUF: usize> Tcb<BUF> {
         // Probe payload mirrors the original segment's bytes. Only flip
         // `tlp_fired` if the probe was actually queued — otherwise the
         // next tick should retry.
-        if self.emit_data_at(entry.seq_start, bytes)? {
+        if self.emit_data_at(start, bytes)? {
             self.tlp_fired = true;
         }
         // RTO must remain armed (TLP is a probe, not a replacement for
@@ -2850,5 +2901,169 @@ mod siphash_tests {
             0x0e, 0x0f,
         ];
         assert_eq!(siphash24(&key, &[]), 0x726f_db47_dd0e_0e31);
+    }
+}
+
+#[cfg(test)]
+mod retransmit_overflow_regression {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
+
+    use super::{Endpoint, Tcb, TcbConfig};
+    use crate::State;
+
+    fn cfg(iss: u32) -> TcbConfig {
+        TcbConfig {
+            local: Endpoint {
+                ip: [10, 0, 0, 1],
+                port: 49152,
+            },
+            remote: Endpoint {
+                ip: [10, 0, 0, 2],
+                port: 80,
+            },
+            iss,
+            initial_rto_ms: 1000,
+        }
+    }
+
+    /// Regression for the `kitchen-sink` chaos failure surfaced as
+    /// `tcp_tick: -9` (`TcpError::Overflow`).
+    ///
+    /// `SendQueue::prune` deliberately keeps a *partially* cumulative-ACKed
+    /// entry whole (RACK needs the original send-ts for the unacked tail),
+    /// so the highest un-SACKed entry can have `seq_start < snd_una`. A TLP
+    /// firing in that state used to feed the raw `seq_start` to
+    /// `emit_data_at`, whose `seq.wrapping_sub(snd_una)` offset wrapped far
+    /// past the send-ring head; `peek_at` then returned 0, tripping the
+    /// `copied != bytes` overflow guard. The probe must instead start at
+    /// `snd_una` and carry only the still-unacked tail.
+    #[test]
+    fn tlp_probe_on_partially_acked_tail_does_not_overflow() {
+        let mut tcb: Tcb = Tcb::new(cfg(1000)).expect("tcb");
+
+        // Synthesize an ESTABLISHED connection where a single 1000-byte
+        // segment [2000, 3000) was transmitted and recorded, then a later
+        // cumulative ACK landed at 2600 — strictly inside it. Its prefix
+        // [2000, 2600) is gone from the send ring; the tail [2600, 3000)
+        // (400 bytes) is still in flight at the ring head.
+        tcb.state = State::Established;
+        tcb.snd_wnd = 65_535;
+        tcb.rcv_nxt = 5_000;
+        tcb.snd_una = 2_600;
+        tcb.snd_nxt = 3_000;
+        tcb.snd_max = 3_000;
+        let copied = tcb.send_ring.write(&[0xAB; 400]);
+        assert_eq!(copied, 400, "send ring must hold the 400-byte unacked tail");
+        // The full original segment, recorded before the partial ACK
+        // pruned snd_una forward — seq_start (2000) sits below snd_una.
+        tcb.send_queue.push(2_000, 1_000, 1, false);
+
+        // Arm the TLP so this tick fires the probe immediately.
+        tcb.srtt_ms = 5;
+        tcb.now_ms = 100;
+        tcb.tlp_deadline = Some(100);
+        tcb.tlp_fired = false;
+
+        // Before the fix this returned Err(TcpError::Overflow) (-9).
+        tcb.tick()
+            .expect("tick must not overflow on a partially-acked TLP tail");
+
+        // The staged probe must cover the unacked tail only: start at
+        // snd_una (2600), never at the entry's original seq_start (2000).
+        let mut buf = [0u8; crate::MAX_PACKET];
+        let n = tcb.extract_packet(&mut buf).expect("extract");
+        assert!(n > 0, "a TLP probe should have been staged");
+        let seg = crate::wire::parse(&buf[..n]).expect("parse probe");
+        assert_eq!(seg.seq, 2_600, "probe must start at snd_una, not seq_start");
+        assert_eq!(
+            seg.payload.len(),
+            400,
+            "probe carries exactly the unacked tail",
+        );
+    }
+
+    /// Regression for the FIN-teardown variant found by the
+    /// `tcb_client_session` fuzzer (also `tcp_tick: -9`).
+    ///
+    /// The RFC 6675 initial retransmit sizes itself from `snd_max - snd_una`,
+    /// which counts the phantom FIN sequence. When the FIN is the only thing
+    /// outstanding (all data ACKed → send ring empty) and recovery is entered
+    /// (e.g. three dup-ACKs at `fin_seq`), that path called
+    /// `emit_data_at(snd_una, 1)` against an empty ring, so `peek_at` returned
+    /// 0 and the `copied != bytes` guard tripped `Overflow`. `emit_data_at`
+    /// now clamps the request to the bytes the ring actually holds.
+    #[test]
+    fn initial_retransmit_with_only_fin_outstanding_does_not_overflow() {
+        let mut tcb: Tcb = Tcb::new(cfg(1000)).expect("tcb");
+
+        // All data ACKed, only the FIN in flight: snd_una == fin_seq,
+        // snd_max == fin_seq + 1, send ring empty.
+        let fin = 5_000u32;
+        tcb.state = State::FinWait1;
+        tcb.snd_wnd = 65_535;
+        tcb.rcv_nxt = 9_000;
+        tcb.snd_una = fin;
+        tcb.snd_nxt = fin.wrapping_add(1);
+        tcb.snd_max = fin.wrapping_add(1);
+        tcb.fin_sent = true;
+        tcb.fin_seq = fin;
+
+        // Enter recovery exactly as three dup-ACKs at fin_seq would, so the
+        // initial retransmit fires with outstanding = snd_max - snd_una = 1
+        // (the phantom FIN byte, nothing behind it in the ring).
+        tcb.cc.enter_recovery(1, fin.wrapping_add(1));
+        tcb.rxt_seq = fin;
+        tcb.rxt_unacked = 0;
+        tcb.now_ms = 100;
+
+        // Before the emit_data_at clamp this returned Err(Overflow) (-9).
+        tcb.tick()
+            .expect("tick must not overflow when only the FIN is outstanding");
+    }
+
+    /// Liveness regression: a FIN that is the *sole* outstanding segment and
+    /// gets lost must be retransmitted on RTO. Previously the RTO path only
+    /// re-emitted SYN/SYN-ACK and `need_fin` gated on `!fin_sent`, so the
+    /// FIN was never resent and the close stalled forever.
+    #[test]
+    fn lost_fin_is_retransmitted_after_rto() {
+        let mut tcb: Tcb = Tcb::new(cfg(1000)).expect("tcb");
+
+        let fin = 5_000u32;
+        tcb.state = State::FinWait1;
+        tcb.snd_wnd = 65_535;
+        tcb.rcv_nxt = 9_000;
+        tcb.snd_una = fin;
+        tcb.snd_nxt = fin.wrapping_add(1);
+        tcb.snd_max = fin.wrapping_add(1);
+        tcb.fin_sent = true;
+        tcb.fin_seq = fin;
+        // FIN is in flight behind an armed RTO that is now due (it was lost).
+        tcb.rto_ms = 200;
+        tcb.rto_deadline = Some(50);
+        tcb.now_ms = 100;
+
+        tcb.tick().expect("tick");
+
+        // The RTO rewinds snd_nxt onto fin_seq, and the FIN block resends it.
+        let mut buf = [0u8; crate::MAX_PACKET];
+        let n = tcb.extract_packet(&mut buf).expect("extract");
+        assert!(n > 0, "a FIN retransmit should have been staged");
+        let seg = crate::wire::parse(&buf[..n]).expect("parse");
+        assert!(
+            seg.has(crate::wire::flags::FIN),
+            "retransmit must carry the FIN flag",
+        );
+        assert_eq!(seg.seq, fin, "FIN retransmit sits at fin_seq");
+        assert_eq!(
+            tcb.snd_nxt,
+            fin.wrapping_add(1),
+            "snd_nxt advances past the FIN again",
+        );
     }
 }

@@ -7,11 +7,27 @@
 //!
 //! Between injects we also tick the clock forward so timer paths
 //! get exercised against the injected segments.
+//!
+//! Oracle: `TcpError::Overflow` is an *internal* invariant-violation
+//! code (a buffer offset/length computed from sequence arithmetic went
+//! out of range). It must be unreachable from any inbound packet or
+//! timer tick, so we treat it as a hard failure rather than swallowing
+//! it like the legitimate protocol errors (`NotForUs`, `MalformedPacket`,
+//! `WouldBlock`, …). This is the check that would have caught the TLP
+//! partial-ACK `tcp_tick: -9` regression.
 
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use tcp_sans_io::{Endpoint, Tcb, TcbConfig};
+use tcp_sans_io::{Endpoint, Tcb, TcbConfig, TcpError};
+
+/// Panic iff a call surfaced the internal `Overflow` invariant code.
+#[track_caller]
+fn assert_not_overflow<T>(r: Result<T, TcpError>) {
+    if let Err(TcpError::Overflow) = r {
+        panic!("internal TcpError::Overflow escaped across the API boundary");
+    }
+}
 
 const LOCAL_IP: [u8; 4] = [10, 0, 0, 1];
 const PEER_IP: [u8; 4] = [10, 0, 0, 2];
@@ -46,12 +62,16 @@ fuzz_target!(|data: &[u8]| {
         let chunk = &data[i..i + take];
         i += take;
 
-        // Inject. Errors are fine (malformed / not-for-us).
-        let _ = tcb.inject_packet(chunk);
+        // Inject. Errors are fine (malformed / not-for-us) — except the
+        // internal Overflow code, which signals a sequence-arithmetic
+        // buffer-bounds bug.
+        assert_not_overflow(tcb.inject_packet(chunk));
         // Drain any reply packets the stack staged.
         let mut out = [0u8; 1500];
         for _ in 0..32 {
-            match tcb.extract_packet(&mut out) {
+            let r = tcb.extract_packet(&mut out);
+            assert_not_overflow(r);
+            match r {
                 Ok(0) | Err(_) => break,
                 Ok(_) => {}
             }
@@ -67,6 +87,6 @@ fuzz_target!(|data: &[u8]| {
         };
         now_ms = now_ms.saturating_add(delta);
         tcb.set_now(now_ms);
-        let _ = tcb.tick();
+        assert_not_overflow(tcb.tick());
     }
 });

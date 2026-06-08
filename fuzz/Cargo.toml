@@ -45,3 +45,10 @@ path = "fuzz_targets/tcb_inject_sequence.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "tcb_client_session"
+path = "fuzz_targets/tcb_client_session.rs"
+test = false
+doc = false
+bench = false

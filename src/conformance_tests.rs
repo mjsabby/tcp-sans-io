@@ -2261,6 +2261,146 @@ fn seq_lt(a: u32, b: u32) -> bool {
     (a.wrapping_sub(b) as i32) < 0
 }
 
+/// Oracle for the overflow-bug class: `TcpError::Overflow` is an internal
+/// invariant-violation code (a buffer offset/length derived from sequence
+/// arithmetic went out of range). It must never escape across the public
+/// API on any reachable path, so surface it as a test failure rather than
+/// folding it into the "expected protocol error" bucket. Returns the
+/// result untouched so call sites can still inspect `Ok`/other `Err`s.
+#[track_caller]
+fn deny_overflow<T>(r: Result<T, crate::TcpError>) -> Result<T, crate::TcpError> {
+    if let Err(crate::TcpError::Overflow) = r {
+        panic!("internal TcpError::Overflow surfaced across the public API");
+    }
+    r
+}
+
+/// Stress the client send/retransmit machinery against many deterministic
+/// streams of cumulative ACKs (frequently landing *inside* an in-flight
+/// segment), SACK blocks (to drive SACK/RACK recovery and its clipped
+/// selective-retransmits, which re-arm TLP), and clock jumps that fire
+/// TLP and RTO. The single oracle is `deny_overflow`: no inbound packet
+/// or timer tick may ever surface the internal `Overflow` code.
+///
+/// This is the *class* of bug the TLP partial-ACK regression belonged to;
+/// the gVisor chaos suite only hit it by timing luck. The seeded PRNG
+/// makes any failure reproduce byte-for-byte.
+#[test]
+fn send_path_stress_never_overflows() {
+    for seed in 0u64..24 {
+        run_send_path_stress(seed);
+    }
+}
+
+fn run_send_path_stress(seed: u64) {
+    let mut tcb = make_tcb();
+    let mut now = 0u64;
+    let peer_ts = handshake_with_ts(&mut tcb, &mut now);
+
+    // xorshift64 — deterministic per seed.
+    let mut state = seed ^ 0xA5A5_5A5A_DEAD_BEEF;
+    let mut rng = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+
+    let una0 = ISS.wrapping_add(1);
+    let mut acked = una0; // peer's cumulative-ACK cursor over our stream
+    let mut hi = una0; // highest (seq+len) we've observed the stack emit
+    let mut produced: u64 = 0;
+    let total: u64 = 128 * 1024;
+    let mut chunk = vec![0u8; 4096];
+
+    for _ in 0..3000 {
+        // 1. Offer more application data so the send ring stays busy.
+        if produced < total {
+            let n = 1 + (rng() as usize % chunk.len());
+            for (k, b) in chunk[..n].iter_mut().enumerate() {
+                *b = (produced.wrapping_add(k as u64) & 0xFF) as u8;
+            }
+            if let Ok(w) = deny_overflow(tcb.send(&chunk[..n])) {
+                produced += w as u64;
+            }
+        }
+
+        // 2. Emit and learn the high-water sequence number.
+        now += 1 + (rng() % 3);
+        tcb.set_now(now);
+        let _ = deny_overflow(tcb.tick());
+        let mut buf = [0u8; MAX_PACKET];
+        loop {
+            match deny_overflow(tcb.extract_packet(&mut buf)) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if let Ok(seg) = wire::parse(&buf[..n]) {
+                        let end = seg.seq.wrapping_add(seg.payload.len() as u32);
+                        if seq_lt(hi, end) {
+                            hi = end;
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+
+        // 3. Inject an ACK at an arbitrary (often mid-segment) offset, with
+        //    ~50% chance of a SACK block above it to drive recovery.
+        let span = hi.wrapping_sub(acked);
+        if (span as i32) > 0 {
+            let new_ack = acked.wrapping_add(rng() as u32 % (span + 1));
+            let above = hi.wrapping_sub(new_ack);
+            let sack = if (above as i32) > 2 && rng() & 1 == 0 {
+                let l = new_ack.wrapping_add(1 + rng() as u32 % above);
+                let rem = hi.wrapping_sub(l);
+                if (rem as i32) > 0 {
+                    Some((l, l.wrapping_add(1 + rng() as u32 % rem)))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let pkt = build_in_full(
+                flags::ACK,
+                PSS.wrapping_add(1),
+                new_ack,
+                PEER_WIN,
+                None,
+                Some((peer_ts.wrapping_add(now as u32), now as u32)),
+                false,
+                sack,
+                &[],
+            );
+            let _ = deny_overflow(tcb.inject_packet(&pkt));
+            let mut b = [0u8; MAX_PACKET];
+            while matches!(deny_overflow(tcb.extract_packet(&mut b)), Ok(n) if n > 0) {}
+            if seq_lt(acked, new_ack) {
+                acked = new_ack;
+            }
+        }
+
+        // 4. Periodically jump the clock to fire TLP (>=10ms) or RTO
+        //    (>=200ms) on whatever tail is currently in flight.
+        if rng() % 3 == 0 {
+            now += 11 + (rng() % 260);
+            tcb.set_now(now);
+            let _ = deny_overflow(tcb.tick());
+            let mut b = [0u8; MAX_PACKET];
+            while matches!(deny_overflow(tcb.extract_packet(&mut b)), Ok(n) if n > 0) {}
+        }
+
+        // 5. Keep the receive side drained.
+        let mut r = [0u8; 2048];
+        let _ = deny_overflow(tcb.recv(&mut r));
+
+        if produced >= total && !seq_lt(acked, hi) {
+            break;
+        }
+    }
+}
+
 /// Repro for the failing `rack_tail_loss_detection.pkt` packetdrill
 /// scenario: with a short ~5ms SRTT, send 4 segments at t≈5ms, SACK
 /// only #4 at t=15ms. Expect retransmit of seq #1 (NOT #4).
