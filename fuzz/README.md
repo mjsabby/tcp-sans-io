@@ -13,7 +13,8 @@ so those are the natural targets.
 | `wire_parse_emit_roundtrip` | For any successfully parsed segment, re-emitting and re-parsing produces the same observable fields (seq, ack, flags, window, MSS / WS / TS / SACK options, payload). |
 | `tcb_inject_sequence` | A fresh `Tcb` in `Listen` survives any sequence of arbitrary `inject_packet` calls + clock ticks without panicking, blowing through bounded buffers, or leaving the state machine in an unreachable state. |
 | `tcb_client_session` | Drives the **active-open send/retransmit** path (`connect` → scripted SACK-enabled handshake → `send` → fuzzer-chosen cumulative-ACK offsets, SACK blocks, and clock jumps that fire TLP/RTO). Asserts the internal `TcpError::Overflow` invariant code never escapes the API. This is the path the `tcp_tick: -9` TLP partial-ACK bug lived in. |
-| `tcb_loopback` | Drives **two real stacks** (client + server) against each other through a fuzzer-controlled chaos channel with a *finite drop budget* (so the channel is eventually reliable). Oracle: the bidirectional transfer **must always converge** — a stack that deadlocks (e.g. the PRR ACK-clock stall: recovery with `snd_credit == 0` and an empty pipe) never does, and trips the iteration budget. This is the deadlock / sender-stall catcher that the single-peer targets cannot be (their synthetic peer may legitimately stall the connection). |
+| `tcb_loopback` | Drives **two real stacks** (client + server) against each other through a fuzzer-controlled chaos channel with a *finite drop budget* (so the channel is eventually reliable). Oracle: the bidirectional transfer **must always converge** — a stack that deadlocks (e.g. the PRR ACK-clock stall: recovery with `snd_credit == 0` and an empty pipe) never does, and trips the iteration budget. A per-step **liveness** oracle (below) trips the same black-hole the *instant* it forms, and the harness fast-forwards its clock to the next armed timer at quiescence so a missing timer surfaces in a fraction of the runtime. This is the deadlock / sender-stall catcher that the single-peer targets cannot be (their synthetic peer may legitimately stall the connection). |
+| `tcb_loopback_small` | Same engine and oracles as `tcb_loopback` but with **8 KiB rings** (vs. the megabyte default). Tiny windows keep the connection in perpetual slow-start + loss-recovery, driving the credit / flight / reassembly-hole edge states — where deadlocks hide — at many times the exec/s. The large-ring variant additionally covers ring wrap-around; run both. |
 
 Both `tcb_*` targets treat a returned `TcpError::Overflow` as a hard
 failure: it is an *internal* "a sequence-derived buffer offset/length
@@ -33,6 +34,7 @@ invariants after every operation (`send` / `inject_packet` / `tick` /
 | `Tcb::debug_validate_invariants()` | `snd_una ≤ snd_nxt ≤ snd_max`; FIN/SYN sequence accounting; outstanding span never exceeds buffered bytes + phantom SYN/FIN; RTO armed only with data in flight; staged packet ≤ `MAX_PACKET`. |
 | Emitted-packet parse + tuple | Every packet the stack emits must re-parse, and must be `local → peer` with the expected 4-tuple (no checksum/header/option corruption, no tuple confusion). |
 | **Livelock / quiescence** | At a *fixed* clock with nothing injected, the stack must stop emitting within a bounded number of `tick`+drain cycles. A stack that emits forever at one instant is livelocked. |
+| **Liveness / no black-hole** (`Tcb::debug_check_liveness()`) | The *deadlock* counterpart to `debug_validate_invariants` (which only checks "a timer implies outstanding data"). Checks the direction deadlocks live in: sent-but-unacked data must always have a retransmit timer (RTO/TLP/RACK) behind it, and data queued under a zero window must have a persist timer. Catches the PRR `snd_credit == 0` stall **and** a lost sole-outstanding FIN at the first quiescent step, not after the whole budget burns down. |
 | **Bounded output** | A single drain may not exceed a hard packet cap (no ACK/output storm). |
 | **Monotonic progress** | `snd_una` and `rcv_nxt` (cumulative cursors) may only advance in serial-number space. |
 | Legal state transitions | Only RFC 793 edges (`Established → FinWait1`, …); rejects impossible jumps like `Closed → Established`. |
@@ -71,6 +73,14 @@ cargo +nightly fuzz run wire_parse -- -max_total_time=300 -timeout=10
 # shallow — see the heap-buffers note below).
 for t in tcb_inject_sequence tcb_client_session; do
     cargo +nightly fuzz run "$t" -- -max_total_time=60 -timeout=10 -rss_limit_mb=4096
+done
+
+# The two-stack deadlock catchers. The small-ring variant is the fast
+# workhorse (perpetual slow-start/recovery, high exec/s); the large-ring
+# variant adds ring wrap-around coverage. Use a generous -timeout: a single
+# input drives a whole transfer.
+for t in tcb_loopback_small tcb_loopback; do
+    cargo +nightly fuzz run "$t" -- -max_total_time=120 -timeout=30 -rss_limit_mb=4096
 done
 ```
 

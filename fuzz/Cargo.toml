@@ -59,3 +59,10 @@ path = "fuzz_targets/tcb_loopback.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "tcb_loopback_small"
+path = "fuzz_targets/tcb_loopback_small.rs"
+test = false
+doc = false
+bench = false
