@@ -101,12 +101,16 @@ fn next_byte(data: &[u8], fi: &mut usize) -> u8 {
     b
 }
 
-/// Decide this packet's fate from a fuzzer byte. **Drops are capped by
-/// `budget`** so the channel is *eventually reliable* — every dropped
-/// segment is ultimately retransmitted and delivered, which is what makes
-/// non-convergence a genuine deadlock rather than a dead link. Duplication
-/// and bounded reordering never lose data, so they stay uncapped.
-fn chaos_decide(b: u8, budget: &mut u32) -> (bool, bool, u64) {
+/// Decide this packet's fate from a fuzzer byte. Chaos only applies while
+/// `lossy` (a bounded early window with drop budget remaining); afterwards
+/// the channel is fully reliable and in-order. **Drops are capped by
+/// `budget`** and the window is iteration-bounded, so the channel is always
+/// *eventually reliable* — which is what makes non-convergence a genuine
+/// deadlock rather than a dead link.
+fn chaos_decide(b: u8, lossy: bool, budget: &mut u32) -> (bool, bool, u64) {
+    if !lossy {
+        return (false, false, 0);
+    }
     let drop = *budget > 0 && (b & 0x07 == 0); // ~12.5% until the budget is spent
     if drop {
         *budget -= 1;
@@ -176,13 +180,19 @@ fuzz_target!(|data: &[u8]| {
         check(&cli);
         check(&srv);
 
+        // Chaos applies only in a bounded early window with drop budget
+        // left; the back half of the run is a fully reliable, in-order
+        // channel, so a correct stack is guaranteed to converge and only a
+        // genuine deadlock fails to.
+        let lossy = iter < 400_000 && drop_budget > 0;
+
         // Stage egress into the links.
         while let Some(n) = no_internal(cli.extract_packet(&mut pkt)) {
             if n == 0 {
                 break;
             }
             if let Some(slice) = pkt.get(..n) {
-                let (d, u, dl) = chaos_decide(next_byte(data, &mut fi), &mut drop_budget);
+                let (d, u, dl) = chaos_decide(next_byte(data, &mut fi), lossy, &mut drop_budget);
                 c2s.offer(iter, slice, d, u, dl);
             }
         }
@@ -191,7 +201,7 @@ fuzz_target!(|data: &[u8]| {
                 break;
             }
             if let Some(slice) = pkt.get(..n) {
-                let (d, u, dl) = chaos_decide(next_byte(data, &mut fi), &mut drop_budget);
+                let (d, u, dl) = chaos_decide(next_byte(data, &mut fi), lossy, &mut drop_budget);
                 s2c.offer(iter, slice, d, u, dl);
             }
         }
@@ -206,7 +216,7 @@ fuzz_target!(|data: &[u8]| {
                     break;
                 }
                 if let Some(slice) = pkt.get(..n) {
-                    let (d, u, dl) = chaos_decide(next_byte(data, &mut fi), &mut drop_budget);
+                    let (d, u, dl) = chaos_decide(next_byte(data, &mut fi), lossy, &mut drop_budget);
                     s2c.offer(iter, slice, d, u, dl);
                 }
             }
@@ -220,7 +230,7 @@ fuzz_target!(|data: &[u8]| {
                     break;
                 }
                 if let Some(slice) = pkt.get(..n) {
-                    let (d, u, dl) = chaos_decide(next_byte(data, &mut fi), &mut drop_budget);
+                    let (d, u, dl) = chaos_decide(next_byte(data, &mut fi), lossy, &mut drop_budget);
                     c2s.offer(iter, slice, d, u, dl);
                 }
             }
