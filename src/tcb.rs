@@ -170,6 +170,20 @@ impl Default for RackLostQueue {
 /// this budget is the only adversarial flood the listener has to absorb.
 const MAX_SYN_RCVD_RETRIES: u8 = 5;
 
+/// RFC 9293 §3.8.3 "R2": the maximum number of consecutive retransmission
+/// timeouts — on data, a SYN, or a FIN — tolerated before a synchronized (or
+/// actively-opening) connection is aborted. The counter resets to zero
+/// whenever `snd_una` advances, i.e. on any proof the peer is still alive, so
+/// only sustained silence trips it. With the capped exponential RTO back-off
+/// (RTO_MIN 200 ms, ×2 per timeout, RTO_MAX 60 s) a budget of 10 places the
+/// abort at ~200 s of wholly-unacknowledged retransmission for the fastest
+/// (RTO_MIN) connections — past the RFC-recommended 100 s floor — and
+/// proportionally longer at larger RTTs. `SYN_RCVD` is exempt: it reverts to
+/// `LISTEN` under its own [`MAX_SYN_RCVD_RETRIES`] budget instead. The abort
+/// is local (no RST is sent — at R2 the peer is presumed unreachable, as Linux
+/// does on `tcp_retries2`).
+const MAX_RETRANSMITS: u8 = 10;
+
 /// SYN-cookie time-bucket width (RFC 4987-style). 64 s matches Linux's
 /// historical choice. The validator accepts both the current bucket and
 /// the previous one, giving cookies a 64-128 s validity window.
@@ -407,6 +421,12 @@ pub struct Tcb<const BUF: usize = BUF_CAP> {
     /// SYN-ACK retransmit counter while in `SynRcvd`. Capped by
     /// [`MAX_SYN_RCVD_RETRIES`]; on overflow we revert to `Listen`.
     syn_rcvd_retries: u8,
+    /// Consecutive RTO firings without `snd_una` advancing — the RFC 9293
+    /// §3.8.3 "R2" counter. Reset to 0 on any forward ACK progress; once it
+    /// exceeds [`MAX_RETRANSMITS`] the connection is aborted (a silent or
+    /// vanished peer can't keep us retransmitting forever). `SYN_RCVD` uses
+    /// `syn_rcvd_retries` instead and never touches this.
+    rtx_count: u8,
     /// 128-bit secret used to MAC SYN cookies (RFC 4987). Live only if
     /// `cookie_secret_set` is true. With cookies enabled, a LISTEN TCB
     /// answers an inbound SYN **statelessly**: the SYN-ACK's ISN encodes
@@ -478,6 +498,7 @@ impl<const BUF: usize> Tcb<BUF> {
             ip_id: 0,
             is_listener: false,
             syn_rcvd_retries: 0,
+            rtx_count: 0,
             cookie_secret: [0u8; 16],
             cookie_secret_set: false,
         })
@@ -833,6 +854,7 @@ impl<const BUF: usize> Tcb<BUF> {
         self.rack_lost_queue.clear();
         self.tlp_deadline = None;
         self.tlp_fired = false;
+        self.rtx_count = 0;
         self.send_ring.clear();
         self.recv_ring.clear();
         self.reasm.clear();
@@ -1013,6 +1035,33 @@ impl<const BUF: usize> Tcb<BUF> {
         Ok(())
     }
 
+    /// RFC 9293 §3.8.3 R2 abort: tear the connection down locally once the
+    /// retransmit budget ([`MAX_RETRANSMITS`]) is spent. Unlike [`Tcb::abort`]
+    /// this emits **no** RST — at R2 the peer is presumed unreachable (Linux
+    /// behaves the same on `tcp_retries2`), and the deployment's
+    /// anti-reflection posture prefers not to spray resets at a silent
+    /// endpoint. The failure surfaces as `ConnectionReset` ("aborted locally")
+    /// via [`Tcb::poll`] / [`Tcb::recv`].
+    fn abort_timed_out(&mut self) {
+        self.state = State::Closed;
+        self.error = Some(TcpError::ConnectionReset);
+        self.send_ring.clear();
+        self.recv_ring.clear();
+        self.reasm.clear();
+        // Nothing is outstanding on a dead connection; collapse the send
+        // sequence so the snd_una/snd_nxt/snd_max invariants hold now that the
+        // ring is empty.
+        self.snd_nxt = self.snd_una;
+        self.snd_max = self.snd_una;
+        self.fin_sent = false;
+        self.rto_deadline = None;
+        self.time_wait_deadline = None;
+        self.persist_deadline = None;
+        self.ack_deadline = None;
+        self.rack_deadline = None;
+        self.tlp_deadline = None;
+    }
+
     /// Aggregate event flags for the host async runtime to dispatch on.
     pub fn poll(&self) -> u32 {
         let mut ev = 0;
@@ -1096,6 +1145,19 @@ impl<const BUF: usize> Tcb<BUF> {
         // RTO continues to use Tahoe-style cwnd=1*MSS + slow-start re-open.
         if let Some(deadline) = self.rto_deadline {
             if self.now_ms >= deadline {
+                // RFC 9293 §3.8.3 (R2): bound retransmissions so a silent or
+                // vanished peer cannot keep us retransmitting forever. Every
+                // retransmitting state except SYN_RCVD (which reverts to
+                // LISTEN under its own budget below) shares this counter; it
+                // was reset on the last forward ACK, so reaching the cap means
+                // nothing has been acknowledged for the whole back-off window.
+                if self.state != State::SynRcvd {
+                    self.rtx_count = self.rtx_count.saturating_add(1);
+                    if self.rtx_count > MAX_RETRANSMITS {
+                        self.abort_timed_out();
+                        return Ok(());
+                    }
+                }
                 let flight = self.snd_nxt.wrapping_sub(self.snd_una);
                 self.cc.on_rto_loss(flight);
                 self.snd_nxt = self.snd_una;
@@ -1278,6 +1340,7 @@ impl<const BUF: usize> Tcb<BUF> {
             self.irs = seg.seq;
             self.rcv_nxt = seg.seq.wrapping_add(1);
             self.snd_una = seg.ack;
+            self.rtx_count = 0;
             // RFC 7323 §2.3: SYN-ACK window field is NEVER scaled.
             self.snd_wnd = seg.window as u32;
 
@@ -2093,6 +2156,9 @@ impl<const BUF: usize> Tcb<BUF> {
         }
         self.send_ring.consume(payload_acked as usize);
         self.snd_una = ack;
+        // Forward progress: the peer is alive and acknowledging, so the
+        // RFC 9293 §3.8.3 R2 retransmit budget starts over.
+        self.rtx_count = 0;
         // If a prior RTO rewound `snd_nxt` to `snd_una`, but the peer's
         // first cumulative ACK after recovery jumps over the rewound
         // point (because the peer had buffered our pre-rewind segments
@@ -3533,5 +3599,108 @@ mod retransmit_overflow_regression {
         assert_eq!(seg.seq, 5_000, "the FIN sits at snd_nxt");
         assert!(tcb.fin_sent, "fin_sent must be pinned after emission");
         assert_eq!(tcb.fin_seq, 5_000, "fin_seq must record the FIN's sequence");
+    }
+
+    /// RFC 9293 §3.8.3 (R2): a synchronized connection whose peer goes silent
+    /// must abort after `MAX_RETRANSMITS` unacknowledged retransmission
+    /// timeouts rather than retransmit forever.
+    #[test]
+    fn r2_aborts_after_max_retransmits_without_ack() {
+        let mut tcb: Tcb = Tcb::new(cfg(1000)).expect("tcb");
+        tcb.state = State::Established;
+        tcb.snd_wnd = 65_535;
+        tcb.rcv_nxt = 9_000;
+        tcb.snd_una = 5_000;
+        tcb.snd_nxt = 6_460;
+        tcb.snd_max = 6_460; // one 1460-byte segment in flight, unacked
+        let n = tcb.send_ring.write(&[0xAB; 1_460]);
+        assert_eq!(n, 1_460);
+        tcb.now_ms = 0;
+        tcb.rto_ms = 200;
+        tcb.arm_rto_for(tcb.snd_nxt);
+
+        let mut fired = 0u32;
+        let mut buf = [0u8; crate::MAX_PACKET];
+        for _ in 0..(super::MAX_RETRANSMITS as u32 + 5) {
+            let dl = tcb.debug_snapshot().rto_deadline;
+            if dl == u64::MAX {
+                break; // no RTO armed
+            }
+            tcb.set_now(dl + 1);
+            tcb.tick().expect("tick");
+            fired += 1;
+            if tcb.state() == State::Closed {
+                break;
+            }
+            while tcb.extract_packet(&mut buf).expect("extract") > 0 {}
+        }
+
+        assert_eq!(
+            fired,
+            super::MAX_RETRANSMITS as u32 + 1,
+            "abort must fire exactly one timeout past the budget",
+        );
+        assert_eq!(tcb.state(), State::Closed, "R2 must abort the connection");
+        assert_eq!(
+            tcb.error,
+            Some(crate::TcpError::ConnectionReset),
+            "the R2 abort surfaces as a local reset",
+        );
+    }
+
+    /// The R2 counter resets on any forward ACK progress, so a peer that keeps
+    /// acknowledging — however slowly — is never spuriously aborted.
+    #[test]
+    fn r2_counter_resets_on_ack_progress() {
+        let mut tcb: Tcb = Tcb::new(cfg(1000)).expect("tcb");
+        tcb.state = State::Established;
+        tcb.snd_wnd = 65_535;
+        tcb.rcv_nxt = 9_000;
+        tcb.snd_una = 5_000;
+        tcb.snd_nxt = 6_460;
+        tcb.snd_max = 6_460;
+        let n = tcb.send_ring.write(&[0xAB; 1_460]);
+        assert_eq!(n, 1_460);
+        tcb.now_ms = 0;
+        tcb.rto_ms = 200;
+        tcb.arm_rto_for(tcb.snd_nxt);
+
+        // Fire a few RTOs short of the budget — no abort yet.
+        let mut buf = [0u8; crate::MAX_PACKET];
+        for _ in 0..(super::MAX_RETRANSMITS as u32 - 2) {
+            let dl = tcb.debug_snapshot().rto_deadline;
+            tcb.set_now(dl + 1);
+            tcb.tick().expect("tick");
+            while tcb.extract_packet(&mut buf).expect("extract") > 0 {}
+        }
+        assert!(tcb.rtx_count > 0, "the counter should have accrued");
+        assert_eq!(tcb.state(), State::Established, "must not have aborted yet");
+
+        // A cumulative ACK advancing snd_una proves the peer is alive.
+        let opts = crate::wire::TcpOptions::NONE;
+        let mut pkt = [0u8; crate::MAX_PACKET];
+        let len = crate::wire::emit(
+            &mut pkt,
+            [10, 0, 0, 2],
+            [10, 0, 0, 1],
+            80,
+            49152,
+            9_000, // seq == our rcv_nxt
+            5_730, // acks 730 of the outstanding bytes
+            crate::wire::flags::ACK,
+            65_535,
+            &opts,
+            &[],
+            1,
+            crate::wire::ecn::NOT_ECT,
+        )
+        .expect("emit");
+        tcb.inject_packet(&pkt[..len]).expect("inject");
+
+        assert_eq!(tcb.snd_una, 5_730, "the ACK must have advanced snd_una");
+        assert_eq!(
+            tcb.rtx_count, 0,
+            "forward ACK progress must reset the R2 retransmit counter",
+        );
     }
 }

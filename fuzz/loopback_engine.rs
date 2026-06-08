@@ -254,7 +254,23 @@ pub fn run<const BUF: usize>(data: &[u8], xfer: u32, send_cap: usize) {
         // the data-path deadlock class this oracle targets. Bugs rooted in
         // *latched* state (e.g. a zero window carried over from the data phase)
         // still reproduce, since the latch happens before `closing`.
-        let lossy = input_left && iter < 400_000 && drop_budget > 0 && both_established && !closing;
+        //
+        // Chaos is also bounded in *virtual time* (`now < CHAOS_MS`). The
+        // harness fast-forwards the clock to each RTO at quiescence, so an
+        // unbounded loss window would let a single segment's retransmits be
+        // dropped enough times in a row to trip the production R2 retransmit
+        // cap (RFC 9293 §3.8.3) — aborting a connection whose peer is in fact
+        // alive. With the RTO back-off, a bounded window admits only a handful
+        // of consecutive drops, well under the R2 budget, so R2 stays reserved
+        // for genuinely vanished peers (which this two-live-stack model never
+        // has). CHAOS_MS is comfortably below the R2 abort time (~200 s).
+        const CHAOS_MS: u64 = 30_000;
+        let lossy = input_left
+            && iter < 400_000
+            && now < CHAOS_MS
+            && drop_budget > 0
+            && both_established
+            && !closing;
 
         // Stage egress into the links.
         while let Some(n) = no_internal(cli.extract_packet(&mut pkt)) {
