@@ -281,7 +281,20 @@ impl SackScoreboard {
             return None;
         }
         let mut cursor = left;
+        let mut guard = 0u32;
         while seq_lt(cursor, right) {
+            // `cursor` strictly advances each iteration (to a SACK range's
+            // right edge, or to the next gap end), so the scan visits at
+            // most `2*SCOREBOARD_CAP` boundaries when ranges are disjoint —
+            // which they always are after `add_range`'s cascade-merge. The
+            // budget defends against a malformed-range invariant violation.
+            if crate::loop_budget_exhausted(
+                &mut guard,
+                (SCOREBOARD_CAP as u32) * 2 + 4,
+                "scoreboard::first_unsacked_subrange",
+            ) {
+                return None;
+            }
             // If cursor is inside any SACK range, jump to its right edge.
             let mut advanced = false;
             for r in self.ranges() {
@@ -339,7 +352,19 @@ impl SackScoreboard {
         // Scan upward from `start`, skipping over SACK ranges. The result
         // is the first gap-start in [start, snd_max) that IsLost holds for.
         let mut cursor = start;
+        let mut guard = 0u32;
         while seq_lt(cursor, snd_max) {
+            // `cursor` strictly advances each iteration (to a SACK range's
+            // right edge, or to the next gap end), bounding the scan at
+            // `2*SCOREBOARD_CAP` boundaries for disjoint ranges. The budget
+            // is a backstop against a broken disjointness invariant.
+            if crate::loop_budget_exhausted(
+                &mut guard,
+                (SCOREBOARD_CAP as u32) * 2 + 4,
+                "scoreboard::next_seg",
+            ) {
+                return None;
+            }
             // If cursor is inside a SACK range, jump to its right edge.
             let mut advanced = false;
             for r in self.ranges() {

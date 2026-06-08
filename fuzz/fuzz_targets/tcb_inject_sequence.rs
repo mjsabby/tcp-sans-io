@@ -74,6 +74,51 @@ fn observe_state(prev: &mut State, tcb: &Tcb) {
     check(tcb);
 }
 
+/// Livelock oracle: at a fixed clock with nothing injected, the stack must
+/// stop emitting within a bounded number of tick+drain cycles. A spin here
+/// would otherwise hang the process with no crash artifact.
+fn settle(tcb: &mut Tcb, prev: &mut State) {
+    for _ in 0..4096 {
+        let _ = no_internal(tcb.tick());
+        observe_state(prev, tcb);
+        let mut out = [0u8; MAX_PACKET];
+        let mut emitted = false;
+        for _ in 0..256 {
+            match no_internal(tcb.extract_packet(&mut out)) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    emitted = true;
+                    observe_state(prev, tcb);
+                }
+            }
+        }
+        if !emitted {
+            return;
+        }
+    }
+    panic!("livelock: stack never quiesced at a fixed clock with no input");
+}
+
+/// Monotonic-progress oracle for the cumulative cursors.
+#[track_caller]
+fn assert_monotonic(prev: &mut (u32, u32), tcb: &Tcb) {
+    let s = tcb.debug_snapshot();
+    assert!(
+        (s.snd_una.wrapping_sub(prev.0) as i32) >= 0,
+        "snd_una regressed: {} -> {}",
+        prev.0,
+        s.snd_una,
+    );
+    assert!(
+        (s.rcv_nxt.wrapping_sub(prev.1) as i32) >= 0,
+        "rcv_nxt regressed: {} -> {}",
+        prev.1,
+        s.rcv_nxt,
+    );
+    prev.0 = s.snd_una;
+    prev.1 = s.rcv_nxt;
+}
+
 const LOCAL_IP: [u8; 4] = [10, 0, 0, 1];
 const PEER_IP: [u8; 4] = [10, 0, 0, 2];
 
@@ -97,6 +142,10 @@ fuzz_target!(|data: &[u8]| {
     let mut now_ms: u64 = 0;
     tcb.set_now(now_ms);
     check(&tcb);
+    let mut mono = {
+        let s = tcb.debug_snapshot();
+        (s.snd_una, s.rcv_nxt)
+    };
 
     // Chunk the input as (length-prefixed) packets. Use the first
     // byte of each chunk as length-1 (so chunk lengths are 1..256
@@ -154,5 +203,9 @@ fuzz_target!(|data: &[u8]| {
         check(&tcb);
         let _ = no_internal(tcb.tick());
         observe_state(&mut prev_state, &tcb);
+
+        // Livelock + monotonic oracles at the (now fixed) clock.
+        settle(&mut tcb, &mut prev_state);
+        assert_monotonic(&mut mono, &tcb);
     }
 });

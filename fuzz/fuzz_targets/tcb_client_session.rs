@@ -138,6 +138,63 @@ fn drain(tcb: &mut Tcb, hi: &mut u32, prev_state: &mut State) {
     }
 }
 
+/// Livelock oracle. At a *fixed* clock with nothing injected, the stack
+/// must stop emitting within a bounded number of `tick`+drain cycles: the
+/// only data it can emit at a single instant is the currently-open window,
+/// and no timer can re-fire without the clock advancing. A stack that keeps
+/// producing output forever at one instant is livelocked. The bound is far
+/// above the worst legitimate burst (`BUF_CAP / MSS` ≈ a few hundred
+/// segments), so only a true spin trips it.
+fn settle(tcb: &mut Tcb, hi: &mut u32, prev_state: &mut State) {
+    for _ in 0..4096 {
+        no_internal(tcb.tick());
+        observe_state(prev_state, tcb);
+        let mut out = [0u8; MAX_PACKET];
+        let mut emitted = false;
+        for _ in 0..256 {
+            match no_internal(tcb.extract_packet(&mut out)) {
+                Some(0) | None => break,
+                Some(n) => {
+                    emitted = true;
+                    let seg = wire::parse(&out[..n]).expect("self-emitted packet must parse");
+                    let end = seg.seq.wrapping_add(seg.seq_len());
+                    if (end.wrapping_sub(*hi) as i32) > 0 {
+                        *hi = end;
+                    }
+                    observe_state(prev_state, tcb);
+                }
+            }
+        }
+        if !emitted {
+            return; // quiesced
+        }
+    }
+    panic!("livelock: stack never quiesced at a fixed clock with no input");
+}
+
+/// Monotonic-progress oracle. `snd_una` and `rcv_nxt` are cumulative TCP
+/// cursors that may only advance (serial arithmetic). A regression means a
+/// valid ACK was un-applied or received data was un-delivered — a
+/// correctness bug that could also drive loops backward.
+#[track_caller]
+fn assert_monotonic(prev: &mut (u32, u32), tcb: &Tcb) {
+    let s = tcb.debug_snapshot();
+    assert!(
+        (s.snd_una.wrapping_sub(prev.0) as i32) >= 0,
+        "snd_una regressed: {} -> {}",
+        prev.0,
+        s.snd_una,
+    );
+    assert!(
+        (s.rcv_nxt.wrapping_sub(prev.1) as i32) >= 0,
+        "rcv_nxt regressed: {} -> {}",
+        prev.1,
+        s.rcv_nxt,
+    );
+    prev.0 = s.snd_una;
+    prev.1 = s.rcv_nxt;
+}
+
 #[track_caller]
 fn assert_sender_core_unchanged(before: DebugSnapshot, after: DebugSnapshot, why: &str) {
     assert_eq!(after.snd_una, before.snd_una, "{why}: snd_una changed");
@@ -270,6 +327,10 @@ fuzz_target!(|data: &[u8]| {
     if !complete_handshake(&mut tcb, &mut now, &mut hi, &mut prev_state) {
         return;
     }
+    let mut mono = {
+        let s = tcb.debug_snapshot();
+        (s.snd_una, s.rcv_nxt)
+    };
 
     let data_opts = TcpOptions {
         mss: None,
@@ -392,5 +453,11 @@ fuzz_target!(|data: &[u8]| {
         let mut rbuf = [0u8; 2048];
         no_internal(tcb.recv(&mut rbuf));
         observe_state(&mut prev_state, &tcb);
+
+        // 6. Livelock + monotonic-progress oracles. With the clock held
+        //    fixed and nothing injected, the stack must quiesce; and the
+        //    cumulative cursors must never have regressed this step.
+        settle(&mut tcb, &mut hi, &mut prev_state);
+        assert_monotonic(&mut mono, &tcb);
     }
 });

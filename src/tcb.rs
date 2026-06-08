@@ -1782,7 +1782,20 @@ impl<const BUF: usize> Tcb<BUF> {
     /// recv_ring fills.
     fn drain_reassembly(&mut self) -> usize {
         let mut total = 0usize;
+        let mut drain_guard = 0u32;
         while let Some((slot_idx, slot_start, slot_len)) = self.reasm.ready_slot(self.rcv_nxt) {
+            // At most `MAX_HOLES` distinct slots can be drained; each
+            // iteration either fully commits one slot (and frees it) or
+            // breaks on a full ring. The budget guards against a future
+            // `ready_slot` that could keep returning a slot the loop
+            // doesn't make progress on.
+            if crate::loop_budget_exhausted(
+                &mut drain_guard,
+                crate::reassembly::MAX_HOLES as u32 + 2,
+                "drain_reassembly",
+            ) {
+                break;
+            }
             // Sanity: the ready_slot should match rcv_nxt exactly.
             if slot_start != self.rcv_nxt {
                 break;
@@ -1793,8 +1806,12 @@ impl<const BUF: usize> Tcb<BUF> {
             self.rcv_nxt = self.rcv_nxt.wrapping_add(written as u32);
             self.reasm.commit_drain(slot_idx, written);
             total += written;
-            if written < slot_len {
-                break; // ring full
+            // Break on a full ring (`written < slot_len`) OR on a degenerate
+            // zero-length slot (`written == 0` with `slot_len == 0`): the
+            // latter would otherwise leave `rcv_nxt` unchanged and have
+            // `ready_slot` return the same slot forever — an infinite loop.
+            if written == 0 || written < slot_len {
+                break; // ring full or degenerate empty slot
             }
         }
         if total > 0 {
@@ -2115,7 +2132,21 @@ impl<const BUF: usize> Tcb<BUF> {
         ) {
             return Ok(());
         }
+        let mut emit_guard = 0u32;
         while !self.tx_ring.is_full() {
+            // The loop terminates when the egress ring fills or
+            // `maybe_send_one` reports nothing eligible. Each `Ok(true)`
+            // pushes exactly one segment into `tx_ring`, so correct
+            // operation needs at most `TX_RING_CAP` iterations; the budget
+            // is a backstop against a `maybe_send_one` that ever returns
+            // `Ok(true)` without consuming ring space.
+            if crate::loop_budget_exhausted(
+                &mut emit_guard,
+                crate::tx_ring::TX_RING_CAP as u32 + 2,
+                "maybe_send_data",
+            ) {
+                break;
+            }
             if !self.maybe_send_one()? {
                 break;
             }

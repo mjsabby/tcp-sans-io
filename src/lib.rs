@@ -109,6 +109,43 @@ pub const REASM_CAP: usize = 16 * 1024;
 /// shrinks by the same amount, so the total stays at 1500.
 pub const MAX_PACKET: usize = 20 + 20 + MSS as usize;
 
+/// Defensive iteration budget for internal loops whose *termination* depends
+/// on invariants that adversarial or buggy input could, in principle,
+/// violate (e.g. the send-side emit loop, OOO-reassembly drain, and the
+/// SACK-scoreboard cursor scans — all of which advance only while a
+/// monotonicity invariant holds).
+///
+/// Returns `true` once the budget is exhausted, signalling the caller to
+/// stop the loop. The semantics differ by build so the same call site both
+/// *catches* infinite loops in testing and *survives* them in production:
+///
+/// * In `test` / `std` builds — which include the coverage-guided fuzz
+///   targets — exhaustion **panics** with a precise location, so an internal
+///   infinite loop fails loudly and immediately instead of hanging (a hang
+///   is the worst fuzzing outcome: no crash artifact, just a timeout).
+/// * In the production `no_std` build it returns `true` to break the loop,
+///   converting a would-be unbounded spin into a graceful (possibly lossy)
+///   stop — denying a remote peer a trivial CPU-exhaustion DoS.
+///
+/// The bound must be chosen comfortably above the worst legitimate iteration
+/// count so it never trips in correct operation.
+#[inline(always)]
+#[allow(clippy::panic)]
+pub(crate) fn loop_budget_exhausted(iters: &mut u32, cap: u32, _what: &str) -> bool {
+    *iters = iters.wrapping_add(1);
+    if *iters <= cap {
+        return false;
+    }
+    #[cfg(any(test, feature = "std"))]
+    {
+        panic!("internal loop budget exhausted in {_what} (> {cap} iterations)");
+    }
+    #[cfg(not(any(test, feature = "std")))]
+    {
+        true
+    }
+}
+
 #[cfg(test)]
 mod loopback_tests;
 
@@ -123,3 +160,32 @@ mod server_tests;
 
 #[cfg(test)]
 mod smoltcp_interop_tests;
+
+#[cfg(test)]
+mod loop_budget_tests {
+    #![allow(clippy::panic)]
+    use super::loop_budget_exhausted;
+
+    /// Within budget the helper returns `false` (keep looping); the call
+    /// count maps 1:1 to invocations.
+    #[test]
+    fn returns_false_until_cap() {
+        let mut iters = 0u32;
+        for _ in 0..5 {
+            assert!(!loop_budget_exhausted(&mut iters, 5, "test"));
+        }
+        assert_eq!(iters, 5);
+    }
+
+    /// In test/std builds, exceeding the budget panics — this is the
+    /// behavior that converts an internal infinite loop into an immediate,
+    /// located fuzz/test failure instead of a hang.
+    #[test]
+    #[should_panic(expected = "internal loop budget exhausted")]
+    fn panics_past_cap() {
+        let mut iters = 0u32;
+        for _ in 0..10 {
+            let _ = loop_budget_exhausted(&mut iters, 3, "test-loop");
+        }
+    }
+}
