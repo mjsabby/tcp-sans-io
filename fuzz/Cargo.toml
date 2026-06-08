@@ -12,7 +12,7 @@ libfuzzer-sys = "0.4"
 
 [dependencies.tcp-sans-io]
 path = ".."
-features = ["std"]
+features = ["std", "heap-buffers"]
 
 # Workspace-style: don't inherit the parent's lints / panic config so
 # the fuzz crate can use std + panic=unwind freely.
