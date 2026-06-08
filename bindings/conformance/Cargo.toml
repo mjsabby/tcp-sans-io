@@ -1,0 +1,25 @@
+# Standalone self-loopback conformance harness.
+#
+# Drives two instances of the stack against each other through the C ABI
+# over an in-memory chaos channel and hash-verifies a bidirectional
+# transfer — no external reference stack, no transport, no root. This is
+# the "tier 1" certification a new binding ports into its own language;
+# Rust integrators can run it directly with `cargo run --release`.
+#
+# Workspace-ignored (like fuzz/) so it doesn't inherit the parent's
+# panic="abort" profile and can link std freely.
+[package]
+name = "tcp-sans-io-conformance"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[workspace]
+
+[dependencies.tcp-sans-io]
+path = "../.."
+features = ["std"]
+
+[[bin]]
+name = "conformance"
+path = "src/main.rs"

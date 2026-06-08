@@ -62,6 +62,15 @@ size_t   tcp_handle_align(void);
  * Currently 1500 (IPv4 fixed 20 + TCP fixed 20 + MSS 1460). */
 size_t   tcp_max_packet(void);
 
+/* Built-in self-conformance smoke test. Drives two in-process instances of
+ * the stack through a byte-exact bidirectional bulk transfer and a clean
+ * close — no storage, transport, clock, or reference peer required. Returns
+ * 0 on success or a negative stage code (see crate::selftest::result).
+ * Call once after loading the library to confirm linkage / ABI / calling
+ * convention before wiring up a real connection. Uses ~256 KiB of the
+ * caller's stack for well under a millisecond. */
+int32_t  tcp_selftest(void);
+
 /* ---- Lifecycle --------------------------------------------------------- */
 int32_t tcp_init(TcpStreamHandle* storage,
                  const uint8_t* local_ip,  uint16_t local_port,

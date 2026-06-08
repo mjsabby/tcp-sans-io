@@ -79,6 +79,9 @@ _lib = _load()
 _lib.tcp_abi_version.restype = c_uint32
 _lib.tcp_abi_version.argtypes = []
 
+_lib.tcp_selftest.restype = c_int32
+_lib.tcp_selftest.argtypes = []
+
 _lib.tcp_handle_size.restype = c_size_t
 _lib.tcp_handle_size.argtypes = []
 
@@ -205,6 +208,17 @@ class TcpError(Exception):
 
 def abi_version() -> int:
     return int(_lib.tcp_abi_version())
+
+
+def selftest() -> int:
+    """Run the built-in self-conformance smoke test.
+
+    Drives two in-process instances of the stack through a byte-exact
+    bidirectional transfer and clean close. Returns 0 on success or a
+    negative stage code. Call once after import to confirm the cdylib is
+    correctly linked and healthy before opening a real connection.
+    """
+    return int(_lib.tcp_selftest())
 
 # ---------------------------------------------------------------------------
 # Pythonic wrapper
