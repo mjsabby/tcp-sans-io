@@ -135,6 +135,14 @@ pub fn run<const BUF: usize>(data: &[u8], xfer: u32, send_cap: usize) {
     let mut now: u64 = 0;
     cli.set_now(now);
     srv.set_now(now);
+    // Both stacks are honest here, and the harness fast-forwards the clock to
+    // each armed timer at quiescence — compressing virtual time in a way that
+    // does not reflect real elapsed time. The on-by-default USER TIMEOUT (a
+    // wall-clock no-progress abort) would therefore fire spuriously, so it is
+    // disabled: this oracle detects genuine stalls via the convergence and
+    // liveness checks instead. (The USER TIMEOUT has its own unit tests.)
+    cli.set_user_timeout(0);
+    srv.set_user_timeout(0);
     if srv.listen().is_err() || cli.connect().is_err() {
         return;
     }

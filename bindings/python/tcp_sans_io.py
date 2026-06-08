@@ -117,6 +117,9 @@ _lib.tcp_close.argtypes = [c_void_p, c_uint64]
 _lib.tcp_set_keepalive.restype = c_int32
 _lib.tcp_set_keepalive.argtypes = [c_void_p, c_uint64, c_uint32, c_uint32, c_uint8]
 
+_lib.tcp_set_user_timeout.restype = c_int32
+_lib.tcp_set_user_timeout.argtypes = [c_void_p, c_uint64, c_uint32]
+
 _lib.tcp_tick.restype = c_int32
 _lib.tcp_tick.argtypes = [c_void_p, c_uint64]
 
@@ -328,6 +331,15 @@ class TcpStream:
         _check(_lib.tcp_set_keepalive(
             self._handle, c_uint64(now_ms),
             c_uint32(idle_ms), c_uint32(intvl_ms), c_uint8(count),
+        ))
+
+    def set_user_timeout(self, now_ms: int, user_timeout_ms: int) -> None:
+        """Set the RFC 9293 3.8.3 USER TIMEOUT: max time without forward
+        progress (snd_una advancing) while send data is outstanding, before the
+        connection aborts. On by default (5 min); bounds the zero-window /
+        dribbled-ACK DoS. ``user_timeout_ms == 0`` disables it."""
+        _check(_lib.tcp_set_user_timeout(
+            self._handle, c_uint64(now_ms), c_uint32(user_timeout_ms),
         ))
 
     def tick(self, now_ms: int) -> None:

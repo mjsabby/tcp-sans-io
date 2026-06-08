@@ -123,13 +123,24 @@ const LOCAL_IP: [u8; 4] = [10, 0, 0, 1];
 const PEER_IP: [u8; 4] = [10, 0, 0, 2];
 
 fn make_tcb() -> Tcb {
-    Tcb::new(TcbConfig {
-        local: Endpoint { ip: LOCAL_IP, port: 8080 },
-        remote: Endpoint { ip: PEER_IP, port: 0 },
+    let mut tcb = Tcb::new(TcbConfig {
+        local: Endpoint {
+            ip: LOCAL_IP,
+            port: 8080,
+        },
+        remote: Endpoint {
+            ip: PEER_IP,
+            port: 0,
+        },
         iss: 0xDEAD_BEEF,
         initial_rto_ms: 1000,
     })
-    .unwrap()
+    .unwrap();
+    // The harness jumps the clock arbitrarily; disable the on-by-default
+    // wall-clock USER TIMEOUT so it can't abort mid-sequence (unit-tested
+    // separately).
+    tcb.set_user_timeout(0);
+    tcb
 }
 
 fuzz_target!(|data: &[u8]| {
@@ -175,10 +186,7 @@ fuzz_target!(|data: &[u8]| {
                     drained += 1;
                     let seg = wire::parse(&out[..n]).expect("self-emitted packet must parse");
                     assert_eq!(seg.src_ip, LOCAL_IP, "emitted packet has wrong source IP");
-                    assert_eq!(
-                        seg.src_port, 8080,
-                        "emitted packet has wrong source port"
-                    );
+                    assert_eq!(seg.src_port, 8080, "emitted packet has wrong source port");
                 }
             }
             observe_state(&mut prev_state, &tcb);

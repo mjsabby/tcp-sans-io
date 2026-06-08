@@ -104,6 +104,16 @@ int32_t tcp_set_cookie_secret(TcpStreamHandle* handle, const uint8_t* secret);
 int32_t tcp_set_keepalive(TcpStreamHandle* handle, uint64_t now_ms,
                           uint32_t idle_ms, uint32_t intvl_ms, uint8_t count);
 
+/* Set the RFC 9293 3.8.3 USER TIMEOUT: max time the connection may go without
+ * forward progress (snd_una advancing) while it still has unacknowledged send
+ * data, before it aborts (ConnectionReset via tcp_poll ERROR / tcp_recv, no
+ * RST). ON BY DEFAULT (5 min) — bounds the zero-window / dribbled-ACK DoS (an
+ * alive-but-stalling peer answering probes while never opening its window).
+ * Resets only on real progress, so it is immune to that proof-of-life trick.
+ * `user_timeout_ms == 0` disables it. */
+int32_t tcp_set_user_timeout(TcpStreamHandle* handle, uint64_t now_ms,
+                             uint32_t user_timeout_ms);
+
 /* ---- State / polling --------------------------------------------------- */
 uint8_t  tcp_state(const TcpStreamHandle* handle);
 uint32_t tcp_poll (const TcpStreamHandle* handle);

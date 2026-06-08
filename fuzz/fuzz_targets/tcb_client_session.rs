@@ -29,8 +29,8 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use tcp_sans_io::wire::{self, flags, SackBlocks, TcpOptions};
 use tcp_sans_io::tcb::DebugSnapshot;
+use tcp_sans_io::wire::{self, flags, SackBlocks, TcpOptions};
 use tcp_sans_io::{Endpoint, State, Tcb, TcbConfig, TcpError, MAX_PACKET};
 
 const C_IP: [u8; 4] = [10, 0, 0, 1];
@@ -121,7 +121,10 @@ fn drain(tcb: &mut Tcb, hi: &mut u32, prev_state: &mut State) {
                 assert_eq!(seg.src_ip, C_IP, "emitted packet has wrong source IP");
                 assert_eq!(seg.dst_ip, S_IP, "emitted packet has wrong destination IP");
                 assert_eq!(seg.src_port, C_PORT, "emitted packet has wrong source port");
-                assert_eq!(seg.dst_port, S_PORT, "emitted packet has wrong destination port");
+                assert_eq!(
+                    seg.dst_port, S_PORT,
+                    "emitted packet has wrong destination port"
+                );
                 // seq_len() counts SYN/FIN, so `hi` advances past a FIN
                 // and the peer can ACK it to reach TIME_WAIT/CLOSED.
                 let end = seg.seq.wrapping_add(seg.seq_len());
@@ -219,13 +222,24 @@ fn ack_packet(ack: u32, sack: SackBlocks) -> Option<Vec<u8>> {
 }
 
 fn make_tcb() -> Option<Tcb> {
-    Tcb::new(TcbConfig {
-        local: Endpoint { ip: C_IP, port: C_PORT },
-        remote: Endpoint { ip: S_IP, port: S_PORT },
+    let mut tcb = Tcb::new(TcbConfig {
+        local: Endpoint {
+            ip: C_IP,
+            port: C_PORT,
+        },
+        remote: Endpoint {
+            ip: S_IP,
+            port: S_PORT,
+        },
         iss: OUR_ISS,
         initial_rto_ms: 1000,
     })
-    .ok()
+    .ok()?;
+    // This target jumps the clock to fire TLP/RTO, compressing virtual time
+    // non-physically; disable the on-by-default wall-clock USER TIMEOUT so it
+    // can't abort the session mid-exploration (it has dedicated unit tests).
+    tcb.set_user_timeout(0);
+    Some(tcb)
 }
 
 fn complete_handshake(tcb: &mut Tcb, now: &mut u64, hi: &mut u32, prev_state: &mut State) -> bool {
@@ -305,8 +319,14 @@ fn no_loss_liveness(data: &[u8]) {
     }
 
     let snap = tcb.debug_snapshot();
-    assert_eq!(snap.send_ring_len, 0, "no-loss session left send bytes queued");
-    assert_eq!(snap.snd_una, snap.snd_nxt, "no-loss session did not ACK all sent seqs");
+    assert_eq!(
+        snap.send_ring_len, 0,
+        "no-loss session left send bytes queued"
+    );
+    assert_eq!(
+        snap.snd_una, snap.snd_nxt,
+        "no-loss session did not ACK all sent seqs"
+    );
     assert_eq!(
         tcb.state(),
         State::FinWait2,

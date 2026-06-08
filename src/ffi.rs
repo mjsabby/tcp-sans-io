@@ -274,6 +274,29 @@ pub extern "C" fn tcp_set_keepalive(
     })
 }
 
+/// Set the RFC 9293 §3.8.3 USER TIMEOUT: the maximum time the connection may
+/// go without forward progress (its `snd_una` advancing) while it still has
+/// unacknowledged send data, before it is aborted (`ConnectionReset` via
+/// `tcp_poll` ERROR / `tcp_recv`, no RST). **On by default** (5 minutes), so
+/// the zero-window / dribbled-ACK denial-of-service — an alive-but-stalling
+/// peer that pins a TCB by answering probes while never opening its window —
+/// is bounded out of the box. Resets only on real progress, so it is immune to
+/// that proof-of-life trick (which the R2 retransmit budget is not). Pass
+/// `0` to disable. Additive ABI: older hosts simply never call it and keep the
+/// default.
+#[no_mangle]
+pub extern "C" fn tcp_set_user_timeout(
+    handle: *mut TcpStreamHandle,
+    now_ms: u64,
+    user_timeout_ms: u32,
+) -> i32 {
+    with_handle(handle, |h| {
+        h.set_now(now_ms);
+        h.set_user_timeout(user_timeout_ms);
+        Ok(())
+    })
+}
+
 /// Abort the connection by emitting a TCP RST. Unlike [`tcp_close`]
 /// (graceful FIN), this is an immediate teardown: a RST+ACK segment is
 /// queued in the TX ring, the TCB transitions to `CLOSED`, all buffered

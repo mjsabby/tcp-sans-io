@@ -145,6 +145,7 @@ mis-ordering, corruption, a panic, or an unbounded loop.
 | `TLP_MIN_PTO` / `DELAYED_ACK` / `TIME_WAIT` | 10 ms / 40 ms / 60 s | `tcb.rs` | Tail-loss-probe floor, delayed-ACK timer (every 2nd segment), 2·MSL wait. |
 | `MAX_SYN_RCVD_RETRIES` | 5 | `tcb.rs` | SYN-ACK retransmits before a half-open reverts to `LISTEN` (one half-open per TCB). |
 | `MAX_RETRANSMITS` | 10 | `tcb.rs` | RFC 9293 §3.8.3 "R2": consecutive RTO timeouts (data / SYN / FIN / zero-window probe) with no proof of life before a connection aborts (~200 s at `RTO_MIN`); resets on any inbound ACK. |
+| `DEFAULT_USER_TIMEOUT_MS` | 300 s | `tcb.rs` | RFC 9293 §3.8.3 USER TIMEOUT: max time with no forward progress (`snd_una` advancing) while send data is outstanding before abort; defends the zero-window / dribbled-ACK DoS. On by default; `set_user_timeout(0)` disables. |
 | Cookie validity | 128 s | `tcb.rs` | `2 × COOKIE_TIME_BUCKET_MS`; MAC truncated to 29 bits (2⁻²⁹ blind forgery). |
 
 ### Why the bounds are sound
@@ -812,17 +813,26 @@ include/
 The stack assumes the host is friendly but the peer is hostile.
 
 - **Resource exhaustion**: bounded SYN_RCVD retransmits (default 5),
-  optional stateless SYN cookies, no allocator to be drained. A peer that
-  goes silent mid-connection cannot pin a TCB forever either: after
-  `MAX_RETRANSMITS` (10) RTO timeouts with no proof of life the connection
-  aborts locally (RFC 9293 §3.8.3 R2), with no RST emitted (the peer is
-  presumed gone, and we never reflect resets at a silent endpoint). The R2
-  counter covers data, SYN, FIN and zero-window persist probes, and resets on
-  *any* inbound ACK — a merely flow-controlled peer that keeps answering is
-  never aborted. For an *idle* connection (nothing in flight, which no other
-  timer would notice) opt-in **TCP keepalive** (RFC 9293 §3.8.4,
-  `set_keepalive` / `tcp_set_keepalive`, off by default) probes for a vanished
-  peer and aborts after an unanswered run.
+  optional stateless SYN cookies, no allocator to be drained. Three layered
+  timeouts keep a single connection from pinning a TCB indefinitely:
+  - **R2 vanished-peer abort** (RFC 9293 §3.8.3, always on, `MAX_RETRANSMITS`
+    = 10). Consecutive RTO timeouts with *no proof of life* abort the
+    connection (no RST — the peer is presumed gone and we never reflect resets
+    at a silent endpoint). Covers data, SYN, FIN and zero-window persist
+    probes; resets on *any* inbound ACK.
+  - **USER TIMEOUT no-progress abort** (RFC 9293 §3.8.3, **on by default**,
+    300 s, `set_user_timeout` / `tcp_set_user_timeout`). Because R2 resets on
+    any sign of life, a peer that is *alive but stalling* — endlessly ACKing
+    zero-window persist probes (or dribbling duplicate ACKs) while never
+    opening its window — would otherwise pin the TCB and its buffers forever
+    (the classic zero-window / "Sockstress" DoS). The USER TIMEOUT closes this:
+    it resets **only** on real forward progress (`snd_una` advancing), so such
+    a peer is aborted after 300 s regardless of proof of life. Set to `0` to
+    disable.
+  - **Keepalive** (RFC 9293 §3.8.4, opt-in, `set_keepalive` /
+    `tcp_set_keepalive`, off by default). For a fully *idle* connection
+    (nothing in flight or queued, which neither timeout above would notice),
+    probes for a vanished peer and aborts after an unanswered run.
 - **Off-path injection**: 5-tuple filter on `inject_packet`; RFC-compliant
   acceptability checks on RST/SYN/ACK; SYN-cookie path is keyed by a
   caller-supplied 128-bit secret (we ship a no_std SipHash-2-4 impl, with

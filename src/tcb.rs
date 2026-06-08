@@ -184,6 +184,19 @@ const MAX_SYN_RCVD_RETRIES: u8 = 5;
 /// does on `tcp_retries2`).
 const MAX_RETRANSMITS: u8 = 10;
 
+/// Default RFC 9293 §3.8.3 USER TIMEOUT: the maximum time a connection may go
+/// **without forward progress** (i.e. without `snd_una` advancing) while it
+/// still has data the peer has not acknowledged, before it is aborted. Unlike
+/// the R2 retransmit counter — which resets on *any* sign of life and so only
+/// catches a wholly silent peer — this clock resets **only** when `snd_una`
+/// advances. That makes it the defence against an *alive-but-stalling* peer:
+/// one that keeps ACKing zero-window persist probes (or dribbles duplicate
+/// ACKs) to look alive while never opening its window, pinning a TCB and its
+/// buffers indefinitely (the classic zero-window / "Sockstress" DoS). On by
+/// default at 5 minutes; `set_user_timeout(0)` disables it. Reconfigurable via
+/// [`Tcb::set_user_timeout`].
+const DEFAULT_USER_TIMEOUT_MS: u32 = 300_000;
+
 /// SYN-cookie time-bucket width (RFC 4987-style). 64 s matches Linux's
 /// historical choice. The validator accepts both the current bucket and
 /// the previous one, giving cookies a 64-128 s validity window.
@@ -443,6 +456,17 @@ pub struct Tcb<const BUF: usize = BUF_CAP> {
     /// Next keepalive action (probe or abort). Re-armed to `now + idle` on
     /// every inbound segment; `None` when keepalive is disabled or unarmed.
     keepalive_deadline: Option<u64>,
+    // ---- USER TIMEOUT (RFC 9293 §3.8.3), on by default -------------------
+    /// Max time without `snd_una` advancing while send work is outstanding,
+    /// before the connection aborts. `0` disables it. Defaults to
+    /// [`DEFAULT_USER_TIMEOUT_MS`]. The no-forward-progress defence against an
+    /// alive-but-stalling peer (zero-window DoS), distinct from the R2
+    /// any-sign-of-life retransmit budget.
+    user_timeout_ms: u32,
+    /// Instant at which the no-progress USER TIMEOUT fires. Armed lazily when
+    /// unacked send work first appears, re-armed to `now + user_timeout_ms`
+    /// whenever `snd_una` advances, cleared when no unacked work remains.
+    user_timeout_deadline: Option<u64>,
     /// 128-bit secret used to MAC SYN cookies (RFC 4987). Live only if
     /// `cookie_secret_set` is true. With cookies enabled, a LISTEN TCB
     /// answers an inbound SYN **statelessly**: the SYN-ACK's ISN encodes
@@ -520,6 +544,8 @@ impl<const BUF: usize> Tcb<BUF> {
             keepalive_count: 0,
             keepalive_probes: 0,
             keepalive_deadline: None,
+            user_timeout_ms: DEFAULT_USER_TIMEOUT_MS,
+            user_timeout_deadline: None,
             cookie_secret: [0u8; 16],
             cookie_secret_set: false,
         })
@@ -776,6 +802,29 @@ impl<const BUF: usize> Tcb<BUF> {
         };
     }
 
+    /// Set the RFC 9293 §3.8.3 USER TIMEOUT: the maximum time the connection
+    /// may go without `snd_una` advancing while it still has unacknowledged
+    /// send work, before it is aborted (`ConnectionReset`, no RST). On by
+    /// default at [`DEFAULT_USER_TIMEOUT_MS`]; pass `0` to disable.
+    ///
+    /// This is the no-forward-progress defence and is deliberately independent
+    /// of the R2 retransmit budget: R2 resets on any sign of life, so a peer
+    /// that keeps ACKing zero-window persist probes (or dribbles duplicate
+    /// ACKs) looks alive to R2 forever. The USER TIMEOUT resets only on real
+    /// progress, so such a stalling peer cannot pin the TCB past this bound.
+    /// Re-arms from the current clock against any outstanding work.
+    pub fn set_user_timeout(&mut self, ms: u32) {
+        self.user_timeout_ms = ms;
+        // Re-arm against current state: if disabled, or there is nothing
+        // outstanding, clear; otherwise start a fresh window now.
+        let has_work = self.snd_una != self.snd_max || !self.send_ring.is_empty();
+        self.user_timeout_deadline = if ms == 0 || !has_work {
+            None
+        } else {
+            Some(self.now_ms.wrapping_add(ms as u64))
+        };
+    }
+
     /// Initiate an active open: transitions `Closed` → `SynSent`, queues a SYN
     /// carrying MSS + Window Scale + Timestamps + SACK_PERMITTED options,
     /// and the ECN-Setup flags (CWR + ECE per RFC 3168 §6.1.1).
@@ -904,6 +953,7 @@ impl<const BUF: usize> Tcb<BUF> {
         self.rtx_count = 0;
         self.keepalive_probes = 0;
         self.keepalive_deadline = None;
+        self.user_timeout_deadline = None;
         self.send_ring.clear();
         self.recv_ring.clear();
         self.reasm.clear();
@@ -1111,6 +1161,7 @@ impl<const BUF: usize> Tcb<BUF> {
         self.tlp_deadline = None;
         self.keepalive_deadline = None;
         self.keepalive_probes = 0;
+        self.user_timeout_deadline = None;
     }
 
     /// Aggregate event flags for the host async runtime to dispatch on.
@@ -1303,6 +1354,11 @@ impl<const BUF: usize> Tcb<BUF> {
         self.check_persist()?;
         // ---- Keepalive (idle-connection vanished-peer probe) ------------
         self.check_keepalive()?;
+        // ---- USER TIMEOUT (no-forward-progress abort) -------------------
+        self.check_user_timeout();
+        if self.state == State::Closed {
+            return Ok(());
+        }
         // ---- Try to push outbound data / FIN ----------------------------
         // Run BEFORE the delayed-ACK fallback below so the ACK gets
         // piggybacked on a data segment if possible. `maybe_send_data`
@@ -2222,6 +2278,19 @@ impl<const BUF: usize> Tcb<BUF> {
         }
         self.send_ring.consume(payload_acked as usize);
         self.snd_una = ack;
+        // Real forward progress re-arms the no-progress USER TIMEOUT: a fresh
+        // window if work remains, disarmed once everything is acknowledged.
+        // (R2's `rtx_count` was already reset above by this acceptable ACK;
+        // the USER TIMEOUT deliberately keys on *advancement*, not mere
+        // liveness, so a stalling peer can't keep it alive.)
+        if self.user_timeout_ms != 0 {
+            let has_work = self.snd_una != self.snd_max || !self.send_ring.is_empty();
+            self.user_timeout_deadline = if has_work {
+                Some(self.now_ms.wrapping_add(self.user_timeout_ms as u64))
+            } else {
+                None
+            };
+        }
         // If a prior RTO rewound `snd_nxt` to `snd_una`, but the peer's
         // first cumulative ACK after recovery jumps over the rewound
         // point (because the peer had buffered our pre-rewind segments
@@ -2869,17 +2938,20 @@ impl<const BUF: usize> Tcb<BUF> {
 
     /// RFC 9293 §3.8.4 keepalive: probe an *idle* ESTABLISHED connection to
     /// discover a vanished peer that no other timer would catch. Opt-in
-    /// (`keepalive_idle_ms == 0` ⇒ disabled). Only runs when nothing is in
-    /// flight (`snd_una == snd_max`); a connection with outstanding data is
-    /// already covered by the R2 retransmit timeout. The probe is a zero-data
-    /// ACK one byte behind `snd_nxt`, which the peer must answer (RFC 1122
-    /// §4.2.3.6); it carries no new sequence space, so it neither advances
-    /// send state nor arms the RTO. After `keepalive_count` unanswered probes
-    /// the peer is declared gone and the connection is aborted locally.
+    /// (`keepalive_idle_ms == 0` ⇒ disabled). Only runs when the connection is
+    /// truly idle — nothing in flight (`snd_una == snd_max`) *and* nothing
+    /// queued (`send_ring` empty); a connection with send work is covered by
+    /// the R2 retransmit budget and the no-progress USER TIMEOUT instead. The
+    /// probe is a zero-data ACK one byte behind `snd_nxt`, which the peer must
+    /// answer (RFC 1122 §4.2.3.6); it carries no new sequence space, so it
+    /// neither advances send state nor arms the RTO. After `keepalive_count`
+    /// unanswered probes the peer is declared gone and the connection is
+    /// aborted locally.
     fn check_keepalive(&mut self) -> Result<(), TcpError> {
         if self.keepalive_idle_ms == 0
             || self.state != State::Established
             || self.snd_una != self.snd_max
+            || !self.send_ring.is_empty()
         {
             return Ok(());
         }
@@ -2909,6 +2981,37 @@ impl<const BUF: usize> Tcb<BUF> {
                 Some(self.now_ms.wrapping_add(self.keepalive_intvl_ms as u64));
         }
         Ok(())
+    }
+
+    /// RFC 9293 §3.8.3 USER TIMEOUT: abort a connection that has made no
+    /// forward progress (`snd_una` not advancing) for `user_timeout_ms` while
+    /// it still has unacknowledged send work. Unlike R2 (which any sign of
+    /// life resets) and keepalive (idle connections only), this fires even
+    /// against a peer that is demonstrably alive but stalling — the
+    /// zero-window / dribbled-duplicate-ACK DoS — because only real progress
+    /// re-arms it. Armed lazily here when work first appears, re-armed on
+    /// progress in `process_ack`, disarmed when work drains.
+    fn check_user_timeout(&mut self) {
+        if self.user_timeout_ms == 0 {
+            self.user_timeout_deadline = None;
+            return;
+        }
+        let has_work = self.snd_una != self.snd_max || !self.send_ring.is_empty();
+        if !has_work {
+            self.user_timeout_deadline = None;
+            return;
+        }
+        match self.user_timeout_deadline {
+            None => {
+                self.user_timeout_deadline =
+                    Some(self.now_ms.wrapping_add(self.user_timeout_ms as u64));
+            }
+            Some(deadline) => {
+                if self.now_ms >= deadline {
+                    self.abort_timed_out();
+                }
+            }
+        }
     }
 
     // ---------------------------------------------------------------------
@@ -3715,6 +3818,7 @@ mod retransmit_overflow_regression {
     fn r2_aborts_after_max_retransmits_without_ack() {
         let mut tcb: Tcb = Tcb::new(cfg(1000)).expect("tcb");
         tcb.state = State::Established;
+        tcb.set_user_timeout(0); // isolate R2 (count-based) from USER TIMEOUT
         tcb.snd_wnd = 65_535;
         tcb.rcv_nxt = 9_000;
         tcb.snd_una = 5_000;
@@ -3761,6 +3865,7 @@ mod retransmit_overflow_regression {
     fn r2_counter_resets_on_ack_progress() {
         let mut tcb: Tcb = Tcb::new(cfg(1000)).expect("tcb");
         tcb.state = State::Established;
+        tcb.set_user_timeout(0); // isolate R2 from USER TIMEOUT
         tcb.snd_wnd = 65_535;
         tcb.rcv_nxt = 9_000;
         tcb.snd_una = 5_000;
@@ -3821,6 +3926,10 @@ mod retransmit_overflow_regression {
     }
 
     fn inject_peer_ack(tcb: &mut Tcb, seq: u32, ack: u32) {
+        inject_peer_ack_win(tcb, seq, ack, 65_535);
+    }
+
+    fn inject_peer_ack_win(tcb: &mut Tcb, seq: u32, ack: u32, window: u16) {
         let opts = crate::wire::TcpOptions::NONE;
         let mut pkt = [0u8; crate::MAX_PACKET];
         let len = crate::wire::emit(
@@ -3832,7 +3941,7 @@ mod retransmit_overflow_regression {
             seq,
             ack,
             crate::wire::flags::ACK,
-            65_535,
+            window,
             &opts,
             &[],
             1,
@@ -3868,6 +3977,7 @@ mod retransmit_overflow_regression {
     fn r2_aborts_silent_peer_during_connect() {
         let mut tcb: Tcb = Tcb::new(cfg(1000)).expect("tcb");
         tcb.set_now(0);
+        tcb.set_user_timeout(0); // isolate R2 from USER TIMEOUT
         tcb.connect().expect("connect");
         assert_eq!(tcb.state(), State::SynSent);
         drain_all(&mut tcb);
@@ -3887,6 +3997,7 @@ mod retransmit_overflow_regression {
     fn r2_aborts_silent_peer_during_close() {
         let mut tcb: Tcb = Tcb::new(cfg(1000)).expect("tcb");
         tcb.state = State::Established;
+        tcb.set_user_timeout(0); // isolate R2 from USER TIMEOUT
         tcb.snd_wnd = 65_535;
         tcb.rcv_nxt = 9_000;
         tcb.snd_una = 5_000;
@@ -3906,13 +4017,17 @@ mod retransmit_overflow_regression {
         );
     }
 
-    /// Proof-of-life: a peer that keeps *answering* — even with non-advancing
-    /// (zero-window / duplicate) ACKs — is alive, not vanished, and must never
-    /// be R2-aborted, no matter how many RTOs fire.
+    /// Proof-of-life isolation: with the USER TIMEOUT disabled, the **R2**
+    /// retransmit counter alone must never abort a peer that keeps answering
+    /// (even with non-advancing zero-window / duplicate ACKs) — R2's job is to
+    /// catch a *silent* peer, and any sign of life resets it. (The
+    /// no-forward-progress abort of such a stalling-but-alive peer is the USER
+    /// TIMEOUT's job, covered separately.)
     #[test]
     fn r2_survives_flow_controlled_alive_peer() {
         let mut tcb: Tcb = Tcb::new(cfg(1000)).expect("tcb");
         tcb.state = State::Established;
+        tcb.set_user_timeout(0); // isolate R2: USER TIMEOUT would otherwise abort
         tcb.snd_wnd = 65_535;
         tcb.rcv_nxt = 9_000;
         tcb.snd_una = 5_000;
@@ -4024,5 +4139,138 @@ mod retransmit_overflow_regression {
             assert!(!drain_all(&mut tcb), "no probes when keepalive is disabled");
             assert_eq!(tcb.state(), State::Established, "idle connection persists");
         }
+    }
+
+    /// The headline attack: a peer that is demonstrably **alive** (it ACKs
+    /// every zero-window persist probe, so R2 never fires) but **never opens
+    /// its window** must not pin the connection forever. The no-progress USER
+    /// TIMEOUT aborts it.
+    #[test]
+    fn user_timeout_aborts_alive_but_stalling_zero_window_peer() {
+        let mut tcb: Tcb = Tcb::new(cfg(1000)).expect("tcb");
+        tcb.state = State::Established;
+        tcb.rcv_nxt = 9_000;
+        tcb.snd_una = 5_000;
+        tcb.snd_nxt = 5_000;
+        tcb.snd_max = 5_000;
+        tcb.snd_wnd = 0; // peer's window is slammed shut
+        let n = tcb.send_ring.write(&[0xAB; 4_000]);
+        assert_eq!(n, 4_000, "we have data we cannot send");
+        tcb.set_now(0);
+        tcb.set_user_timeout(10_000); // 10 s no-progress budget for the test
+
+        // Prime the persist timer (the first tick arms it on the zero window).
+        tcb.tick().expect("tick");
+        drain_all(&mut tcb);
+
+        let mut probed = false;
+        for _ in 0..2_000 {
+            let dl = tcb
+                .debug_next_deadline()
+                .expect("a timer is always armed here");
+            tcb.set_now(dl + 1);
+            tcb.tick().expect("tick");
+            if tcb.state() == State::Closed {
+                break;
+            }
+            // The peer answers the persist probe — proof of life (resets R2) —
+            // but keeps advertising a zero window, so no progress is made.
+            if drain_all(&mut tcb) {
+                probed = true;
+            }
+            inject_peer_ack_win(&mut tcb, 9_000, 5_000, 0);
+            assert_eq!(
+                tcb.rtx_count, 0,
+                "the answered probe keeps R2 from ever firing"
+            );
+        }
+        assert!(
+            probed,
+            "the stack must have sent at least one zero-window probe"
+        );
+        assert_eq!(
+            tcb.state(),
+            State::Closed,
+            "an alive-but-stalling peer must hit the USER TIMEOUT",
+        );
+        assert_eq!(tcb.error, Some(crate::TcpError::ConnectionReset));
+        assert!(
+            tcb.now_ms >= 10_000,
+            "abort must not fire before the no-progress budget elapses",
+        );
+    }
+
+    /// The USER TIMEOUT re-arms on real forward progress, so a peer that keeps
+    /// genuinely advancing `snd_una` — however slowly — is never aborted.
+    #[test]
+    fn user_timeout_resets_on_forward_progress() {
+        let mut tcb: Tcb = Tcb::new(cfg(1000)).expect("tcb");
+        tcb.state = State::Established;
+        tcb.snd_wnd = 65_535;
+        tcb.rcv_nxt = 9_000;
+        tcb.snd_una = 5_000;
+        tcb.snd_nxt = 5_000;
+        tcb.snd_max = 5_000;
+        tcb.set_now(0);
+        tcb.set_user_timeout(10_000);
+
+        let mut una = 5_000u32;
+        // 30 rounds of slow-but-real progress, each well within the budget but
+        // collectively far past it: the connection must survive.
+        for r in 0..30u64 {
+            let _ = tcb.send_ring.write(&[0xCD; 100]);
+            tcb.set_now(r * 8_000 + 1); // 8 s between rounds (< 10 s budget)
+            tcb.tick().expect("tick");
+            drain_all(&mut tcb);
+            una = una.wrapping_add(100); // peer acknowledges the new bytes
+            inject_peer_ack_win(&mut tcb, 9_000, una, 65_535);
+            assert_eq!(
+                tcb.state(),
+                State::Established,
+                "progress must keep it alive"
+            );
+        }
+        assert!(
+            tcb.now_ms > 10_000,
+            "we ran well past a single budget window"
+        );
+    }
+
+    /// `set_user_timeout(0)` disables the no-progress abort entirely: a stalled
+    /// connection then persists indefinitely (host opted out of the defence).
+    #[test]
+    fn user_timeout_disabled_allows_indefinite_stall() {
+        let mut tcb: Tcb = Tcb::new(cfg(1000)).expect("tcb");
+        tcb.state = State::Established;
+        tcb.rcv_nxt = 9_000;
+        tcb.snd_una = 5_000;
+        tcb.snd_nxt = 5_000;
+        tcb.snd_max = 5_000;
+        tcb.snd_wnd = 0;
+        let _ = tcb.send_ring.write(&[0xAB; 4_000]);
+        tcb.set_now(0);
+        tcb.set_user_timeout(0); // disabled
+
+        // Prime the persist timer, then stall indefinitely.
+        tcb.tick().expect("tick");
+        drain_all(&mut tcb);
+
+        for _ in 0..200 {
+            let dl = tcb.debug_next_deadline().expect("persist stays armed");
+            tcb.set_now(dl + 1);
+            tcb.tick().expect("tick");
+            drain_all(&mut tcb);
+            inject_peer_ack_win(&mut tcb, 9_000, 5_000, 0);
+            assert_eq!(tcb.state(), State::Established, "no abort when disabled");
+        }
+        assert!(tcb.now_ms > 10_000_000, "ran for a very long virtual time");
+    }
+
+    /// USER TIMEOUT is on by default at `DEFAULT_USER_TIMEOUT_MS`.
+    #[test]
+    fn user_timeout_on_by_default() {
+        let tcb: Tcb = Tcb::new(cfg(1000)).expect("tcb");
+        assert_eq!(tcb.user_timeout_ms, super::DEFAULT_USER_TIMEOUT_MS);
+        assert_eq!(super::DEFAULT_USER_TIMEOUT_MS, 300_000);
     }
 }
