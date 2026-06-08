@@ -554,6 +554,82 @@ impl<const BUF: usize> Tcb<BUF> {
         }
     }
 
+    /// Expensive-ish internal consistency checks for tests and fuzz targets.
+    ///
+    /// This is intentionally *not* part of the C ABI and is compiled only for
+    /// Rust tests or `feature = "std"` harnesses (the fuzz crate enables
+    /// `std`). Keep these assertions semantic rather than implementation-
+    /// incidental: a valid peer should never be able to drive the TCB into a
+    /// state that makes this return `Err`.
+    #[cfg(any(test, feature = "std"))]
+    pub fn debug_validate_invariants(&self) -> Result<(), &'static str> {
+        if seq_lt(self.snd_max, self.snd_una) {
+            return Err("snd_max is behind snd_una");
+        }
+        if seq_lt(self.snd_nxt, self.snd_una) {
+            return Err("snd_nxt is behind snd_una");
+        }
+        if seq_lt(self.snd_max, self.snd_nxt) {
+            return Err("snd_nxt is beyond snd_max");
+        }
+
+        let outstanding = self.snd_max.wrapping_sub(self.snd_una);
+        let mut phantom = 0u32;
+
+        // SYN/SYN-ACK consume one byte of sequence space but are never stored
+        // in the send ring.
+        if matches!(self.state, State::SynSent | State::SynRcvd)
+            && seq_lt(self.snd_una, self.snd_max)
+        {
+            phantom = phantom.saturating_add(1);
+        }
+
+        if self.fin_sent {
+            let fin_end = self.fin_seq.wrapping_add(1);
+            if seq_gt(fin_end, self.snd_max) {
+                return Err("fin_seq is beyond snd_max");
+            }
+            // A FIN consumes one byte of sequence space but is not buffered.
+            if seq_le(self.snd_una, self.fin_seq) && seq_lt(self.fin_seq, self.snd_max) {
+                phantom = phantom.saturating_add(1);
+            }
+
+            if !matches!(
+                self.state,
+                State::FinWait1
+                    | State::FinWait2
+                    | State::Closing
+                    | State::TimeWait
+                    | State::LastAck
+                    | State::Closed
+            ) {
+                return Err("fin_sent set in non-closing state");
+            }
+            if matches!(self.state, State::FinWait2 | State::TimeWait | State::Closed)
+                && seq_lt(self.snd_una, fin_end)
+            {
+                return Err("state requires our FIN to be ACKed");
+            }
+        }
+
+        let buffered_plus_phantom = (self.send_ring.len() as u32).saturating_add(phantom);
+        if outstanding > buffered_plus_phantom {
+            return Err("outstanding sequence span exceeds buffered data plus SYN/FIN");
+        }
+
+        if let Some(n) = self.tx_ring.peek_head_len() {
+            if n > crate::MAX_PACKET {
+                return Err("staged packet exceeds MAX_PACKET");
+            }
+        }
+
+        if self.rto_deadline.is_some() && seq_le(self.snd_max, self.snd_una) {
+            return Err("RTO armed with no outstanding sequence space");
+        }
+
+        Ok(())
+    }
+
     /// Update the host clock. Called before every tick / packet operation.
     #[inline]
     pub fn set_now(&mut self, now_ms: u64) {
