@@ -169,6 +169,12 @@ fuzz_target!(|data: &[u8]| {
     };
     let mut cli_sync = false;
     let mut srv_sync = false;
+    // Chaos is withheld until both ends have reached ESTABLISHED at least
+    // once, so the handshake always completes (a dropped 3rd-ACK that trips
+    // the server's SynRcvd retransmit budget is a legitimate half-open, not
+    // a deadlock — not what this oracle is for). Data + close paths still
+    // get full chaos, which is where the deadlock / lost-FIN classes live.
+    let mut both_established = false;
 
     let budget = 3_000_000u64;
     for iter in 0..budget {
@@ -185,10 +191,13 @@ fuzz_target!(|data: &[u8]| {
         check(&srv);
 
         // Chaos applies only in a bounded early window with drop budget
-        // left; the back half of the run is a fully reliable, in-order
-        // channel, so a correct stack is guaranteed to converge and only a
-        // genuine deadlock fails to.
-        let lossy = iter < 400_000 && drop_budget > 0;
+        // left, and only after the handshake has completed; the back half of
+        // the run is a fully reliable, in-order channel, so a correct stack
+        // is guaranteed to converge and only a genuine deadlock fails to.
+        if cli.state() == State::Established && srv.state() == State::Established {
+            both_established = true;
+        }
+        let lossy = iter < 400_000 && drop_budget > 0 && both_established;
 
         // Stage egress into the links.
         while let Some(n) = no_internal(cli.extract_packet(&mut pkt)) {
