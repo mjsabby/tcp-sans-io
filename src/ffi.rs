@@ -249,6 +249,31 @@ pub extern "C" fn tcp_close(handle: *mut TcpStreamHandle, now_ms: u64) -> i32 {
     })
 }
 
+/// Enable (or reconfigure) TCP keepalive (RFC 9293 §3.8.4) on this
+/// connection. After `idle_ms` of inbound silence on an *idle* ESTABLISHED
+/// connection (nothing in flight — outstanding data is already covered by the
+/// retransmit timeout), up to `count` probes are sent `intvl_ms` apart; if
+/// none is answered the connection is aborted as a vanished peer (surfaced via
+/// `tcp_poll`'s ERROR bit and `tcp_recv` returning `ConnectionReset`, with no
+/// RST emitted). Any inbound segment resets the idle timer. `idle_ms == 0`
+/// disables keepalive (the default), so it never perturbs the wire unless a
+/// host opts in. Additive ABI: hosts built against an older version simply
+/// never call it.
+#[no_mangle]
+pub extern "C" fn tcp_set_keepalive(
+    handle: *mut TcpStreamHandle,
+    now_ms: u64,
+    idle_ms: u32,
+    intvl_ms: u32,
+    count: u8,
+) -> i32 {
+    with_handle(handle, |h| {
+        h.set_now(now_ms);
+        h.set_keepalive(idle_ms, intvl_ms, count);
+        Ok(())
+    })
+}
+
 /// Abort the connection by emitting a TCP RST. Unlike [`tcp_close`]
 /// (graceful FIN), this is an immediate teardown: a RST+ACK segment is
 /// queued in the TX ring, the TCB transitions to `CLOSED`, all buffered

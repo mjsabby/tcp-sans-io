@@ -421,12 +421,28 @@ pub struct Tcb<const BUF: usize = BUF_CAP> {
     /// SYN-ACK retransmit counter while in `SynRcvd`. Capped by
     /// [`MAX_SYN_RCVD_RETRIES`]; on overflow we revert to `Listen`.
     syn_rcvd_retries: u8,
-    /// Consecutive RTO firings without `snd_una` advancing — the RFC 9293
-    /// §3.8.3 "R2" counter. Reset to 0 on any forward ACK progress; once it
-    /// exceeds [`MAX_RETRANSMITS`] the connection is aborted (a silent or
-    /// vanished peer can't keep us retransmitting forever). `SYN_RCVD` uses
-    /// `syn_rcvd_retries` instead and never touches this.
+    /// Consecutive RTO firings with no proof of life from the peer — the RFC
+    /// 9293 §3.8.3 "R2" counter. Reset to 0 by any acceptable inbound ACK
+    /// (`process_ack`), not just a forward-progress one, so a flow-controlled
+    /// but live peer is never aborted; once it exceeds [`MAX_RETRANSMITS`] a
+    /// truly silent/vanished peer can no longer keep us retransmitting
+    /// forever. `SYN_RCVD` uses `syn_rcvd_retries` instead and never touches
+    /// this.
     rtx_count: u8,
+    // ---- Keepalive (RFC 9293 §3.8.4), opt-in (off unless set_keepalive) ---
+    /// Idle time before the first keepalive probe, in ms. `0` disables
+    /// keepalive entirely (the default).
+    keepalive_idle_ms: u32,
+    /// Interval between successive keepalive probes, in ms.
+    keepalive_intvl_ms: u32,
+    /// Unanswered keepalive probes tolerated before the connection is aborted.
+    keepalive_count: u8,
+    /// Probes sent in the current idle episode; reset to 0 by any inbound
+    /// segment (proof the peer is alive).
+    keepalive_probes: u8,
+    /// Next keepalive action (probe or abort). Re-armed to `now + idle` on
+    /// every inbound segment; `None` when keepalive is disabled or unarmed.
+    keepalive_deadline: Option<u64>,
     /// 128-bit secret used to MAC SYN cookies (RFC 4987). Live only if
     /// `cookie_secret_set` is true. With cookies enabled, a LISTEN TCB
     /// answers an inbound SYN **statelessly**: the SYN-ACK's ISN encodes
@@ -499,6 +515,11 @@ impl<const BUF: usize> Tcb<BUF> {
             is_listener: false,
             syn_rcvd_retries: 0,
             rtx_count: 0,
+            keepalive_idle_ms: 0,
+            keepalive_intvl_ms: 0,
+            keepalive_count: 0,
+            keepalive_probes: 0,
+            keepalive_deadline: None,
             cookie_secret: [0u8; 16],
             cookie_secret_set: false,
         })
@@ -717,6 +738,7 @@ impl<const BUF: usize> Tcb<BUF> {
             self.rack_deadline,
             self.persist_deadline,
             self.ack_deadline,
+            self.keepalive_deadline,
         ]
         .into_iter()
         .flatten()
@@ -727,6 +749,31 @@ impl<const BUF: usize> Tcb<BUF> {
     #[inline]
     pub fn set_now(&mut self, now_ms: u64) {
         self.now_ms = now_ms;
+    }
+
+    /// Enable (or reconfigure) TCP keepalive (RFC 9293 §3.8.4) for this
+    /// connection. Off by default — it never perturbs the wire unless a host
+    /// opts in.
+    ///
+    /// After `idle_ms` of total inbound silence on an otherwise-idle
+    /// `ESTABLISHED` connection — *idle* meaning nothing is in flight, since
+    /// outstanding data is already covered by the R2 retransmit timeout — up
+    /// to `count` zero-data probes are sent `intvl_ms` apart. The peer must
+    /// answer each with an ACK (the probe sits one byte behind `snd_nxt`); if
+    /// none of the `count` probes is answered the connection is aborted as a
+    /// vanished peer (surfaced as `ConnectionReset`, no RST). Any inbound
+    /// segment resets the idle timer and probe count. Pass `idle_ms == 0` to
+    /// disable.
+    pub fn set_keepalive(&mut self, idle_ms: u32, intvl_ms: u32, count: u8) {
+        self.keepalive_idle_ms = idle_ms;
+        self.keepalive_intvl_ms = intvl_ms.max(1);
+        self.keepalive_count = count;
+        self.keepalive_probes = 0;
+        self.keepalive_deadline = if idle_ms == 0 {
+            None
+        } else {
+            Some(self.now_ms.wrapping_add(idle_ms as u64))
+        };
     }
 
     /// Initiate an active open: transitions `Closed` → `SynSent`, queues a SYN
@@ -855,6 +902,8 @@ impl<const BUF: usize> Tcb<BUF> {
         self.tlp_deadline = None;
         self.tlp_fired = false;
         self.rtx_count = 0;
+        self.keepalive_probes = 0;
+        self.keepalive_deadline = None;
         self.send_ring.clear();
         self.recv_ring.clear();
         self.reasm.clear();
@@ -1060,6 +1109,8 @@ impl<const BUF: usize> Tcb<BUF> {
         self.ack_deadline = None;
         self.rack_deadline = None;
         self.tlp_deadline = None;
+        self.keepalive_deadline = None;
+        self.keepalive_probes = 0;
     }
 
     /// Aggregate event flags for the host async runtime to dispatch on.
@@ -1127,6 +1178,12 @@ impl<const BUF: usize> Tcb<BUF> {
             && (seg.src_ip != self.remote.ip || seg.src_port != self.remote.port)
         {
             return Err(TcpError::NotForUs);
+        }
+        // Any inbound segment is proof the peer is alive: re-arm the keepalive
+        // idle timer and clear the unanswered-probe count.
+        if self.keepalive_idle_ms != 0 {
+            self.keepalive_probes = 0;
+            self.keepalive_deadline = Some(self.now_ms.wrapping_add(self.keepalive_idle_ms as u64));
         }
         self.on_segment(&seg)
     }
@@ -1244,6 +1301,8 @@ impl<const BUF: usize> Tcb<BUF> {
         }
         // ---- Persist (zero-window probe) timer --------------------------
         self.check_persist()?;
+        // ---- Keepalive (idle-connection vanished-peer probe) ------------
+        self.check_keepalive()?;
         // ---- Try to push outbound data / FIN ----------------------------
         // Run BEFORE the delayed-ACK fallback below so the ACK gets
         // piggybacked on a data segment if possible. `maybe_send_data`
@@ -2004,6 +2063,13 @@ impl<const BUF: usize> Tcb<BUF> {
             self.send_pure_ack()?;
             return Ok(());
         }
+        // Proof of life: any acceptable ACK (even a duplicate / zero-window
+        // probe response) shows the peer is still there, so the RFC 9293
+        // §3.8.3 R2 "vanished peer" budget starts over. On the symmetric paths
+        // this stack targets (WireGuard tunnels), a total absence of ACKs is
+        // the only reliable signal that the peer is truly gone — a peer that
+        // is merely flow-controlled keeps answering, and must not be aborted.
+        self.rtx_count = 0;
 
         // RFC 3168 §6.1.2: an ECE-marked ACK is a congestion signal. Enter
         // PRR recovery (same response as a 3-dup-ACK / SACK trigger) and
@@ -2156,9 +2222,6 @@ impl<const BUF: usize> Tcb<BUF> {
         }
         self.send_ring.consume(payload_acked as usize);
         self.snd_una = ack;
-        // Forward progress: the peer is alive and acknowledging, so the
-        // RFC 9293 §3.8.3 R2 retransmit budget starts over.
-        self.rtx_count = 0;
         // If a prior RTO rewound `snd_nxt` to `snd_una`, but the peer's
         // first cumulative ACK after recovery jumps over the rewound
         // point (because the peer had buffered our pre-rewind segments
@@ -2801,6 +2864,50 @@ impl<const BUF: usize> Tcb<BUF> {
         let next = self.persist_backoff_ms.saturating_mul(2);
         self.persist_backoff_ms = next.clamp(RTO_MIN_MS, RTO_MAX_MS);
         self.persist_deadline = Some(self.now_ms.wrapping_add(self.persist_backoff_ms as u64));
+        Ok(())
+    }
+
+    /// RFC 9293 §3.8.4 keepalive: probe an *idle* ESTABLISHED connection to
+    /// discover a vanished peer that no other timer would catch. Opt-in
+    /// (`keepalive_idle_ms == 0` ⇒ disabled). Only runs when nothing is in
+    /// flight (`snd_una == snd_max`); a connection with outstanding data is
+    /// already covered by the R2 retransmit timeout. The probe is a zero-data
+    /// ACK one byte behind `snd_nxt`, which the peer must answer (RFC 1122
+    /// §4.2.3.6); it carries no new sequence space, so it neither advances
+    /// send state nor arms the RTO. After `keepalive_count` unanswered probes
+    /// the peer is declared gone and the connection is aborted locally.
+    fn check_keepalive(&mut self) -> Result<(), TcpError> {
+        if self.keepalive_idle_ms == 0
+            || self.state != State::Established
+            || self.snd_una != self.snd_max
+        {
+            return Ok(());
+        }
+        let deadline = match self.keepalive_deadline {
+            Some(d) => d,
+            None => return Ok(()),
+        };
+        if self.now_ms < deadline {
+            return Ok(());
+        }
+        if self.keepalive_probes >= self.keepalive_count {
+            // None of the probes was answered — the peer has vanished.
+            self.abort_timed_out();
+            return Ok(());
+        }
+        let opts = self.data_options();
+        let queued = self.emit_segment(
+            flags::ACK,
+            self.snd_nxt.wrapping_sub(1),
+            self.rcv_nxt,
+            &opts,
+            &[],
+        )?;
+        if queued {
+            self.keepalive_probes = self.keepalive_probes.saturating_add(1);
+            self.keepalive_deadline =
+                Some(self.now_ms.wrapping_add(self.keepalive_intvl_ms as u64));
+        }
         Ok(())
     }
 
@@ -3702,5 +3809,220 @@ mod retransmit_overflow_regression {
             tcb.rtx_count, 0,
             "forward ACK progress must reset the R2 retransmit counter",
         );
+    }
+
+    fn drain_all(tcb: &mut Tcb) -> bool {
+        let mut buf = [0u8; crate::MAX_PACKET];
+        let mut emitted = false;
+        while tcb.extract_packet(&mut buf).expect("extract") > 0 {
+            emitted = true;
+        }
+        emitted
+    }
+
+    fn inject_peer_ack(tcb: &mut Tcb, seq: u32, ack: u32) {
+        let opts = crate::wire::TcpOptions::NONE;
+        let mut pkt = [0u8; crate::MAX_PACKET];
+        let len = crate::wire::emit(
+            &mut pkt,
+            [10, 0, 0, 2],
+            [10, 0, 0, 1],
+            80,
+            49152,
+            seq,
+            ack,
+            crate::wire::flags::ACK,
+            65_535,
+            &opts,
+            &[],
+            1,
+            crate::wire::ecn::NOT_ECT,
+        )
+        .expect("emit");
+        tcb.inject_packet(&pkt[..len]).expect("inject");
+    }
+
+    /// Drive RTO firings (no inbound traffic) until the connection aborts or a
+    /// generous cap is hit; returns the number of timeouts that fired.
+    fn run_rtos_until_closed(tcb: &mut Tcb) -> u32 {
+        let mut fired = 0u32;
+        for _ in 0..(super::MAX_RETRANSMITS as u32 + 5) {
+            let dl = tcb.debug_snapshot().rto_deadline;
+            if dl == u64::MAX {
+                break;
+            }
+            tcb.set_now(dl + 1);
+            tcb.tick().expect("tick");
+            fired += 1;
+            if tcb.state() == State::Closed {
+                break;
+            }
+            drain_all(tcb);
+        }
+        fired
+    }
+
+    /// Vanished peer on the **connect** path: an unanswered SYN must time out
+    /// (R2 applies to SYN_SENT) rather than retransmit forever.
+    #[test]
+    fn r2_aborts_silent_peer_during_connect() {
+        let mut tcb: Tcb = Tcb::new(cfg(1000)).expect("tcb");
+        tcb.set_now(0);
+        tcb.connect().expect("connect");
+        assert_eq!(tcb.state(), State::SynSent);
+        drain_all(&mut tcb);
+
+        let fired = run_rtos_until_closed(&mut tcb);
+        assert_eq!(
+            tcb.state(),
+            State::Closed,
+            "connect to a silent peer must time out"
+        );
+        assert_eq!(fired, super::MAX_RETRANSMITS as u32 + 1);
+    }
+
+    /// Vanished peer on the **close** path: an unanswered FIN must time out
+    /// rather than leave us in FIN_WAIT_1 forever.
+    #[test]
+    fn r2_aborts_silent_peer_during_close() {
+        let mut tcb: Tcb = Tcb::new(cfg(1000)).expect("tcb");
+        tcb.state = State::Established;
+        tcb.snd_wnd = 65_535;
+        tcb.rcv_nxt = 9_000;
+        tcb.snd_una = 5_000;
+        tcb.snd_nxt = 5_000;
+        tcb.snd_max = 5_000;
+        tcb.now_ms = 0;
+        tcb.rto_ms = 200;
+        tcb.close().expect("close");
+        assert_eq!(tcb.state(), State::FinWait1);
+        drain_all(&mut tcb);
+
+        run_rtos_until_closed(&mut tcb);
+        assert_eq!(
+            tcb.state(),
+            State::Closed,
+            "a silent peer during close must time out"
+        );
+    }
+
+    /// Proof-of-life: a peer that keeps *answering* — even with non-advancing
+    /// (zero-window / duplicate) ACKs — is alive, not vanished, and must never
+    /// be R2-aborted, no matter how many RTOs fire.
+    #[test]
+    fn r2_survives_flow_controlled_alive_peer() {
+        let mut tcb: Tcb = Tcb::new(cfg(1000)).expect("tcb");
+        tcb.state = State::Established;
+        tcb.snd_wnd = 65_535;
+        tcb.rcv_nxt = 9_000;
+        tcb.snd_una = 5_000;
+        tcb.snd_nxt = 6_460;
+        tcb.snd_max = 6_460;
+        let _ = tcb.send_ring.write(&[0xAB; 1_460]);
+        tcb.now_ms = 0;
+        tcb.rto_ms = 200;
+        tcb.arm_rto_for(tcb.snd_nxt);
+
+        for _ in 0..(super::MAX_RETRANSMITS as u32 * 3) {
+            let dl = tcb.debug_snapshot().rto_deadline;
+            tcb.set_now(dl + 1);
+            tcb.tick().expect("tick");
+            drain_all(&mut tcb);
+            // Peer answers each retransmit with a duplicate ACK (no progress).
+            inject_peer_ack(&mut tcb, 9_000, 5_000);
+            assert_ne!(
+                tcb.state(),
+                State::Closed,
+                "an answering peer must not be aborted"
+            );
+        }
+        assert_eq!(tcb.state(), State::Established);
+        assert!(tcb.rtx_count <= 1, "each answer resets the R2 counter");
+    }
+
+    /// Keepalive catches a vanished peer on an **idle** connection that no
+    /// other timer would notice (nothing in flight, both sides quiet).
+    #[test]
+    fn keepalive_aborts_vanished_idle_peer() {
+        let mut tcb: Tcb = Tcb::new(cfg(1000)).expect("tcb");
+        tcb.state = State::Established;
+        tcb.snd_wnd = 65_535;
+        tcb.rcv_nxt = 9_000;
+        tcb.snd_una = 5_000;
+        tcb.snd_nxt = 5_000;
+        tcb.snd_max = 5_000; // idle: nothing in flight
+        tcb.set_now(0);
+        tcb.set_keepalive(1_000, 200, 3);
+
+        let mut probes = 0u32;
+        for _ in 0..10 {
+            let dl = match tcb.debug_next_deadline() {
+                Some(d) => d,
+                None => break,
+            };
+            tcb.set_now(dl + 1);
+            tcb.tick().expect("tick");
+            if drain_all(&mut tcb) {
+                probes += 1;
+            }
+            if tcb.state() == State::Closed {
+                break;
+            }
+        }
+        assert_eq!(
+            tcb.state(),
+            State::Closed,
+            "keepalive must abort a vanished idle peer"
+        );
+        assert_eq!(
+            probes, 3,
+            "exactly keepalive_count probes precede the abort"
+        );
+    }
+
+    /// A peer that answers keepalive probes is alive: the connection must
+    /// survive indefinitely.
+    #[test]
+    fn keepalive_survives_responding_peer() {
+        let mut tcb: Tcb = Tcb::new(cfg(1000)).expect("tcb");
+        tcb.state = State::Established;
+        tcb.snd_wnd = 65_535;
+        tcb.rcv_nxt = 9_000;
+        tcb.snd_una = 5_000;
+        tcb.snd_nxt = 5_000;
+        tcb.snd_max = 5_000;
+        tcb.set_now(0);
+        tcb.set_keepalive(1_000, 200, 3);
+
+        for _ in 0..20 {
+            let dl = tcb.debug_next_deadline().expect("keepalive armed");
+            tcb.set_now(dl + 1);
+            tcb.tick().expect("tick");
+            drain_all(&mut tcb);
+            // Peer answers the probe — proof of life.
+            inject_peer_ack(&mut tcb, 9_000, 5_000);
+            assert_ne!(tcb.state(), State::Closed, "an answering peer must survive");
+        }
+        assert_eq!(tcb.state(), State::Established);
+    }
+
+    /// Keepalive is off by default: an idle connection is left completely
+    /// alone (no probes, no abort) no matter how much time passes.
+    #[test]
+    fn keepalive_off_by_default_leaves_idle_connection_alone() {
+        let mut tcb: Tcb = Tcb::new(cfg(1000)).expect("tcb");
+        tcb.state = State::Established;
+        tcb.snd_wnd = 65_535;
+        tcb.rcv_nxt = 9_000;
+        tcb.snd_una = 5_000;
+        tcb.snd_nxt = 5_000;
+        tcb.snd_max = 5_000;
+
+        for i in 0..50u64 {
+            tcb.set_now((i + 1) * 100_000); // advance 100 s per tick
+            tcb.tick().expect("tick");
+            assert!(!drain_all(&mut tcb), "no probes when keepalive is disabled");
+            assert_eq!(tcb.state(), State::Established, "idle connection persists");
+        }
     }
 }

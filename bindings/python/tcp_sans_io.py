@@ -114,6 +114,9 @@ _lib.tcp_set_cookie_secret.argtypes = [c_void_p, c_void_p]
 _lib.tcp_close.restype = c_int32
 _lib.tcp_close.argtypes = [c_void_p, c_uint64]
 
+_lib.tcp_set_keepalive.restype = c_int32
+_lib.tcp_set_keepalive.argtypes = [c_void_p, c_uint64, c_uint32, c_uint32, c_uint8]
+
 _lib.tcp_tick.restype = c_int32
 _lib.tcp_tick.argtypes = [c_void_p, c_uint64]
 
@@ -316,6 +319,16 @@ class TcpStream:
 
     def close(self, now_ms: int) -> None:
         _check(_lib.tcp_close(self._handle, c_uint64(now_ms)))
+
+    def set_keepalive(self, now_ms: int, idle_ms: int, intvl_ms: int, count: int) -> None:
+        """Enable TCP keepalive (RFC 9293 3.8.4). After ``idle_ms`` of inbound
+        silence on an idle ESTABLISHED connection, up to ``count`` probes are
+        sent ``intvl_ms`` apart; an unanswered run aborts the connection as a
+        vanished peer. ``idle_ms == 0`` disables it (the default)."""
+        _check(_lib.tcp_set_keepalive(
+            self._handle, c_uint64(now_ms),
+            c_uint32(idle_ms), c_uint32(intvl_ms), c_uint8(count),
+        ))
 
     def tick(self, now_ms: int) -> None:
         _check(_lib.tcp_tick(self._handle, c_uint64(now_ms)))

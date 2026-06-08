@@ -144,7 +144,7 @@ mis-ordering, corruption, a panic, or an unbounded loop.
 | `RTO_MIN` / `RTO_MAX` | 200 ms / 60 s | `tcb.rs` | RTO clamp; exponential backoff is capped at `RTO_MAX`. |
 | `TLP_MIN_PTO` / `DELAYED_ACK` / `TIME_WAIT` | 10 ms / 40 ms / 60 s | `tcb.rs` | Tail-loss-probe floor, delayed-ACK timer (every 2nd segment), 2·MSL wait. |
 | `MAX_SYN_RCVD_RETRIES` | 5 | `tcb.rs` | SYN-ACK retransmits before a half-open reverts to `LISTEN` (one half-open per TCB). |
-| `MAX_RETRANSMITS` | 10 | `tcb.rs` | RFC 9293 §3.8.3 "R2": consecutive unacked RTO timeouts (data / SYN / FIN) before a connection aborts (~200 s at `RTO_MIN`); resets on any ACK progress. |
+| `MAX_RETRANSMITS` | 10 | `tcb.rs` | RFC 9293 §3.8.3 "R2": consecutive RTO timeouts (data / SYN / FIN / zero-window probe) with no proof of life before a connection aborts (~200 s at `RTO_MIN`); resets on any inbound ACK. |
 | Cookie validity | 128 s | `tcb.rs` | `2 × COOKIE_TIME_BUCKET_MS`; MAC truncated to 29 bits (2⁻²⁹ blind forgery). |
 
 ### Why the bounds are sound
@@ -814,9 +814,15 @@ The stack assumes the host is friendly but the peer is hostile.
 - **Resource exhaustion**: bounded SYN_RCVD retransmits (default 5),
   optional stateless SYN cookies, no allocator to be drained. A peer that
   goes silent mid-connection cannot pin a TCB forever either: after
-  `MAX_RETRANSMITS` (10) unacknowledged RTO timeouts the connection aborts
-  locally (RFC 9293 §3.8.3 R2), with no RST emitted (the peer is presumed
-  gone, and we never reflect resets at a silent endpoint).
+  `MAX_RETRANSMITS` (10) RTO timeouts with no proof of life the connection
+  aborts locally (RFC 9293 §3.8.3 R2), with no RST emitted (the peer is
+  presumed gone, and we never reflect resets at a silent endpoint). The R2
+  counter covers data, SYN, FIN and zero-window persist probes, and resets on
+  *any* inbound ACK — a merely flow-controlled peer that keeps answering is
+  never aborted. For an *idle* connection (nothing in flight, which no other
+  timer would notice) opt-in **TCP keepalive** (RFC 9293 §3.8.4,
+  `set_keepalive` / `tcp_set_keepalive`, off by default) probes for a vanished
+  peer and aborts after an unanswered run.
 - **Off-path injection**: 5-tuple filter on `inject_packet`; RFC-compliant
   acceptability checks on RST/SYN/ACK; SYN-cookie path is keyed by a
   caller-supplied 128-bit secret (we ship a no_std SipHash-2-4 impl, with

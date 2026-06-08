@@ -95,6 +95,15 @@ int32_t tcp_tick   (TcpStreamHandle* handle, uint64_t now_ms);
  * `secret` must point to exactly 16 readable bytes from a CSPRNG. */
 int32_t tcp_set_cookie_secret(TcpStreamHandle* handle, const uint8_t* secret);
 
+/* Enable/reconfigure TCP keepalive (RFC 9293 3.8.4). After `idle_ms` of
+ * inbound silence on an idle ESTABLISHED connection (nothing in flight), up
+ * to `count` probes are sent `intvl_ms` apart; if none is answered the
+ * connection aborts as a vanished peer (ConnectionReset via tcp_poll ERROR /
+ * tcp_recv), no RST emitted. Any inbound segment resets the idle timer.
+ * `idle_ms == 0` disables it (the default). Off unless called. */
+int32_t tcp_set_keepalive(TcpStreamHandle* handle, uint64_t now_ms,
+                          uint32_t idle_ms, uint32_t intvl_ms, uint8_t count);
+
 /* ---- State / polling --------------------------------------------------- */
 uint8_t  tcp_state(const TcpStreamHandle* handle);
 uint32_t tcp_poll (const TcpStreamHandle* handle);
