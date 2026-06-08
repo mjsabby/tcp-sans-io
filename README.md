@@ -206,6 +206,62 @@ hang-free** against a hostile peer:
   length; `tcp_init` writes a fresh, zeroed `Tcb` over reused host
   storage. A peer cannot read uninitialised or prior-connection memory.
 
+## Clock model and tick cadence
+
+TCP is **inherently time-dependent**: retransmission (RTO), Tail Loss
+Probe (TLP), delayed-ACK, `TIME_WAIT`, zero-window persist probing, and
+RACK's reordering window are all driven by elapsed time, not by packets
+alone. This stack handles that without owning a clock, threads, or
+syscalls: **`now_ms` (`u64` milliseconds) is supplied by the host** on
+every `tcp_tick`, `tcp_inject_packet`, `tcp_send`, `tcp_close`, and
+`tcp_abort` call. The stack has no other notion of time.
+
+That is the core reason the library is shaped this way. A sans-I/O stack
+with an **external clock source** is a pure, deterministic function of
+`(inputs, now_ms)` — which is exactly what makes it testable: the
+conformance suite steps the clock millisecond-by-millisecond, and the
+gVisor chaos harness advances a virtual clock by hand to reproduce loss
+and reordering byte-for-byte. The same code path runs in production
+against a real monotonic clock. There is no hidden timer thread to mock.
+
+**What needs a periodic `tick()`.** Responses to events — an ACK or data
+segment triggered by an inbound packet, or by an application `send()` —
+are emitted *inline* during `inject`/`send`. But timer *expiry* (RTO
+retransmit, TLP probe, `TIME_WAIT` reaping, persist probe, a delayed-ACK
+that didn't get piggybacked) is evaluated only inside `tick()`. So the
+host must call `tcp_tick(now_ms)` **periodically even when no packets are
+arriving**, or those timers never fire.
+
+**How fast does the clock need to drive?** The timer floors are:
+
+| Timer | Floor | Effect of a coarse/late tick |
+|---|---|---|
+| RACK reorder window | `max(SRTT/4, 1 ms)` | Loss declared slightly later on low-RTT reordering paths. |
+| TLP PTO | `max(2·SRTT, 10 ms)` | Tail-loss probe fires up to one tick late. |
+| Delayed ACK | 40 ms | ACK latency rises by up to one tick. |
+| RTO | `200 ms … 60 s` | Negligible: a 10 ms tick is 20× finer than the floor. |
+| `TIME_WAIT` | 60 s | Irrelevant to cadence. |
+
+A **~10 ms periodic tick with 1–2 ms of jitter is more than adequate** —
+it matches the TLP floor and is far finer than `RTO_MIN`. Driving finer
+(1–2 ms) only helps RACK on very-low-RTT LAN paths where `SRTT/4` dips
+below 10 ms; on WAN/tunnel paths the reorder window is already ≥ 10 ms,
+so 10 ms loses nothing. **Cadence and jitter affect only loss-recovery
+latency and ACK timing — never correctness** (per the bounds invariant
+above): a coarse or jittery clock makes recovery slower, never wrong.
+
+**Clock requirements.**
+
+- Use a **monotonic, millisecond-resolution** source — `Instant`,
+  `clock_gettime(CLOCK_MONOTONIC)`, `QueryPerformanceCounter` — not
+  wall-clock. A backward step just postpones timers and a large forward
+  jump fires them early; both are harmless but best avoided.
+- The recommended driving pattern is **event + periodic**: call `tick()`
+  with a fresh `now_ms` right after a batch of injects (so responses are
+  clocked correctly) and from a periodic timer at your finest affordable
+  cadence (1–10 ms) for the idle case. Pass the *same* `now_ms` you read
+  for that turn into every call in the turn.
+
 ## How will it perform in 2026?
 
 Honest assessment by path profile (in-process numbers; see *Benchmarks*
