@@ -52,3 +52,10 @@ path = "fuzz_targets/tcb_client_session.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "tcb_loopback"
+path = "fuzz_targets/tcb_loopback.rs"
+test = false
+doc = false
+bench = false

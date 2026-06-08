@@ -13,6 +13,7 @@ so those are the natural targets.
 | `wire_parse_emit_roundtrip` | For any successfully parsed segment, re-emitting and re-parsing produces the same observable fields (seq, ack, flags, window, MSS / WS / TS / SACK options, payload). |
 | `tcb_inject_sequence` | A fresh `Tcb` in `Listen` survives any sequence of arbitrary `inject_packet` calls + clock ticks without panicking, blowing through bounded buffers, or leaving the state machine in an unreachable state. |
 | `tcb_client_session` | Drives the **active-open send/retransmit** path (`connect` → scripted SACK-enabled handshake → `send` → fuzzer-chosen cumulative-ACK offsets, SACK blocks, and clock jumps that fire TLP/RTO). Asserts the internal `TcpError::Overflow` invariant code never escapes the API. This is the path the `tcp_tick: -9` TLP partial-ACK bug lived in. |
+| `tcb_loopback` | Drives **two real stacks** (client + server) against each other through a fuzzer-controlled chaos channel with a *finite drop budget* (so the channel is eventually reliable). Oracle: the bidirectional transfer **must always converge** — a stack that deadlocks (e.g. the PRR ACK-clock stall: recovery with `snd_credit == 0` and an empty pipe) never does, and trips the iteration budget. This is the deadlock / sender-stall catcher that the single-peer targets cannot be (their synthetic peer may legitimately stall the connection). |
 
 Both `tcb_*` targets treat a returned `TcpError::Overflow` as a hard
 failure: it is an *internal* "a sequence-derived buffer offset/length

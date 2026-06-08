@@ -31,6 +31,9 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --release --lib --no-deps -- -D warnings
 
+      - name: self-loopback conformance harness (chaos, hash-verified)
+        run: cargo run --release --manifest-path bindings/conformance/Cargo.toml
+
       - name: Upload cdylib + header
         uses: actions/upload-artifact@v4
         with:
