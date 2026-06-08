@@ -416,6 +416,10 @@ with `src/ffi.rs`).
 - **Rust harness** — `bindings/wgserver-rs/` (standalone server binary
   multiplexing N TCBs on a single UDP socket; depends on the parent
   crate as an rlib).
+- **Conformance harness** — `bindings/conformance/` (standalone
+  self-loopback certifier; drives two stacks against each other through
+  the C ABI over a chaos channel and hash-verifies the transfer — no
+  external stack or root needed; `cargo run --release`).
 
 All use the host-allocated storage pattern: query
 `tcp_handle_size()` / `tcp_handle_align()`, allocate that much memory in the
@@ -459,6 +463,7 @@ for the `HALF_OPEN` → `ESTABLISHED` transition.
 
 ```c
 // --- one-time setup ---
+if (tcp_selftest() != 0) abort();      // smoke-test linkage/ABI/health first
 void* mem = aligned_alloc(tcp_handle_align(), tcp_handle_size());
 tcp_init(mem, local_ip, local_port, remote_ip, remote_port,
          csprng_u32(), /*initial_rto_ms=*/1000);
@@ -600,30 +605,39 @@ larger `RUST_MIN_STACK` from `.cargo/config.toml` for stack-allocated TCBs.
 ### How do you know you got it right? (canonical conformance)
 
 There is a canonical, executable answer: **drive a hash-verified
-bidirectional bulk transfer against a reference TCP and check both
-SHA-256 digests match.** If a fresh, independent TCP (the Linux kernel,
-gVisor's netstack, or even a second instance of this stack in loopback)
+bidirectional bulk transfer and check both digests match.** If an
+independent TCP — or even a second instance of this stack in loopback —
 agrees with you byte-for-byte in *both* directions over a multi-MiB
-transfer, your integration — sizing, ordering, draining, clocking, close
-sequence — is correct. A single dropped/duplicated/reordered byte from a
+transfer, your integration (sizing, ordering, draining, clocking, close
+sequence) is correct. A single dropped/duplicated/reordered byte from a
 driver bug changes the digest.
 
-The repo ships these as the reference self-tests; port the one closest to
-your transport:
+The easiest path needs **no external stack and no root**: drive two
+instances of your own binding against each other through an in-memory
+channel that injects loss / reordering / duplication. That single test
+exercises your entire integration surface. Two tiers, easiest first:
 
-| Self-test | What it proves | File |
-|---|---|---|
-| **vs gVisor netstack** | 1 GiB each way, SHA-256 verified, client + server | `bindings/gvisor/integration_test.go`, `server_integration_test.go` |
-| **vs real Linux kernel (TUN)** | Same, against an actual kernel TCP | `bindings/gvisor/tun_test.go`, `tun_server_test.go` |
-| **Adversarial channel** | Survives loss/reorder/dup/corruption/jitter | `bindings/gvisor/chaos_test.go` |
-| **Pure-Rust loopback** | Two TCBs talk through an in-memory wire | `src/loopback_tests.rs` |
+| Tier | Self-test | What it proves | Reference |
+|---|---|---|---|
+| 0 | `tcp_selftest()` | Linkage / ABI / calling convention + core health, in one call | built-in |
+| 1 | **self-loopback** | *Your* pump loop is correct, under chaos — no external peer | `bindings/conformance/` (`cargo run --release`) |
+| 2 | gVisor netstack | Interop with a foreign stack, 1 GiB each way, SHA-256 | `bindings/gvisor/integration_test.go`, `server_integration_test.go` |
+| 2 | real Linux kernel (TUN) | Interop with an actual kernel TCP | `bindings/gvisor/tun_test.go`, `tun_server_test.go` |
+| 2 | adversarial channel | Survives loss/reorder/dup/corruption/jitter | `bindings/gvisor/chaos_test.go` |
+
+`bindings/conformance/` is the Tier-1 reference: a ~200-line standalone
+binary that drives two stacks through the C ABI over a chaos channel and
+hash-verifies the transfer, exiting 0/1. Port it into your language's test
+suite to self-certify. **`SKILL.md`** at the repo root is a step-by-step
+walkthrough of the whole integrate-and-certify process.
 
 A minimal acceptance checklist for a new binding:
 
-- [ ] `tcp_abi_version()` matches the header you built against.
+- [ ] `tcp_selftest()` returns 0 and `tcp_abi_version()` matches the header.
 - [ ] Handshake reaches `ESTABLISHED` against a real peer.
-- [ ] A ≥ 1 MiB bidirectional transfer matches SHA-256 **both ways**.
-- [ ] Same transfer over a lossy/reordering channel still matches.
+- [ ] Tier-1 self-loopback: ≥ 256 KiB bidirectional, byte-exact, clean close.
+- [ ] Tier-1 under loss + reorder + dup still byte-exact.
+- [ ] (Recommended) Tier-2 interop: ≥ 1 MiB bidirectional vs a foreign stack.
 - [ ] Graceful `close` reaches `CLOSED` on both ends (no leaked handles).
 - [ ] A fuzz/property run of your wrapper shows no leaks or panics.
 
