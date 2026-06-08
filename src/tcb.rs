@@ -127,10 +127,9 @@ impl RackLostQueue {
         }
         // Shift right by 1 from pos.
         for i in (pos..self.len).rev() {
-            if let (Some(src), Some(dst)) = (
-                self.ranges.get(i).copied(),
-                self.ranges.get_mut(i + 1),
-            ) {
+            if let (Some(src), Some(dst)) =
+                (self.ranges.get(i).copied(), self.ranges.get_mut(i + 1))
+            {
                 *dst = src;
             }
         }
@@ -146,10 +145,9 @@ impl RackLostQueue {
         }
         let first = self.ranges.first().copied();
         for i in 1..self.len {
-            if let (Some(src), Some(dst)) = (
-                self.ranges.get(i).copied(),
-                self.ranges.get_mut(i - 1),
-            ) {
+            if let (Some(src), Some(dst)) =
+                (self.ranges.get(i).copied(), self.ranges.get_mut(i - 1))
+            {
                 *dst = src;
             }
         }
@@ -605,8 +603,10 @@ impl<const BUF: usize> Tcb<BUF> {
             ) {
                 return Err("fin_sent set in non-closing state");
             }
-            if matches!(self.state, State::FinWait2 | State::TimeWait | State::Closed)
-                && seq_lt(self.snd_una, fin_end)
+            if matches!(
+                self.state,
+                State::FinWait2 | State::TimeWait | State::Closed
+            ) && seq_lt(self.snd_una, fin_end)
             {
                 return Err("state requires our FIN to be ACKed");
             }
@@ -628,6 +628,78 @@ impl<const BUF: usize> Tcb<BUF> {
         }
 
         Ok(())
+    }
+
+    /// Liveness oracle — the *deadlock* counterpart to
+    /// [`Self::debug_validate_invariants`] (which only checks the safe
+    /// direction, "a timer implies outstanding data"). This checks the
+    /// direction deadlocks actually live in: **outstanding work implies a
+    /// timer that will eventually act on it**. Call it at *rest* (after the
+    /// host has drained `tx_ring` and run a `tick`); it self-skips while
+    /// output is still staged, so progress-in-flight is never misread as a
+    /// stall.
+    ///
+    /// Two black-hole classes are covered, each an invariant a correct stack
+    /// must always maintain:
+    ///
+    /// 1. **Dead ACK clock.** Sequence space that has been sent but not yet
+    ///    acknowledged (`snd_una < snd_max`) must always have a
+    ///    retransmission timer behind it — RTO, TLP, or RACK. With none, no
+    ///    event will ever put those bytes back on the wire, the peer's
+    ///    cumulative ACK can never advance, and the connection black-holes.
+    ///    This is precisely the shape of the PRR `snd_credit == 0` recovery
+    ///    stall and of a lost sole-outstanding FIN.
+    ///
+    /// 2. **Stalled persist.** Data is queued to send but the peer's window
+    ///    is shut (`snd_wnd == 0`) and nothing is in flight to clock it back
+    ///    open; a persist probe must be scheduled or the window may never
+    ///    reopen.
+    #[cfg(any(test, feature = "std"))]
+    pub fn debug_check_liveness(&self) -> Result<(), &'static str> {
+        // At rest only: staged egress means progress is already pending and
+        // resolves the instant the host drains the ring.
+        if self.tx_ring.peek_head_len().is_some() {
+            return Ok(());
+        }
+        // Class 1 — dead ACK clock.
+        if seq_lt(self.snd_una, self.snd_max)
+            && self.rto_deadline.is_none()
+            && self.tlp_deadline.is_none()
+            && self.rack_deadline.is_none()
+        {
+            return Err("liveness: outstanding data with no retransmit timer");
+        }
+        // Class 2 — stalled persist (only meaningful while we may still send).
+        if self.state.can_send()
+            && self.send_ring.len() != 0
+            && self.snd_wnd == 0
+            && seq_le(self.snd_max, self.snd_una)
+            && self.persist_deadline.is_none()
+        {
+            return Err("liveness: data queued under zero window with no persist timer");
+        }
+        Ok(())
+    }
+
+    /// Earliest *output-producing* armed deadline — the next instant at which
+    /// a tick would put a segment on the wire (RTO / TLP / RACK retransmit,
+    /// persist probe, or a delayed ACK). Deliberately excludes the TIME_WAIT
+    /// expiry, which produces no wire output and only reaps the slot: a
+    /// harness must not fast-forward a peer *out* of TIME_WAIT, or it loses
+    /// the 2·MSL window during which TIME_WAIT exists precisely to re-ACK the
+    /// other side's retransmitted FIN. `None` if the stack is idle.
+    #[cfg(any(test, feature = "std"))]
+    pub fn debug_next_deadline(&self) -> Option<u64> {
+        [
+            self.rto_deadline,
+            self.tlp_deadline,
+            self.rack_deadline,
+            self.persist_deadline,
+            self.ack_deadline,
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
     /// Update the host clock. Called before every tick / packet operation.
@@ -1404,8 +1476,7 @@ impl<const BUF: usize> Tcb<BUF> {
             sack_permitted: false,
             sack: SackBlocks::EMPTY,
         };
-        let win =
-            u16::try_from(self.advertised_window().min(u16::MAX as u32)).unwrap_or(u16::MAX);
+        let win = u16::try_from(self.advertised_window().min(u16::MAX as u32)).unwrap_or(u16::MAX);
         // Direct emit so we don't mutate any per-connection state — staying
         // in LISTEN is the whole point of this path. IP TOS is NOT_ECT:
         // SYN-ACK segments MUST NOT be ECT-marked (RFC 3168 §6.1.1), and
@@ -1417,9 +1488,19 @@ impl<const BUF: usize> Tcb<BUF> {
         let ip_id = self.ip_id;
         let queued = self.tx_ring.push_with(|buf| {
             wire::emit(
-                buf, local_ip, src_ip, local_port, src_port,
-                cookie, ack, flags::SYN | flags::ACK, win,
-                &opts, &[], ip_id, wire::ecn::NOT_ECT,
+                buf,
+                local_ip,
+                src_ip,
+                local_port,
+                src_port,
+                cookie,
+                ack,
+                flags::SYN | flags::ACK,
+                win,
+                &opts,
+                &[],
+                ip_id,
+                wire::ecn::NOT_ECT,
             )
         })?;
         if queued {
@@ -1447,8 +1528,7 @@ impl<const BUF: usize> Tcb<BUF> {
         let buckets = [now_bucket, now_bucket.wrapping_sub(1)];
         let mut matched = false;
         for &bucket in &buckets {
-            let expected =
-                self.compute_cookie(bucket, seg.src_ip, seg.src_port, mss_idx, peer_seq);
+            let expected = self.compute_cookie(bucket, seg.src_ip, seg.src_port, mss_idx, peer_seq);
             if expected == cookie {
                 matched = true;
                 break;
@@ -1678,8 +1758,26 @@ impl<const BUF: usize> Tcb<BUF> {
             }
         }
 
-        // Sequence-number acceptability test (RFC 793 §3.3).
+        // Sequence-number acceptability test (RFC 793 §3.3 / RFC 9293
+        // §3.10.7.4 step 1).
         if !self.in_window(seg.seq, seg.payload.len() as u32) {
+            // The segment is unacceptable, so none of its payload may be
+            // accepted. But an *old duplicate* — one ending at or before
+            // RCV.NXT — can still carry a cumulative ACK that advances
+            // SND.UNA; that is exactly what a duplicate ACK is (RFC 5681
+            // §3.2). In a bidirectional transfer, once both directions rewind
+            // SND.NXT below the peer's RCV.NXT after loss, *every* pure ACK is
+            // "old" at the peer. Dropping the ACK field wholesale then wedges
+            // both senders: each retransmits a fully-received segment forever,
+            // never sees its own data acknowledged, so cwnd never reopens.
+            // Process the ACK first, then reply with the mandated duplicate
+            // ACK. `process_ack` clamps to SND.MAX, so a blind or stale ACK
+            // can never acknowledge data we did not send.
+            let ends_at_or_before_rcv_nxt =
+                seq_le(seg.seq.wrapping_add(seg.payload.len() as u32), self.rcv_nxt);
+            if ends_at_or_before_rcv_nxt && seg.has(flags::ACK) {
+                self.process_ack(seg)?;
+            }
             self.send_pure_ack()?;
             return Ok(());
         }
@@ -1872,12 +1970,9 @@ impl<const BUF: usize> Tcb<BUF> {
         let mut latest_sack_end_seq: u32 = 0;
         if self.sack_enabled {
             for (l, r) in seg.options.sack.as_slice().iter().copied() {
-                let new_bytes = self.sack_scoreboard.bytes_newly_covered(
-                    l,
-                    r,
-                    self.snd_una,
-                    self.snd_max,
-                );
+                let new_bytes =
+                    self.sack_scoreboard
+                        .bytes_newly_covered(l, r, self.snd_una, self.snd_max);
                 if new_bytes > 0 {
                     newly_sacked = newly_sacked.saturating_add(new_bytes);
                     // RACK marker: among the newly-SACKed bytes, find the
@@ -1932,8 +2027,7 @@ impl<const BUF: usize> Tcb<BUF> {
                 && self.scale_peer_window(seg.window) == self.snd_wnd
                 && !self.cc.in_recovery()
             {
-                let sack_trigger =
-                    self.sack_enabled && !seg.options.sack.is_empty();
+                let sack_trigger = self.sack_enabled && !seg.options.sack.is_empty();
                 let pure_dup = seg.payload.is_empty() && !seg.has(flags::FIN);
                 let trigger = if sack_trigger {
                     true
@@ -2014,7 +2108,10 @@ impl<const BUF: usize> Tcb<BUF> {
 
         // Also use cumulative ACK as a RACK delivery signal: the segment
         // whose end_seq matches the new snd_una was just delivered.
-        if let Some(entry) = self.send_queue.find_latest_covering(self.snd_una.wrapping_sub(1)) {
+        if let Some(entry) = self
+            .send_queue
+            .find_latest_covering(self.snd_una.wrapping_sub(1))
+        {
             self.rack
                 .update_on_delivery(entry.send_ts_ms, entry.seq_end, self.now_ms);
         }
@@ -2188,8 +2285,16 @@ impl<const BUF: usize> Tcb<BUF> {
             let credit = self.cc.snd_credit();
             if let Some((seq, end)) = self.rack_lost_queue.take_lowest() {
                 // Clip to [snd_una, snd_max).
-                let lo = if seq_lt(seq, self.snd_una) { self.snd_una } else { seq };
-                let hi = if seq_gt(end, self.snd_max) { self.snd_max } else { end };
+                let lo = if seq_lt(seq, self.snd_una) {
+                    self.snd_una
+                } else {
+                    seq
+                };
+                let hi = if seq_gt(end, self.snd_max) {
+                    self.snd_max
+                } else {
+                    end
+                };
                 if seq_lt(lo, hi) {
                     // Find the first un-SACKed sub-range within [lo, hi).
                     let (sub_lo, sub_hi) = self
@@ -2197,8 +2302,7 @@ impl<const BUF: usize> Tcb<BUF> {
                         .first_unsacked_subrange(lo, hi)
                         .unwrap_or((lo, hi));
                     let len = sub_hi.wrapping_sub(sub_lo);
-                    let bytes =
-                        core::cmp::min(len, core::cmp::min(credit, mss_payload)) as usize;
+                    let bytes = core::cmp::min(len, core::cmp::min(credit, mss_payload)) as usize;
                     if bytes > 0 {
                         return self.emit_data_at(sub_lo, bytes);
                     }
@@ -2239,11 +2343,10 @@ impl<const BUF: usize> Tcb<BUF> {
                 }
             } else if self.sack_enabled {
                 // Phase 2: NextSeg-driven selective retransmit.
-                if let Some((rxt_seq, rxt_len)) = self.sack_scoreboard.next_seg(
-                    self.rxt_seq,
-                    self.snd_max,
-                    mss_payload,
-                ) {
+                if let Some((rxt_seq, rxt_len)) =
+                    self.sack_scoreboard
+                        .next_seg(self.rxt_seq, self.snd_max, mss_payload)
+                {
                     let bytes =
                         core::cmp::min(rxt_len, core::cmp::min(credit, mss_payload)) as usize;
                     if bytes > 0 {
@@ -2255,6 +2358,20 @@ impl<const BUF: usize> Tcb<BUF> {
 
         let flight = self.snd_nxt.wrapping_sub(self.snd_una);
         let allowed = self.cc.allowed(self.snd_wnd);
+
+        // A FIN is a pure control segment: it occupies one sequence number but
+        // carries no data, so — unlike a data segment — it owes no receive
+        // window and is bound by neither the peer's advertised window nor
+        // cwnd / PRR credit. Emit it here, *before* the window gates below.
+        // Otherwise a simultaneous close in which the peer's window is
+        // momentarily 0 (and never refreshed, because the peer has nothing
+        // left to send and so emits no window update) wedges forever in
+        // FIN_WAIT_2 / CLOSING with the FIN never reaching the wire. This only
+        // fires once the send ring is fully drained, so it never preempts data
+        // or a retransmit.
+        if self.try_emit_fin()? {
+            return Ok(true);
+        }
 
         // ---- Zero-window: arm persist timer instead of sending ----------
         if self.snd_wnd == 0 {
@@ -2275,8 +2392,7 @@ impl<const BUF: usize> Tcb<BUF> {
         // Outside recovery, snd_credit is u32::MAX (a no-op clamp).
         let window = core::cmp::min(allowed - flight, self.cc.snd_credit());
         let unsent = (self.send_ring.len() as u32).saturating_sub(flight);
-        let payload_bytes =
-            core::cmp::min(window, core::cmp::min(unsent, mss_payload)) as usize;
+        let payload_bytes = core::cmp::min(window, core::cmp::min(unsent, mss_payload)) as usize;
 
         if payload_bytes > 0 {
             // Stack-local scratch sized for the worst case (no TS).
@@ -2319,17 +2435,25 @@ impl<const BUF: usize> Tcb<BUF> {
             return Ok(true);
         }
 
-        // Nothing more to send from the ring → (re)transmit the FIN.
-        //
-        // The FIN occupies a single sequence number immediately past all
-        // buffered data. Gating on `snd_nxt == fin_at` (rather than the old
-        // `!fin_sent`) makes this block cover BOTH the first emission and a
-        // retransmission after an RTO rewound `snd_nxt` back onto the FIN's
-        // sequence. Without it a FIN that is the sole outstanding segment
-        // would never be resent (the RTO path only re-emits SYN/SYN-ACK),
-        // stalling the close forever. A FIN still in flight has
-        // `snd_nxt == fin_seq + 1`, so it is never spuriously resent; an
-        // ACKed FIN has `snd_una > fin_seq`, so `fin_at` no longer matches.
+        // The closing FIN is a pure control segment handled up front by
+        // `try_emit_fin` (before the window gates), so nothing remains here.
+        Ok(false)
+    }
+
+    /// Emit (or retransmit) the connection-closing FIN if one is owed and all
+    /// buffered data has already been sent. A pure FIN carries no payload, so
+    /// — unlike a data segment — it is bound by neither the peer's receive
+    /// window nor cwnd / PRR credit and must go out even into a zero window.
+    ///
+    /// The FIN occupies a single sequence number immediately past all buffered
+    /// data. Gating on `snd_nxt == fin_at` (rather than `!fin_sent`) makes one
+    /// path cover BOTH the first emission and a retransmission after an RTO
+    /// rewound `snd_nxt` back onto the FIN's sequence — without it, a FIN that
+    /// is the sole outstanding segment would never be resent (the RTO path
+    /// only re-emits SYN/SYN-ACK), stalling the close forever. A FIN still in
+    /// flight has `snd_nxt == fin_seq + 1`, so it is never spuriously resent;
+    /// an ACKed FIN has `snd_una > fin_seq`, so `fin_at` no longer matches.
+    fn try_emit_fin(&mut self) -> Result<bool, TcpError> {
         let fin_at = if self.fin_sent {
             self.fin_seq
         } else {
@@ -2339,39 +2463,37 @@ impl<const BUF: usize> Tcb<BUF> {
             self.state,
             State::FinWait1 | State::Closing | State::LastAck
         ) && self.send_ring.is_empty()
-            && window > 0
             && self.snd_nxt == fin_at;
-        if need_fin {
-            let opts = self.data_options();
-            let queued = self.emit_segment(
-                flags::FIN | flags::ACK,
-                self.snd_nxt,
-                self.rcv_nxt,
-                &opts,
-                &[],
-            )?;
-            if !queued {
-                return Ok(false);
-            }
-            if !self.fin_sent {
-                // First emission only: pin the FIN's sequence and charge
-                // one byte of (PRR) send credit. Retransmits must not
-                // re-charge or re-pin.
-                self.fin_seq = self.snd_nxt;
-                self.cc.on_send(1);
-                self.fin_sent = true;
-            }
-            self.snd_nxt = self.snd_nxt.wrapping_add(1);
-            self.bump_snd_max();
-            self.pending_ack = false;
-            self.delayed_ack_count = 0;
-            self.ack_deadline = None;
-            if self.rto_deadline.is_none() {
-                self.arm_rto_for(self.snd_nxt);
-            }
-            return Ok(true);
+        if !need_fin {
+            return Ok(false);
         }
-        Ok(false)
+        let opts = self.data_options();
+        let queued = self.emit_segment(
+            flags::FIN | flags::ACK,
+            self.snd_nxt,
+            self.rcv_nxt,
+            &opts,
+            &[],
+        )?;
+        if !queued {
+            return Ok(false);
+        }
+        if !self.fin_sent {
+            // First emission only: pin the FIN's sequence and charge one byte
+            // of (PRR) send credit. Retransmits must not re-charge or re-pin.
+            self.fin_seq = self.snd_nxt;
+            self.cc.on_send(1);
+            self.fin_sent = true;
+        }
+        self.snd_nxt = self.snd_nxt.wrapping_add(1);
+        self.bump_snd_max();
+        self.pending_ack = false;
+        self.delayed_ack_count = 0;
+        self.ack_deadline = None;
+        if self.rto_deadline.is_none() {
+            self.arm_rto_for(self.snd_nxt);
+        }
+        Ok(true)
     }
 
     /// Emit `bytes` of data from the send ring starting at sequence `seq`.
@@ -2485,10 +2607,7 @@ impl<const BUF: usize> Tcb<BUF> {
         let scan = crate::rack::detect_lost(&self.rack, &self.send_queue, self.now_ms);
 
         // Enter recovery on first RACK-detected loss, if not already.
-        if !scan.lost.is_empty()
-            && !self.cc.in_recovery()
-            && seq_gt(self.snd_max, self.snd_una)
-        {
+        if !scan.lost.is_empty() && !self.cc.in_recovery() && seq_gt(self.snd_max, self.snd_una) {
             let flight = self.snd_max.wrapping_sub(self.snd_una);
             self.cc.enter_recovery(flight, self.snd_max);
             self.rxt_seq = self.snd_una;
@@ -2602,7 +2721,8 @@ impl<const BUF: usize> Tcb<BUF> {
             }
             let seq = self.snd_nxt;
             let opts = self.data_options();
-            let queued = self.emit_segment(flags::ACK | flags::PSH, seq, self.rcv_nxt, &opts, &byte)?;
+            let queued =
+                self.emit_segment(flags::ACK | flags::PSH, seq, self.rcv_nxt, &opts, &byte)?;
             if queued {
                 self.snd_nxt = self.snd_nxt.wrapping_add(1);
                 self.bump_snd_max();
@@ -2692,9 +2812,19 @@ impl<const BUF: usize> Tcb<BUF> {
         let ip_id = self.ip_id;
         let queued = self.tx_ring.push_with(|buf| {
             wire::emit(
-                buf, src_ip, dst_ip, src_port, dst_port,
-                seq, ack, adjusted_flags, window,
-                options, payload, ip_id, ecn_codepoint,
+                buf,
+                src_ip,
+                dst_ip,
+                src_port,
+                dst_port,
+                seq,
+                ack,
+                adjusted_flags,
+                window,
+                options,
+                payload,
+                ip_id,
+                ecn_codepoint,
             )
         })?;
         if queued {
@@ -3240,5 +3370,168 @@ mod retransmit_overflow_regression {
             !tcb.cc.in_recovery(),
             "the empty-pipe/zero-credit recovery must have been force-exited",
         );
+        assert!(
+            tcb.debug_check_liveness().is_ok(),
+            "after the force-exit a retransmit timer must be armed (live again)",
+        );
+    }
+
+    /// The liveness oracle (`debug_check_liveness`) must flag a dead ACK
+    /// clock: sequence space that is sent-but-unacknowledged with *no*
+    /// retransmit timer behind it can never be re-sent, so the peer's ACK
+    /// never comes. This is the unit-level proof the oracle is non-vacuous —
+    /// the same shape the loopback fuzzer catches end-to-end.
+    #[test]
+    fn liveness_oracle_flags_outstanding_data_with_no_timer() {
+        let mut tcb: Tcb = Tcb::new(cfg(1000)).expect("tcb");
+        tcb.state = State::Established;
+        tcb.snd_wnd = 65_535;
+        tcb.rcv_nxt = 9_000;
+        tcb.snd_una = 5_000;
+        tcb.snd_nxt = 5_000;
+        tcb.snd_max = 7_000; // 2000 bytes sent-but-unacked
+
+        // Healthy: a retransmit timer is armed over the outstanding data.
+        tcb.rto_deadline = Some(1_200);
+        tcb.tlp_deadline = None;
+        tcb.rack_deadline = None;
+        assert!(
+            tcb.debug_check_liveness().is_ok(),
+            "armed RTO over outstanding data is live",
+        );
+
+        // Black hole: every retransmit timer disarmed while data is unacked.
+        tcb.rto_deadline = None;
+        assert_eq!(
+            tcb.debug_check_liveness(),
+            Err("liveness: outstanding data with no retransmit timer"),
+        );
+
+        // TLP or RACK alone is enough to keep the ACK clock alive.
+        tcb.tlp_deadline = Some(1_100);
+        assert!(tcb.debug_check_liveness().is_ok());
+        tcb.tlp_deadline = None;
+        tcb.rack_deadline = Some(1_050);
+        assert!(tcb.debug_check_liveness().is_ok());
+
+        // Fully acknowledged: no outstanding data, vacuously live.
+        tcb.rack_deadline = None;
+        tcb.snd_una = tcb.snd_max;
+        assert!(
+            tcb.debug_check_liveness().is_ok(),
+            "no outstanding data is vacuously live",
+        );
+    }
+
+    /// The liveness oracle must also flag a stalled persist: data queued to
+    /// send under a slammed-shut peer window with nothing in flight and no
+    /// persist timer can never make progress.
+    #[test]
+    fn liveness_oracle_flags_zero_window_without_persist() {
+        let mut tcb: Tcb = Tcb::new(cfg(1000)).expect("tcb");
+        tcb.state = State::Established;
+        tcb.rcv_nxt = 9_000;
+        tcb.snd_una = 5_000;
+        tcb.snd_nxt = 5_000;
+        tcb.snd_max = 5_000; // nothing in flight
+        tcb.snd_wnd = 0; // peer advertised a zero window
+        let n = tcb.send_ring.write(&[0x5A; 1_000]);
+        assert_eq!(n, 1_000, "send ring must hold the window-blocked data");
+
+        tcb.persist_deadline = None;
+        assert_eq!(
+            tcb.debug_check_liveness(),
+            Err("liveness: data queued under zero window with no persist timer"),
+        );
+
+        // A scheduled persist probe will reopen the window: live again.
+        tcb.persist_deadline = Some(1_500);
+        assert!(tcb.debug_check_liveness().is_ok());
+    }
+
+    /// Reproduces the bidirectional small-window deadlock surfaced by the
+    /// `tcb_loopback_small` fuzz target. In a two-way transfer, once *both*
+    /// directions rewind `snd_nxt` below the peer's `rcv_nxt` after loss,
+    /// every pure ACK arrives "old" (`SEG.SEQ < RCV.NXT`). Such a segment is
+    /// unacceptable per RFC 9293 §3.10.7.4 step 1, but its cumulative ACK must
+    /// still be processed (it is exactly a duplicate ACK, RFC 5681 §3.2). The
+    /// pre-fix code dropped the whole segment, freezing `snd_una`, starving
+    /// cwnd of ACKs, and making both senders retransmit already-received data
+    /// forever.
+    #[test]
+    fn old_duplicate_ack_still_advances_snd_una() {
+        let mut tcb: Tcb = Tcb::new(cfg(1000)).expect("tcb");
+        tcb.state = State::Established;
+        tcb.snd_wnd = 65_535;
+        // We put [5000, 7048) on the wire (snd_max = 7048); an RTO rewound
+        // snd_nxt to 6460 (one segment resent), so snd_una still lags.
+        tcb.snd_una = 5_000;
+        tcb.snd_nxt = 6_460;
+        tcb.snd_max = 7_048;
+        let n = tcb.send_ring.write(&[0xAB; 2_048]);
+        assert_eq!(n, 2_048, "send ring must hold the outstanding bytes");
+        // Our receive side has already advanced (we got the peer's data).
+        tcb.rcv_nxt = 9_000;
+        tcb.rcv_wnd = 8_192;
+
+        // Peer's pure ACK: SEQ = 8700 (300 below our rcv_nxt → an old
+        // duplicate), ACK = 7048 (acknowledges *all* our outstanding data).
+        let opts = crate::wire::TcpOptions::NONE;
+        let mut buf = [0u8; crate::MAX_PACKET];
+        let len = crate::wire::emit(
+            &mut buf,
+            [10, 0, 0, 2], // src = remote
+            [10, 0, 0, 1], // dst = local
+            80,
+            49152,
+            8_700, // SEQ below our rcv_nxt: old duplicate
+            7_048, // ACK covers snd_max
+            crate::wire::flags::ACK,
+            65_535,
+            &opts,
+            &[],
+            1,
+            crate::wire::ecn::NOT_ECT,
+        )
+        .expect("emit");
+        tcb.inject_packet(&buf[..len]).expect("inject");
+
+        assert_eq!(
+            tcb.snd_una, 7_048,
+            "an old-duplicate pure ACK must still advance snd_una to the acked high-water",
+        );
+    }
+
+    /// Reproduces the simultaneous-close deadlock surfaced by the
+    /// `tcb_loopback_small` fuzz target. A pure FIN owes no receive-window
+    /// space, so it must be emitted even when the peer's advertised window is
+    /// 0. Pre-fix, `maybe_send_one` took the zero-window persist early-return
+    /// before ever reaching the FIN, so a close in which the peer's window was
+    /// momentarily 0 (and never refreshed, because the peer had nothing left
+    /// to send) wedged forever in CLOSING / FIN_WAIT_2 with the FIN never on
+    /// the wire.
+    #[test]
+    fn fin_is_emitted_into_a_zero_window() {
+        let mut tcb: Tcb = Tcb::new(cfg(1000)).expect("tcb");
+        tcb.state = State::FinWait1;
+        tcb.snd_wnd = 0; // peer advertised a zero window
+        tcb.snd_una = 5_000;
+        tcb.snd_nxt = 5_000;
+        tcb.snd_max = 5_000; // all data acked → send ring empty
+        tcb.rcv_nxt = 9_000;
+        tcb.now_ms = 1_000;
+
+        tcb.tick().expect("tick");
+        let mut buf = [0u8; crate::MAX_PACKET];
+        let n = tcb.extract_packet(&mut buf).expect("extract");
+        assert!(n > 0, "a FIN must be emitted even into a zero window");
+        let seg = crate::wire::parse(&buf[..n]).expect("parse");
+        assert!(
+            seg.has(crate::wire::flags::FIN),
+            "the emitted segment must carry FIN",
+        );
+        assert_eq!(seg.seq, 5_000, "the FIN sits at snd_nxt");
+        assert!(tcb.fin_sent, "fin_sent must be pinned after emission");
+        assert_eq!(tcb.fin_seq, 5_000, "fin_seq must record the FIN's sequence");
     }
 }
