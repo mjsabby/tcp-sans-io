@@ -1,0 +1,80 @@
+// TCP connection state machine for tcp-sans-io.
+//
+// This is the authoritative, implementation-accurate transition graph. Its
+// edges are exactly the relation enforced by `allowed_transition()` in
+// fuzz/fuzz_targets/tcb_client_session.rs (the oracle that panics on any
+// transition not drawn here), so the picture and the running check cannot
+// drift apart. Transition sites live in src/tcb.rs; State is in src/state.rs.
+//
+// Regenerate the SVG after editing:
+//   dot -Tsvg docs/state-machine.dot -o docs/state-machine.svg
+//
+// Legend:
+//   solid black   normal protocol transition (trigger / action)
+//   bold purple   SYN_RCVD -> LISTEN revert: the stateful flood-resistance
+//                 path (bounded SYN-ACK retransmit budget, then recycle slot)
+//   dashed grey   abort: RST received, local abort(), or host reset() -> CLOSED
+//
+digraph tcp_state_machine {
+    rankdir=TB;
+    bgcolor="white";
+    node [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=11, margin="0.18,0.08"];
+    edge [fontname="Helvetica", fontsize=9];
+
+    // ---- States (colour-grouped by phase) -------------------------------
+    Closed      [fillcolor="#e8e8e8", label="CLOSED"];
+    Listen      [fillcolor="#d6f0f5", label="LISTEN"];
+    SynSent     [fillcolor="#cfe6ff", label="SYN_SENT"];
+    SynRcvd     [fillcolor="#cfe6ff", label="SYN_RCVD"];
+    Established  [fillcolor="#cdeccd", label="ESTABLISHED"];
+    FinWait1    [fillcolor="#f6e7b6", label="FIN_WAIT_1"];
+    FinWait2    [fillcolor="#f6e7b6", label="FIN_WAIT_2"];
+    Closing     [fillcolor="#f6e7b6", label="CLOSING"];
+    TimeWait    [fillcolor="#f3d6a6", label="TIME_WAIT"];
+    CloseWait   [fillcolor="#f6e7b6", label="CLOSE_WAIT"];
+    LastAck     [fillcolor="#f6e7b6", label="LAST_ACK"];
+
+    // ---- Opens ----------------------------------------------------------
+    Closed   -> SynSent     [label="connect()\n/ send SYN"];
+    Closed   -> Listen      [label="listen()"];
+    Listen   -> SynRcvd     [label="recv SYN\n/ send SYN-ACK"];
+    SynSent  -> Established  [label="recv SYN-ACK\n/ send ACK"];
+    SynRcvd  -> Established  [label="recv ACK (3rd)"];
+
+    // Stateful flood resistance: at most one half-open slot, bounded
+    // SYN-ACK retransmits, then the slot is recycled back to LISTEN. An
+    // in-window RST in SYN_RCVD recycles it the same way.
+    SynRcvd  -> Listen      [label="SYN-ACK budget exhausted\nor in-window RST (listener)",
+                             color="#7b2fbe", fontcolor="#7b2fbe", penwidth=2.0];
+
+    // ---- Active close (we call close() first) ---------------------------
+    Established -> FinWait1 [label="close()\n/ send FIN"];
+    SynRcvd     -> FinWait1 [label="close()\n/ send FIN"];
+    FinWait1 -> FinWait2    [label="recv ACK of FIN"];
+    FinWait1 -> Closing     [label="recv FIN\n(simultaneous close)"];
+    FinWait1 -> TimeWait    [label="recv FIN+ACK\n(both at once)"];
+    FinWait2 -> TimeWait    [label="recv FIN\n/ send ACK"];
+    Closing  -> TimeWait    [label="recv ACK of FIN"];
+    TimeWait -> Closed      [label="2*MSL timeout"];
+
+    // ---- Passive close (peer FINs first) --------------------------------
+    Established -> CloseWait [label="recv FIN\n/ send ACK"];
+    CloseWait   -> LastAck   [label="close()\n/ send FIN"];
+    LastAck     -> Closed    [label="recv ACK of FIN"];
+
+    // ---- Aborts: RST received / abort() / reset() -> CLOSED -------------
+    edge [style=dashed, color="#999999", fontcolor="#999999"];
+    SynSent     -> Closed [label="RST / reset()"];
+    SynRcvd     -> Closed [label="RST (non-listener)\n/ reset()"];
+    Listen      -> Closed [label="close()"];
+    Established -> Closed [label="RST / abort()\n/ reset()"];
+    FinWait1    -> Closed [label="RST / reset()"];
+    FinWait2    -> Closed [label="RST / reset()"];
+    Closing     -> Closed [label="RST / reset()"];
+    CloseWait   -> Closed [label="RST / abort()\n/ reset()"];
+
+    // ---- Rank hints for a clean top-to-bottom flow ----------------------
+    { rank=same; SynSent; SynRcvd; }
+    { rank=same; FinWait1; CloseWait; }
+    { rank=same; FinWait2; Closing; }
+}

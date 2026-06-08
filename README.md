@@ -103,6 +103,24 @@ loopback tests with peer + client) per thread. Production callers route
 through the C ABI (`tcp_init`) which writes into host-provided heap
 storage, so this only affects pure-Rust users and tests.
 
+## Connection state machine
+
+The eleven TCP states and every transition the stack can take. The graph is
+**implementation-accurate** — its edges are exactly the relation enforced by
+`allowed_transition()` in the `tcb_client_session` fuzz target, which panics if
+the live TCB ever makes a move the picture doesn't show, so the two cannot
+drift apart.
+
+![TCP connection state machine](docs/state-machine.svg)
+
+Bold purple is the non-textbook **SYN_RCVD → LISTEN** revert: the stateful
+passive path keeps at most one half-open slot and recycles it after a bounded
+SYN-ACK retransmit budget (the flood-resistance argument), rather than leaking
+it. Dashed grey edges are aborts (RST / `abort()` / `reset()`). See
+[`docs/state-machine.md`](docs/state-machine.md) for a live-rendering Mermaid
+copy, the full transition table with code citations, and how to regenerate the
+SVG from [`docs/state-machine.dot`](docs/state-machine.dot).
+
 ## Extents and bounds
 
 Every data structure in the stack is fixed-capacity — there is no
