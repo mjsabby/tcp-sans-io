@@ -421,6 +421,215 @@ All use the host-allocated storage pattern: query
 `tcp_handle_size()` / `tcp_handle_align()`, allocate that much memory in the
 host, pass the pointer to `tcp_init`. Memory ownership stays with the host.
 
+## Integrating the library
+
+This is a **sans-I/O** stack: it owns the TCP protocol state machine and
+*nothing else*. **The host owns the clock, the memory, the datagram
+transport, the scheduling, and the application data flow.** The stack
+never allocates, never blocks, never spawns a thread, never reads the
+clock, and never touches a socket. You drive it; it tells you what bytes
+to put on the wire and hands you back the bytes the peer sent.
+
+### What the host must provide
+
+1. **Per-connection storage** — `tcp_handle_size()` bytes at
+   `tcp_handle_align()` alignment, owned and freed by you. One block per
+   connection (TCB).
+2. **A monotonic millisecond clock** — see *Clock model and tick cadence*.
+   Read it once per turn; pass the same `now_ms` into every call that turn.
+3. **A datagram transport** — something that moves raw IPv4+TCP datagrams
+   to/from the peer (a WireGuard tunnel, a UDP socket, a TUN device…).
+   The stack hands you complete IP datagrams to send and expects complete
+   IP datagrams back.
+4. **A driver loop** that pumps the four interaction points (inject /
+   tick / extract / send-recv) and calls `tick()` **periodically even when
+   idle**.
+5. **A high-entropy `iss`** (RFC 6528) per connection — derive it from a
+   CSPRNG, never a counter. Servers that want stateless SYN-cookie flood
+   resistance also pass a 16-byte CSPRNG secret to `tcp_set_cookie_secret`.
+6. **5-tuple demux** — route each inbound datagram to the TCB that owns
+   its 4-tuple. The stack rejects mismatches with `NOT_FOR_US`, but you
+   shouldn't rely on that for routing N connections.
+
+### The canonical pump loop
+
+One "turn" of the driver, for an active (client) connection. Server is
+identical except you call `tcp_listen` instead of `tcp_connect` and watch
+for the `HALF_OPEN` → `ESTABLISHED` transition.
+
+```c
+// --- one-time setup ---
+void* mem = aligned_alloc(tcp_handle_align(), tcp_handle_size());
+tcp_init(mem, local_ip, local_port, remote_ip, remote_port,
+         csprng_u32(), /*initial_rto_ms=*/1000);
+tcp_connect(mem, now_ms());            // or tcp_listen(mem, now_ms())
+
+uint8_t pkt[1500];                     // MUST be >= tcp_max_packet()
+size_t  n;
+
+// --- per turn (run on packet arrival AND on a ~1-10 ms periodic timer) ---
+uint64_t now = now_ms();               // one clock read; reuse all turn
+
+// 1. Feed every inbound datagram, draining responses after each.
+for (each datagram d from the wire for this 4-tuple) {
+    int rc = tcp_inject_packet(mem, d.buf, d.len, now);
+    // rc < 0 for NOT_FOR_US / MALFORMED_PACKET / INVALID_STATE is benign:
+    // drop the datagram and continue. (OVERFLOW must never happen.)
+    while (tcp_extract_packet(mem, pkt, sizeof pkt, &n) == 0 && n > 0)
+        wire_send(pkt, n);             // drain BEFORE the next inject
+}
+
+// 2. Application I/O, gated on poll(). NOTE: tcp_send only *buffers* into
+//    the send ring — it stages no packets itself; the next tcp_tick (or
+//    inbound inject) turns those bytes into segments. tcp_recv copies out.
+uint32_t ev = tcp_poll(mem);
+if (ev & TCP_EV_WRITABLE) {
+    size_t w;
+    int rc = tcp_send(mem, app_out, app_out_len, &w);   // rc == WOULD_BLOCK ⇒ ring full, retry later
+}
+if (ev & TCP_EV_READABLE) {
+    size_t r;
+    int rc = tcp_recv(mem, app_in, sizeof app_in, &r);  // rc == CONNECTION_CLOSED ⇒ peer EOF
+}
+
+// 3. Drive timers (RTO / TLP / TIME_WAIT / persist / delayed-ACK) AND flush
+//    the data just buffered by tcp_send; then drain everything to the wire.
+tcp_tick(mem, now);
+while (tcp_extract_packet(mem, pkt, sizeof pkt, &n) == 0 && n > 0)
+    wire_send(pkt, n);
+
+// --- shutdown ---
+tcp_close(mem, now_ms());              // then keep pumping turns until
+// tcp_state(mem) == TCP_STATE_CLOSED  (FIN handshake + TIME_WAIT complete);
+tcp_destroy(mem);                      // flips the magic guard (no free)
+free(mem);                             // you own the memory
+```
+
+### The contract — do X, not Z
+
+**MUST**
+- Size every `extract_packet` buffer to **≥ `tcp_max_packet()`** (1500). A
+  smaller buffer returns `BUFFER_TOO_SMALL` and leaves the packet staged.
+- **Drain `extract_packet` in a loop until it returns 0** after every
+  `inject_packet`, `tick`, and `close`. The egress ring holds only
+  `TX_RING_CAP` (32) packets; not draining stalls emission. (`send` stages
+  nothing itself — it buffers; the next `tick` flushes it.)
+- Call **`tick()` periodically even when no packets arrive** — timers only
+  fire there (see *Clock model*).
+- Pass a **monotonic, non-decreasing `now_ms`**; use the same value for
+  every call within a turn.
+- Seed `iss` from a **CSPRNG** (per connection). Servers: cookie secret
+  from a CSPRNG too.
+- After `tcp_close`, **keep pumping** until `tcp_state` is `CLOSED`; only
+  then `tcp_destroy` + free.
+
+**SHOULD**
+- Treat `inject_packet` errors (`NOT_FOR_US`, `MALFORMED_PACKET`,
+  `INVALID_STATE`) as *drop-and-continue* — they are normal under a hostile
+  or mis-routed wire, not fatal.
+- Treat `WOULD_BLOCK` from `send` as backpressure (the send ring is full);
+  retry after a later turn drains it. Treat `CONNECTION_CLOSED` from `recv`
+  as EOF and `CONNECTION_RESET` as an aborted peer.
+- Drive `tick()` *event + periodic*: right after a batch of injects, and on
+  a 1–10 ms timer for the idle case.
+
+**DON'T**
+- Don't touch one handle from two threads at once — the stack has **no
+  internal locking** (it's single-threaded by design; shard TCBs across
+  threads, one owner each).
+- Don't `send`/`recv`/`inject`/`tick` after `tcp_destroy`, and don't reuse
+  storage without a fresh `tcp_init` (the magic guard will reject it).
+- Don't assume `OVERFLOW` (`-9`) is recoverable — it signals an internal
+  invariant bug; please file it. It is fuzzed against and should never
+  surface.
+
+### `tcp_poll()` event flags
+
+`tcp_poll` is a cheap, allocation-free snapshot you can use instead of
+inspecting state directly:
+
+| Flag | Meaning / action |
+|---|---|
+| `READABLE` | `recv` will return bytes. |
+| `WRITABLE` | `send` will accept bytes (Established/CloseWait + ring has room). |
+| `ESTABLISHED` | Handshake complete; bulk data may flow. |
+| `PEER_CLOSED` | Peer sent FIN — keep draining `recv`, then `close` your side. |
+| `CLOSED` | Fully torn down; safe to `destroy`. |
+| `TX_PENDING` | Egress ring non-empty — you must `extract_packet`. |
+| `ERROR` | A terminal error latched; `recv` surfaces the code (`RESET`/`CLOSED`). |
+| `LISTENING` / `HALF_OPEN` | Server: in `LISTEN` / mid-handshake (`SYN_RCVD`). |
+
+### Using it from Rust (no FFI)
+
+The same model, via `Tcb` directly — no C ABI, no `unsafe` on your side:
+
+```rust
+use tcp_sans_io::{Tcb, TcbConfig, Endpoint, State, MAX_PACKET};
+
+let mut tcb = Tcb::new(TcbConfig {
+    local:  Endpoint { ip: local_ip,  port: local_port },
+    remote: Endpoint { ip: remote_ip, port: remote_port },
+    iss: csprng_u32(),          // RFC 6528
+    initial_rto_ms: 1000,
+})?;
+tcb.set_now(now);
+tcb.connect()?;                 // or tcb.listen()?
+
+// per turn:
+tcb.set_now(now);
+tcb.inject_packet(&datagram)?;  // Err(NotForUs/Malformed) ⇒ drop & continue
+if tcb.state() == State::Established {
+    let _ = tcb.send(app_out);          // buffers; Err(WouldBlock) ⇒ retry later
+    let n = tcb.recv(&mut app_in)?;     // Err(ConnectionClosed) ⇒ EOF
+}
+tcb.tick()?;                    // fires timers + flushes buffered send data
+let mut pkt = [0u8; MAX_PACKET];
+loop {
+    let n = tcb.extract_packet(&mut pkt)?;
+    if n == 0 { break; }
+    wire_send(&pkt[..n]);
+}
+```
+
+`Tcb<const BUF>` is generic over ring capacity (default `BUF_CAP` = 1 MiB).
+A `Tcb` is ~2.15 MiB, so **box it** (or use the `heap-buffers` feature, or
+the `small-buffers` feature for many idle TCBs) rather than holding it as a
+stack local — see *Memory footprint*. Pure-Rust callers also need the
+larger `RUST_MIN_STACK` from `.cargo/config.toml` for stack-allocated TCBs.
+
+### How do you know you got it right? (canonical conformance)
+
+There is a canonical, executable answer: **drive a hash-verified
+bidirectional bulk transfer against a reference TCP and check both
+SHA-256 digests match.** If a fresh, independent TCP (the Linux kernel,
+gVisor's netstack, or even a second instance of this stack in loopback)
+agrees with you byte-for-byte in *both* directions over a multi-MiB
+transfer, your integration — sizing, ordering, draining, clocking, close
+sequence — is correct. A single dropped/duplicated/reordered byte from a
+driver bug changes the digest.
+
+The repo ships these as the reference self-tests; port the one closest to
+your transport:
+
+| Self-test | What it proves | File |
+|---|---|---|
+| **vs gVisor netstack** | 1 GiB each way, SHA-256 verified, client + server | `bindings/gvisor/integration_test.go`, `server_integration_test.go` |
+| **vs real Linux kernel (TUN)** | Same, against an actual kernel TCP | `bindings/gvisor/tun_test.go`, `tun_server_test.go` |
+| **Adversarial channel** | Survives loss/reorder/dup/corruption/jitter | `bindings/gvisor/chaos_test.go` |
+| **Pure-Rust loopback** | Two TCBs talk through an in-memory wire | `src/loopback_tests.rs` |
+
+A minimal acceptance checklist for a new binding:
+
+- [ ] `tcp_abi_version()` matches the header you built against.
+- [ ] Handshake reaches `ESTABLISHED` against a real peer.
+- [ ] A ≥ 1 MiB bidirectional transfer matches SHA-256 **both ways**.
+- [ ] Same transfer over a lossy/reordering channel still matches.
+- [ ] Graceful `close` reaches `CLOSED` on both ends (no leaked handles).
+- [ ] A fuzz/property run of your wrapper shows no leaks or panics.
+
+If those pass, you've done all the right things — the digests are the
+proof.
+
 ## Testing
 
 | Layer | What it covers | Files |
