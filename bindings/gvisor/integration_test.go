@@ -76,8 +76,8 @@ func newNetstackPeer(t *testing.T) *netstackPeer {
 }
 
 func TestAbiVersion(t *testing.T) {
-	if v := AbiVersion(); v != 1 {
-		t.Fatalf("ABI version = %d, want 1", v)
+	if v := AbiVersion(); v != 2 {
+		t.Fatalf("ABI version = %d, want 2", v)
 	}
 }
 

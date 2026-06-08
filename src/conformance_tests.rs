@@ -2476,3 +2476,52 @@ fn handshake_with_ts_iss(tcb: &mut Tcb, now: &mut u64, iss: u32) -> u32 {
     assert_eq!(ack.flags, flags::ACK);
     peer_ts
 }
+
+/// A recycled TCB that is `reinit`'d onto a new 5-tuple / ISS must emit a SYN
+/// byte-for-byte identical to a freshly constructed TCB with the same config.
+/// This proves `reinit` fully resets the sequence variables, options and
+/// window scale to the post-`new` shape (and re-points local/remote/ISS),
+/// while reusing the existing ring storage.
+#[test]
+fn reinit_yields_byte_identical_syn_to_fresh_new() {
+    let cfg_a = TcbConfig {
+        local: Endpoint { ip: CLIENT_IP, port: CLIENT_PORT },
+        remote: Endpoint { ip: SERVER_IP, port: SERVER_PORT },
+        iss: ISS,
+        initial_rto_ms: INIT_RTO_MS,
+    };
+    let cfg_b = TcbConfig {
+        local: Endpoint { ip: [192, 168, 7, 7], port: 51000 },
+        remote: Endpoint { ip: [8, 8, 8, 8], port: 443 },
+        iss: 0xDEAD_BEEF,
+        initial_rto_ms: INIT_RTO_MS,
+    };
+
+    // Dirty a TCB: build with cfg_a, actively open it and emit a SYN (advances
+    // seq, arms the RTO, sets options), then recycle it onto cfg_b.
+    let mut recycled: Tcb = Tcb::new(cfg_a).expect("tcb");
+    recycled.set_now(0);
+    recycled.connect().expect("connect a");
+    let mut scratch = [0u8; MAX_PACKET];
+    let _ = recycled.extract_packet(&mut scratch).expect("syn a");
+    recycled.reinit(cfg_b);
+    assert_eq!(recycled.state(), State::Closed, "reinit must return to CLOSED");
+
+    // Fresh TCB with the same (cfg_b) config.
+    let mut fresh: Tcb = Tcb::new(cfg_b).expect("tcb");
+
+    // Drive both identically from CLOSED and compare the emitted SYN bytes.
+    recycled.set_now(0);
+    fresh.set_now(0);
+    recycled.connect().expect("connect recycled");
+    fresh.connect().expect("connect fresh");
+    let mut p_recycled = [0u8; MAX_PACKET];
+    let mut p_fresh = [0u8; MAX_PACKET];
+    let n_recycled = recycled.extract_packet(&mut p_recycled).expect("syn recycled");
+    let n_fresh = fresh.extract_packet(&mut p_fresh).expect("syn fresh");
+    assert_eq!(
+        &p_recycled[..n_recycled],
+        &p_fresh[..n_fresh],
+        "reinit'd SYN must be byte-identical to a fresh TCB's SYN"
+    );
+}

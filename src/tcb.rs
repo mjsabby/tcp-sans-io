@@ -184,16 +184,21 @@ const COOKIE_TIME_BUCKET_MS: u64 = 64_000;
 const COOKIE_MSS_TABLE: [u16; 8] = [536, 1300, 1440, 1452, 1460, 1480, 9000, 65495];
 
 /// Window Scale shift count (RFC 7323 §2) we advertise on outbound
-/// SYN / SYN-ACK. Chosen as the minimal scale that lets us advertise the
-/// full receive ring without truncation: `BUF_CAP / 2^LOCAL_WS_SHIFT`
-/// must fit in a 16-bit window field (max 65535).
+/// SYN / SYN-ACK, derived from the receive-ring capacity `buf`: the minimal
+/// scale that lets us advertise the full ring without truncation
+/// (`buf >> shift` must fit a 16-bit window field, max 65535).
 ///
-/// With `BUF_CAP = 1 MiB` we need shift ≥ 5 (1MiB >> 5 = 32_768 ≤ 65535;
-/// shift = 4 would give 65_536 which overflows u16). Picking the minimal
-/// scale matters because each shift coarsens the window granularity by
-/// 2x — at shift=5 we advertise in 32-byte units, which is fine for
-/// MSS-class transfers.
-const LOCAL_WS_SHIFT: u8 = 5;
+/// E.g. `buf = 1 MiB` needs shift ≥ 5 (1MiB >> 5 = 32_768 ≤ 65535; shift 4
+/// would give 65_536, overflowing u16). The minimal scale matters because
+/// each shift coarsens window granularity by 2x. Evaluated at compile time
+/// per `Tcb<BUF>` as the associated const `Tcb::<BUF>::WS`.
+const fn local_ws_shift(buf: usize) -> u8 {
+    let mut shift = 0u8;
+    while (buf >> shift) > u16::MAX as usize {
+        shift += 1;
+    }
+    shift
+}
 
 /// Compact internal-state snapshot intended only for diagnostic logging.
 /// Layout is C-compatible so it can be exposed to FFI consumers.
@@ -230,7 +235,7 @@ struct RttProbe {
 }
 
 /// Per-connection state.
-pub struct Tcb {
+pub struct Tcb<const BUF: usize = BUF_CAP> {
     state: State,
 
     local: Endpoint,
@@ -272,7 +277,7 @@ pub struct Tcb {
     /// if the peer didn't offer WS.
     snd_wscale: u8,
     /// Shift count we apply to our own advertised window on outbound
-    /// segments. Set to [`LOCAL_WS_SHIFT`] iff the peer offered WS in
+    /// segments. Set to the local window-scale shift iff the peer offered WS in
     /// the handshake (per RFC 7323 §2.2: a TCP must not send WS unless
     /// the peer also did); otherwise 0.
     rcv_wscale: u8,
@@ -344,8 +349,8 @@ pub struct Tcb {
     tlp_fired: bool,
 
     // ---- Buffers ---------------------------------------------------------
-    send_ring: Ring<BUF_CAP>,
-    recv_ring: Ring<BUF_CAP>,
+    send_ring: Ring<BUF>,
+    recv_ring: Ring<BUF>,
 
     // ---- Out-of-order reassembly (multi-hole, RFC 6675-grade) -----------
     /// Multi-range out-of-order buffer. Holds up to MAX_HOLES disjoint
@@ -414,7 +419,10 @@ pub struct Tcb {
     cookie_secret_set: bool,
 }
 
-impl Tcb {
+impl<const BUF: usize> Tcb<BUF> {
+    /// Window-scale shift advertised for this ring capacity (compile-time).
+    const WS: u8 = local_ws_shift(BUF);
+
     /// Construct a TCB in the `CLOSED` state.
     pub fn new(cfg: TcbConfig) -> Result<Self, TcpError> {
         Ok(Self {
@@ -427,7 +435,7 @@ impl Tcb {
             snd_wnd: 0,
             iss: cfg.iss,
             rcv_nxt: 0,
-            rcv_wnd: BUF_CAP as u32,
+            rcv_wnd: BUF as u32,
             irs: 0,
             local_mss: MSS,
             peer_mss: DEFAULT_PEER_MSS,
@@ -451,7 +459,7 @@ impl Tcb {
             send_ring: Ring::new()?,
             recv_ring: Ring::new()?,
             reasm: crate::reassembly::Reassembly::new(),
-            cc: Tahoe::new(BUF_CAP as u32),
+            cc: Tahoe::new(BUF as u32),
             now_ms: 0,
             rto_ms: cfg.initial_rto_ms.clamp(RTO_MIN_MS, RTO_MAX_MS),
             srtt_ms: 0,
@@ -475,6 +483,29 @@ impl Tcb {
             cookie_secret: [0u8; 16],
             cookie_secret_set: false,
         })
+    }
+
+    /// Re-point an existing TCB at a new 5-tuple / ISS and reset it to the
+    /// post-`new` `CLOSED` shape **in place**, reusing the already-allocated
+    /// ring storage — no allocation and no multi-MiB ring memcpy. This lets a
+    /// pool recycle a TCB across connections without freeing/reallocating its
+    /// rings. After `reinit` the caller drives it exactly like a fresh TCB:
+    /// `set_now`, then `listen` (passive) or `connect` (active).
+    pub fn reinit(&mut self, cfg: TcbConfig) {
+        self.local = cfg.local;
+        self.remote = cfg.remote;
+        self.iss = cfg.iss;
+        self.rto_ms = cfg.initial_rto_ms.clamp(RTO_MIN_MS, RTO_MAX_MS);
+        self.local_mss = MSS;
+        self.is_listener = false;
+        self.cookie_secret = [0u8; 16];
+        self.cookie_secret_set = false;
+        self.now_ms = 0;
+        self.ip_id = 0;
+        // Clears the rings (O(1) index reset; storage retained) and resets
+        // every per-connection field to its post-`new` value.
+        self.reset_connection_state();
+        self.state = State::Closed;
     }
 
     // ---------------------------------------------------------------------
@@ -545,7 +576,7 @@ impl Tcb {
         // `process_ack` below.
         let opts = TcpOptions {
             mss: Some(self.local_mss),
-            wscale: Some(LOCAL_WS_SHIFT),
+            wscale: Some(Self::WS),
             ts: Some((self.ts_val(), 0)),
             sack_permitted: true,
             sack: SackBlocks::EMPTY,
@@ -634,7 +665,7 @@ impl Tcb {
         self.snd_max = self.iss;
         self.snd_wnd = 0;
         self.rcv_nxt = 0;
-        self.rcv_wnd = BUF_CAP as u32;
+        self.rcv_wnd = BUF as u32;
         self.irs = 0;
         self.peer_mss = DEFAULT_PEER_MSS;
         self.ts_enabled = false;
@@ -657,7 +688,7 @@ impl Tcb {
         self.send_ring.clear();
         self.recv_ring.clear();
         self.reasm.clear();
-        self.cc = Tahoe::new(BUF_CAP as u32);
+        self.cc = Tahoe::new(BUF as u32);
         self.rto_deadline = None;
         self.rtt_probe = None;
         self.srtt_ms = 0;
@@ -946,7 +977,7 @@ impl Tcb {
                 if self.state == State::SynSent {
                     let opts = TcpOptions {
                         mss: Some(self.local_mss),
-                        wscale: Some(LOCAL_WS_SHIFT),
+                        wscale: Some(Self::WS),
                         ts: Some((self.ts_val(), 0)),
                         sack_permitted: true,
                         sack: SackBlocks::EMPTY,
@@ -1113,7 +1144,7 @@ impl Tcb {
             // variable; if peer omits it, both directions stay unscaled.
             if let Some(peer_ws) = seg.options.wscale {
                 self.snd_wscale = peer_ws.min(14);
-                self.rcv_wscale = LOCAL_WS_SHIFT;
+                self.rcv_wscale = Self::WS;
             }
             if let Some((tsval, tsecr)) = seg.options.ts {
                 self.ts_enabled = true;
@@ -1228,7 +1259,7 @@ impl Tcb {
         // scaling; otherwise both directions stay unscaled.
         if let Some(peer_ws) = seg.options.wscale {
             self.snd_wscale = peer_ws.min(14);
-            self.rcv_wscale = LOCAL_WS_SHIFT;
+            self.rcv_wscale = Self::WS;
         }
         if let Some((tsval, _)) = seg.options.ts {
             self.ts_enabled = true;

@@ -196,7 +196,7 @@ def make_client() -> tcp_sans_io.TcpStream:
 
 class IntegrationTests(unittest.TestCase):
     def test_abi_version(self) -> None:
-        self.assertEqual(tcp_sans_io.abi_version(), 1)
+        self.assertEqual(tcp_sans_io.abi_version(), 2)
 
     def test_handshake(self) -> None:
         client = make_client()

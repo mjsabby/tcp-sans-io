@@ -131,7 +131,7 @@ internal static class Program
 
     private static void TestAbiVersion()
     {
-        AssertEqual(1u, Native.tcp_abi_version(), "abi version");
+        AssertEqual(2u, Native.tcp_abi_version(), "abi version");
     }
 
     private static void TestHandshake()

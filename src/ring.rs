@@ -9,6 +9,9 @@ use crate::error::TcpError;
 /// SPSC byte ring with capacity `N`. `N` *must* be a power of two — this is
 /// checked at construction time so the modulo can be a cheap mask.
 pub struct Ring<const N: usize> {
+    #[cfg(feature = "heap-buffers")]
+    buf: alloc::boxed::Box<[u8]>, // always length N; allocated off the stack
+    #[cfg(not(feature = "heap-buffers"))]
     buf: [u8; N],
     head: usize, // read cursor (next byte to read)
     tail: usize, // write cursor (next byte to write)
@@ -18,12 +21,33 @@ pub struct Ring<const N: usize> {
 impl<const N: usize> Ring<N> {
     /// Construct an empty ring. Returns `Overflow` if `N` is not a power of
     /// two or is zero — both invariants the index math relies on.
+    #[cfg(not(feature = "heap-buffers"))]
     pub const fn new() -> Result<Self, TcpError> {
         if N == 0 || (N & (N - 1)) != 0 {
             return Err(TcpError::Overflow);
         }
         Ok(Self {
             buf: [0u8; N],
+            head: 0,
+            tail: 0,
+            len: 0,
+        })
+    }
+
+    /// Heap-backed construction: the allocator zeroes the `N`-byte buffer in
+    /// place, so no `[u8; N]` is ever materialized on the stack. This is what
+    /// lets `Box::new(Tcb::new())` avoid a multi-MiB stack temporary in debug
+    /// builds (no RVO). Returns `Overflow` on bad `N` or allocation failure.
+    #[cfg(feature = "heap-buffers")]
+    pub fn new() -> Result<Self, TcpError> {
+        if N == 0 || (N & (N - 1)) != 0 {
+            return Err(TcpError::Overflow);
+        }
+        let mut v: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+        v.try_reserve_exact(N).map_err(|_| TcpError::Overflow)?;
+        v.resize(N, 0);
+        Ok(Self {
+            buf: v.into_boxed_slice(),
             head: 0,
             tail: 0,
             len: 0,

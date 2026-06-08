@@ -22,6 +22,12 @@ std = []
 # (~150 KiB/Tcb vs ~2.15 MiB/Tcb). The default build is unaffected.
 # Used by bindings/wgserver-rs/ for the 10000-connection stress test.
 small-buffers = []
+# Heap-allocate each ring buffer (`Box<[u8]>`) instead of storing it inline in
+# the Tcb. Keeps `Tcb` tiny so `Box::new(Tcb::new())` builds without a multi-MiB
+# stack temporary (debug builds get no return-value optimization, so an inline
+# 2 MiB Tcb overflows even a 16 MiB thread stack). Requires `alloc`; leaves the
+# no_std / C-FFI inline POD layout untouched when off.
+heap-buffers = []
 
 [profile.release]
 panic = "abort"

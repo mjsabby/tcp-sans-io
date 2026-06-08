@@ -21,6 +21,9 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+#[cfg(feature = "heap-buffers")]
+extern crate alloc;
+
 #[cfg(all(not(test), not(feature = "host_panic_handler"), not(feature = "std")))]
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
