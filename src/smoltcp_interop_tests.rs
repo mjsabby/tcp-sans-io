@@ -27,7 +27,12 @@
 //!   that show up under sustained traffic.
 
 #![cfg(test)]
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 extern crate std;
 
@@ -130,8 +135,14 @@ impl InteropHarness {
         // `listen()`, so smoltcp's ephemeral port doesn't need to match
         // anything we set here.
         let mut our = Tcb::new(TcbConfig {
-            local: Endpoint { ip: OUR_IP, port: OUR_PORT },
-            remote: Endpoint { ip: SMOLTCP_IP, port: 0 },
+            local: Endpoint {
+                ip: OUR_IP,
+                port: OUR_PORT,
+            },
+            remote: Endpoint {
+                ip: SMOLTCP_IP,
+                port: 0,
+            },
             iss: 0x1000_0000,
             initial_rto_ms: 1000,
         })
@@ -144,7 +155,10 @@ impl InteropHarness {
         let mut iface = Interface::new(cfg, &mut device, Instant::from_millis(0));
         iface.update_ip_addrs(|addrs| {
             addrs
-                .push(IpCidr::new(IpAddress::v4(SMOLTCP_IP[0], SMOLTCP_IP[1], SMOLTCP_IP[2], SMOLTCP_IP[3]), 24))
+                .push(IpCidr::new(
+                    IpAddress::v4(SMOLTCP_IP[0], SMOLTCP_IP[1], SMOLTCP_IP[2], SMOLTCP_IP[3]),
+                    24,
+                ))
                 .unwrap();
         });
 
@@ -227,7 +241,10 @@ fn smoltcp_handshake_only() {
                 IpAddress::v4(OUR_IP[0], OUR_IP[1], OUR_IP[2], OUR_IP[3]),
                 OUR_PORT,
             ),
-            IpListenEndpoint { addr: None, port: SMOLTCP_PORT },
+            IpListenEndpoint {
+                addr: None,
+                port: SMOLTCP_PORT,
+            },
         )
         .expect("smoltcp connect");
     }
@@ -239,9 +256,12 @@ fn smoltcp_handshake_only() {
         let our_est = matches!(h.our.state(), State::Established);
         smoltcp_est && our_est
     });
-    assert!(established, "handshake did not complete (our state: {:?}, smoltcp: {:?})",
+    assert!(
+        established,
+        "handshake did not complete (our state: {:?}, smoltcp: {:?})",
         h.our.state(),
-        h.sockets.get::<tcp::Socket>(h.tcp_handle).state());
+        h.sockets.get::<tcp::Socket>(h.tcp_handle).state()
+    );
 
     // smoltcp half-closes.
     h.sockets.get_mut::<tcp::Socket>(h.tcp_handle).close();
@@ -259,16 +279,16 @@ fn smoltcp_handshake_only() {
     // Drive until both sides are fully closed.
     let closed = h.pump_until(5_000, |h| {
         let sock = h.sockets.get::<tcp::Socket>(h.tcp_handle);
-        let smoltcp_closed = matches!(
-            sock.state(),
-            tcp::State::Closed | tcp::State::TimeWait
-        );
+        let smoltcp_closed = matches!(sock.state(), tcp::State::Closed | tcp::State::TimeWait);
         let our_closed = matches!(h.our.state(), State::Closed | State::TimeWait);
         smoltcp_closed && our_closed
     });
-    assert!(closed, "close did not complete (our state: {:?}, smoltcp: {:?})",
+    assert!(
+        closed,
+        "close did not complete (our state: {:?}, smoltcp: {:?})",
         h.our.state(),
-        h.sockets.get::<tcp::Socket>(h.tcp_handle).state());
+        h.sockets.get::<tcp::Socket>(h.tcp_handle).state()
+    );
 }
 
 #[test]
@@ -285,7 +305,10 @@ fn smoltcp_active_open_bulk_transfer() {
                 IpAddress::v4(OUR_IP[0], OUR_IP[1], OUR_IP[2], OUR_IP[3]),
                 OUR_PORT,
             ),
-            IpListenEndpoint { addr: None, port: SMOLTCP_PORT },
+            IpListenEndpoint {
+                addr: None,
+                port: SMOLTCP_PORT,
+            },
         )
         .expect("connect");
     }
@@ -350,11 +373,13 @@ fn smoltcp_active_open_bulk_transfer() {
 
     // Both ends fully drain.
     assert!(
-        h.pump_until(5_000, |h| matches!(h.our.state(), State::Closed | State::TimeWait)
-            && matches!(
-                h.sockets.get::<tcp::Socket>(h.tcp_handle).state(),
-                tcp::State::Closed | tcp::State::TimeWait
-            )),
+        h.pump_until(5_000, |h| matches!(
+            h.our.state(),
+            State::Closed | State::TimeWait
+        ) && matches!(
+            h.sockets.get::<tcp::Socket>(h.tcp_handle).state(),
+            tcp::State::Closed | tcp::State::TimeWait
+        )),
         "both sides did not reach Closed/TimeWait (our: {:?}, smoltcp: {:?})",
         h.our.state(),
         h.sockets.get::<tcp::Socket>(h.tcp_handle).state(),

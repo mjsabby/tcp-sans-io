@@ -69,7 +69,6 @@ impl Default for SackScoreboard {
 }
 
 impl SackScoreboard {
-
     pub fn clear(&mut self) {
         self.len = 0;
         for r in self.ranges.iter_mut() {
@@ -265,7 +264,11 @@ impl SackScoreboard {
         for r in self.ranges() {
             // Intersection with [left, right).
             let il = if seq_lt(r.left, left) { left } else { r.left };
-            let ir = if seq_lt(r.right, right) { r.right } else { right };
+            let ir = if seq_lt(r.right, right) {
+                r.right
+            } else {
+                right
+            };
             if seq_lt(il, ir) {
                 covered = covered.saturating_add(ir.wrapping_sub(il));
             }
@@ -487,8 +490,16 @@ fn overlap_or_adjacent(a: Range, b: Range) -> bool {
 #[inline]
 fn union_of(a: Range, b: Range) -> Range {
     Range {
-        left: if seq_lt(a.left, b.left) { a.left } else { b.left },
-        right: if seq_gt(a.right, b.right) { a.right } else { b.right },
+        left: if seq_lt(a.left, b.left) {
+            a.left
+        } else {
+            b.left
+        },
+        right: if seq_gt(a.right, b.right) {
+            a.right
+        } else {
+            b.right
+        },
     }
 }
 
@@ -511,7 +522,12 @@ fn seq_le(a: u32, b: u32) -> bool {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
 
     use super::*;
 
@@ -529,7 +545,13 @@ mod tests {
         let mut sb = SackScoreboard::new();
         sb.add_range(100, 200, 0, 10_000);
         assert_eq!(sb.ranges().len(), 1);
-        assert_eq!(sb.ranges()[0], Range { left: 100, right: 200 });
+        assert_eq!(
+            sb.ranges()[0],
+            Range {
+                left: 100,
+                right: 200
+            }
+        );
         assert_eq!(sb.sacked_above(0), 100);
         assert_eq!(sb.sacked_above(150), 50);
         assert_eq!(sb.sacked_above(200), 0);
@@ -541,7 +563,13 @@ mod tests {
         sb.add_range(100, 200, 0, 10_000);
         sb.add_range(200, 300, 0, 10_000);
         assert_eq!(sb.ranges().len(), 1);
-        assert_eq!(sb.ranges()[0], Range { left: 100, right: 300 });
+        assert_eq!(
+            sb.ranges()[0],
+            Range {
+                left: 100,
+                right: 300
+            }
+        );
     }
 
     #[test]
@@ -550,7 +578,13 @@ mod tests {
         sb.add_range(100, 200, 0, 10_000);
         sb.add_range(150, 250, 0, 10_000);
         assert_eq!(sb.ranges().len(), 1);
-        assert_eq!(sb.ranges()[0], Range { left: 100, right: 250 });
+        assert_eq!(
+            sb.ranges()[0],
+            Range {
+                left: 100,
+                right: 250
+            }
+        );
     }
 
     #[test]
@@ -570,8 +604,20 @@ mod tests {
         sb.add_range(500, 600, 0, 10_000);
         sb.prune_below(200);
         assert_eq!(sb.ranges().len(), 2);
-        assert_eq!(sb.ranges()[0], Range { left: 200, right: 300 });
-        assert_eq!(sb.ranges()[1], Range { left: 500, right: 600 });
+        assert_eq!(
+            sb.ranges()[0],
+            Range {
+                left: 200,
+                right: 300
+            }
+        );
+        assert_eq!(
+            sb.ranges()[1],
+            Range {
+                left: 500,
+                right: 600
+            }
+        );
     }
 
     #[test]

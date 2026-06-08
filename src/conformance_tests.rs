@@ -231,7 +231,11 @@ fn handshake_with_ts(tcb: &mut Tcb, now: &mut u64) -> u32 {
     // SYN packet may also carry ECE+CWR as the ECN-Setup flags per RFC
     // 3168 §6.1.1; mask them off for the "pure SYN" check.
     let syn_only = syn.flags & !(flags::ECE | flags::CWR);
-    assert_eq!(syn_only, flags::SYN, "first packet must be SYN (with optional ECN-Setup)");
+    assert_eq!(
+        syn_only,
+        flags::SYN,
+        "first packet must be SYN (with optional ECN-Setup)"
+    );
     assert_eq!(syn.seq, ISS);
     assert_eq!(syn.ack, 0);
     assert_eq!(syn.mss, Some(1460), "SYN must carry MSS=1460");
@@ -618,10 +622,7 @@ fn second_hole_is_dropped_held_run_preserved() {
     assert_eq!(n, a.len() + b.len() + d.len() + c.len());
     assert_eq!(&buf[..a.len()], a);
     assert_eq!(&buf[a.len()..a.len() + b.len()], b);
-    assert_eq!(
-        &buf[a.len() + b.len()..a.len() + b.len() + d.len()],
-        d
-    );
+    assert_eq!(&buf[a.len() + b.len()..a.len() + b.len() + d.len()], d);
     assert_eq!(&buf[a.len() + b.len() + d.len()..n], c);
 }
 
@@ -764,7 +765,6 @@ fn close_is_idempotent() {
     assert!(try_pop(&mut tcb).is_none(), "no second FIN");
 }
 
-
 /// RFC 5681 §3.2 explicitly excludes piggybacked ACKs from the dup-ACK
 /// counter: in a bidirectional bulk transfer the peer's piggybacked ACKs
 /// naturally arrive at the same `snd_una` between RTTs (peer outpaces our
@@ -905,7 +905,10 @@ fn syn_offers_sack_permitted() {
         syn.sack_permitted,
         "SYN must offer SACK_PERMITTED (RFC 2018 §2)",
     );
-    assert!(syn.sack.is_empty(), "SYN itself must not carry a SACK block");
+    assert!(
+        syn.sack.is_empty(),
+        "SYN itself must not carry a SACK block"
+    );
 }
 
 /// When the peer's SYN-ACK echoes SACK_PERMITTED, an out-of-order segment
@@ -1537,10 +1540,7 @@ fn outbound_data_window_is_scaled() {
     // Empty receive ring → advertised_window = BUF_CAP. After right-shift
     // by local_ws and saturation to u16::MAX, peer multiplies back to
     // (advertised_field << local_ws), recovering ≤ BUF_CAP.
-    let expected = core::cmp::min(
-        (crate::BUF_CAP as u32) >> local_ws,
-        u16::MAX as u32,
-    ) as u16;
+    let expected = core::cmp::min((crate::BUF_CAP as u32) >> local_ws, u16::MAX as u32) as u16;
     assert_eq!(
         third_ack.window, expected,
         "post-handshake window must be advertised >> rcv_wscale (saturated)",
@@ -1798,7 +1798,8 @@ fn rto_still_collapses_cwnd_to_one_mss() {
     let _ = handshake_with_ts(&mut tcb, &mut now);
 
     // Put one segment in flight.
-    let payload: ::std::vec::Vec<u8> = (0..1448).collect::<::std::vec::Vec<usize>>()
+    let payload: ::std::vec::Vec<u8> = (0..1448)
+        .collect::<::std::vec::Vec<usize>>()
         .iter()
         .map(|i| (i & 0xFF) as u8)
         .collect();
@@ -1820,10 +1821,7 @@ fn rto_still_collapses_cwnd_to_one_mss() {
         snap.cwnd, 1460,
         "RTO must collapse cwnd to 1*MSS (RFC 5681 §3)",
     );
-    assert!(
-        snap.ssthresh >= 2 * 1460,
-        "RTO must set ssthresh ≥ 2*MSS",
-    );
+    assert!(snap.ssthresh >= 2 * 1460, "RTO must set ssthresh ≥ 2*MSS",);
 }
 
 // ---------------------------------------------------------------------------
@@ -2194,10 +2192,7 @@ fn rack_reorder_timer_marks_old_unsacked_segments_lost() {
         tcb.tick().expect("tick");
         match try_pop(&mut tcb) {
             Some(s) => {
-                if s.flags & flags::PSH != 0
-                    && !s.payload.is_empty()
-                    && seq_lt(s.seq, s4_seq)
-                {
+                if s.flags & flags::PSH != 0 && !s.payload.is_empty() && seq_lt(s.seq, s4_seq) {
                     rack_retx += 1;
                 }
             }
@@ -2470,8 +2465,14 @@ fn rack_tail_loss_short_rtt_retransmits_first_unsacked() {
 /// will wrap within a small transfer.
 fn make_tcb_with_iss(iss: u32) -> Tcb {
     let cfg = TcbConfig {
-        local: Endpoint { ip: CLIENT_IP, port: CLIENT_PORT },
-        remote: Endpoint { ip: SERVER_IP, port: SERVER_PORT },
+        local: Endpoint {
+            ip: CLIENT_IP,
+            port: CLIENT_PORT,
+        },
+        remote: Endpoint {
+            ip: SERVER_IP,
+            port: SERVER_PORT,
+        },
         iss,
         initial_rto_ms: INIT_RTO_MS,
     };
@@ -2625,14 +2626,26 @@ fn handshake_with_ts_iss(tcb: &mut Tcb, now: &mut u64, iss: u32) -> u32 {
 #[test]
 fn reinit_yields_byte_identical_syn_to_fresh_new() {
     let cfg_a = TcbConfig {
-        local: Endpoint { ip: CLIENT_IP, port: CLIENT_PORT },
-        remote: Endpoint { ip: SERVER_IP, port: SERVER_PORT },
+        local: Endpoint {
+            ip: CLIENT_IP,
+            port: CLIENT_PORT,
+        },
+        remote: Endpoint {
+            ip: SERVER_IP,
+            port: SERVER_PORT,
+        },
         iss: ISS,
         initial_rto_ms: INIT_RTO_MS,
     };
     let cfg_b = TcbConfig {
-        local: Endpoint { ip: [192, 168, 7, 7], port: 51000 },
-        remote: Endpoint { ip: [8, 8, 8, 8], port: 443 },
+        local: Endpoint {
+            ip: [192, 168, 7, 7],
+            port: 51000,
+        },
+        remote: Endpoint {
+            ip: [8, 8, 8, 8],
+            port: 443,
+        },
         iss: 0xDEAD_BEEF,
         initial_rto_ms: INIT_RTO_MS,
     };
@@ -2645,7 +2658,11 @@ fn reinit_yields_byte_identical_syn_to_fresh_new() {
     let mut scratch = [0u8; MAX_PACKET];
     let _ = recycled.extract_packet(&mut scratch).expect("syn a");
     recycled.reinit(cfg_b);
-    assert_eq!(recycled.state(), State::Closed, "reinit must return to CLOSED");
+    assert_eq!(
+        recycled.state(),
+        State::Closed,
+        "reinit must return to CLOSED"
+    );
 
     // Fresh TCB with the same (cfg_b) config.
     let mut fresh: Tcb = Tcb::new(cfg_b).expect("tcb");
@@ -2657,7 +2674,9 @@ fn reinit_yields_byte_identical_syn_to_fresh_new() {
     fresh.connect().expect("connect fresh");
     let mut p_recycled = [0u8; MAX_PACKET];
     let mut p_fresh = [0u8; MAX_PACKET];
-    let n_recycled = recycled.extract_packet(&mut p_recycled).expect("syn recycled");
+    let n_recycled = recycled
+        .extract_packet(&mut p_recycled)
+        .expect("syn recycled");
     let n_fresh = fresh.extract_packet(&mut p_fresh).expect("syn fresh");
     assert_eq!(
         &p_recycled[..n_recycled],

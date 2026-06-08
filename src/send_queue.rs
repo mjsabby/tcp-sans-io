@@ -280,7 +280,7 @@ mod tests {
     fn find_latest_covering_picks_newest() {
         let mut q = SendQueue::new();
         q.push(100, 100, 1, false); // original
-        q.push(100, 100, 5, true);  // retransmit
+        q.push(100, 100, 5, true); // retransmit
         let e = q.find_latest_covering(150).unwrap();
         assert_eq!(e.send_ts_ms, 5);
         assert!(e.is_retx);

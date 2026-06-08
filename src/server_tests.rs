@@ -292,7 +292,16 @@ fn syn_rcvd_retransmits_synack_on_rto_then_reverts_to_listen() {
     s.set_now(0);
     s.listen().expect("listen");
 
-    let syn = build_in(flags::SYN, CLIENT_ISS, 0, PEER_WIN, Some(1460), None, false, &[]);
+    let syn = build_in(
+        flags::SYN,
+        CLIENT_ISS,
+        0,
+        PEER_WIN,
+        Some(1460),
+        None,
+        false,
+        &[],
+    );
     s.set_now(0);
     s.inject_packet(&syn).expect("inject SYN");
     assert_eq!(s.state(), State::SynRcvd);
@@ -339,7 +348,16 @@ fn syn_retransmit_in_syn_rcvd_is_idempotent() {
     s.set_now(0);
     s.listen().expect("listen");
 
-    let syn = build_in(flags::SYN, CLIENT_ISS, 0, PEER_WIN, Some(1460), None, false, &[]);
+    let syn = build_in(
+        flags::SYN,
+        CLIENT_ISS,
+        0,
+        PEER_WIN,
+        Some(1460),
+        None,
+        false,
+        &[],
+    );
     s.set_now(0);
     s.inject_packet(&syn).expect("inject SYN");
     let synack0 = pop(&mut s);
@@ -379,7 +397,10 @@ fn listen_drops_bare_ack_silently_when_no_cookie_secret() {
     );
     s.inject_packet(&bogus).expect("inject bogus ACK");
     assert_eq!(s.state(), State::Listen, "must remain in LISTEN");
-    assert!(try_pop(&mut s).is_none(), "must not respond — no reflection");
+    assert!(
+        try_pop(&mut s).is_none(),
+        "must not respond — no reflection"
+    );
 }
 
 #[test]
@@ -472,7 +493,16 @@ fn syn_rcvd_rejects_off_path_syn_from_different_remote() {
     s.listen().expect("listen");
 
     // Legitimate handshake start.
-    let syn = build_in(flags::SYN, CLIENT_ISS, 0, PEER_WIN, Some(1460), None, false, &[]);
+    let syn = build_in(
+        flags::SYN,
+        CLIENT_ISS,
+        0,
+        PEER_WIN,
+        Some(1460),
+        None,
+        false,
+        &[],
+    );
     s.inject_packet(&syn).expect("inject SYN");
     let _ = pop(&mut s);
     assert_eq!(s.state(), State::SynRcvd);
@@ -502,7 +532,16 @@ fn syn_rcvd_blind_ack_with_wrong_ack_value_does_not_promote() {
     s.set_now(0);
     s.listen().expect("listen");
 
-    let syn = build_in(flags::SYN, CLIENT_ISS, 0, PEER_WIN, Some(1460), None, false, &[]);
+    let syn = build_in(
+        flags::SYN,
+        CLIENT_ISS,
+        0,
+        PEER_WIN,
+        Some(1460),
+        None,
+        false,
+        &[],
+    );
     s.inject_packet(&syn).expect("inject SYN");
     let _ = pop(&mut s);
 
@@ -531,7 +570,16 @@ fn syn_rcvd_off_path_rst_with_wrong_seq_is_dropped() {
     s.set_now(0);
     s.listen().expect("listen");
 
-    let syn = build_in(flags::SYN, CLIENT_ISS, 0, PEER_WIN, Some(1460), None, false, &[]);
+    let syn = build_in(
+        flags::SYN,
+        CLIENT_ISS,
+        0,
+        PEER_WIN,
+        Some(1460),
+        None,
+        false,
+        &[],
+    );
     s.inject_packet(&syn).expect("inject SYN");
     let _ = pop(&mut s);
     assert_eq!(s.state(), State::SynRcvd);
@@ -559,7 +607,16 @@ fn syn_rcvd_in_window_rst_reverts_to_listen() {
     s.set_now(0);
     s.listen().expect("listen");
 
-    let syn = build_in(flags::SYN, CLIENT_ISS, 0, PEER_WIN, Some(1460), None, false, &[]);
+    let syn = build_in(
+        flags::SYN,
+        CLIENT_ISS,
+        0,
+        PEER_WIN,
+        Some(1460),
+        None,
+        false,
+        &[],
+    );
     s.inject_packet(&syn).expect("inject SYN");
     let _ = pop(&mut s);
 
@@ -613,7 +670,10 @@ fn cookie_handshake_round_trip() {
     assert_eq!(synack.ack, CLIENT_ISS.wrapping_add(1));
     let cookie = synack.seq;
     assert_eq!(s.state(), State::Listen, "stateless cookies stay in LISTEN");
-    assert!(!synack.sack_permitted, "cookie SYN-ACK does not negotiate SACK");
+    assert!(
+        !synack.sack_permitted,
+        "cookie SYN-ACK does not negotiate SACK"
+    );
 
     // Client final ACK echoing cookie+1.
     let ack = build_in(
@@ -628,7 +688,11 @@ fn cookie_handshake_round_trip() {
     );
     s.set_now(2);
     s.inject_packet(&ack).expect("inject final ACK");
-    assert_eq!(s.state(), State::Established, "cookie validates → ESTABLISHED");
+    assert_eq!(
+        s.state(),
+        State::Established,
+        "cookie validates → ESTABLISHED"
+    );
 }
 
 #[test]
@@ -701,7 +765,16 @@ fn cookie_rejects_third_ack_after_secret_rotation() {
     s.set_now(0);
     s.listen().expect("listen");
 
-    let syn = build_in(flags::SYN, CLIENT_ISS, 0, PEER_WIN, Some(1460), None, false, &[]);
+    let syn = build_in(
+        flags::SYN,
+        CLIENT_ISS,
+        0,
+        PEER_WIN,
+        Some(1460),
+        None,
+        false,
+        &[],
+    );
     s.inject_packet(&syn).expect("inject SYN");
     let synack = pop(&mut s);
     let cookie = synack.seq;
@@ -764,7 +837,11 @@ fn syn_flood_under_cookies_holds_no_state() {
         // the FFI contract requires a drained tx_buf before inject.
         let _ = try_pop(&mut s);
         s.inject_packet(&syn).expect("inject flood SYN");
-        assert_eq!(s.state(), State::Listen, "SYN-flood iter {i} promoted state");
+        assert_eq!(
+            s.state(),
+            State::Listen,
+            "SYN-flood iter {i} promoted state"
+        );
         // Drain *this* iteration's cookie SYN-ACK so the next inject
         // can run.
         let _ = try_pop(&mut s);
@@ -781,7 +858,16 @@ fn syn_flood_without_cookies_caps_half_open_lifetime() {
     s.set_now(0);
     s.listen().expect("listen");
 
-    let syn = build_in(flags::SYN, CLIENT_ISS, 0, PEER_WIN, Some(1460), None, false, &[]);
+    let syn = build_in(
+        flags::SYN,
+        CLIENT_ISS,
+        0,
+        PEER_WIN,
+        Some(1460),
+        None,
+        false,
+        &[],
+    );
     s.inject_packet(&syn).expect("inject SYN");
     assert_eq!(s.state(), State::SynRcvd);
 
@@ -814,7 +900,8 @@ fn closed_to_listen_to_closed_is_clean() {
     assert_eq!(s.state(), State::Listen);
     s.close().expect("close listener");
     assert_eq!(s.state(), State::Closed);
-}#[test]
+}
+#[test]
 fn listen_recycles_after_clean_close() {
     // Full handshake, peer FINs, we FIN, both sides clean — TCB returns
     // to a usable LISTEN if `is_listener` was set. (Right now only RTO
@@ -825,7 +912,16 @@ fn listen_recycles_after_clean_close() {
     s.set_now(0);
     s.listen().expect("listen");
 
-    let syn = build_in(flags::SYN, CLIENT_ISS, 0, PEER_WIN, Some(1460), None, false, &[]);
+    let syn = build_in(
+        flags::SYN,
+        CLIENT_ISS,
+        0,
+        PEER_WIN,
+        Some(1460),
+        None,
+        false,
+        &[],
+    );
     s.inject_packet(&syn).expect("inject SYN");
     let _ = pop(&mut s);
     let ack = build_in(
@@ -940,9 +1036,7 @@ fn passive_handshake_negotiates_window_scale() {
     // exact shift is implementation-defined; we just assert it's present.
     let synack = pop(&mut s);
     assert_eq!(synack.flags, flags::SYN | flags::ACK);
-    let our_ws = synack
-        .wscale
-        .expect("SYN-ACK must echo our local WS shift");
+    let our_ws = synack.wscale.expect("SYN-ACK must echo our local WS shift");
     assert!(our_ws >= 1, "shift ≥ 1 required to fit our BUF_CAP");
     // SYN-ACK window itself is NEVER scaled (RFC 7323 §2.3).
     assert_eq!(

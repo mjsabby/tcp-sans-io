@@ -1071,7 +1071,8 @@ fn bidirectional_bulk_with_outbound_loss_recovers() {
     let mut iters = 0usize;
     let max_iters = 200_000;
 
-    while (peer.received.len() < cli_payload.len() || cli_received_from_peer.len() < srv_payload.len())
+    while (peer.received.len() < cli_payload.len()
+        || cli_received_from_peer.len() < srv_payload.len())
         && iters < max_iters
     {
         iters += 1;
@@ -1092,9 +1093,7 @@ fn bidirectional_bulk_with_outbound_loss_recovers() {
         loop {
             match client.recv(&mut rbuf) {
                 Ok(0) => break,
-                Ok(n) => {
-                    cli_received_from_peer.extend_from_slice(rbuf.get(..n).expect("range"))
-                }
+                Ok(n) => cli_received_from_peer.extend_from_slice(rbuf.get(..n).expect("range")),
                 Err(TcpError::ConnectionClosed) => break,
                 Err(e) => panic!("recv: {e:?}"),
             }

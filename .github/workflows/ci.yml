@@ -19,8 +19,11 @@ jobs:
 
       - name: Install stable Rust toolchain
         run: |
-          rustup toolchain install stable --profile minimal --no-self-update --component clippy
+          rustup toolchain install stable --profile minimal --no-self-update --component clippy --component rustfmt
           rustup default stable
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
 
       - name: cargo build --release
         run: cargo build --release --lib --verbose

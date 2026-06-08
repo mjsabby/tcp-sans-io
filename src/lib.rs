@@ -41,7 +41,12 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
 //
 // The stub below provides that symbol. It must never run; if it ever does,
 // the unwinder is being driven on a panic-abort build, which is a bug.
-#[cfg(all(not(test), not(feature = "host_panic_handler"), not(feature = "std"), target_os = "linux"))]
+#[cfg(all(
+    not(test),
+    not(feature = "host_panic_handler"),
+    not(feature = "std"),
+    target_os = "linux"
+))]
 #[no_mangle]
 extern "C" fn rust_eh_personality() {
     loop {

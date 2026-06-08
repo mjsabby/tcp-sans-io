@@ -17,7 +17,7 @@
 //! in the held byte count. Adjacent ranges are merged on insert, so the
 //! data structure always represents the minimum set of disjoint runs.
 
-use crate::{REASM_CAP};
+use crate::REASM_CAP;
 
 /// Maximum number of disjoint holes the reassembler will track. Linux
 /// uses ~16 in practice; 4 is enough for the per-RTT loss-pattern
@@ -87,7 +87,6 @@ impl Default for Reassembly {
 }
 
 impl Reassembly {
-
     /// Clear all held data. Used on connection teardown / RESET / listener
     /// recycle.
     pub fn clear(&mut self) {
@@ -158,7 +157,9 @@ impl Reassembly {
         // slots that now abut.
         let new_end = seq.wrapping_add(payload.len() as u32);
         for i in 0..MAX_HOLES {
-            let Some(slot) = self.slots.get(i) else { continue };
+            let Some(slot) = self.slots.get(i) else {
+                continue;
+            };
             if !slot.is_used() {
                 continue;
             }
@@ -211,10 +212,9 @@ impl Reassembly {
                 let tag = self.bump_tag();
                 if let Some(slot) = self.slots.get_mut(i) {
                     let dst_off = slot.len;
-                    if let (Some(dst), Some(src)) = (
-                        slot.data.get_mut(dst_off..dst_off + n),
-                        payload.get(..n),
-                    ) {
+                    if let (Some(dst), Some(src)) =
+                        (slot.data.get_mut(dst_off..dst_off + n), payload.get(..n))
+                    {
                         dst.copy_from_slice(src);
                     }
                     slot.len += n;
@@ -235,10 +235,9 @@ impl Reassembly {
                     // Shift existing bytes right by `n`.
                     let kept = core::cmp::min(slot.len, SLOT_CAP - n);
                     slot.data.copy_within(0..kept, n);
-                    if let (Some(dst), Some(src)) = (
-                        slot.data.get_mut(..n),
-                        payload.get(payload.len() - n..),
-                    ) {
+                    if let (Some(dst), Some(src)) =
+                        (slot.data.get_mut(..n), payload.get(payload.len() - n..))
+                    {
                         dst.copy_from_slice(src);
                     }
                     slot.start = seq.wrapping_add((payload.len() - n) as u32);
@@ -312,7 +311,9 @@ impl Reassembly {
     /// Consume the first `n` bytes of slot `i` (the caller successfully
     /// wrote them into the receive ring). `n == slot.len` frees the slot.
     pub fn commit_drain(&mut self, i: usize, n: usize) {
-        let Some(slot) = self.slots.get_mut(i) else { return };
+        let Some(slot) = self.slots.get_mut(i) else {
+            return;
+        };
         if !slot.is_used() {
             return;
         }
@@ -453,10 +454,9 @@ impl Reassembly {
                             None => continue,
                         };
                         let mut buf = [0u8; SLOT_CAP];
-                        if let (Some(dst), Some(src)) = (
-                            buf.get_mut(..copy),
-                            s.data.get(len_j - copy..len_j),
-                        ) {
+                        if let (Some(dst), Some(src)) =
+                            (buf.get_mut(..copy), s.data.get(len_j - copy..len_j))
+                        {
                             dst.copy_from_slice(src);
                         }
                         buf
@@ -464,10 +464,9 @@ impl Reassembly {
                     if let Some(slot_i) = self.slots.get_mut(i) {
                         let kept = core::cmp::min(slot_i.len, SLOT_CAP - copy);
                         slot_i.data.copy_within(0..kept, copy);
-                        if let (Some(dst), Some(src)) = (
-                            slot_i.data.get_mut(..copy),
-                            src_bytes.get(..copy),
-                        ) {
+                        if let (Some(dst), Some(src)) =
+                            (slot_i.data.get_mut(..copy), src_bytes.get(..copy))
+                        {
                             dst.copy_from_slice(src);
                         }
                         slot_i.start = end_j.wrapping_sub(copy as u32);

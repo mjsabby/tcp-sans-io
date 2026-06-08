@@ -18,7 +18,7 @@
 //! segment; the resulting SACK/ACK lets RACK detect the loss
 //! ~10x faster than waiting for RTO.
 
-use crate::send_queue::{SendQueue, SendEntry};
+use crate::send_queue::{SendEntry, SendQueue};
 
 /// RACK's recovery state — the "most recently delivered segment"
 /// markers from RFC 8985 §6.1.
@@ -122,8 +122,7 @@ impl Rack {
         }
         // Strictly-earlier predicate (RFC 8985 §6.1).
         let earlier = entry.send_ts_ms < self.xmit_ts_ms
-            || (entry.send_ts_ms == self.xmit_ts_ms
-                && seq_le(entry.seq_end, self.end_seq));
+            || (entry.send_ts_ms == self.xmit_ts_ms && seq_le(entry.seq_end, self.end_seq));
         if !earlier {
             return Ordering::NotEligible;
         }
@@ -162,11 +161,7 @@ pub enum Ordering {
 /// Returns at most 16 lost ranges per scan; callers should drain the
 /// returned set into a persistent retransmit queue and re-scan on the
 /// next ACK / timer expiry to pick up the rest if there are more.
-pub fn detect_lost(
-    rack: &Rack,
-    queue: &SendQueue,
-    now_ms: u64,
-) -> ScanResult {
+pub fn detect_lost(rack: &Rack, queue: &SendQueue, now_ms: u64) -> ScanResult {
     let mut lost = LostRanges::new();
     let mut next_deadline: Option<u64> = None;
     for entry in queue.iter() {
@@ -184,7 +179,10 @@ pub fn detect_lost(
             Ordering::NotEligible => {}
         }
     }
-    ScanResult { lost, next_deadline }
+    ScanResult {
+        lost,
+        next_deadline,
+    }
 }
 
 pub struct ScanResult {
@@ -250,7 +248,12 @@ mod tests {
     fn unprimed_rack_never_marks_lost() {
         let rack = Rack::new();
         let mut q = SendQueue::new();
-        q.push_entry(SendEntry { seq_start: 0, seq_end: 1000, send_ts_ms: 100, is_retx: false });
+        q.push_entry(SendEntry {
+            seq_start: 0,
+            seq_end: 1000,
+            send_ts_ms: 100,
+            is_retx: false,
+        });
         let r = detect_lost(&rack, &q, 1_000_000);
         assert!(r.lost.is_empty());
         assert_eq!(r.next_deadline, None);
@@ -260,13 +263,18 @@ mod tests {
     fn detect_lost_basic() {
         let mut rack = Rack::new();
         rack.set_reo_wnd_from_srtt(40); // reo_wnd = 10
-        // Simulate: seg @ ts=100 ends at 1000, seg @ ts=200 ends at 2000.
-        // Update RACK with the later delivery.
+                                        // Simulate: seg @ ts=100 ends at 1000, seg @ ts=200 ends at 2000.
+                                        // Update RACK with the later delivery.
         rack.update_on_delivery(200, 2000, 250);
         // Now classify the seg @ ts=100, end=1000 at now=400.
         // earlier? yes (100 < 200). elapsed = 400-100 = 300 ≥ rtt(50)+reo_wnd(10) = 60. → Lost.
         let mut q = SendQueue::new();
-        q.push_entry(SendEntry { seq_start: 0, seq_end: 1000, send_ts_ms: 100, is_retx: false });
+        q.push_entry(SendEntry {
+            seq_start: 0,
+            seq_end: 1000,
+            send_ts_ms: 100,
+            is_retx: false,
+        });
         let r = detect_lost(&rack, &q, 400);
         assert_eq!(r.lost.as_slice(), &[(0, 1000)]);
     }
@@ -279,7 +287,12 @@ mod tests {
         // rtt = 50, reo_wnd = 10, threshold = 60.
         // entry @ ts=180, now = 210. elapsed = 30. remaining = 30.
         let mut q = SendQueue::new();
-        q.push_entry(SendEntry { seq_start: 0, seq_end: 1000, send_ts_ms: 180, is_retx: false });
+        q.push_entry(SendEntry {
+            seq_start: 0,
+            seq_end: 1000,
+            send_ts_ms: 180,
+            is_retx: false,
+        });
         let r = detect_lost(&rack, &q, 210);
         assert!(r.lost.is_empty());
         assert_eq!(r.next_deadline, Some(210 + 30));
@@ -292,7 +305,12 @@ mod tests {
         rack.update_on_delivery(200, 2000, 250);
         // Entry @ ts=300 (strictly later than RACK.xmit_ts=200).
         let mut q = SendQueue::new();
-        q.push_entry(SendEntry { seq_start: 2000, seq_end: 3000, send_ts_ms: 300, is_retx: false });
+        q.push_entry(SendEntry {
+            seq_start: 2000,
+            seq_end: 3000,
+            send_ts_ms: 300,
+            is_retx: false,
+        });
         let r = detect_lost(&rack, &q, 10_000);
         assert!(r.lost.is_empty());
         assert_eq!(r.next_deadline, None);

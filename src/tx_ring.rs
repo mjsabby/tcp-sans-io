@@ -169,7 +169,12 @@ impl Default for TxRing {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
 
     use super::*;
 
@@ -186,10 +191,12 @@ mod tests {
     #[test]
     fn push_then_pop_roundtrips_bytes() {
         let mut r = TxRing::new();
-        assert!(r.push_with(|b| {
-            b[..3].copy_from_slice(b"abc");
-            Ok(3)
-        }).unwrap());
+        assert!(r
+            .push_with(|b| {
+                b[..3].copy_from_slice(b"abc");
+                Ok(3)
+            })
+            .unwrap());
         assert_eq!(r.len(), 1);
         assert_eq!(r.peek_head_len(), Some(3));
         let mut out = [0u8; 32];
@@ -202,11 +209,21 @@ mod tests {
     fn fills_to_capacity_then_refuses() {
         let mut r = TxRing::new();
         for i in 0..TX_RING_CAP {
-            assert!(r.push_with(|b| { b[0] = i as u8; Ok(1) }).unwrap());
+            assert!(r
+                .push_with(|b| {
+                    b[0] = i as u8;
+                    Ok(1)
+                })
+                .unwrap());
         }
         assert!(r.is_full());
         // 33rd push: ring full, returns false (not Err).
-        assert!(!r.push_with(|b| { b[0] = 0xFF; Ok(1) }).unwrap());
+        assert!(!r
+            .push_with(|b| {
+                b[0] = 0xFF;
+                Ok(1)
+            })
+            .unwrap());
         assert_eq!(r.len(), TX_RING_CAP);
     }
 
@@ -214,7 +231,11 @@ mod tests {
     fn fifo_order_preserved() {
         let mut r = TxRing::new();
         for i in 0..5u8 {
-            r.push_with(|b| { b[0] = i; Ok(1) }).unwrap();
+            r.push_with(|b| {
+                b[0] = i;
+                Ok(1)
+            })
+            .unwrap();
         }
         let mut out = [0u8; 8];
         for i in 0..5u8 {
@@ -244,9 +265,16 @@ mod tests {
     #[test]
     fn pop_into_small_buffer_returns_error_and_keeps_slot() {
         let mut r = TxRing::new();
-        r.push_with(|b| { b[..4].copy_from_slice(b"data"); Ok(4) }).unwrap();
+        r.push_with(|b| {
+            b[..4].copy_from_slice(b"data");
+            Ok(4)
+        })
+        .unwrap();
         let mut small = [0u8; 2];
-        assert!(matches!(r.pop_into(&mut small), Err(TcpError::BufferTooSmall)));
+        assert!(matches!(
+            r.pop_into(&mut small),
+            Err(TcpError::BufferTooSmall)
+        ));
         assert_eq!(r.len(), 1, "slot kept on error");
         let mut big = [0u8; 8];
         assert_eq!(r.pop_into(&mut big).unwrap(), 4);
@@ -257,7 +285,11 @@ mod tests {
     fn clear_drops_all_pending() {
         let mut r = TxRing::new();
         for _ in 0..3 {
-            r.push_with(|b| { b[0] = 1; Ok(1) }).unwrap();
+            r.push_with(|b| {
+                b[0] = 1;
+                Ok(1)
+            })
+            .unwrap();
         }
         r.clear();
         assert!(r.is_empty());
@@ -271,14 +303,22 @@ mod tests {
         let mut buf = [0u8; 8];
         // Push 10, pop 10, push 30, pop 30 — exercises wraparound.
         for i in 0..10u8 {
-            r.push_with(|b| { b[0] = i; Ok(1) }).unwrap();
+            r.push_with(|b| {
+                b[0] = i;
+                Ok(1)
+            })
+            .unwrap();
         }
         for i in 0..10u8 {
             r.pop_into(&mut buf).unwrap();
             assert_eq!(buf[0], i);
         }
         for i in 0..30u8 {
-            r.push_with(|b| { b[0] = i; Ok(1) }).unwrap();
+            r.push_with(|b| {
+                b[0] = i;
+                Ok(1)
+            })
+            .unwrap();
         }
         for i in 0..30u8 {
             r.pop_into(&mut buf).unwrap();

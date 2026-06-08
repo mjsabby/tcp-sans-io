@@ -502,7 +502,7 @@ pub fn emit(
         .ok_or(TcpError::BufferTooSmall)?;
     ip.fill(0);
     put_u8(ip, 0, 0x45)?; // version=4, IHL=5
-    // TOS byte: DSCP=0, ECN codepoint in low 2 bits (RFC 3168 §5).
+                          // TOS byte: DSCP=0, ECN codepoint in low 2 bits (RFC 3168 §5).
     put_u8(ip, 1, ecn & ecn::MASK)?;
     put_u16(ip, 2, total_u16)?;
     put_u16(ip, 4, ip_id)?;
