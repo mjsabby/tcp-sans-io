@@ -156,7 +156,9 @@ fuzz_target!(|data: &[u8]| {
     let mut fi = 0usize;
     let mut drop_budget = 4000u32;
 
-    // Monotonic-progress oracle state.
+    // Monotonic-progress oracle state. Only enforced across two consecutive
+    // *synchronized* states, so the legitimate `rcv_nxt: 0 -> irs+1` jump at
+    // the handshake (and `snd_una` at SYN-ACK) isn't misread as a regress.
     let mut mono_c = {
         let s = cli.debug_snapshot();
         (s.snd_una, s.rcv_nxt)
@@ -165,6 +167,8 @@ fuzz_target!(|data: &[u8]| {
         let s = srv.debug_snapshot();
         (s.snd_una, s.rcv_nxt)
     };
+    let mut cli_sync = false;
+    let mut srv_sync = false;
 
     let budget = 3_000_000u64;
     for iter in 0..budget {
@@ -275,21 +279,42 @@ fuzz_target!(|data: &[u8]| {
             srv_recv += n as u32;
         }
 
-        // Monotonic-progress oracle: cumulative cursors never regress.
+        // Monotonic-progress oracle: cumulative cursors never regress —
+        // checked only between consecutive synchronized states.
+        let sync = |st: State| {
+            matches!(
+                st,
+                State::Established
+                    | State::FinWait1
+                    | State::FinWait2
+                    | State::Closing
+                    | State::CloseWait
+                    | State::LastAck
+                    | State::TimeWait
+            )
+        };
         let c = {
             let s = cli.debug_snapshot();
             (s.snd_una, s.rcv_nxt)
         };
-        assert!((c.0.wrapping_sub(mono_c.0) as i32) >= 0, "cli snd_una regressed");
-        assert!((c.1.wrapping_sub(mono_c.1) as i32) >= 0, "cli rcv_nxt regressed");
+        let c_now = sync(cli.state());
+        if cli_sync && c_now {
+            assert!((c.0.wrapping_sub(mono_c.0) as i32) >= 0, "cli snd_una regressed");
+            assert!((c.1.wrapping_sub(mono_c.1) as i32) >= 0, "cli rcv_nxt regressed");
+        }
         mono_c = c;
+        cli_sync = c_now;
         let s = {
             let s = srv.debug_snapshot();
             (s.snd_una, s.rcv_nxt)
         };
-        assert!((s.0.wrapping_sub(mono_s.0) as i32) >= 0, "srv snd_una regressed");
-        assert!((s.1.wrapping_sub(mono_s.1) as i32) >= 0, "srv rcv_nxt regressed");
+        let s_now = sync(srv.state());
+        if srv_sync && s_now {
+            assert!((s.0.wrapping_sub(mono_s.0) as i32) >= 0, "srv snd_una regressed");
+            assert!((s.1.wrapping_sub(mono_s.1) as i32) >= 0, "srv rcv_nxt regressed");
+        }
         mono_s = s;
+        srv_sync = s_now;
 
         if !closing && cli_sent == XFER && cli_recv == XFER && srv_sent == XFER && srv_recv == XFER {
             let _ = cli.close();
