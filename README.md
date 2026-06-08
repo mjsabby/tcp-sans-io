@@ -84,7 +84,7 @@ with PRR and RACK-TLP loss detection.
 Per-connection: ~2.15 MiB.
 
 - `BUF_CAP = 1 MiB` send ring + `1 MiB` receive ring.
-- 16 KiB single-hole reassembly buffer.
+- 16 KiB out-of-order reassembly arena (4 holes × 4 KiB).
 - 24 KiB RACK send-record queue (per-segment metadata for time-based loss detection).
 - 48 KiB egress staging ring (32 packet slots × `MAX_PACKET`).
 - ~1.5 KiB SYN-cookie secret + various scalar state.
@@ -97,11 +97,114 @@ at 160 Mbit/s).
 The Rust thread stack default (1 MiB on Windows, 8 MiB on Linux) is **too
 small** for a Tcb constructed as a stack local — between the 2 MiB rings,
 the 24 KiB RACK send-queue, and the 48 KiB egress ring, a Tcb is ~2.15 MiB.
-The included `.cargo/config.toml` sets `RUST_MIN_STACK = 16777216` (16 MiB)
+The included `.cargo/config.toml` sets `RUST_MIN_STACK = 33554432` (32 MiB)
 for the build/test environment, which comfortably fits multiple Tcbs (e.g.
 loopback tests with peer + client) per thread. Production callers route
 through the C ABI (`tcp_init`) which writes into host-provided heap
 storage, so this only affects pure-Rust users and tests.
+
+## Extents and bounds
+
+Every data structure in the stack is fixed-capacity — there is no
+allocator and nothing grows with peer behaviour. The table lists each
+bound, where it lives, and what it caps. **The central invariant is that
+every one of these is a *performance* knob, not a *correctness* knob**
+(see "Why the bounds are sound" below): exceeding a capacity always
+degrades to retransmission or backpressure, never to data loss,
+mis-ordering, corruption, a panic, or an unbounded loop.
+
+| Bound | Value | Where | What it limits |
+|---|---|---|---|
+| `BUF_CAP` | 1 MiB (32 KiB w/ `small-buffers`) | `lib.rs` | Send + receive ring capacity; also the un-scaled receive window = in-flight ceiling per RTT. Power of two; window-scale shift derived from it (5 at 1 MiB). |
+| `MSS` / `MAX_PACKET` | 1460 / 1500 B | `lib.rs` | Largest payload / largest emitted datagram. |
+| `REASM_CAP` / `MAX_HOLES` / `SLOT_CAP` | 16 KiB / 4 / 4 KiB | `reassembly.rs` | Out-of-order data held while waiting for gaps to fill: at most 4 disjoint runs, 4 KiB each. |
+| `SCOREBOARD_CAP` | 16 | `scoreboard.rs` | Sender-side SACK ranges tracked for RFC 6675 retransmit. |
+| `SEND_QUEUE_CAP` | 1024 | `send_queue.rs` | In-flight segment records RACK can time-based-loss-detect (≈ `BUF_CAP / MSS` with margin). Oldest evicted on overflow. |
+| `TX_RING_CAP` | 32 | `tx_ring.rs` | Egress packets staged per emit burst before the host must drain. |
+| SACK blocks emitted | ≤ 4 (≤ 3 with TS) | `tcb.rs` | Bounded by the 40-byte TCP option area. |
+| `INITIAL_WINDOW` | 10·MSS (14600 B) | `congestion.rs` | RFC 6928 initial cwnd. |
+| `RTO_MIN` / `RTO_MAX` | 200 ms / 60 s | `tcb.rs` | RTO clamp; exponential backoff is capped at `RTO_MAX`. |
+| `TLP_MIN_PTO` / `DELAYED_ACK` / `TIME_WAIT` | 10 ms / 40 ms / 60 s | `tcb.rs` | Tail-loss-probe floor, delayed-ACK timer (every 2nd segment), 2·MSL wait. |
+| `MAX_SYN_RCVD_RETRIES` | 5 | `tcb.rs` | SYN-ACK retransmits before a half-open reverts to `LISTEN` (one half-open per TCB). |
+| Cookie validity | 128 s | `tcb.rs` | `2 × COOKIE_TIME_BUCKET_MS`; MAC truncated to 29 bits (2⁻²⁹ blind forgery). |
+
+### Why the bounds are sound
+
+The receiver only ever delivers a **contiguous prefix** starting at
+`rcv_nxt`, and only ever cumulatively ACKs / SACKs data it is actually
+holding. So any byte the stack cannot store is simply never acknowledged,
+and the peer retransmits it (via RACK/fast-retransmit once the gap is
+visible, or the RTO safety net). Concretely:
+
+- **Reassembly overflow** (a 5th simultaneous hole, or a run that
+  outgrows its 4 KiB slot) → the un-storable segment is **dropped**, not
+  mis-filed. `rcv_nxt` doesn't advance over a gap, the dropped range is
+  never SACKed, and the sender resends it. The application can never
+  observe a gap or out-of-order bytes.
+- **`SEND_QUEUE_CAP` overflow** → the *oldest* record is evicted. That
+  segment loses RACK time-based detection but is still covered by RTO, so
+  it is recovered, just later.
+- **`SCOREBOARD_CAP`** comfortably exceeds the ≤ 4 SACK blocks a
+  compliant peer can send (option-space limited); crafted excess is
+  merged, never overflowed.
+- **`TX_RING_CAP` full** → emit returns "ring full", the caller drains
+  and re-ticks; bookkeeping (`snd_nxt`, FIN state) is *not* advanced, so
+  nothing is skipped.
+- **Receive ring full** (app not draining) → `drain_reassembly` stops and
+  the advertised window shrinks toward zero. The peer stalls on flow
+  control (correct backpressure), and the zero-window persist timer keeps
+  the connection alive.
+
+In other words, shrinking `BUF_CAP` to 32 KiB or `MAX_HOLES` to 1 changes
+throughput under loss, never the bytes the application sees.
+
+### What "4 reassembly holes" actually costs
+
+`MAX_HOLES = 4` × `SLOT_CAP = 4 KiB` means the receiver can absorb up to
+four disjoint loss gaps (or ~16 KiB of out-of-order data) per window and
+recover them in a single RTT via SACK-driven selective retransmit:
+
+- **Light/moderate loss** (the WireGuard-tunnel target): a window rarely
+  has more than one or two holes, so 4 is ample and recovery is
+  one-RTT — indistinguishable from a 16-hole Linux receiver.
+- **Heavy/bursty loss** (> 4 gaps in one window, e.g. a long burst drop):
+  the 5th+ gap's data is dropped and re-fetched only after an earlier
+  hole drains, so recovery for the excess degrades from "one RTT" toward
+  RTO-paced, go-back-N-like behaviour. Throughput drops; **correctness is
+  untouched.**
+- **`SLOT_CAP = 4 KiB`**: an individual TCP segment (≤ MSS = 1460 B)
+  always fits; the cap only limits how large a single *accumulated*
+  contiguous out-of-order run can grow before it needs a second slot.
+
+Raising `MAX_HOLES` improves heavy-loss throughput at a linear memory
+cost (`MAX_HOLES × SLOT_CAP`) and a small constant per-segment CPU cost
+(insert/merge and SACK generation are O(`MAX_HOLES`)). It is a deliberate
+footprint-vs-loss-resilience trade, not a correctness decision.
+
+### Termination and resource safety
+
+These bounds are also what make the stack **DoS-resistant and
+hang-free** against a hostile peer:
+
+- **No unbounded loops.** Every loop reachable from `inject_packet` /
+  `tick` / `send` is bounded by one of: a fixed-capacity array, a
+  strictly-advancing index ≤ a slice length (e.g. TCP-option parsing), a
+  strictly-decreasing variant (merge passes), or an explicit
+  `loop_budget_exhausted` guard on the four invariant-dependent loops
+  (send-emit, reassembly drain, SACK `next_seg` / `first_unsacked`).
+  Those guards `panic!` under test/fuzz builds (caught immediately) and
+  degrade to a graceful stop in the shipped `no_std` build (no CPU-spin
+  DoS). See `fuzz/` for the livelock and bounded-output oracles.
+- **No amplification.** One inbound segment stages at most a bounded
+  burst (≤ `TX_RING_CAP`) before the host must drain; there is no
+  reflection multiplier.
+- **No state exhaustion.** One half-open per TCB with a 5-retransmit
+  budget, or stateless SYN cookies; no allocator to drain.
+- **No information disclosure.** Emitted packets are built in
+  zero-initialised scratch with headers `fill(0)`'d and exactly the
+  payload bytes copied; the egress ring returns exactly the emitted
+  length; `tcp_init` writes a fresh, zeroed `Tcb` over reused host
+  storage. A peer cannot read uninitialised or prior-connection memory.
 
 ## How will it perform in 2026?
 
