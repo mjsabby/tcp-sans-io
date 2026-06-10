@@ -59,6 +59,12 @@ struct Conn {
     served: u64,
     /// Latched peer 5-tuple last seen on this TCB (for debug).
     peer_seen: Option<([u8; 4], u16)>,
+    /// Outer UDP source address of the last datagram this TCB *accepted*.
+    /// Egress for this connection goes here. Without per-connection
+    /// addressing, all egress chased the most recent UDP source seen on
+    /// the socket — any datagram from anywhere (even one failing to
+    /// parse) redirected every in-flight connection's replies.
+    udp_peer: Option<SocketAddr>,
 }
 
 pub struct Server {
@@ -101,7 +107,7 @@ impl Server {
         let mut conns: Vec<Conn> = Vec::with_capacity(cfg.num_listeners as usize);
         for i in 0..cfg.num_listeners {
             let port = cfg.base_port + i;
-            let iss = derive_iss(cfg.server_ip, port);
+            let iss = fresh_iss();
             let tcb_cfg = TcbConfig {
                 local: Endpoint {
                     ip: cfg.server_ip,
@@ -128,6 +134,7 @@ impl Server {
                 closing: false,
                 served: 0,
                 peer_seen: None,
+                udp_peer: None,
             });
         }
 
@@ -198,6 +205,11 @@ impl Server {
                             let was_listen = conn.tcb.state() == State::Listen;
                             match conn.tcb.inject_packet(pkt) {
                                 Ok(()) => {
+                                    // Pin this connection's egress to the
+                                    // outer address of the datagram the TCB
+                                    // accepted (the 5-tuple filter inside
+                                    // inject_packet vouched for it).
+                                    conn.udp_peer = Some(src);
                                     // Promote to active set if EITHER the TCB
                                     // left LISTEN OR the inject queued egress
                                     // bytes (stateless cookie SYN-ACK, RST
@@ -308,13 +320,17 @@ impl Server {
             }
         }
 
-        // Drain any segments the TCB wants on the wire.
+        // Drain any segments the TCB wants on the wire. Egress goes to the
+        // UDP address this connection's traffic actually arrived from; the
+        // global last-seen `peer` is only the bootstrap fallback for a TCB
+        // that has never accepted a datagram.
+        let egress = conn.udp_peer.unwrap_or(peer);
         loop {
             match conn.tcb.extract_packet(&mut self.extract_buf) {
                 Ok(0) => break,
                 Ok(n) => {
                     self.stats.udp_tx += 1;
-                    if let Err(e) = self.sock.send_to(&self.extract_buf[..n], peer) {
+                    if let Err(e) = self.sock.send_to(&self.extract_buf[..n], egress) {
                         if e.kind() == io::ErrorKind::WouldBlock {
                             break;
                         }
@@ -421,11 +437,29 @@ impl Server {
         // Re-arm LISTEN when the TCB has drained back to Closed or TimeWait.
         let final_state = conn.tcb.state();
         if final_state == State::Closed || final_state == State::TimeWait {
-            // Drop the active flag, re-arm.
+            // Drop the active flag, re-arm with a *fresh* ISS — `listen()`
+            // alone reuses the prior incarnation's `iss`, which would give
+            // every connection on this port the same predictable ISN
+            // (RFC 6528 wants per-connection randomness).
             conn.active = false;
             conn.closing = false;
             conn.pending.clear();
             conn.peer_seen = None;
+            conn.udp_peer = None;
+            conn.tcb.set_now(now_ms);
+            let port = self.cfg.base_port + idx as u16;
+            conn.tcb.reinit(TcbConfig {
+                local: Endpoint {
+                    ip: self.cfg.server_ip,
+                    port,
+                },
+                remote: Endpoint {
+                    ip: [0, 0, 0, 0],
+                    port: 0,
+                },
+                iss: fresh_iss(),
+                initial_rto_ms: 1000,
+            });
             conn.tcb.set_now(now_ms);
             if let Err(e) = conn.tcb.listen() {
                 if !self.cfg.quiet {
@@ -514,16 +548,18 @@ fn parse_dest_index(
     Some(idx)
 }
 
-/// Deterministic per-listener ISS derived from the (server_ip, port)
-/// pair so tests can predict sequence numbers if needed.
-fn derive_iss(ip: [u8; 4], port: u16) -> u32 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in ip {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x100_0000_01b3);
-    }
-    h ^= port as u64;
-    h = h.wrapping_mul(0x100_0000_01b3);
+/// Per-connection ISS from OS-seeded entropy. RFC 6528 (and the library's
+/// host contract) require a CSPRNG-derived ISS per connection; the previous
+/// fixed FNV of `(server_ip, port)` gave every incarnation on a port the
+/// same predictable ISN. `RandomState` carries per-process SipHash keys
+/// seeded from the OS CSPRNG plus a per-instance counter, so each call
+/// yields an off-path-unpredictable value with no extra dependency. (The
+/// Go driver learns the server ISS from the SYN-ACK, so nothing relies on
+/// predictability.)
+fn fresh_iss() -> u32 {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    let h = RandomState::new().build_hasher().finish();
     (h ^ (h >> 32)) as u32
 }
 
