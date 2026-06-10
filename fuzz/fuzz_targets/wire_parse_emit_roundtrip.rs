@@ -62,9 +62,15 @@ fuzz_target!(|data: &[u8]| {
     // Option semantics: each option that the first parse identified
     // must reappear in the re-parse.
     assert_eq!(seg.options.mss, seg2.options.mss, "MSS option changed");
-    assert_eq!(seg.options.wscale, seg2.options.wscale, "WSCALE option changed");
+    assert_eq!(
+        seg.options.wscale, seg2.options.wscale,
+        "WSCALE option changed"
+    );
     assert_eq!(seg.options.ts, seg2.options.ts, "TS option changed");
-    assert_eq!(seg.options.sack_permitted, seg2.options.sack_permitted, "SACK_PERMITTED changed");
+    assert_eq!(
+        seg.options.sack_permitted, seg2.options.sack_permitted,
+        "SACK_PERMITTED changed"
+    );
     // SACK blocks: same count + same ranges.
     assert_eq!(
         seg.options.sack.as_slice(),
