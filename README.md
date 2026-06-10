@@ -547,6 +547,12 @@ free(mem);                             // you own the memory
   from a CSPRNG too.
 - After `tcp_close`, **keep pumping** until `tcp_state` is `CLOSED`; only
   then `tcp_destroy` + free.
+- **Bound the number of concurrent TCBs** and refuse/evict past that budget.
+  Each TCB is independent and costs ≈ `2 * BUF_CAP` (~2 MiB default, ~64 KiB
+  under `small-buffers`); the per-connection reapers (R2 / USER TIMEOUT /
+  keepalive, all on by default) bound each connection's *lifetime*, never the
+  aggregate *count* — only the host can do that. On `PEER_CLOSED` you **must**
+  eventually `close`; keepalive does not probe `CLOSE_WAIT`.
 
 **SHOULD**
 - Treat `inject_packet` errors (`NOT_FOR_US`, `MALFORMED_PACKET`,
@@ -829,10 +835,15 @@ The stack assumes the host is friendly but the peer is hostile.
     it resets **only** on real forward progress (`snd_una` advancing), so such
     a peer is aborted after 300 s regardless of proof of life. Set to `0` to
     disable.
-  - **Keepalive** (RFC 9293 §3.8.4, opt-in, `set_keepalive` /
-    `tcp_set_keepalive`, off by default). For a fully *idle* connection
-    (nothing in flight or queued, which neither timeout above would notice),
-    probes for a vanished peer and aborts after an unanswered run.
+  - **Keepalive** (RFC 9293 §3.8.4, **on by default**, `set_keepalive` /
+    `tcp_set_keepalive`; balanced profile = 10 min idle / 60 s interval / 4
+    probes ≈ 14 min to reap). For a fully *idle* connection (nothing in flight
+    or queued — the one shape neither timeout above looks at, since both key on
+    outstanding send work), it probes for a vanished peer and aborts after an
+    unanswered run. This closes the idle-connection memory-pinning DoS (complete
+    a handshake, then go silent) out of the box. A *live* idle peer answers each
+    probe and survives, so the steady-state cost is one probe per idle period.
+    Set `idle_ms = 0` to disable.
 - **Off-path injection**: 5-tuple filter on `inject_packet`; RFC-compliant
   acceptability checks on RST/SYN/ACK; SYN-cookie path is keyed by a
   caller-supplied 128-bit secret (we ship a no_std SipHash-2-4 impl, with

@@ -3,3 +3,6 @@ target/
 bindings/csharp/bin
 bindings/csharp/obj
 *.pyc
+# Coverage-guided fuzzing artifacts — regenerable, never source.
+fuzz/corpus/
+fuzz/artifacts/

@@ -112,6 +112,33 @@ impl Reassembly {
         self.held_bytes() == 0
     }
 
+    /// Debug invariant: no two held runs overlap. The whole structure relies
+    /// on this — overlapping slots double-count [`Self::held_bytes`] (shrinking
+    /// the advertised window) and can strand a run below `rcv_nxt` where it can
+    /// never drain (a receive-side wedge). `O(MAX_HOLES²)` (≤ 16 comparisons),
+    /// invoked only by test / fuzz oracles, never on the hot path.
+    pub fn debug_overlap_free(&self) -> bool {
+        for i in 0..MAX_HOLES {
+            let a = match self.slots.get(i) {
+                Some(s) if s.is_used() => s,
+                _ => continue,
+            };
+            for j in (i + 1)..MAX_HOLES {
+                let b = match self.slots.get(j) {
+                    Some(s) if s.is_used() => s,
+                    _ => continue,
+                };
+                // Half-open [start, end) ranges overlap iff each starts before
+                // the other ends (wrap-aware; held runs always lie within the
+                // receive window, so the < 2^31 span assumption holds).
+                if seq_lt(a.start, b.end()) && seq_lt(b.start, a.end()) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     /// Insert an out-of-order payload at `seq`. Bytes that overlap with
     /// already-held data are silently discarded (idempotent on retransmit).
     /// If the new bytes abut an existing slot they extend it (and may
@@ -147,15 +174,58 @@ impl Reassembly {
             return 0;
         }
 
-        // Try to extend an existing slot. Three cases per slot:
-        //   * Append (seq == slot.end): copy bytes onto the right edge.
-        //   * Prepend (seq + len == slot.start): copy onto the left edge.
-        //   * Overlap fully (seq >= slot.start && seq+len <= slot.end): drop.
-        //   * Partial overlap: trim payload to the non-overlapping portion
-        //     then re-attempt.
-        // After any successful extension, attempt to merge with neighbour
-        // slots that now abut.
-        let new_end = seq.wrapping_add(payload.len() as u32);
+        // Reduce the incoming range to the largest gap that (a) starts at or
+        // after `seq` and (b) overlaps nothing already held, so the structural
+        // invariant "slots never overlap" is preserved. Without this, a segment
+        // that starts *inside* an existing slot (a right / middle overlap, the
+        // mirror image of the left overlap below) gets stored as a second,
+        // overlapping slot. That is remotely triggerable and harmful twice over:
+        // `held_bytes()` then double-counts the overlap — under-reporting the
+        // advertised receive window for the life of the connection — and once
+        // the lower slot drains, the higher slot is stranded with
+        // `start < rcv_nxt` and can never be drained, wedging `rcv_nxt` even
+        // though the peer already saw those bytes ACK/SACKed. Trailing bytes
+        // past the first gap are dropped; the sender's RTO retransmits them,
+        // exactly as for any other range that doesn't fit.
+        //
+        // (a) Skip a leading prefix already covered by a slot. Re-scan after
+        //     each advance because the new `seq` may land inside another slot.
+        //     Bounded: at most `MAX_HOLES` disjoint slots can cover the prefix.
+        for _ in 0..=MAX_HOLES {
+            let mut advanced = false;
+            for i in 0..MAX_HOLES {
+                let Some(slot) = self.slots.get(i) else {
+                    continue;
+                };
+                if !slot.is_used() {
+                    continue;
+                }
+                if seq_le(slot.start, seq) && seq_lt(seq, slot.end()) {
+                    let skip = slot.end().wrapping_sub(seq) as usize;
+                    if skip >= payload.len() {
+                        return 0; // fully covered by this slot
+                    }
+                    match payload.get(skip..) {
+                        Some(p) => {
+                            payload = p;
+                            seq = seq.wrapping_add(skip as u32);
+                            advanced = true;
+                        }
+                        None => return 0,
+                    }
+                    break;
+                }
+            }
+            if !advanced {
+                break;
+            }
+        }
+        if payload.is_empty() {
+            return 0;
+        }
+        // (b) Clip the trailing edge so the kept range stops before the next
+        //     slot, leaving a range disjoint from everything already held.
+        let mut new_end = seq.wrapping_add(payload.len() as u32);
         for i in 0..MAX_HOLES {
             let Some(slot) = self.slots.get(i) else {
                 continue;
@@ -163,24 +233,19 @@ impl Reassembly {
             if !slot.is_used() {
                 continue;
             }
-            // Fully covered by an existing slot → discard (duplicate).
-            if seq_le(slot.start, seq) && seq_le(new_end, slot.end()) {
-                return 0;
+            if seq_lt(seq, slot.start) && seq_lt(slot.start, new_end) {
+                new_end = slot.start;
             }
-            // Overlap on the left: trim payload's leading bytes.
-            if seq_le(seq, slot.start) && seq_gt(new_end, slot.start) {
-                let trim_back = new_end.wrapping_sub(slot.start) as usize;
-                if trim_back < payload.len() {
-                    if let Some(p) = payload.get(..payload.len() - trim_back) {
-                        payload = p;
-                    }
-                    if payload.is_empty() {
-                        return 0;
-                    }
-                }
+        }
+        let keep = new_end.wrapping_sub(seq) as usize;
+        if keep == 0 {
+            return 0;
+        }
+        if keep < payload.len() {
+            match payload.get(..keep) {
+                Some(p) => payload = p,
+                None => return 0,
             }
-            // Overlap on the right: trim payload's trailing bytes (advance
-            // start). Recompute new_end after these trims is below.
         }
 
         let new_end = seq.wrapping_add(payload.len() as u32);
@@ -505,11 +570,137 @@ impl Reassembly {
 // ---- Wrap-aware comparisons (same semantics as tcb.rs's helpers) ----
 
 #[inline]
-fn seq_gt(a: u32, b: u32) -> bool {
-    (a.wrapping_sub(b) as i32) > 0
+fn seq_le(a: u32, b: u32) -> bool {
+    (a.wrapping_sub(b) as i32) <= 0
 }
 
 #[inline]
-fn seq_le(a: u32, b: u32) -> bool {
-    (a.wrapping_sub(b) as i32) <= 0
+fn seq_lt(a: u32, b: u32) -> bool {
+    (a.wrapping_sub(b) as i32) < 0
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
+
+    extern crate std;
+    use super::*;
+    use std::vec::Vec;
+
+    /// Drain every contiguous run starting at `*rcv_nxt`, advancing it. This
+    /// mirrors `Tcb::drain_reassembly` but without a receive ring, so the test
+    /// can observe exactly which bytes the reassembler can hand off in order.
+    fn drain_contig(r: &mut Reassembly, rcv_nxt: &mut u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut guard = 0;
+        while let Some((idx, start, len)) = r.ready_slot(*rcv_nxt) {
+            assert_eq!(start, *rcv_nxt, "ready_slot must match rcv_nxt exactly");
+            out.extend_from_slice(&r.slot_bytes(idx)[..len]);
+            *rcv_nxt = rcv_nxt.wrapping_add(len as u32);
+            r.commit_drain(idx, len);
+            guard += 1;
+            assert!(guard <= MAX_HOLES + 2, "drain made no progress");
+        }
+        out
+    }
+
+    /// A non-overlapping pair of out-of-order runs must be held verbatim and
+    /// then drained in order once the gap is closed.
+    #[test]
+    fn disjoint_runs_reassemble_in_order() {
+        let mut r = Reassembly::new();
+        let a = [0xAA; 100];
+        let b = [0xBB; 100];
+        assert_eq!(r.insert(110, &a, 100), 100); // [110, 210)
+        assert_eq!(r.insert(210, &b, 100), 100); // [210, 310) — abuts, merges
+        assert_eq!(r.held_bytes(), 200);
+        let filler = [0xCC; 10];
+        // Simulate the gap [100,110) being delivered in order, then drain.
+        let mut rcv = 110u32;
+        let _ = filler;
+        let drained = drain_contig(&mut r, &mut rcv);
+        assert_eq!(drained.len(), 200);
+        assert_eq!(rcv, 310);
+        assert!(r.is_empty());
+    }
+
+    /// Regression: a run that *starts inside* an already-held run (a right /
+    /// middle overlap) must not be stored as a second, overlapping slot.
+    ///
+    /// Overlapping slots are a remotely-triggerable defect:
+    ///   * `held_bytes()` double-counts the overlap, so the advertised receive
+    ///     window is under-reported for the life of the connection (a bounded
+    ///     but permanent shrink), and
+    ///   * once the lower slot drains, the higher slot is stranded with
+    ///     `start < rcv_nxt` and can never be drained — the receiver can never
+    ///     hand those bytes to the application even though it ACK/SACKed them,
+    ///     wedging `rcv_nxt` (a receive-side stall no timer recovers).
+    #[test]
+    fn right_overlap_is_merged_not_duplicated() {
+        let mut r = Reassembly::new();
+        let a = [0xAA; 100]; // [100, 200)
+        let b = [0xBB; 150]; // [150, 300) — starts inside `a`, extends past it
+        assert_eq!(r.insert(100, &a, 0), 100);
+        r.insert(150, &b, 0);
+
+        // The distinct held span is [100, 300) = 200 bytes. A double-counting
+        // overlap would report 250.
+        assert_eq!(
+            r.held_bytes(),
+            200,
+            "overlapping slots double-count held_bytes (window-shrink DoS)"
+        );
+
+        // Everything drains contiguously from 100 with nothing stranded.
+        let mut rcv = 100u32;
+        let drained = drain_contig(&mut r, &mut rcv);
+        assert_eq!(drained.len(), 200, "stranded receive data (rcv_nxt wedge)");
+        assert_eq!(rcv, 300);
+        assert!(r.is_empty(), "no slot left stranded below rcv_nxt");
+        // The non-overlapping regions keep their original bytes.
+        assert_eq!(&drained[..50], &[0xAA; 50]); // [100,150) — only in `a`
+        assert_eq!(&drained[150..], &[0xBB; 50]); // [250,300) — only in `b`
+    }
+
+    /// A run that fully spans an existing slot (overlap on both sides) must
+    /// also avoid creating overlaps; the surplus is dropped (RTO-recoverable),
+    /// never stored as an overlapping slot.
+    #[test]
+    fn spanning_overlap_keeps_disjoint_invariant() {
+        let mut r = Reassembly::new();
+        let mid = [0x11; 50]; // [200, 250)
+        let span = [0x22; 300]; // [100, 400) — engulfs [200,250)
+        assert_eq!(r.insert(200, &mid, 0), 50);
+        r.insert(100, &span, 0);
+        // No overlap may exist: the held total can never exceed the true span
+        // [100,400) = 300 bytes.
+        assert!(
+            r.held_bytes() <= 300,
+            "spanning insert created an overlapping slot: held={}",
+            r.held_bytes()
+        );
+        // Whatever is held must drain in one contiguous, strictly-advancing
+        // sequence from 100 (no slot stranded below rcv_nxt).
+        let mut rcv = 100u32;
+        let drained = drain_contig(&mut r, &mut rcv);
+        assert_eq!(drained.len() as u32, rcv.wrapping_sub(100));
+        assert!(r.is_empty(), "no stranded slot after spanning overlap");
+    }
+
+    /// A fully-duplicate run (already entirely covered) is dropped.
+    #[test]
+    fn fully_covered_run_is_dropped() {
+        let mut r = Reassembly::new();
+        let a = [0xAA; 200];
+        assert_eq!(r.insert(100, &a, 0), 200);
+        // [120,180) ⊂ [100,300): nothing new.
+        let inner = [0xBB; 60];
+        assert_eq!(r.insert(120, &inner, 0), 0);
+        assert_eq!(r.held_bytes(), 200);
+    }
 }

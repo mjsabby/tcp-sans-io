@@ -137,12 +137,15 @@ pub fn run<const BUF: usize>(data: &[u8], xfer: u32, send_cap: usize) {
     srv.set_now(now);
     // Both stacks are honest here, and the harness fast-forwards the clock to
     // each armed timer at quiescence — compressing virtual time in a way that
-    // does not reflect real elapsed time. The on-by-default USER TIMEOUT (a
-    // wall-clock no-progress abort) would therefore fire spuriously, so it is
-    // disabled: this oracle detects genuine stalls via the convergence and
-    // liveness checks instead. (The USER TIMEOUT has its own unit tests.)
+    // does not reflect real elapsed time. The on-by-default wall-clock aborts
+    // (USER TIMEOUT's no-progress abort, and keepalive's vanished-peer abort)
+    // would therefore fire spuriously against these honest, live stacks, so
+    // both are disabled: this oracle detects genuine stalls via the convergence
+    // and liveness checks instead. (Both have their own unit/conformance tests.)
     cli.set_user_timeout(0);
     srv.set_user_timeout(0);
+    cli.set_keepalive(0, 0, 0);
+    srv.set_keepalive(0, 0, 0);
     if srv.listen().is_err() || cli.connect().is_err() {
         return;
     }

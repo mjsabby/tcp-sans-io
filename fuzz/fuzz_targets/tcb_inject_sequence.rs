@@ -137,9 +137,10 @@ fn make_tcb() -> Tcb {
     })
     .unwrap();
     // The harness jumps the clock arbitrarily; disable the on-by-default
-    // wall-clock USER TIMEOUT so it can't abort mid-sequence (unit-tested
-    // separately).
+    // wall-clock aborts (USER TIMEOUT and keepalive) so neither can fire mid-
+    // sequence on the compressed virtual clock (both are unit-tested separately).
     tcb.set_user_timeout(0);
+    tcb.set_keepalive(0, 0, 0);
     tcb
 }
 

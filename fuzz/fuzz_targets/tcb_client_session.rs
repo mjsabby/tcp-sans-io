@@ -236,9 +236,11 @@ fn make_tcb() -> Option<Tcb> {
     })
     .ok()?;
     // This target jumps the clock to fire TLP/RTO, compressing virtual time
-    // non-physically; disable the on-by-default wall-clock USER TIMEOUT so it
-    // can't abort the session mid-exploration (it has dedicated unit tests).
+    // non-physically; disable the on-by-default wall-clock aborts (USER TIMEOUT
+    // and keepalive) so neither can fire mid-exploration on the compressed
+    // clock (both have dedicated unit tests).
     tcb.set_user_timeout(0);
+    tcb.set_keepalive(0, 0, 0);
     Some(tcb)
 }
 

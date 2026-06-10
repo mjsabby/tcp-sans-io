@@ -324,10 +324,11 @@ class TcpStream:
         _check(_lib.tcp_close(self._handle, c_uint64(now_ms)))
 
     def set_keepalive(self, now_ms: int, idle_ms: int, intvl_ms: int, count: int) -> None:
-        """Enable TCP keepalive (RFC 9293 3.8.4). After ``idle_ms`` of inbound
-        silence on an idle ESTABLISHED connection, up to ``count`` probes are
-        sent ``intvl_ms`` apart; an unanswered run aborts the connection as a
-        vanished peer. ``idle_ms == 0`` disables it (the default)."""
+        """Reconfigure/disable TCP keepalive (RFC 9293 3.8.4). After ``idle_ms``
+        of inbound silence on an idle ESTABLISHED connection, up to ``count``
+        probes are sent ``intvl_ms`` apart; an unanswered run aborts the
+        connection as a vanished peer. On by default (10 min / 60 s / 4 probes);
+        pass ``idle_ms == 0`` to disable."""
         _check(_lib.tcp_set_keepalive(
             self._handle, c_uint64(now_ms),
             c_uint32(idle_ms), c_uint32(intvl_ms), c_uint8(count),
