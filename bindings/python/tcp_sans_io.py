@@ -114,6 +114,12 @@ _lib.tcp_set_cookie_secret.argtypes = [c_void_p, c_void_p]
 _lib.tcp_close.restype = c_int32
 _lib.tcp_close.argtypes = [c_void_p, c_uint64]
 
+_lib.tcp_abort.restype = c_int32
+_lib.tcp_abort.argtypes = [c_void_p, c_uint64]
+
+_lib.tcp_max_packet.restype = c_size_t
+_lib.tcp_max_packet.argtypes = []
+
 _lib.tcp_set_keepalive.restype = c_int32
 _lib.tcp_set_keepalive.argtypes = [c_void_p, c_uint64, c_uint32, c_uint32, c_uint8]
 
@@ -216,6 +222,23 @@ def abi_version() -> int:
     return int(_lib.tcp_abi_version())
 
 
+#: The ABI generation this wrapper was written against.
+EXPECTED_ABI_VERSION = 2
+
+# Fail fast on a stale / mismatched cdylib: the loader falls back through
+# several build directories, and driving a different ABI generation blind
+# would corrupt the handle. Checked once at import.
+if abi_version() != EXPECTED_ABI_VERSION:
+    raise RuntimeError(
+        f"tcp-sans-io: cdylib ABI version {abi_version()} != expected "
+        f"{EXPECTED_ABI_VERSION}; rebuild the library or update this binding"
+    )
+
+#: Size every `extract_packet` buffer to this (queried from the cdylib, per
+#: the FFI contract — never hardcode 1500).
+MAX_PACKET = int(_lib.tcp_max_packet())
+
+
 def selftest() -> int:
     """Run the built-in self-conformance smoke test.
 
@@ -241,6 +264,17 @@ class TcpStream:
 
     Storage for the handle is allocated as an aligned ``c_uint64`` array so
     the FFI's ``tcp_handle_align()`` requirement is always satisfied.
+
+    Contract notes (see the repo README "Integrating the library"):
+
+    * ``iss`` must be CSPRNG-derived per connection (RFC 6528) — e.g.
+      ``secrets.randbits(32)``. Never a counter or constant in production.
+    * ``destroy()`` (and therefore ``with``-exit / GC) only invalidates the
+      handle — it does **not** close the connection. For a graceful
+      shutdown call :meth:`close` and keep pumping tick/extract until
+      :meth:`state` is ``State.CLOSED``; for an immediate one call
+      :meth:`abort` and drain the RST. Destroying mid-connection silently
+      abandons the peer.
     """
 
     __slots__ = ("_storage", "_handle", "_destroyed")
@@ -256,6 +290,15 @@ class TcpStream:
     ) -> None:
         if len(local_ip) != 4 or len(remote_ip) != 4:
             raise ValueError("local_ip / remote_ip must be exactly 4 bytes")
+        if not 0 <= local_port <= 0xFFFF or not 0 <= remote_port <= 0xFFFF:
+            raise ValueError("ports must be in 0..=65535")
+        if not 0 <= iss <= 0xFFFF_FFFF:
+            # The FFI contract wants a high-entropy 32-bit ISS (RFC 6528) —
+            # e.g. ``secrets.randbits(32)``. Reject out-of-range rather than
+            # silently masking a typo.
+            raise ValueError("iss must be a u32 (use secrets.randbits(32))")
+        if not 0 <= initial_rto_ms <= 0xFFFF_FFFF:
+            raise ValueError("initial_rto_ms must be a u32")
 
         size = int(_lib.tcp_handle_size())
         align = int(_lib.tcp_handle_align())
@@ -279,7 +322,7 @@ class TcpStream:
             c_uint16(local_port),
             ctypes.cast(remote_ip_buf, c_void_p),
             c_uint16(remote_port),
-            c_uint32(iss & 0xFFFF_FFFF),
+            c_uint32(iss),
             c_uint32(initial_rto_ms),
         )
         _check(rc)
@@ -323,6 +366,14 @@ class TcpStream:
     def close(self, now_ms: int) -> None:
         _check(_lib.tcp_close(self._handle, c_uint64(now_ms)))
 
+    def abort(self, now_ms: int) -> None:
+        """Immediate teardown: queue a RST+ACK in the egress ring, drop all
+        buffered data, and transition to CLOSED. Drain ``extract_packet``
+        once afterwards so the RST actually reaches the wire, then
+        ``destroy()``. Idempotent on CLOSED; no wire effect in LISTEN /
+        SYN_SENT."""
+        _check(_lib.tcp_abort(self._handle, c_uint64(now_ms)))
+
     def set_keepalive(self, now_ms: int, idle_ms: int, intvl_ms: int, count: int) -> None:
         """Reconfigure/disable TCP keepalive (RFC 9293 3.8.4). After ``idle_ms``
         of inbound silence on an idle ESTABLISHED connection, up to ``count``
@@ -357,9 +408,18 @@ class TcpStream:
     # ---- buffers -------------------------------------------------------
 
     def send(self, data: bytes) -> int:
+        """Buffer application bytes into the send ring; the next ``tick`` (or
+        inbound inject) turns them into segments.
+
+        Returns the number of bytes accepted, which may be **less than**
+        ``len(data)`` when the ring is nearly full — re-offer the remainder
+        after a later turn drains it. A completely full ring (the stack's
+        ``WouldBlock`` backpressure) returns ``0``; it is never an error.
+        Raises :class:`TcpError` for genuine failures (e.g. ``InvalidState``
+        when the connection cannot send)."""
         if not data:
             return 0
-        buf = (c_uint8 * len(data))(*data)
+        buf = (c_uint8 * len(data)).from_buffer_copy(data)
         written = c_size_t(0)
         rc = _lib.tcp_send(
             self._handle,
@@ -367,10 +427,20 @@ class TcpStream:
             c_size_t(len(data)),
             ctypes.byref(written),
         )
+        if rc == -6:  # WouldBlock: ring full — pure backpressure, retry later.
+            return 0
         _check(rc)
         return int(written.value)
 
     def recv(self, max_bytes: int = 4096) -> bytes:
+        """Drain bytes from the receive ring.
+
+        Returns ``b""`` both when no data is currently available and on a
+        clean EOF (peer FINned and everything buffered has been consumed) —
+        the socket-module convention. Distinguish the two via
+        ``poll() & Events.PEER_CLOSED`` / ``Events.READABLE`` or ``state()``.
+        Raises :class:`TcpError` with code ``ConnectionReset`` if the peer
+        reset (or the stack aborted) the connection."""
         buf = (c_uint8 * max_bytes)()
         read = c_size_t(0)
         rc = _lib.tcp_recv(
@@ -379,31 +449,42 @@ class TcpStream:
             c_size_t(max_bytes),
             ctypes.byref(read),
         )
+        if rc == -8:  # ConnectionClosed: clean EOF.
+            return b""
         _check(rc)
         n = int(read.value)
         return bytes(buf[:n])
 
-    def inject_packet(self, packet: bytes, now_ms: int) -> None:
+    def inject_packet(self, packet: bytes, now_ms: int) -> bool:
+        """Feed one inbound IPv4+TCP datagram into the state machine.
+
+        Returns ``True`` if the stack accepted the datagram, ``False`` for
+        the contract's benign drop-and-continue rejections (``NotForUs``,
+        ``MalformedPacket``, ``InvalidState``) — normal under a hostile or
+        mis-routed wire, never fatal. Raises :class:`TcpError` only for
+        genuinely unexpected codes. Drain ``extract_packet`` until ``None``
+        after every call."""
         if not packet:
-            return
-        buf = (c_uint8 * len(packet))(*packet)
+            return False
+        buf = (c_uint8 * len(packet)).from_buffer_copy(packet)
         rc = _lib.tcp_inject_packet(
             self._handle,
             ctypes.cast(buf, c_void_p),
             c_size_t(len(packet)),
             c_uint64(now_ms),
         )
+        if rc in (-3, -4, -5):  # InvalidState / MalformedPacket / NotForUs
+            return False
         _check(rc)
+        return True
 
     def extract_packet(self) -> Optional[bytes]:
-        # 1500 is the cdylib's MAX_PACKET (IPv4(20) + TCP(20) + MSS(1460)).
-        cap = 1500
-        buf = (c_uint8 * cap)()
+        buf = (c_uint8 * MAX_PACKET)()
         written = c_size_t(0)
         rc = _lib.tcp_extract_packet(
             self._handle,
             ctypes.cast(buf, c_void_p),
-            c_size_t(cap),
+            c_size_t(MAX_PACKET),
             ctypes.byref(written),
         )
         _check(rc)

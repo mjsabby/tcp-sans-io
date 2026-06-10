@@ -18,6 +18,8 @@
 
 # Our third ACK: pure ACK, echoes peer's TSval=1000, ECT(0) marked at IP
 # layer (ECN is now negotiated and SYN-ACK was confirming).
-+0 > . 1:1(0) ack 1 ecn ECT0 <nop,nop,TS val * ecr 1000>
+# The handshake-completing ACK is a *pure* ACK: Not-ECT per RFC 3168
+# §6.1.4 even though ECN was negotiated.
++0 > . 1:1(0) ack 1 ecn NotECT <nop,nop,TS val * ecr 1000>
 
 --expect_state ESTABLISHED

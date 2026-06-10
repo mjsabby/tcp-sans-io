@@ -14,18 +14,18 @@ internal static class Native
 
     // ---- Sizing / ABI ------------------------------------------------------
 
-    [DllImport(LibName)]
+    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
     public static extern uint tcp_abi_version();
 
-    [DllImport(LibName)]
+    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
     public static extern UIntPtr tcp_handle_size();
 
-    [DllImport(LibName)]
+    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
     public static extern UIntPtr tcp_handle_align();
 
     // ---- Lifecycle ---------------------------------------------------------
 
-    [DllImport(LibName)]
+    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
     public static extern int tcp_init(
         IntPtr storage,
         IntPtr localIp,
@@ -35,58 +35,75 @@ internal static class Native
         uint iss,
         uint initialRtoMs);
 
-    [DllImport(LibName)]
+    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
     public static extern int tcp_destroy(IntPtr handle);
 
     // ---- Connection control -----------------------------------------------
 
-    [DllImport(LibName)]
+    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
     public static extern int tcp_connect(IntPtr handle, ulong nowMs);
 
-    [DllImport(LibName)]
+    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
     public static extern int tcp_listen(IntPtr handle, ulong nowMs);
 
-    [DllImport(LibName)]
+    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
     public static extern int tcp_set_cookie_secret(IntPtr handle, IntPtr secret);
 
-    [DllImport(LibName)]
+    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
     public static extern int tcp_close(IntPtr handle, ulong nowMs);
 
-    [DllImport(LibName)]
+    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int tcp_abort(IntPtr handle, ulong nowMs);
+
+    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int tcp_set_keepalive(
+        IntPtr handle, ulong nowMs, uint idleMs, uint intvlMs, byte count);
+
+    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int tcp_set_user_timeout(
+        IntPtr handle, ulong nowMs, uint userTimeoutMs);
+
+    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern UIntPtr tcp_max_packet();
+
+    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int tcp_selftest();
+
+    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
     public static extern int tcp_tick(IntPtr handle, ulong nowMs);
 
     // ---- Introspection -----------------------------------------------------
 
-    [DllImport(LibName)]
+    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
     public static extern byte tcp_state(IntPtr handle);
 
-    [DllImport(LibName)]
+    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
     public static extern uint tcp_poll(IntPtr handle);
 
     // ---- Buffers -----------------------------------------------------------
 
-    [DllImport(LibName)]
+    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
     public static extern int tcp_send(
         IntPtr handle,
         IntPtr data,
         UIntPtr len,
         out UIntPtr written);
 
-    [DllImport(LibName)]
+    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
     public static extern int tcp_recv(
         IntPtr handle,
         IntPtr buf,
         UIntPtr cap,
         out UIntPtr read);
 
-    [DllImport(LibName)]
+    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
     public static extern int tcp_inject_packet(
         IntPtr handle,
         IntPtr packet,
         UIntPtr len,
         ulong nowMs);
 
-    [DllImport(LibName)]
+    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
     public static extern int tcp_extract_packet(
         IntPtr handle,
         IntPtr buf,

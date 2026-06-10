@@ -117,6 +117,14 @@ func (t *Transport) RegisterInbox(srcIP [4]byte, srcPort uint16, capacity int) *
 		owner: t,
 	}
 	t.mu.Lock()
+	// A duplicate (srcIP, srcPort) registration would silently orphan the
+	// previous inbox (reader routes only to the new one, old channel never
+	// closed, its Recv blocks until timeout forever). Close the old one so
+	// its owner observes ErrInboxClosed. Lock order: t.mu → closeMu, same
+	// as Transport.Close.
+	if old, ok := t.boxes[k]; ok {
+		old.closeNoUnregister()
+	}
 	t.boxes[k] = box
 	t.mu.Unlock()
 	return box
@@ -238,19 +246,19 @@ func (i *Inbox) Recv(timeout time.Duration) ([]byte, error) {
 }
 
 // Close removes the inbox from the routing table and closes its channel.
+//
+// Lock order is `Transport.mu` → `Inbox.closeMu`, matching Transport.Close
+// (which holds `mu` while calling closeNoUnregister). The previous version
+// nested them the other way around (closeMu → mu), so a client goroutine's
+// deferred Inbox.Close racing Transport.Close was an AB-BA deadlock that
+// hung the whole test binary.
 func (i *Inbox) Close() {
-	i.closeMu.Lock()
-	defer i.closeMu.Unlock()
-	if i.closed {
-		return
-	}
-	i.closed = true
 	if i.owner != nil {
 		i.owner.mu.Lock()
 		delete(i.owner.boxes, i.key)
 		i.owner.mu.Unlock()
 	}
-	close(i.ch)
+	i.closeNoUnregister()
 }
 
 // closeNoUnregister is the variant called by Transport.Close when the

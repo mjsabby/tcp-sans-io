@@ -32,6 +32,10 @@ func RunScript(s *Script) error {
 		sym:    NewSymTab(defaultOurISS, defaultPeerISS),
 		ipID:   1,
 	}
+	// The --connect / --listen directive allocates the cdylib handle
+	// (C storage + tcp_init); without this every script run leaked one
+	// TCB's worth of native memory and skipped tcp_destroy.
+	defer r.Free()
 	for stepIdx, step := range s.Steps {
 		r.advanceClock(step.AtMs())
 		if err := r.runStep(step); err != nil {
@@ -227,7 +231,14 @@ func (r *runner) runInject(st InjectStep) error {
 		return fmt.Errorf("build: %v", err)
 	}
 	r.ipID++
-	if err := r.handle.InjectPacket(pkt, r.nowMs); err != nil {
+	// The host contract treats NotForUs / MalformedPacket / InvalidState as
+	// benign drop-and-continue (normal for stray, late, or deliberately
+	// malformed script packets — e.g. one injected during CLOSED / TIME_WAIT
+	// teardown). Only unexpected codes fail the script.
+	if err := r.handle.InjectPacket(pkt, r.nowMs); err != nil &&
+		!errors.Is(err, ErrNotForUs) &&
+		!errors.Is(err, ErrMalformedPacket) &&
+		!errors.Is(err, ErrInvalidState) {
 		return fmt.Errorf("inject: %v", err)
 	}
 	return r.handle.Tick(r.nowMs)

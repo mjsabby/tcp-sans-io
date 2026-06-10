@@ -184,17 +184,18 @@ fn parse_args() -> Result<ServerConfig, String> {
                 cookie_secret = match v.as_str() {
                     "none" => None,
                     "random" => {
-                        // Use the seed-from-time hack — fine for tests.
-                        let nanos = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_nanos() as u64)
-                            .unwrap_or(0xc0de_c0de_c0de_c0deu64);
+                        // OS-seeded entropy via RandomState's per-process
+                        // CSPRNG-derived SipHash keys (the same std-only
+                        // technique as `fresh_iss`). The previous
+                        // time-seeded LCG was predictable to anyone who
+                        // could bound the start time, defeating the very
+                        // cookie protection it simulates.
+                        use std::collections::hash_map::RandomState;
+                        use std::hash::{BuildHasher, Hasher};
                         let mut s = [0u8; 16];
-                        let mut x = nanos.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
                         for chunk in s.chunks_mut(8) {
-                            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-                            let bytes = x.to_le_bytes();
-                            chunk.copy_from_slice(&bytes[..chunk.len()]);
+                            let x = RandomState::new().build_hasher().finish();
+                            chunk.copy_from_slice(&x.to_le_bytes()[..chunk.len()]);
                         }
                         Some(s)
                     }

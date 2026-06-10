@@ -46,8 +46,10 @@ with PRR and RACK-TLP loss detection.
 | Persist (zero-window probe) | RFC 1122 §4.2.2.17 | 1989 | ✅ |
 | Delayed ACK | RFC 1122 §4.2.3.2 | 1989 | ✅ |
 | 2·MSL TIME_WAIT | RFC 793 §3.4 | 1981 | ✅ (60 s) |
-| **ECN** | **RFC 3168** | **2001** | ✅ added in this generation |
+| **ECN** | **RFC 3168** | **2001** | ✅ added in this generation (ECT(0) on first data transmissions only; pure ACKs / retransmits / probes are Not-ECT per §6.1.4–6.1.6) |
 | **RACK-TLP loss detection** | **RFC 8985 + 8298** | **2021** | ✅ added in this generation — time-based loss + Tail Loss Probe |
+| **Blind-attack hardening** | **RFC 5961 §3–4** | **2010** | ✅ exact-`RCV.NXT` RST acceptance + challenge ACK; SYN-in-window challenge ACK |
+| Window-update freshness (SND.WL1/WL2) | RFC 9293 §3.10.7.4 | — | ✅ reordered stale ACKs cannot regress `snd_wnd` |
 
 ### Deliberately deferred (post-2017 modernisations)
 
@@ -844,10 +846,12 @@ The stack assumes the host is friendly but the peer is hostile.
     a handshake, then go silent) out of the box. A *live* idle peer answers each
     probe and survives, so the steady-state cost is one probe per idle period.
     Set `idle_ms = 0` to disable.
-- **Off-path injection**: 5-tuple filter on `inject_packet`; RFC-compliant
-  acceptability checks on RST/SYN/ACK; SYN-cookie path is keyed by a
-  caller-supplied 128-bit secret (we ship a no_std SipHash-2-4 impl, with
-  RFC test vectors).
+- **Off-path injection**: 5-tuple filter on `inject_packet`; RFC 5961
+  acceptability checks on synchronized connections — a RST is honoured only
+  at exactly `RCV.NXT` (in-window-but-inexact elicits a challenge ACK,
+  out-of-window is dropped), and a SYN at any sequence elicits a challenge
+  ACK rather than a teardown; SYN-cookie path is keyed by a caller-supplied
+  128-bit secret (we ship a no_std SipHash-2-4 impl, with RFC test vectors).
 - **Reflection / amplification**: a bare ACK in `LISTEN` is silently
   dropped (RFC 793 would RST; the spec response would let an attacker use
   us as a reflector), spoofed cookie ACKs face a 1-in-2²⁹ blind-forgery

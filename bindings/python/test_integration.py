@@ -179,13 +179,16 @@ def _seq_ge(a: int, b: int) -> bool:
 
 def drain(client: tcp_sans_io.TcpStream, now_ms: int) -> list[bytes]:
     out: list[bytes] = []
-    while True:
+    # Bounded: the egress ring holds at most 32 packets and a tick at a fixed
+    # clock cannot stage unboundedly. If a stack regression ever violates
+    # that, fail loudly instead of hanging the whole unittest run.
+    for _ in range(128):
         client.tick(now_ms)
         pkt = client.extract_packet()
         if pkt is None:
-            break
+            return out
         out.append(pkt)
-    return out
+    raise AssertionError("drain did not quiesce within 128 iterations")
 
 
 def make_client() -> tcp_sans_io.TcpStream:
@@ -229,7 +232,7 @@ class IntegrationTests(unittest.TestCase):
         peer = TestPeer()
         now = 1000
         try:
-            self._handshake(client, peer, now)
+            now = self._handshake(client, peer, now)
             now += 50
 
             # Client → peer
@@ -244,8 +247,11 @@ class IntegrationTests(unittest.TestCase):
             self.assertEqual(len(replies), 1)
             self.assertEqual(bytes(peer.received), req)
 
+            # Contract: drain after EVERY inject (a pure ACK stages nothing,
+            # but the reference harness must model the loop correctly).
             now += 1
-            client.inject_packet(replies[0], now)
+            self.assertTrue(client.inject_packet(replies[0], now))
+            drain(client, now)
 
             # Peer → client
             resp = b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\nhello world"
@@ -253,9 +259,15 @@ class IntegrationTests(unittest.TestCase):
             peer.now_ms = now
             data = peer.send_data(resp)
             now += 1
-            client.inject_packet(data, now)
+            self.assertTrue(client.inject_packet(data, now))
             got = client.recv(4096)
             self.assertEqual(got, resp)
+            # A single segment arms the 40 ms delayed-ACK timer; tick past it
+            # and the peer's data must be ACKed.
+            now += 41
+            for pkt in drain(client, now):
+                peer.handle(pkt)
+            self.assertEqual(peer.snd_una, peer.snd_nxt, "response data ACKed")
         finally:
             client.destroy()
 
@@ -264,7 +276,7 @@ class IntegrationTests(unittest.TestCase):
         peer = TestPeer()
         now = 1000
         try:
-            self._handshake(client, peer, now)
+            now = self._handshake(client, peer, now)
             now += 50
 
             client.close(now)
@@ -304,7 +316,7 @@ class IntegrationTests(unittest.TestCase):
         peer = TestPeer()
         now = 1000
         try:
-            self._handshake(client, peer, now)
+            now = self._handshake(client, peer, now)
             now += 5
 
             peer.now_ms = now
@@ -312,6 +324,7 @@ class IntegrationTests(unittest.TestCase):
                 wire.RST | wire.ACK, peer.snd_nxt, peer.rcv_nxt, peer._opts()
             )
             client.inject_packet(rst, now)
+            drain(client, now)
 
             self.assertEqual(client.state(), tcp_sans_io.State.CLOSED)
             self.assertTrue(client.poll() & tcp_sans_io.Events.ERROR)
@@ -321,9 +334,114 @@ class IntegrationTests(unittest.TestCase):
         finally:
             client.destroy()
 
+    def test_selftest_and_max_packet(self) -> None:
+        self.assertEqual(tcp_sans_io.selftest(), 0, "built-in selftest")
+        self.assertGreaterEqual(tcp_sans_io.MAX_PACKET, 1500)
+
+    def test_benign_inject_codes_do_not_raise(self) -> None:
+        client = make_client()
+        try:
+            # InvalidState: nothing connected yet → benign False, no raise.
+            peer = TestPeer()
+            peer.now_ms = 1000
+            stray = peer._emit(wire.ACK, 1, 1, peer._opts())
+            self.assertFalse(client.inject_packet(stray, 1000))
+            # Garbage: malformed → benign False, no raise.
+            self.assertFalse(client.inject_packet(b"\x45" + b"\x00" * 30, 1001))
+        finally:
+            client.destroy()
+
+    def test_abort_emits_rst(self) -> None:
+        client = make_client()
+        peer = TestPeer()
+        now = 1000
+        try:
+            now = self._handshake(client, peer, now)
+            now += 5
+            client.abort(now)
+            self.assertEqual(client.state(), tcp_sans_io.State.CLOSED)
+            pkts = drain(client, now)
+            self.assertEqual(len(pkts), 1, "abort queues exactly one RST")
+            seg = wire.parse(pkts[0])
+            self.assertTrue(seg.has(wire.RST))
+            self.assertTrue(seg.has(wire.ACK))
+        finally:
+            client.destroy()
+
+    def test_passive_open_listen(self) -> None:
+        """The cdylib as the SERVER: listen() → SYN → SYN-ACK → ACK →
+        ESTABLISHED, then a data round-trip. Mirrors src/server_tests.rs."""
+        server = tcp_sans_io.TcpStream(
+            SERVER_IP, SERVER_PORT, bytes(4), 0, SERVER_ISS, 1000
+        )
+        now = 1000
+        cli_iss = CLIENT_ISS
+
+        def cli_emit(flags: int, seq: int, ack: int, payload: bytes = b"",
+                     mss: int | None = None) -> bytes:
+            return wire.emit(
+                CLIENT_IP, SERVER_IP, CLIENT_PORT, SERVER_PORT,
+                seq, ack, flags, 65_535,
+                wire.TcpOptions(mss=mss), payload, 1,
+            )
+
+        try:
+            server.listen(now)
+            self.assertEqual(server.state(), tcp_sans_io.State.LISTEN)
+            self.assertTrue(server.poll() & tcp_sans_io.Events.LISTENING)
+
+            # Client SYN → server must answer SYN-ACK and sit in SYN_RCVD.
+            now += 5
+            self.assertTrue(
+                server.inject_packet(cli_emit(wire.SYN, cli_iss, 0, mss=1460), now)
+            )
+            pkts = drain(server, now)
+            self.assertEqual(len(pkts), 1, "expected SYN-ACK")
+            synack = wire.parse(pkts[0])
+            self.assertTrue(synack.has(wire.SYN) and synack.has(wire.ACK))
+            self.assertEqual(synack.ack, (cli_iss + 1) & 0xFFFF_FFFF)
+            self.assertEqual(synack.seq, SERVER_ISS)
+            self.assertEqual(server.state(), tcp_sans_io.State.SYN_RCVD)
+            self.assertTrue(server.poll() & tcp_sans_io.Events.HALF_OPEN)
+
+            # Third ACK → ESTABLISHED.
+            now += 5
+            third_ack = cli_emit(
+                wire.ACK, (cli_iss + 1) & 0xFFFF_FFFF, (SERVER_ISS + 1) & 0xFFFF_FFFF
+            )
+            self.assertTrue(server.inject_packet(third_ack, now))
+            drain(server, now)
+            self.assertEqual(server.state(), tcp_sans_io.State.ESTABLISHED)
+
+            # Client data → server application.
+            now += 5
+            ping = cli_emit(
+                wire.ACK | wire.PSH,
+                (cli_iss + 1) & 0xFFFF_FFFF,
+                (SERVER_ISS + 1) & 0xFFFF_FFFF,
+                b"ping",
+            )
+            self.assertTrue(server.inject_packet(ping, now))
+            drain(server, now)
+            self.assertEqual(server.recv(64), b"ping")
+
+            # Server application → client.
+            now += 5
+            self.assertEqual(server.send(b"pong"), 4)
+            pkts = drain(server, now)
+            self.assertTrue(pkts, "server must emit its data")
+            reply = wire.parse(pkts[-1])
+            self.assertEqual(reply.payload, b"pong")
+            self.assertEqual(reply.seq, (SERVER_ISS + 1) & 0xFFFF_FFFF)
+        finally:
+            server.destroy()
+
     # ---- helpers ------------------------------------------------------
 
-    def _handshake(self, client: tcp_sans_io.TcpStream, peer: TestPeer, now: int) -> None:
+    def _handshake(self, client: tcp_sans_io.TcpStream, peer: TestPeer, now: int) -> int:
+        """Drive the 3-way handshake. Returns the advanced clock so callers
+        stay monotonic (the stack last saw ``now + 10``; reusing the caller's
+        original ``now`` afterwards would step the clock backwards)."""
         client.connect(now)
         pkts = drain(client, now)
         self.assertEqual(len(pkts), 1)
@@ -335,6 +453,7 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(len(pkts), 1)
         peer.handle(pkts[0])
         self.assertEqual(client.state(), tcp_sans_io.State.ESTABLISHED)
+        return now + 10
 
 
 if __name__ == "__main__":

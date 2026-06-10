@@ -205,6 +205,9 @@ impl Link {
 fn run_transfer(name: &str, xfer: u32, chaos: Chaos, seed: u64) -> Result<(), String> {
     const CLI: u32 = 0x0000_0001;
     const SRV: u32 = 0x8000_0001;
+    // Fixed ISS values keep this certifier byte-for-byte reproducible.
+    // Do NOT copy that into a production integration: the host contract
+    // (RFC 6528) requires a CSPRNG-derived `iss` per connection.
     let cli = Handle::new([10, 0, 0, 1], 40000, [10, 0, 0, 2], 80, 0x1111_1111);
     let srv = Handle::new([10, 0, 0, 2], 80, [10, 0, 0, 1], 40000, 0x9999_9999);
 

@@ -298,7 +298,15 @@ pub struct Tcb<const BUF: usize = BUF_CAP> {
     /// See conformance test `cumulative_ack_after_sack_rewind_is_accepted`.
     snd_max: u32,
     snd_wnd: u32, // peer's advertised window
-    iss: u32,     // initial send sequence
+    /// Segment sequence number of the last window update (RFC 9293 SND.WL1).
+    /// Together with `snd_wl2` this gates `snd_wnd` updates so a *reordered
+    /// stale* ACK cannot regress the send window (e.g. spuriously re-zero it
+    /// after the peer already reopened, stalling the sender into persist
+    /// mode until the next genuine ACK).
+    snd_wl1: u32,
+    /// Segment acknowledgment number of the last window update (SND.WL2).
+    snd_wl2: u32,
+    iss: u32, // initial send sequence
 
     // ---- Receive Sequence Variables --------------------------------------
     rcv_nxt: u32, // next byte expected
@@ -508,6 +516,8 @@ impl<const BUF: usize> Tcb<BUF> {
             snd_nxt: cfg.iss,
             snd_max: cfg.iss,
             snd_wnd: 0,
+            snd_wl1: 0,
+            snd_wl2: 0,
             iss: cfg.iss,
             rcv_nxt: 0,
             rcv_wnd: BUF as u32,
@@ -660,10 +670,11 @@ impl<const BUF: usize> Tcb<BUF> {
         let mut phantom = 0u32;
 
         // SYN/SYN-ACK consume one byte of sequence space but are never stored
-        // in the send ring.
-        if matches!(self.state, State::SynSent | State::SynRcvd)
-            && seq_lt(self.snd_una, self.snd_max)
-        {
+        // in the send ring. An un-ACKed SYN can also outlive the handshake
+        // states: `close()` in SYN_RCVD moves to FIN_WAIT_1 with the SYN-ACK
+        // still unacknowledged, so key on "our ISS not yet ACKed" rather than
+        // on the state.
+        if self.snd_una == self.iss && seq_lt(self.snd_una, self.snd_max) {
             phantom = phantom.saturating_add(1);
         }
 
@@ -859,6 +870,13 @@ impl<const BUF: usize> Tcb<BUF> {
         if self.state != State::Closed {
             return Err(TcpError::InvalidState);
         }
+        // A `Closed` TCB may be the remnant of a previous connection (a full
+        // lifecycle ends here, as do RST / local aborts). Wipe all
+        // per-connection state — `listen()` already does the equivalent —
+        // so the new connection can't inherit a latched `error`, a stale
+        // `fin_sent`/`ts_recent`/scoreboard, or undrained ring bytes.
+        self.is_listener = false;
+        self.reset_connection_state();
         self.state = State::SynSent;
         self.snd_una = self.iss;
         // Offer Window Scale (RFC 7323 §2), Timestamps (RFC 7323 §3) and
@@ -956,6 +974,8 @@ impl<const BUF: usize> Tcb<BUF> {
         self.snd_nxt = self.iss;
         self.snd_max = self.iss;
         self.snd_wnd = 0;
+        self.snd_wl1 = 0;
+        self.snd_wl2 = 0;
         self.rcv_nxt = 0;
         self.rcv_wnd = BUF as u32;
         self.irs = 0;
@@ -1143,21 +1163,11 @@ impl<const BUF: usize> Tcb<BUF> {
                 )?;
             }
         }
-        self.state = State::Closed;
-        self.error = Some(TcpError::ConnectionReset);
-        // Drop any unsent / unread / OOO bytes. The caller asked to
-        // abort, not to drain.
-        self.send_ring.clear();
-        self.recv_ring.clear();
-        self.reasm.clear();
-        // Clear every protocol-level timer so a subsequent `tick`
-        // call doesn't drive anything.
-        self.rto_deadline = None;
-        self.time_wait_deadline = None;
-        self.persist_deadline = None;
-        self.ack_deadline = None;
-        self.rack_deadline = None;
-        self.tlp_deadline = None;
+        // Same teardown as the timer-driven local aborts (drops buffers,
+        // collapses the send-sequence span, clears *every* timer including
+        // keepalive / USER TIMEOUT so no reaper fires on a dead TCB), minus
+        // the RST that was queued above for the host to drain.
+        self.abort_timed_out();
         Ok(())
     }
 
@@ -1470,6 +1480,18 @@ impl<const BUF: usize> Tcb<BUF> {
             self.rto_deadline = None;
             return Ok(());
         }
+        // Synchronized states: RFC 9293 §3.10.7.4 / RFC 5961 §3.2. Honour the
+        // RST only if SEG.SEQ is exactly RCV.NXT. An in-window-but-inexact
+        // RST gets a challenge ACK (a legitimately resetting peer — e.g. one
+        // that rebooted — answers it with an exact-match RST); anything else
+        // is dropped. Without this check a blind attacker who guesses the
+        // 4-tuple could tear the connection down with *any* sequence number.
+        if seg.seq != self.rcv_nxt {
+            if self.in_window(seg.seq, 0) {
+                self.send_pure_ack()?;
+            }
+            return Ok(());
+        }
         self.error = Some(TcpError::ConnectionReset);
         self.state = State::Closed;
         self.rto_deadline = None;
@@ -1495,6 +1517,8 @@ impl<const BUF: usize> Tcb<BUF> {
             self.rtx_count = 0;
             // RFC 7323 §2.3: SYN-ACK window field is NEVER scaled.
             self.snd_wnd = seg.window as u32;
+            self.snd_wl1 = seg.seq;
+            self.snd_wl2 = seg.ack;
 
             // Negotiate options.
             if let Some(mss) = seg.options.mss {
@@ -1613,6 +1637,8 @@ impl<const BUF: usize> Tcb<BUF> {
         self.rcv_nxt = seg.seq.wrapping_add(1);
         // RFC 7323 §2.3: SYN window field is NEVER scaled.
         self.snd_wnd = seg.window as u32;
+        self.snd_wl1 = seg.seq;
+        self.snd_wl2 = seg.ack;
         if let Some(mss) = seg.options.mss {
             self.peer_mss = mss.max(DEFAULT_PEER_MSS);
         }
@@ -1772,6 +1798,8 @@ impl<const BUF: usize> Tcb<BUF> {
         // `seg.window as u32` — but go through the helper for symmetry
         // with the rest of the codebase.
         self.snd_wnd = self.scale_peer_window(seg.window);
+        self.snd_wl1 = seg.seq;
+        self.snd_wl2 = seg.ack;
         // Inherit the third ACK's TS, if any. Cookie mode does not
         // negotiate SACK — see emit_cookie_synack for the reasoning.
         if let Some((tsval, _)) = seg.options.ts {
@@ -1884,6 +1912,8 @@ impl<const BUF: usize> Tcb<BUF> {
         // Third ACK is no longer a SYN segment, so peer's window field is
         // scaled per the negotiated `snd_wscale` (0 if WS wasn't offered).
         self.snd_wnd = self.scale_peer_window(seg.window);
+        self.snd_wl1 = seg.seq;
+        self.snd_wl2 = seg.ack;
         self.rto_deadline = None;
         self.rtt_probe = None;
         self.syn_rcvd_retries = 0;
@@ -1973,6 +2003,20 @@ impl<const BUF: usize> Tcb<BUF> {
             }
         }
 
+        // RFC 5961 §4.2: a SYN arriving on a synchronized connection — any
+        // sequence number — elicits a challenge ACK and is otherwise dropped.
+        // This defeats blind in-window SYNs (which RFC 793 §3.9 would have
+        // answered with a connection-killing RST), while still resolving the
+        // two legitimate cases: a peer that genuinely restarted answers our
+        // ACK with an exact-match RST that `handle_rst` accepts, and a peer
+        // retransmitting its SYN-ACK because our final handshake ACK was
+        // lost receives exactly the ACK (snd_nxt / rcv_nxt) it needs to
+        // reach ESTABLISHED.
+        if seg.has(flags::SYN) {
+            self.send_pure_ack()?;
+            return Ok(());
+        }
+
         // Sequence-number acceptability test (RFC 793 §3.3 / RFC 9293
         // §3.10.7.4 step 1).
         if !self.in_window(seg.seq, seg.payload.len() as u32) {
@@ -1993,6 +2037,13 @@ impl<const BUF: usize> Tcb<BUF> {
             if ends_at_or_before_rcv_nxt && seg.has(flags::ACK) {
                 self.process_ack(seg)?;
             }
+            // RFC 9293 §3.10.7.4 (TIME-WAIT): a retransmitted FIN — always
+            // "unacceptable" here since its sequence lies below RCV.NXT —
+            // proves the peer never saw our last ACK. Restart the 2·MSL
+            // timer alongside the duplicate ACK sent below.
+            if self.state == State::TimeWait && seg.has(flags::FIN) {
+                self.time_wait_deadline = Some(self.now_ms.wrapping_add(TIME_WAIT_MS));
+            }
             self.send_pure_ack()?;
             return Ok(());
         }
@@ -2012,10 +2063,25 @@ impl<const BUF: usize> Tcb<BUF> {
         // abuts the held run) so the sender doesn't have to retransmit
         // the bytes we already received.
         if !seg.payload.is_empty() && self.state.can_recv() {
-            if seg.seq == self.rcv_nxt {
-                let written = self.recv_ring.write(seg.payload);
+            // A retransmit may straddle rcv_nxt (old prefix + fresh suffix),
+            // e.g. after a previous delivery was cut short by a full receive
+            // ring. Trim the already-received prefix and deliver the rest in
+            // order (RFC 9293 §3.10.7.4: "trim off any portion that lies
+            // outside the window", and equally any portion already received)
+            // rather than discarding the whole segment and waiting another
+            // round-trip for the peer to re-chunk from SND.UNA.
+            let in_order: Option<&[u8]> = if seg.seq == self.rcv_nxt {
+                Some(seg.payload)
+            } else if seq_lt(seg.seq, self.rcv_nxt) {
+                let lead = self.rcv_nxt.wrapping_sub(seg.seq) as usize;
+                seg.payload.get(lead..).filter(|p| !p.is_empty())
+            } else {
+                None
+            };
+            if let Some(payload) = in_order {
+                let written = self.recv_ring.write(payload);
                 self.rcv_nxt = self.rcv_nxt.wrapping_add(written as u32);
-                if written == seg.payload.len() && self.drain_reassembly() > 0 {
+                if written == payload.len() && self.drain_reassembly() > 0 {
                     filled_gap = true;
                 }
             } else if seq_gt(seg.seq, self.rcv_nxt) {
@@ -2032,6 +2098,11 @@ impl<const BUF: usize> Tcb<BUF> {
             if fin_seq == self.rcv_nxt {
                 self.rcv_nxt = self.rcv_nxt.wrapping_add(1);
                 self.advance_state_on_remote_fin();
+            } else if self.state == State::TimeWait {
+                // RFC 9293 §3.10.7.4 (TIME-WAIT): a retransmitted FIN —
+                // evidence the peer never saw our last ACK — restarts the
+                // 2·MSL timer in addition to the duplicate ACK sent below.
+                self.time_wait_deadline = Some(self.now_ms.wrapping_add(TIME_WAIT_MS));
             }
         }
 
@@ -2290,7 +2361,7 @@ impl<const BUF: usize> Tcb<BUF> {
             }
             self.run_rack_scan();
             // Even duplicate ACKs may carry a window update.
-            self.update_send_window(seg.window);
+            self.update_send_window(seg);
             return Ok(());
         }
 
@@ -2418,6 +2489,12 @@ impl<const BUF: usize> Tcb<BUF> {
         } else {
             self.arm_rto_for(self.snd_nxt);
         }
+        // RFC 8985 §7.2: restart the TLP probe timer on an ACK that leaves
+        // data outstanding, even if this turn emits nothing new — otherwise
+        // a tail loss in the still-in-flight suffix waits for the full RTO.
+        if seq_gt(self.snd_max, self.snd_una) {
+            self.arm_tlp();
+        }
 
         // FIN ACK transitions.
         if self.fin_sent && self.snd_una == self.fin_seq.wrapping_add(1) {
@@ -2432,12 +2509,26 @@ impl<const BUF: usize> Tcb<BUF> {
             };
         }
 
-        self.update_send_window(seg.window);
+        self.update_send_window(seg);
         Ok(())
     }
 
-    fn update_send_window(&mut self, window: u16) {
-        self.snd_wnd = self.scale_peer_window(window);
+    /// Apply the peer's advertised window from an acceptable ACK, gated by
+    /// the RFC 9293 §3.10.7.4 SND.WL1/SND.WL2 freshness test: only a segment
+    /// that is *newer* than the last window update (later SEQ, or same SEQ
+    /// with an ACK at least as high) may change `snd_wnd`. Without this, a
+    /// reordered stale ACK could regress the window — most damagingly,
+    /// re-zeroing it after the peer had already reopened, parking the sender
+    /// in persist-probe mode for no reason.
+    fn update_send_window(&mut self, seg: &Segment<'_>) {
+        let fresh = seq_lt(self.snd_wl1, seg.seq)
+            || (self.snd_wl1 == seg.seq && seq_le(self.snd_wl2, seg.ack));
+        if !fresh {
+            return;
+        }
+        self.snd_wnd = self.scale_peer_window(seg.window);
+        self.snd_wl1 = seg.seq;
+        self.snd_wl2 = seg.ack;
         if self.snd_wnd > 0 {
             // Window opened — cancel persist timer.
             self.persist_deadline = None;
@@ -2539,8 +2630,21 @@ impl<const BUF: usize> Tcb<BUF> {
                     let len = sub_hi.wrapping_sub(sub_lo);
                     let bytes = core::cmp::min(len, core::cmp::min(credit, mss_payload)) as usize;
                     if bytes > 0 {
-                        return self.emit_data_at(sub_lo, bytes);
+                        let queued = self.emit_data_at(sub_lo, bytes)?;
+                        if !queued {
+                            // Egress ring full: put the range back rather
+                            // than dropping it, so the retransmit isn't
+                            // deferred to a later RACK re-scan or, worst
+                            // case, the RTO.
+                            self.rack_lost_queue.insert_sorted(sub_lo, hi, self.snd_una);
+                        }
+                        return Ok(queued);
                     }
+                    // PRR credit exhausted: re-queue the loss marker for the
+                    // next credit-replenishing ACK instead of discarding it,
+                    // then fall through (the credit-exempt FIN below may
+                    // still be emittable).
+                    self.rack_lost_queue.insert_sorted(sub_lo, hi, self.snd_una);
                 }
             }
         }
@@ -2640,12 +2744,18 @@ impl<const BUF: usize> Tcb<BUF> {
             let seq = self.snd_nxt;
             let payload_slice = tmp.get(..payload_bytes).ok_or(TcpError::Overflow)?;
             let opts = self.data_options();
-            let queued = self.emit_segment(
+            // ECT(0)-eligible only on a *first* transmission (RFC 3168
+            // §6.1.5). After an RTO rewinds snd_nxt this same path re-emits
+            // previously-sent bytes; those start below snd_max and must go
+            // out Not-ECT.
+            let first_tx = seq == self.snd_max;
+            let queued = self.emit_segment_ect(
                 flags::ACK | flags::PSH,
                 seq,
                 self.rcv_nxt,
                 &opts,
                 payload_slice,
+                first_tx,
             )?;
             if !queued {
                 return Ok(false);
@@ -3068,6 +3178,10 @@ impl<const BUF: usize> Tcb<BUF> {
         Ok(())
     }
 
+    /// Emit with the Not-ECT IP codepoint. Correct for everything except
+    /// *first transmissions of data*: RFC 3168 §6.1.4–6.1.6 forbid ECT on
+    /// SYNs, pure ACKs, retransmissions, and window probes. The fresh-data
+    /// path in `maybe_send_one` calls [`Self::emit_segment_ect`] instead.
     fn emit_segment(
         &mut self,
         flag_bits: u8,
@@ -3075,6 +3189,18 @@ impl<const BUF: usize> Tcb<BUF> {
         ack: u32,
         options: &TcpOptions,
         payload: &[u8],
+    ) -> Result<bool, TcpError> {
+        self.emit_segment_ect(flag_bits, seq, ack, options, payload, false)
+    }
+
+    fn emit_segment_ect(
+        &mut self,
+        flag_bits: u8,
+        seq: u32,
+        ack: u32,
+        options: &TcpOptions,
+        payload: &[u8],
+        ect: bool,
     ) -> Result<bool, TcpError> {
         if self.tx_ring.is_full() {
             // Caller hasn't drained the ring — the retransmit timer or
@@ -3107,10 +3233,10 @@ impl<const BUF: usize> Tcb<BUF> {
             }
         }
 
-        // IP-layer ECN codepoint (RFC 3168 §6.1.1):
-        //   * SYN / SYN-ACK MUST NOT be ECT-marked.
-        //   * Once ECN is negotiated, all other segments use ECT(0).
-        let ecn_codepoint = if self.ecn_enabled && !is_syn {
+        // IP-layer ECN codepoint (RFC 3168 §6.1.1, §6.1.4–6.1.6): only first
+        // transmissions of data may be ECT-marked (the `ect` argument); SYN /
+        // SYN-ACK, pure ACKs, retransmissions and window probes MUST NOT be.
+        let ecn_codepoint = if self.ecn_enabled && !is_syn && ect {
             wire::ecn::ECT_0
         } else {
             wire::ecn::NOT_ECT
@@ -4334,5 +4460,77 @@ mod retransmit_overflow_regression {
         let tcb: Tcb = Tcb::new(cfg(1000)).expect("tcb");
         assert_eq!(tcb.user_timeout_ms, super::DEFAULT_USER_TIMEOUT_MS);
         assert_eq!(super::DEFAULT_USER_TIMEOUT_MS, 300_000);
+    }
+
+    /// RFC 9293 §3.10.7.4 (TIME-WAIT): a retransmitted FIN — proof the peer
+    /// never saw our final ACK — must restart the 2·MSL timer (and be
+    /// re-ACKed), not let the slot expire mid-conversation.
+    #[test]
+    fn retransmitted_fin_restarts_time_wait() {
+        let mut tcb: Tcb = Tcb::new(cfg(1000)).expect("tcb");
+        tcb.state = State::TimeWait;
+        tcb.snd_wnd = 65_535;
+        tcb.snd_una = 5_001;
+        tcb.snd_nxt = 5_001;
+        tcb.snd_max = 5_001;
+        tcb.rcv_nxt = 9_001; // peer's FIN at 9_000 already consumed
+        tcb.now_ms = 100_000;
+        tcb.time_wait_deadline = Some(130_000); // 30 s left of the original 60
+
+        // Peer retransmits its FIN (seq one below rcv_nxt).
+        let opts = crate::wire::TcpOptions::NONE;
+        let mut pkt = [0u8; crate::MAX_PACKET];
+        let len = crate::wire::emit(
+            &mut pkt,
+            [10, 0, 0, 2],
+            [10, 0, 0, 1],
+            80,
+            49152,
+            9_000,
+            5_001,
+            crate::wire::flags::FIN | crate::wire::flags::ACK,
+            65_535,
+            &opts,
+            &[],
+            1,
+            crate::wire::ecn::NOT_ECT,
+        )
+        .expect("emit");
+        tcb.inject_packet(&pkt[..len]).expect("inject dup FIN");
+
+        assert_eq!(tcb.state(), State::TimeWait, "still in TIME_WAIT");
+        assert_eq!(
+            tcb.time_wait_deadline,
+            Some(100_000 + super::TIME_WAIT_MS),
+            "2*MSL must restart from the retransmitted FIN",
+        );
+        assert!(drain_all(&mut tcb), "the dup FIN must be re-ACKed");
+    }
+
+    /// `close()` in SYN_RCVD (RFC 793 §3.10 CLOSE) forms a FIN while the
+    /// SYN-ACK is itself still unacknowledged — two phantom sequence bytes
+    /// outstanding with an empty send ring. The invariant oracle must
+    /// account for both (regression for the SYN-phantom check being keyed
+    /// on state rather than on "ISS not yet ACKed").
+    #[test]
+    fn close_from_syn_rcvd_keeps_invariants() {
+        let mut tcb: Tcb = Tcb::new(cfg(1000)).expect("tcb");
+        // Hand-built SYN_RCVD: SYN-ACK emitted (iss consumed), nothing ACKed.
+        tcb.state = State::SynRcvd;
+        tcb.is_listener = true;
+        tcb.snd_una = 1000; // == iss
+        tcb.snd_nxt = 1001;
+        tcb.snd_max = 1001;
+        tcb.rcv_nxt = 9_001;
+        tcb.snd_wnd = 65_535;
+        tcb.now_ms = 50;
+
+        tcb.close().expect("close from SYN_RCVD");
+        assert_eq!(tcb.state(), State::FinWait1);
+        tcb.tick().expect("tick");
+        assert!(drain_all(&mut tcb), "FIN must be emitted");
+        assert!(tcb.fin_sent);
+        tcb.debug_validate_invariants()
+            .expect("SYN + FIN phantoms must both be accounted");
     }
 }

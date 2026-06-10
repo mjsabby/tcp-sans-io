@@ -16,6 +16,9 @@ internal static class Program
     private static readonly byte[] ServerIp = { 10, 0, 0, 2 };
     private const ushort ClientPort = 49152;
     private const ushort ServerPort = 80;
+    // Deterministic ISS values keep these tests reproducible. Production
+    // hosts MUST derive iss from a CSPRNG per connection (RFC 6528), e.g.
+    // BitConverter.ToUInt32(RandomNumberGenerator.GetBytes(4)).
     private const uint ServerIss = 0x9000_0000;
     private const uint ClientIss = 0x1000_0000;
 
@@ -30,6 +33,8 @@ internal static class Program
         Run("request_response", TestRequestResponse);
         Run("active_close", TestActiveClose);
         Run("rst_aborts", TestRstAborts);
+        Run("abort_emits_rst", TestAbortEmitsRst);
+        Run("passive_open_listen", TestPassiveOpenListen);
 
         Console.WriteLine();
         Console.WriteLine(_failed == 0
@@ -102,6 +107,22 @@ internal static class Program
                     (name, asm, search) =>
                         name == Native.LibName ? NativeLibrary.Load(path) : IntPtr.Zero);
                 Console.WriteLine($"loaded {path}");
+                // Hard-fail on a mismatched or unhealthy cdylib before any
+                // test drives it: a wrong ABI generation would corrupt the
+                // handle, and the built-in selftest catches linkage /
+                // calling-convention / gross protocol breakage in one call.
+                uint abi = Native.tcp_abi_version();
+                if (abi != 2)
+                {
+                    throw new InvalidOperationException(
+                        $"cdylib ABI version {abi} != expected 2 — rebuild the library");
+                }
+                int selftest = Native.tcp_selftest();
+                if (selftest != 0)
+                {
+                    throw new InvalidOperationException(
+                        $"tcp_selftest() failed with stage code {selftest}");
+                }
                 return;
             }
         }
@@ -188,8 +209,11 @@ internal static class Program
             }
         }
 
+        // Contract: drain after EVERY inject (a pure ACK stages nothing, but
+        // the reference harness must model the pump loop correctly).
         now += 1;
-        client.InjectPacket(replies[0], now);
+        Assert(client.InjectPacket(replies[0], now), "inject ack accepted");
+        Drain(client, now);
 
         var resp = Encoding.ASCII.GetBytes(
             "HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\nhello world");
@@ -197,7 +221,7 @@ internal static class Program
         peer.NowMs = now;
         var data = peer.SendData(resp);
         now += 1;
-        client.InjectPacket(data, now);
+        Assert(client.InjectPacket(data, now), "inject data accepted");
         var got = client.Recv(4096);
         AssertEqual(resp.Length, got.Length, "recv len");
         for (int i = 0; i < resp.Length; i++)
@@ -207,6 +231,90 @@ internal static class Program
                 throw new InvalidOperationException("response mismatch");
             }
         }
+        // A single inbound segment arms the 40 ms delayed-ACK timer; tick
+        // past it and the peer's data must be ACKed.
+        now += 41;
+        foreach (var pkt in Drain(client, now)) peer.Handle(pkt);
+        AssertEqual(peer.SndNxt, peer.SndUna, "response data ACKed");
+    }
+
+    private static void TestAbortEmitsRst()
+    {
+        using var client = MakeClient();
+        var peer = new TestPeer();
+        ulong now = 1000;
+
+        Handshake(client, peer, ref now);
+        now += 5;
+
+        client.Abort(now);
+        AssertEqual(TcpState.Closed, client.State(), "CLOSED after abort");
+        var pkts = Drain(client, now);
+        AssertEqual(1, pkts.Count, "abort queues exactly one RST");
+        var seg = Wire.Parse(pkts[0]);
+        Assert(seg.Has(Flags.RST), "RST flag set");
+        Assert(seg.Has(Flags.ACK), "RST carries ACK (RFC 5961-friendly abort)");
+    }
+
+    private static void TestPassiveOpenListen()
+    {
+        // The cdylib as the SERVER: Listen() → SYN → SYN-ACK → ACK →
+        // ESTABLISHED, then a data round-trip. Mirrors src/server_tests.rs.
+        using var server = new TcpStream(
+            ServerIp, ServerPort, new byte[4], 0, ServerIss, 1000);
+        ulong now = 1000;
+
+        server.Listen(now);
+        AssertEqual(TcpState.Listen, server.State(), "LISTEN");
+        Assert((server.Poll() & TcpEvents.Listening) != 0, "LISTENING event");
+
+        // Client SYN → server answers SYN-ACK and sits in SYN_RCVD.
+        now += 5;
+        var syn = EmitFromClient(Flags.SYN, ClientIss, 0, mss: 1460);
+        Assert(server.InjectPacket(syn, now), "SYN accepted");
+        var pkts = Drain(server, now);
+        AssertEqual(1, pkts.Count, "SYN-ACK");
+        var synack = Wire.Parse(pkts[0]);
+        Assert(synack.Has(Flags.SYN) && synack.Has(Flags.ACK), "SYN-ACK flags");
+        AssertEqual(ClientIss + 1, synack.Ack, "SYN-ACK acks client ISS+1");
+        AssertEqual(ServerIss, synack.Seq, "SYN-ACK at server ISS");
+        AssertEqual(TcpState.SynRcvd, server.State(), "SYN_RCVD");
+        Assert((server.Poll() & TcpEvents.HalfOpen) != 0, "HALF_OPEN event");
+
+        // Third ACK → ESTABLISHED.
+        now += 5;
+        var third = EmitFromClient(Flags.ACK, ClientIss + 1, ServerIss + 1);
+        Assert(server.InjectPacket(third, now), "third ACK accepted");
+        Drain(server, now);
+        AssertEqual(TcpState.Established, server.State(), "ESTABLISHED");
+
+        // Client data → server application.
+        now += 5;
+        var ping = EmitFromClient(
+            (byte)(Flags.ACK | Flags.PSH), ClientIss + 1, ServerIss + 1,
+            payload: Encoding.ASCII.GetBytes("ping"));
+        Assert(server.InjectPacket(ping, now), "data accepted");
+        Drain(server, now);
+        AssertEqual("ping", Encoding.ASCII.GetString(server.Recv(64)), "server recv");
+
+        // Server application → client.
+        now += 5;
+        AssertEqual(4, server.Send(Encoding.ASCII.GetBytes("pong")), "server send");
+        pkts = Drain(server, now);
+        Assert(pkts.Count >= 1, "server must emit its data");
+        var reply = Wire.Parse(pkts[^1]);
+        AssertEqual("pong", Encoding.ASCII.GetString(reply.Payload), "server payload");
+        AssertEqual(ServerIss + 1, reply.Seq, "server data at ISS+1");
+    }
+
+    /// <summary>Hand-craft a CLIENT → SERVER packet for the passive tests.</summary>
+    private static byte[] EmitFromClient(
+        byte flags, uint seq, uint ack, ushort? mss = null, byte[]? payload = null)
+    {
+        var opts = new TcpOptions { Mss = mss };
+        return Wire.Emit(
+            ClientIp, ServerIp, ClientPort, ServerPort,
+            seq, ack, flags, 65_535, opts, payload, 1);
     }
 
     private static void TestActiveClose()
@@ -283,14 +391,17 @@ internal static class Program
     private static List<byte[]> Drain(TcpStream client, ulong now)
     {
         var packets = new List<byte[]>();
-        while (true)
+        // Bounded: the egress ring holds at most 32 packets and a tick at a
+        // fixed clock cannot stage unboundedly. A stack regression that
+        // violates this must fail the test, not hang CI forever.
+        for (int i = 0; i < 128; i++)
         {
             client.Tick(now);
             var pkt = client.ExtractPacket();
-            if (pkt is null) break;
+            if (pkt is null) return packets;
             packets.Add(pkt);
         }
-        return packets;
+        throw new InvalidOperationException("drain did not quiesce within 128 iterations");
     }
 
     private static void Handshake(TcpStream client, TestPeer peer, ref ulong now)
