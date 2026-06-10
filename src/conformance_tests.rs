@@ -2057,8 +2057,10 @@ fn syn_ack_with_ece_only_enables_ecn() {
         wire::ecn::ECT_0,
         "post-handshake data on ECN-enabled connection must be ECT(0)",
     );
-    // Third ACK (post-handshake but no payload) is also ECT(0) per RFC 3168.
-    assert_eq!(third_ack_raw[1] & wire::ecn::MASK, wire::ecn::ECT_0);
+    // The third ACK is a *pure* ACK: RFC 3168 §6.1.4 mandates pure ACKs be
+    // sent Not-ECT even on an ECN-negotiated connection (a CE mark on a pure
+    // ACK is congestion feedback the ACK-only flow can't react to).
+    assert_eq!(third_ack_raw[1] & wire::ecn::MASK, wire::ecn::NOT_ECT);
 }
 
 /// SYN-ACK without ECE disables ECN entirely. Subsequent segments must
@@ -2833,4 +2835,322 @@ fn reinit_yields_byte_identical_syn_to_fresh_new() {
         &p_fresh[..n_fresh],
         "reinit'd SYN must be byte-identical to a fresh TCB's SYN"
     );
+}
+
+// ---------------------------------------------------------------------------
+// RFC 5961 blind-attack hardening + window-update freshness regressions
+// ---------------------------------------------------------------------------
+
+/// RFC 5961 §3.2: a RST whose SEQ is *not* exactly RCV.NXT must not tear the
+/// connection down. In-window-but-inexact gets a challenge ACK; fully
+/// out-of-window is dropped silently. Pre-fix, ANY RST from the 4-tuple —
+/// any sequence number, i.e. a blind off-path forgery — closed the
+/// connection instantly.
+#[test]
+fn blind_rst_does_not_kill_established_connection() {
+    let mut tcb = make_tcb();
+    let mut now = 0u64;
+    let _ = handshake_with_ts(&mut tcb, &mut now);
+
+    // In-window but not at RCV.NXT: challenge ACK, connection survives.
+    now += 1;
+    let rst_inexact = build_in(
+        flags::RST,
+        PSS.wrapping_add(1000),
+        0,
+        PEER_WIN,
+        None,
+        None,
+        &[],
+    );
+    tcb.set_now(now);
+    tcb.inject_packet(&rst_inexact).expect("inject inexact RST");
+    assert_eq!(tcb.state(), State::Established, "inexact RST must not kill");
+    assert_eq!(tcb.poll() & events::ERROR, 0);
+    let challenge = try_pop(&mut tcb).expect("challenge ACK owed");
+    assert_eq!(challenge.flags & flags::ACK, flags::ACK);
+    assert_eq!(challenge.ack, PSS.wrapping_add(1), "challenge ACKs RCV.NXT");
+
+    // Far out of window (below RCV.NXT): dropped with no response at all.
+    now += 1;
+    let rst_oow = build_in(
+        flags::RST,
+        PSS.wrapping_sub(50_000),
+        0,
+        PEER_WIN,
+        None,
+        None,
+        &[],
+    );
+    tcb.set_now(now);
+    tcb.inject_packet(&rst_oow)
+        .expect("inject out-of-window RST");
+    assert_eq!(tcb.state(), State::Established);
+    assert!(
+        try_pop(&mut tcb).is_none(),
+        "out-of-window RST elicits nothing (no reflection)"
+    );
+
+    // Exact-match RST still works (the legitimate reset path).
+    now += 1;
+    let rst_exact = build_in(
+        flags::RST | flags::ACK,
+        PSS.wrapping_add(1),
+        ISS.wrapping_add(1),
+        PEER_WIN,
+        None,
+        None,
+        &[],
+    );
+    tcb.set_now(now);
+    tcb.inject_packet(&rst_exact).expect("inject exact RST");
+    assert_eq!(tcb.state(), State::Closed, "exact-SEQ RST must still reset");
+}
+
+/// RFC 5961 §4.2: a SYN on a synchronized connection elicits a challenge
+/// ACK and is dropped — it must neither kill the connection (RFC 793 §3.9
+/// would have RST) nor desynchronise any state.
+#[test]
+fn syn_in_established_elicits_challenge_ack() {
+    let mut tcb = make_tcb();
+    let mut now = 0u64;
+    let _ = handshake_with_ts(&mut tcb, &mut now);
+
+    now += 1;
+    let blind_syn = build_in(
+        flags::SYN,
+        PSS.wrapping_add(777),
+        0,
+        PEER_WIN,
+        Some(1460),
+        None,
+        &[],
+    );
+    tcb.set_now(now);
+    tcb.inject_packet(&blind_syn).expect("inject blind SYN");
+    assert_eq!(
+        tcb.state(),
+        State::Established,
+        "SYN must not disturb state"
+    );
+    let challenge = try_pop(&mut tcb).expect("challenge ACK owed");
+    assert_eq!(challenge.flags & flags::ACK, flags::ACK);
+    assert_eq!(
+        challenge.seq,
+        ISS.wrapping_add(1),
+        "challenge carries SND.NXT"
+    );
+    assert_eq!(
+        challenge.ack,
+        PSS.wrapping_add(1),
+        "challenge carries RCV.NXT"
+    );
+}
+
+/// RFC 9293 §3.10.7.4 SND.WL1/SND.WL2: a *reordered stale* ACK (older SEQ)
+/// must not regress the send window. Pre-fix, a delayed duplicate carrying
+/// the peer's earlier window=0 advertisement re-zeroed `snd_wnd` after the
+/// peer had already reopened it, parking the sender in persist mode.
+#[test]
+fn stale_window_update_is_ignored() {
+    let mut tcb = make_tcb();
+    let mut now = 0u64;
+    let peer_ts = handshake_with_ts(&mut tcb, &mut now);
+
+    // Peer sends 10 bytes (SEQ advances) and opens the window wide.
+    now += 1;
+    let fresh = build_in(
+        flags::ACK | flags::PSH,
+        PSS.wrapping_add(1),
+        ISS.wrapping_add(1),
+        PEER_WIN,
+        None,
+        Some((peer_ts.wrapping_add(1), now as u32)),
+        b"0123456789",
+    );
+    tcb.set_now(now);
+    tcb.inject_packet(&fresh).expect("inject fresh data");
+    while try_pop(&mut tcb).is_some() {}
+
+    // A reordered, *older* pure ACK (SEQ below the data segment) arrives
+    // late advertising window=0 — stale information.
+    now += 1;
+    let stale = build_in(
+        flags::ACK,
+        PSS, // SEQ older than the last window update's SEG.SEQ
+        ISS.wrapping_add(1),
+        0, // stale zero window
+        None,
+        Some((peer_ts, now as u32)),
+        &[],
+    );
+    tcb.set_now(now);
+    tcb.inject_packet(&stale).expect("inject stale ACK");
+    while try_pop(&mut tcb).is_some() {}
+
+    // The send window must still be open: data flows immediately.
+    tcb.send(b"hello").expect("send");
+    now += 1;
+    tcb.set_now(now);
+    tcb.tick().expect("tick");
+    let data = try_pop(&mut tcb).expect("stale zero-window must not gate send");
+    assert_eq!(data.payload, b"hello");
+}
+
+/// A *fresh* zero-window advertisement (newer SEQ/ACK) must still be
+/// honoured — the WL1/WL2 gate only rejects stale segments.
+#[test]
+fn fresh_zero_window_still_gates_send() {
+    let mut tcb = make_tcb();
+    let mut now = 0u64;
+    let peer_ts = handshake_with_ts(&mut tcb, &mut now);
+
+    now += 1;
+    let zero = build_in(
+        flags::ACK,
+        PSS.wrapping_add(1),
+        ISS.wrapping_add(1),
+        0,
+        None,
+        Some((peer_ts.wrapping_add(1), now as u32)),
+        &[],
+    );
+    tcb.set_now(now);
+    tcb.inject_packet(&zero).expect("inject zero-window");
+    while try_pop(&mut tcb).is_some() {}
+
+    tcb.send(b"blocked").expect("send buffers");
+    now += 1;
+    tcb.set_now(now);
+    tcb.tick().expect("tick");
+    assert!(
+        try_pop(&mut tcb).is_none(),
+        "no data may be emitted into a fresh zero window"
+    );
+}
+
+/// A retransmit that straddles RCV.NXT (stale prefix + fresh suffix) must
+/// deliver the fresh suffix rather than discard the whole segment. The
+/// pre-fix behaviour dropped it and waited a full extra round-trip for the
+/// sender to re-chunk from SND.UNA.
+#[test]
+fn partial_overlap_segment_delivers_fresh_suffix() {
+    let mut tcb = make_tcb();
+    let mut now = 0u64;
+    let peer_ts = handshake_with_ts(&mut tcb, &mut now);
+
+    // Peer delivers [PSS+1, PSS+11) = "0123456789".
+    now += 1;
+    let first = build_in(
+        flags::ACK | flags::PSH,
+        PSS.wrapping_add(1),
+        ISS.wrapping_add(1),
+        PEER_WIN,
+        None,
+        Some((peer_ts.wrapping_add(1), now as u32)),
+        b"0123456789",
+    );
+    tcb.set_now(now);
+    tcb.inject_packet(&first).expect("inject first");
+    while try_pop(&mut tcb).is_some() {}
+    let mut buf = [0u8; 64];
+    assert_eq!(tcb.recv(&mut buf).expect("recv"), 10);
+
+    // Peer retransmits a *larger* segment from the same SEQ: 10 old bytes
+    // plus 10 fresh ones.
+    now += 1;
+    let overlap = build_in(
+        flags::ACK | flags::PSH,
+        PSS.wrapping_add(1),
+        ISS.wrapping_add(1),
+        PEER_WIN,
+        None,
+        Some((peer_ts.wrapping_add(2), now as u32)),
+        b"0123456789ABCDEFGHIJ",
+    );
+    tcb.set_now(now);
+    tcb.inject_packet(&overlap).expect("inject overlap");
+    let ack = try_pop(&mut tcb).expect("segment must be ACKed");
+    assert_eq!(
+        ack.ack,
+        PSS.wrapping_add(21),
+        "cumulative ACK must cover the fresh suffix"
+    );
+    let n = tcb.recv(&mut buf).expect("recv suffix");
+    assert_eq!(&buf[..n], b"ABCDEFGHIJ", "exactly the fresh bytes, once");
+}
+
+/// RFC 3168 §6.1.5: retransmissions MUST NOT be ECT-marked, even on an
+/// ECN-negotiated connection (first transmissions of data are ECT(0) —
+/// covered by `syn_ack_with_ece_only_enables_ecn`).
+#[test]
+fn retransmission_is_not_ect_marked() {
+    let mut tcb = make_tcb();
+    let mut now = 0u64;
+    let _ = handshake_with_ecn(&mut tcb, &mut now);
+
+    tcb.send(b"payload").expect("send");
+    now += 1;
+    tcb.set_now(now);
+    tcb.tick().expect("tick");
+    let (first_raw, first) = pop(&mut tcb);
+    assert_eq!(
+        first_raw[1] & wire::ecn::MASK,
+        wire::ecn::ECT_0,
+        "first transmission is ECT(0)"
+    );
+    assert_eq!(first.payload, b"payload");
+
+    // No ACK arrives; let the RTO fire and re-emit the same bytes.
+    now += 5_000;
+    tcb.set_now(now);
+    tcb.tick().expect("tick");
+    let (retx_raw, retx) = pop(&mut tcb);
+    assert_eq!(retx.payload, b"payload", "RTO must retransmit the data");
+    assert_eq!(
+        retx_raw[1] & wire::ecn::MASK,
+        wire::ecn::NOT_ECT,
+        "retransmission must be Not-ECT per RFC 3168 §6.1.5"
+    );
+}
+
+/// `connect()` on a TCB whose previous connection ended (here: by RST) must
+/// start from a clean slate — no latched ERROR, no stale receive bytes. Pre-
+/// fix, the latched `ConnectionReset` survived into the new connection and
+/// every `recv` on it failed.
+#[test]
+fn connect_after_closed_connection_starts_clean() {
+    let mut tcb = make_tcb();
+    let mut now = 0u64;
+    let _ = handshake_with_ts(&mut tcb, &mut now);
+
+    // Kill the first connection with a legitimate (exact-SEQ) RST.
+    now += 1;
+    let rst = build_in(
+        flags::RST | flags::ACK,
+        PSS.wrapping_add(1),
+        ISS.wrapping_add(1),
+        PEER_WIN,
+        None,
+        None,
+        &[],
+    );
+    tcb.set_now(now);
+    tcb.inject_packet(&rst).expect("inject RST");
+    assert_eq!(tcb.state(), State::Closed);
+    assert_ne!(tcb.poll() & events::ERROR, 0, "first connection errored");
+
+    // Re-open. The new incarnation must not inherit the error latch.
+    now += 1;
+    tcb.set_now(now);
+    tcb.connect().expect("re-connect from CLOSED");
+    assert_eq!(tcb.state(), State::SynSent);
+    assert_eq!(
+        tcb.poll() & events::ERROR,
+        0,
+        "stale ConnectionReset must not leak into the new connection"
+    );
+    let syn = try_pop(&mut tcb).expect("fresh SYN");
+    assert_eq!(syn.flags & flags::SYN, flags::SYN);
+    assert_eq!(syn.seq, ISS, "fresh incarnation restarts at ISS");
 }
