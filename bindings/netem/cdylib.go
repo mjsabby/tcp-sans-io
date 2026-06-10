@@ -61,6 +61,16 @@ var (
 type TcpHandle struct {
 	storage unsafe.Pointer
 	handle  *C.struct_TcpStreamHandle
+	start   time.Time
+}
+
+// now returns milliseconds from a monotonic origin. The FFI contract
+// requires a monotonic, non-decreasing now_ms; time.Now().UnixMilli()
+// is wall clock (Go strips the monotonic reading in UnixMilli) and can
+// step backwards under NTP, stalling every stack timer for the size of
+// the step. time.Since uses the monotonic reading.
+func (h *TcpHandle) now() C.uint64_t {
+	return C.uint64_t(time.Since(h.start).Milliseconds())
 }
 
 func NewTcpHandle(localIP []byte, localPort uint16, remoteIP []byte, remotePort uint16,
@@ -89,6 +99,7 @@ func NewTcpHandle(localIP []byte, localPort uint16, remoteIP []byte, remotePort 
 	return &TcpHandle{
 		storage: storage,
 		handle:  (*C.struct_TcpStreamHandle)(storage),
+		start:   time.Now(),
 	}, nil
 }
 
@@ -102,15 +113,25 @@ func (h *TcpHandle) Free() {
 }
 
 func (h *TcpHandle) Connect() error {
-	rc := C.tcp_connect(h.handle, C.uint64_t(uint64(time.Now().UnixMilli())))
+	rc := C.tcp_connect(h.handle, h.now())
 	if rc != 0 {
 		return fmt.Errorf("tcp_connect: %d", rc)
 	}
 	return nil
 }
 
+// Listen transitions CLOSED → LISTEN (passive open). The remote endpoint
+// given to NewTcpHandle is wildcarded; the next inbound SYN pins it.
+func (h *TcpHandle) Listen() error {
+	rc := C.tcp_listen(h.handle, h.now())
+	if rc != 0 {
+		return fmt.Errorf("tcp_listen: %d", rc)
+	}
+	return nil
+}
+
 func (h *TcpHandle) Close() error {
-	rc := C.tcp_close(h.handle, C.uint64_t(uint64(time.Now().UnixMilli())))
+	rc := C.tcp_close(h.handle, h.now())
 	if rc != 0 {
 		return fmt.Errorf("tcp_close: %d", rc)
 	}
@@ -122,7 +143,7 @@ func (h *TcpHandle) State() uint8 {
 }
 
 func (h *TcpHandle) Tick() error {
-	rc := C.tcp_tick(h.handle, C.uint64_t(uint64(time.Now().UnixMilli())))
+	rc := C.tcp_tick(h.handle, h.now())
 	if rc != 0 {
 		return fmt.Errorf("tcp_tick: %d", rc)
 	}
@@ -180,7 +201,7 @@ func (h *TcpHandle) InjectPacket(pkt []byte) error {
 		return nil
 	}
 	rc := C.tcp_inject_packet(h.handle, (*C.uchar)(unsafe.Pointer(&pkt[0])), C.size_t(len(pkt)),
-		C.uint64_t(uint64(time.Now().UnixMilli())))
+		h.now())
 	switch rc {
 	case 0:
 		return nil

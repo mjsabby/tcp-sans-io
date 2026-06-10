@@ -285,6 +285,14 @@ func Parse(pkt []byte) (*ParsedPacket, error) {
 	if totalLen > len(pkt) {
 		return nil, fmt.Errorf("IP total %d > buf %d", totalLen, len(pkt))
 	}
+	// Lower bound too: a crafted total-length smaller than the headers would
+	// make `pkt[ihl:totalLen]` slice out of range (totalLen < ihl panics with
+	// low > high) or leave a TCP slice shorter than the fixed-header reads
+	// below (index out of range). This decoder is fed raw adversarial bytes,
+	// so it must reject, not panic.
+	if totalLen < ihl+TCPHdrLen {
+		return nil, fmt.Errorf("IP total %d too small for headers (ihl=%d)", totalLen, ihl)
+	}
 	if inetChecksum(pkt[:ihl], 0) != 0 {
 		// Many adversary inputs have bad IP csum on purpose — return
 		// a typed error so callers can distinguish.
