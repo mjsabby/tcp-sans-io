@@ -626,6 +626,156 @@ fn second_hole_is_dropped_held_run_preserved() {
     assert_eq!(&buf[a.len() + b.len() + d.len()..n], c);
 }
 
+/// Security / DoS regression: a peer that sends an out-of-order run which
+/// *starts inside* an already-buffered run (a right / middle overlap) must not
+/// strand any received bytes.
+///
+/// Before the reassembly fix the overlapping run was stored as a second,
+/// overlapping slot. Once the lower slot drained, the higher one was orphaned
+/// (`start < rcv_nxt`) and could never be drained, so the receiver could never
+/// hand the tail to the application even though it had ACK/SACKed it — a
+/// remotely-triggerable receive-side wedge the send-side timers don't recover
+/// (USER TIMEOUT keys on outstanding send work; keepalive, though on by default,
+/// only fires on a *fully idle* connection, not one still receiving). The same
+/// overlap made `held_bytes` double-count, permanently shrinking the window.
+#[test]
+fn overlapping_out_of_order_segments_do_not_strand_receive_data() {
+    let mut tcb = make_tcb();
+    let mut now = 0u64;
+    let _ = handshake_with_ts(&mut tcb, &mut now);
+
+    let base = PSS.wrapping_add(1); // rcv_nxt immediately after the handshake
+
+    // Out-of-order run X = [base+10, base+110).
+    let x = [0xA5u8; 100];
+    now += 1;
+    tcb.set_now(now);
+    tcb.inject_packet(&build_in(
+        flags::ACK | flags::PSH,
+        base.wrapping_add(10),
+        ISS.wrapping_add(1),
+        PEER_WIN,
+        None,
+        Some((50, 0)),
+        &x,
+    ))
+    .expect("inject X");
+    let _ = try_pop(&mut tcb); // dup-ACK at rcv_nxt
+
+    // Out-of-order run Y = [base+60, base+160): starts *inside* X and runs past
+    // its right edge — exactly the right/middle-overlap case.
+    let y = [0x5Au8; 100];
+    now += 1;
+    tcb.set_now(now);
+    tcb.inject_packet(&build_in(
+        flags::ACK | flags::PSH,
+        base.wrapping_add(60),
+        ISS.wrapping_add(1),
+        PEER_WIN,
+        None,
+        Some((51, 0)),
+        &y,
+    ))
+    .expect("inject Y");
+    let _ = try_pop(&mut tcb); // dup-ACK at rcv_nxt
+
+    // Gap filler F = [base, base+10) closes the hole at rcv_nxt.
+    let f = [0x33u8; 10];
+    now += 1;
+    tcb.set_now(now);
+    tcb.inject_packet(&build_in(
+        flags::ACK | flags::PSH,
+        base,
+        ISS.wrapping_add(1),
+        PEER_WIN,
+        None,
+        Some((52, 0)),
+        &f,
+    ))
+    .expect("inject F");
+    let (_, ack) = pop(&mut tcb);
+
+    // The contiguous union actually received is [base, base+160) = 160 bytes.
+    // The cumulative ACK must cover all of it, and recv() must hand back every
+    // byte — nothing orphaned in an overlapping slot.
+    assert_eq!(
+        ack.ack,
+        base.wrapping_add(160),
+        "cumulative ACK must cover the full received union"
+    );
+
+    let mut got = Vec::new();
+    let mut buf = [0u8; 256];
+    loop {
+        let n = tcb.recv(&mut buf).expect("recv");
+        if n == 0 {
+            break;
+        }
+        got.extend_from_slice(&buf[..n]);
+    }
+    assert_eq!(
+        got.len(),
+        160,
+        "every received byte must be delivered (no stranded reassembly slot)"
+    );
+    // Unambiguous (non-overlapping) regions retain their original bytes.
+    assert_eq!(&got[..10], &f, "filler bytes [base, base+10)");
+    assert_eq!(
+        &got[10..60],
+        &[0xA5u8; 50],
+        "X-only bytes [base+10, base+60)"
+    );
+    assert_eq!(
+        &got[110..160],
+        &[0x5Au8; 50],
+        "Y-only bytes [base+110, base+160)"
+    );
+}
+
+/// Security / DoS regression: keepalive is **on by default**, so a connection
+/// whose peer completes the handshake and then vanishes on an otherwise-idle
+/// link is reaped without any host configuration. Nothing is in flight and
+/// nothing is queued, so neither the R2 retransmit budget nor the USER TIMEOUT
+/// (both keyed on outstanding send work) would ever look at it — keepalive is
+/// the only timer that catches this idle-connection memory-pinning attack.
+#[test]
+fn keepalive_on_by_default_reaps_vanished_idle_peer() {
+    let mut tcb = make_tcb();
+    let mut now = 0u64;
+    let _ = handshake_with_ts(&mut tcb, &mut now);
+    assert_eq!(tcb.state(), State::Established);
+
+    // The peer goes silent. With no host call to set_keepalive, the default
+    // keepalive must probe and then abort the connection on its own.
+    let mut probes = 0u32;
+    let mut buf = [0u8; MAX_PACKET];
+    for _ in 0..32 {
+        let dl = match tcb.debug_next_deadline() {
+            Some(d) => d,
+            None => break,
+        };
+        now = dl + 1;
+        tcb.set_now(now);
+        tcb.tick().expect("tick");
+        loop {
+            let n = tcb.extract_packet(&mut buf).expect("extract");
+            if n == 0 {
+                break;
+            }
+            probes += 1;
+        }
+        if tcb.state() == State::Closed {
+            break;
+        }
+    }
+    assert_eq!(
+        tcb.state(),
+        State::Closed,
+        "default keepalive must reap a vanished idle peer"
+    );
+    assert!(probes >= 1, "keepalive must have probed before the abort");
+}
+
 /// Inbound packet whose TCP checksum is wrong must be silently rejected:
 /// state and ack-clock unchanged.
 #[test]

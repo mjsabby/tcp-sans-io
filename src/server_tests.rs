@@ -695,6 +695,89 @@ fn cookie_handshake_round_trip() {
     );
 }
 
+/// Security / DoS regression: a connection promoted to ESTABLISHED via the
+/// stateless SYN-cookie path must end the promoting inject with keepalive
+/// armed, so a peer that completes the cookie handshake and then vanishes is
+/// still reaped by the (default-on) keepalive.
+///
+/// The cookie path is special: `try_promote_via_cookie` runs
+/// `reset_connection_state` (which clears `keepalive_deadline`) *inside* the
+/// third-ACK inject, so the proof-of-life re-arm must happen after segment
+/// processing — otherwise this most-attacked, stateless path would be the one
+/// place keepalive silently fails to arm and an abandoned connection pins its
+/// buffers forever.
+#[test]
+fn cookie_promoted_idle_connection_is_reaped_by_default_keepalive() {
+    let mut s = make_listener();
+    s.set_cookie_secret(&COOKIE_SECRET);
+    s.set_now(0);
+    s.listen().expect("listen");
+
+    // SYN → cookie SYN-ACK (stays LISTEN, holds no state).
+    let syn = build_in(
+        flags::SYN,
+        CLIENT_ISS,
+        0,
+        PEER_WIN,
+        Some(1460),
+        Some((100, 0)),
+        true,
+        &[],
+    );
+    s.set_now(1);
+    s.inject_packet(&syn).expect("inject SYN");
+    let synack = pop(&mut s);
+    let cookie = synack.seq;
+
+    // Third ACK validates the cookie → ESTABLISHED, all within this one inject
+    // (the inject that also wipes per-connection state mid-promotion).
+    let ack = build_in(
+        flags::ACK,
+        CLIENT_ISS.wrapping_add(1),
+        cookie.wrapping_add(1),
+        PEER_WIN,
+        None,
+        Some((101, 0)),
+        false,
+        &[],
+    );
+    s.set_now(2);
+    s.inject_packet(&ack).expect("inject final ACK");
+    assert_eq!(
+        s.state(),
+        State::Established,
+        "cookie validates → ESTABLISHED"
+    );
+
+    // Peer now vanishes. Without arming-after-promotion the connection would
+    // have no timer at all and sit in ESTABLISHED forever; with the fix the
+    // default keepalive probes and then reaps it.
+    let mut probes = 0u32;
+    for _ in 0..32 {
+        let dl = match s.debug_next_deadline() {
+            Some(d) => d,
+            None => break,
+        };
+        s.set_now(dl + 1);
+        s.tick().expect("tick");
+        while try_pop(&mut s).is_some() {
+            probes += 1;
+        }
+        if s.state() == State::Closed {
+            break;
+        }
+    }
+    assert_eq!(
+        s.state(),
+        State::Closed,
+        "vanished cookie-promoted peer must be reaped by default keepalive"
+    );
+    assert!(
+        probes >= 1,
+        "keepalive must have probed the cookie-promoted peer"
+    );
+}
+
 #[test]
 fn cookie_rejects_forged_third_ack() {
     let mut s = make_listener();

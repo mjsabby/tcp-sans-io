@@ -309,3 +309,54 @@ proptest! {
         prop_assert!(seq_gt(a, way_behind));
     }
 }
+
+// ---------------------------------------------------------------------------
+// Reassembly — held runs must stay disjoint under arbitrary insert sequences
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 2048, ..ProptestConfig::default() })]
+
+    /// The multi-hole reassembler must keep its held runs disjoint after ANY
+    /// sequence of inserts — overlapping, abutting, nested, duplicate, or
+    /// slot-exhausting. An overlap is a remotely-triggerable defect: it
+    /// double-counts `held_bytes` (a permanent advertised-window shrink) and
+    /// can strand a run below `rcv_nxt` where it can never drain (a
+    /// receive-side wedge that no timer recovers). Draining from `rcv_nxt`
+    /// must then yield strictly-forward runs and free every slot — never
+    /// leaving one orphaned behind the cursor.
+    #[test]
+    fn reassembly_inserts_stay_disjoint(
+        rcv_nxt in any::<u32>(),
+        ops in proptest::collection::vec((0u32..4096, 1usize..1024), 1..48),
+    ) {
+        use crate::reassembly::{Reassembly, MAX_HOLES};
+        let mut r = Reassembly::new();
+        for (off, len) in &ops {
+            let seq = rcv_nxt.wrapping_add(*off);
+            let payload = vec![0xABu8; *len];
+            let stored = r.insert(seq, &payload, rcv_nxt);
+            prop_assert!(stored <= *len);
+            prop_assert!(
+                r.debug_overlap_free(),
+                "overlap after insert rcv_nxt+{} len {}",
+                off,
+                len
+            );
+            prop_assert!(r.held_bytes() <= crate::REASM_CAP);
+        }
+        // Drain from rcv_nxt: each run starts exactly at the cursor, advances
+        // it forward, and is freed — nothing is stranded behind the cursor.
+        let mut cursor = rcv_nxt;
+        let mut guard = 0usize;
+        while let Some((idx, start, len)) = r.ready_slot(cursor) {
+            prop_assert_eq!(start, cursor);
+            prop_assert!(len > 0);
+            cursor = cursor.wrapping_add(len as u32);
+            r.commit_drain(idx, len);
+            prop_assert!(r.debug_overlap_free());
+            guard += 1;
+            prop_assert!(guard <= MAX_HOLES + 2, "drain failed to terminate");
+        }
+    }
+}

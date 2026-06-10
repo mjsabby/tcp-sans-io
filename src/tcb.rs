@@ -197,6 +197,23 @@ const MAX_RETRANSMITS: u8 = 10;
 /// [`Tcb::set_user_timeout`].
 const DEFAULT_USER_TIMEOUT_MS: u32 = 300_000;
 
+/// Default RFC 9293 §3.8.4 keepalive, **on by default**. Catches the one DoS
+/// the send-side timers miss: a peer that completes the handshake and then goes
+/// silent on a fully *idle* connection (nothing in flight, nothing queued), so
+/// neither the R2 retransmit budget nor the USER TIMEOUT — both keyed on
+/// outstanding send work — ever looks at it. Without keepalive such a connection
+/// pins its TCB (≈ 2·BUF_CAP of ring buffers) until the host tears it down; an
+/// attacker who completes many handshakes and goes quiet exhausts memory.
+///
+/// A *live* idle peer answers each probe (RFC 1122 §4.2.3.6), which resets the
+/// idle timer, so the steady-state cost on a legitimately-idle connection is one
+/// probe every `IDLE` period. Only a vanished/silent peer is reaped, after
+/// `IDLE + COUNT*INTVL` ≈ 14 min. Reconfigure or disable (`idle_ms == 0`) via
+/// [`Tcb::set_keepalive`].
+const DEFAULT_KEEPALIVE_IDLE_MS: u32 = 600_000; // 10 min of silence before probing
+const DEFAULT_KEEPALIVE_INTVL_MS: u32 = 60_000; // 60 s between unanswered probes
+const DEFAULT_KEEPALIVE_COUNT: u8 = 4; // probes before declaring the peer gone
+
 /// SYN-cookie time-bucket width (RFC 4987-style). 64 s matches Linux's
 /// historical choice. The validator accepts both the current bucket and
 /// the previous one, giving cookies a 64-128 s validity window.
@@ -442,9 +459,9 @@ pub struct Tcb<const BUF: usize = BUF_CAP> {
     /// forever. `SYN_RCVD` uses `syn_rcvd_retries` instead and never touches
     /// this.
     rtx_count: u8,
-    // ---- Keepalive (RFC 9293 §3.8.4), opt-in (off unless set_keepalive) ---
-    /// Idle time before the first keepalive probe, in ms. `0` disables
-    /// keepalive entirely (the default).
+    // ---- Keepalive (RFC 9293 §3.8.4), on by default (DEFAULT_KEEPALIVE_*) ---
+    /// Idle time before the first keepalive probe, in ms. Defaults to
+    /// [`DEFAULT_KEEPALIVE_IDLE_MS`]; `0` disables keepalive entirely.
     keepalive_idle_ms: u32,
     /// Interval between successive keepalive probes, in ms.
     keepalive_intvl_ms: u32,
@@ -539,9 +556,9 @@ impl<const BUF: usize> Tcb<BUF> {
             is_listener: false,
             syn_rcvd_retries: 0,
             rtx_count: 0,
-            keepalive_idle_ms: 0,
-            keepalive_intvl_ms: 0,
-            keepalive_count: 0,
+            keepalive_idle_ms: DEFAULT_KEEPALIVE_IDLE_MS,
+            keepalive_intvl_ms: DEFAULT_KEEPALIVE_INTVL_MS,
+            keepalive_count: DEFAULT_KEEPALIVE_COUNT,
             keepalive_probes: 0,
             keepalive_deadline: None,
             user_timeout_ms: DEFAULT_USER_TIMEOUT_MS,
@@ -695,6 +712,15 @@ impl<const BUF: usize> Tcb<BUF> {
             return Err("RTO armed with no outstanding sequence space");
         }
 
+        // Out-of-order reassembly slots must never overlap: an overlap both
+        // double-counts the advertised-window reservation (`held_bytes`) and
+        // can strand a run below `rcv_nxt` that then never drains — a
+        // receive-side wedge a malicious peer can trigger with overlapping OOO
+        // segments. Cheap (≤ 16 comparisons); oracle-only call site.
+        if !self.reasm.debug_overlap_free() {
+            return Err("reassembly slots overlap");
+        }
+
         Ok(())
     }
 
@@ -777,9 +803,10 @@ impl<const BUF: usize> Tcb<BUF> {
         self.now_ms = now_ms;
     }
 
-    /// Enable (or reconfigure) TCP keepalive (RFC 9293 §3.8.4) for this
-    /// connection. Off by default — it never perturbs the wire unless a host
-    /// opts in.
+    /// Reconfigure (or disable) TCP keepalive (RFC 9293 §3.8.4) for this
+    /// connection. **On by default** — see [`DEFAULT_KEEPALIVE_IDLE_MS`] — so an
+    /// idle connection whose peer vanishes is reaped out of the box; call this
+    /// only to retune the cadence or to disable it (`idle_ms == 0`).
     ///
     /// After `idle_ms` of total inbound silence on an otherwise-idle
     /// `ESTABLISHED` connection — *idle* meaning nothing is in flight, since
@@ -1230,13 +1257,23 @@ impl<const BUF: usize> Tcb<BUF> {
         {
             return Err(TcpError::NotForUs);
         }
+        let res = self.on_segment(&seg);
         // Any inbound segment is proof the peer is alive: re-arm the keepalive
-        // idle timer and clear the unanswered-probe count.
-        if self.keepalive_idle_ms != 0 {
+        // idle timer and clear the unanswered-probe count. Done *after*
+        // `on_segment` so that a connection promoted to ESTABLISHED within this
+        // same inject leaves the call with its idle timer armed. This matters
+        // for the SYN-cookie third-ACK path: `try_promote_via_cookie` calls
+        // `reset_connection_state` (which clears `keepalive_deadline`) mid-
+        // promotion, so arming beforehand would be wiped — leaving a cookie-
+        // promoted peer that then goes silent un-probed forever. That is the
+        // flood-resistant path most likely to be attacked, so it must not be the
+        // one path where keepalive fails to arm. Skipped once Closed (e.g. the
+        // segment was a RST): no point timing a dead connection.
+        if self.keepalive_idle_ms != 0 && self.state != State::Closed {
             self.keepalive_probes = 0;
             self.keepalive_deadline = Some(self.now_ms.wrapping_add(self.keepalive_idle_ms as u64));
         }
-        self.on_segment(&seg)
+        res
     }
 
     /// Drive timers and try to push more data on the wire.
@@ -4121,10 +4158,24 @@ mod retransmit_overflow_regression {
         assert_eq!(tcb.state(), State::Established);
     }
 
-    /// Keepalive is off by default: an idle connection is left completely
-    /// alone (no probes, no abort) no matter how much time passes.
+    /// Keepalive is **on by default** with the balanced profile, so a fresh
+    /// TCB reaps a vanished idle peer with no host configuration. (The full
+    /// reaping path through a real handshake is covered end-to-end in
+    /// `conformance_tests` and `server_tests`; here we pin the defaults.)
     #[test]
-    fn keepalive_off_by_default_leaves_idle_connection_alone() {
+    fn keepalive_is_on_by_default() {
+        let tcb: Tcb = Tcb::new(cfg(1000)).expect("tcb");
+        assert_ne!(tcb.keepalive_idle_ms, 0, "keepalive must be on by default");
+        assert_eq!(tcb.keepalive_idle_ms, super::DEFAULT_KEEPALIVE_IDLE_MS);
+        assert_eq!(tcb.keepalive_intvl_ms, super::DEFAULT_KEEPALIVE_INTVL_MS);
+        assert_eq!(tcb.keepalive_count, super::DEFAULT_KEEPALIVE_COUNT);
+    }
+
+    /// `set_keepalive(0, …)` disables keepalive: an idle connection is then
+    /// left completely alone (no probes, no abort) no matter how much time
+    /// passes, even though the default would have reaped it.
+    #[test]
+    fn keepalive_can_be_disabled() {
         let mut tcb: Tcb = Tcb::new(cfg(1000)).expect("tcb");
         tcb.state = State::Established;
         tcb.snd_wnd = 65_535;
@@ -4132,11 +4183,22 @@ mod retransmit_overflow_regression {
         tcb.snd_una = 5_000;
         tcb.snd_nxt = 5_000;
         tcb.snd_max = 5_000;
+        tcb.set_now(0);
+
+        // Arm keepalive, then disable it: the timer must clear and never fire.
+        tcb.set_keepalive(1_000, 200, 3);
+        assert!(tcb.debug_next_deadline().is_some(), "keepalive armed");
+        tcb.set_keepalive(0, 0, 0);
+        assert_eq!(
+            tcb.debug_next_deadline(),
+            None,
+            "disabling keepalive clears its timer"
+        );
 
         for i in 0..50u64 {
             tcb.set_now((i + 1) * 100_000); // advance 100 s per tick
             tcb.tick().expect("tick");
-            assert!(!drain_all(&mut tcb), "no probes when keepalive is disabled");
+            assert!(!drain_all(&mut tcb), "no probes once keepalive is disabled");
             assert_eq!(tcb.state(), State::Established, "idle connection persists");
         }
     }
