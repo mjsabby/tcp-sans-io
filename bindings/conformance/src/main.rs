@@ -332,12 +332,9 @@ fn run_transfer(name: &str, xfer: u32, chaos: Chaos, seed: u64) -> Result<(), St
 }
 
 fn main() {
-    // `tcp_init` materialises a full ~2.15 MiB `Tcb` (default inline 1 MiB
-    // rings) while writing it into the host storage block, so the *calling
-    // thread* needs a few MiB of stack headroom. Real FFI hosts either run
-    // on a generous stack (Python/.NET main threads are several MiB) or
-    // build the cdylib with the `heap-buffers` feature. We make the
-    // requirement explicit by running on a 16 MiB stack.
+    // `tcp_init` builds the ~2.15 MiB `Tcb` in place in the host's storage
+    // block (`Tcb::init_in_place`) and `tcp_selftest` uses 16 KiB rings, so
+    // no FFI host needs a large stack. The 16 MiB thread is only headroom.
     let handle = std::thread::Builder::new()
         .stack_size(16 * 1024 * 1024)
         .spawn(run)

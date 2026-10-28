@@ -1,10 +1,11 @@
 //! Acknowledgment processing and loss recovery.
 //!
 //! Per ACK: validate (RFC 9293 + RFC 5961 §5), absorb SACK blocks (D-SACK
-//! per RFC 2883 is detected and *never* treated as loss), apply the
-//! cumulative ACK, take an RTT sample (TSecr or Karn), update the send
-//! window, run loss detection (RACK with SACK, RFC 6582 NewReno without),
-//! then let congestion control react: PRR during a reduction, slow start /
+//! per RFC 2883 is detected, validated, and *never* treated as loss), apply
+//! the cumulative ACK, take an RTT sample (our send times; TSecr only when
+//! retransmitted data is acknowledged), update the send window, run loss
+//! detection (RACK with SACK, RFC 6582 NewReno without), then let
+//! congestion control react: PRR during a reduction, slow start /
 //! congestion avoidance otherwise.
 
 use super::{seq_ge, seq_gt, seq_le, seq_lt, Deadline, Tcb, TLP_MIN_PTO_MS, TLP_WC_DELACK_MS};
@@ -61,7 +62,7 @@ impl<const BUF: usize> Tcb<BUF> {
                     || blocks
                         .get(1)
                         .is_some_and(|&(l1, r1)| seq_le(l1, l0) && seq_le(r0, r1));
-                if is_dsack {
+                if is_dsack && self.dsack_valid(l0, r0, mss) {
                     dsack = Some((l0, r0));
                     self.stats.dsacks_received = self.stats.dsacks_received.saturating_add(1);
                     self.rack.on_dsack(self.snd_una, self.snd_nxt);
@@ -92,14 +93,20 @@ impl<const BUF: usize> Tcb<BUF> {
             let fin_acked =
                 self.fin_sent && seq_le(prior_una, self.fin_seq) && seq_gt(ack, self.fin_seq);
             let sacked_before = self.rtx.sacked_bytes();
-            let mut karn_ts: Option<u64> = None;
+            // Send times of the newly acknowledged segments, for the RTT.
+            let mut oldest_ts: Option<u64> = None;
+            let mut newest_ts = 0u64;
+            let mut retrans_acked = false;
             {
                 let rack = &mut self.rack;
                 self.rtx.ack_to(ack, |s, newly| {
                     if newly {
                         rack.on_delivered(s, now, tsecr_ms);
-                        if !s.has(seg_flags::EVER_RETRANS) {
-                            karn_ts = Some(karn_ts.map_or(s.xmit_ts, |k| k.max(s.xmit_ts)));
+                        newest_ts = newest_ts.max(s.xmit_ts);
+                        if s.has(seg_flags::EVER_RETRANS) {
+                            retrans_acked = true;
+                        } else {
+                            oldest_ts = Some(oldest_ts.map_or(s.xmit_ts, |k| k.min(s.xmit_ts)));
                         }
                     }
                 });
@@ -123,10 +130,18 @@ impl<const BUF: usize> Tcb<BUF> {
             self.snd_una = ack;
             self.syn_unacked = false;
             self.dup_acks = 0;
-            // RTT: RFC 7323 RTTM when timestamps are on, else Karn.
-            let sample = match tsecr_ms {
-                Some(t) => Some((now as u32).wrapping_sub(t)),
-                None => karn_ts.and_then(|x| u32::try_from(now.saturating_sub(x)).ok()),
+            // RTT, preferring our own send times as Linux does: the peer and
+            // middleboxes control TSecr. Without retransmissions, time the
+            // oldest newly ACKed segment (what an RFC 7323 echo reports).
+            // Otherwise Karn's rule rules out send times and TSecr (RTTM)
+            // names the transmission that arrived; it is believed only if
+            // not later than the newest transmission this ACK covers.
+            let sample = if retrans_acked {
+                tsecr_ms
+                    .filter(|&t| !seq_gt(t, newest_ts as u32))
+                    .map(|t| (now as u32).wrapping_sub(t))
+            } else {
+                oldest_ts.and_then(|x| u32::try_from(now.saturating_sub(x)).ok())
             };
             if let Some(r) = sample {
                 if r < 60_000 {
@@ -272,6 +287,26 @@ impl<const BUF: usize> Tcb<BUF> {
         self.snd_wl1 = seq;
         self.snd_wl2 = seg.ack;
         self.max_snd_wnd = self.max_snd_wnd.max(wnd);
+    }
+
+    /// Linux `tcp_dsack_seen`: believe a D-SACK only if it is non-empty,
+    /// within what we sent, at most MAX.SND.WND long, and (cumulatively)
+    /// reports no more duplicate segments than we retransmitted. A forged
+    /// or network-duplicated D-SACK then cannot widen RACK's reordering
+    /// window or undo a congestion response.
+    fn dsack_valid(&mut self, l: u32, r: u32, mss: u32) -> bool {
+        let max_wnd = self.max_snd_wnd.max(u32::from(self.local_mss));
+        let len = r.wrapping_sub(l);
+        if !seq_lt(l, r) || seq_gt(r, self.snd_nxt) || len > max_wnd {
+            return false;
+        }
+        let segs = u64::from(len.div_ceil(mss.max(1)));
+        let total = self.dsack_segs.saturating_add(segs);
+        if total > self.stats.segs_retrans {
+            return false;
+        }
+        self.dsack_segs = total;
+        true
     }
 
     /// Re-arm the USER TIMEOUT only on meaningful progress: at least one

@@ -613,6 +613,52 @@ fn listener_rst_goes_to_sender_and_is_rate_limited() {
     assert_eq!(s.state(), State::Listen);
 }
 
+/// Unacceptable 1-byte segments used to draw an un-throttled ACK of up to
+/// 76 bytes (TS + D-SACK + SACK) for half of all sequence numbers, ACK bit
+/// or not, with a D-SACK for whatever range they named. Now a segment with
+/// none of ACK/SYN/RST gets nothing, one whose ACK field is unacceptable
+/// (RFC 5961 §5.2) goes through the rate limiter, and the immediate
+/// duplicate-data ACK never reports sequence space never received.
+#[test]
+fn unacceptable_segments_need_an_acceptable_ack_for_an_immediate_reply() {
+    fn flood(c: &mut Tcb, seq: u32, ack: u32, fl: u8, opts: &TcpOptions, n: u32) -> Vec<Out> {
+        let mut replies = Vec::new();
+        for k in 0..n {
+            c.set_now(2000 + u64::from(k));
+            let _ = c.inject_packet(&pkt(
+                SRV,
+                CLI,
+                seq.wrapping_add(k),
+                ack,
+                fl,
+                8192,
+                opts,
+                b"x",
+            ));
+            replies.extend(drain(c));
+        }
+        replies
+    }
+    let (mut c, sseq, iss) = established(1000, true, false);
+    let old = sseq.wrapping_sub(1_000_000); // below the peer's ISN
+    assert!(flood(&mut c, old, 0, 0, &TcpOptions::NONE, 200).is_empty());
+    let blind = (iss + 1).wrapping_add(0x4000_0000);
+    assert!(flood(&mut c, old, blind, flags::ACK, &TcpOptions::NONE, 200).len() <= 1);
+    // The peer's own duplicates carry the timestamp RFC 7323 §3.2 requires
+    // on every segment once negotiated.
+    let genuine = flood(&mut c, old, iss + 1, flags::ACK, &ts(5, 0), 3);
+    assert_eq!(
+        genuine.len(),
+        3,
+        "the peer's duplicates are answered at once"
+    );
+    assert!(
+        genuine.iter().all(|o| o.opts.sack.as_slice().is_empty()),
+        "D-SACK for never-received data: {:?}",
+        genuine[0].opts.sack
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Handshake robustness
 // ---------------------------------------------------------------------------
@@ -1272,6 +1318,131 @@ fn duplicate_data_is_reported_with_dsack() {
     let out = drain(&mut c);
     assert_eq!(out.len(), 1);
     assert_eq!(out[0].opts.sack.as_slice()[0], (sseq, sseq + 500));
+}
+
+/// A D-SACK is believed only for data we retransmitted (Linux
+/// `tcp_dsack_seen`): a forged or network-duplicated one used to widen
+/// RACK's reordering window (slowing loss detection) on every ACK.
+#[test]
+fn dsack_is_believed_only_for_retransmitted_data() {
+    fn ack_with_dsack(c: &mut Tcb, sseq: u32, now: u64, ack: u32, blk: (u32, u32)) {
+        c.set_now(now);
+        let o = TcpOptions {
+            ts: Some((4, 0)),
+            sack: SackBlocks::from_slice(&[blk]),
+            ..TcpOptions::NONE
+        };
+        c.inject_packet(&pkt(SRV, CLI, sseq, ack, flags::ACK, 0xffff, &o, &[]))
+            .unwrap();
+        drain(c);
+    }
+    let (mut c, sseq, _) = established(1000, true, false);
+    let segs = send_burst(&mut c, 1020, 2 * 1448);
+    ack_with_dsack(&mut c, sseq, 1030, segs[0].1, segs[0]);
+    assert_eq!(c.stats().dsacks_received, 0, "nothing was retransmitted");
+    // Once the tail really is retransmitted (TLP / RTO), its D-SACK counts.
+    let mut now = 1030;
+    let mut retx = None;
+    while retx.is_none() && now < 10_000 {
+        now += 5;
+        c.set_now(now);
+        c.tick().unwrap();
+        retx = drain(&mut c)
+            .into_iter()
+            .find(|o| o.len > 0)
+            .map(|o| (o.seq, o.seq + o.len as u32));
+    }
+    ack_with_dsack(&mut c, sseq, now + 10, segs[1].1, retx.unwrap());
+    assert_eq!(c.stats().dsacks_received, 1);
+}
+
+/// RTT comes from our own send times whenever the ACK covers no
+/// retransmission: TSecr is the peer's to forge (or a middlebox's to
+/// mangle). Echoing "now" used to force SRTT and min_rtt to 1 ms, and a
+/// 59 s old echo pushed the RTO to 60 s. After a retransmission TSecr
+/// decides, but not if it is later than any transmission it could echo.
+#[test]
+fn forged_tsecr_cannot_skew_rtt() {
+    fn send_and_ack(c: &mut Tcb, sseq: u32, sent: u64, acked: u64, tsecr: u32) {
+        c.set_now(sent);
+        c.send(&[7u8; 1000]).unwrap();
+        c.tick().unwrap();
+        drain(c);
+        c.set_now(acked);
+        let nxt = c.debug_snapshot().snd_nxt;
+        c.inject_packet(&pkt(
+            SRV,
+            CLI,
+            sseq,
+            nxt,
+            flags::ACK,
+            8192,
+            &ts(9, tsecr),
+            &[],
+        ))
+        .unwrap();
+        drain(c);
+    }
+    let iss = 1_000_000;
+    let mut c = new_tcb(CLI, SRV, iss);
+    c.set_now(1000);
+    c.connect().unwrap();
+    drain(&mut c);
+    c.set_now(1010);
+    let o = TcpOptions {
+        mss: Some(1460),
+        ts: Some((1, 1010)), // claims our SYN left just now
+        sack_permitted: true,
+        ..TcpOptions::NONE
+    };
+    let synack = pkt(
+        SRV,
+        CLI,
+        SRV_ISS,
+        iss + 1,
+        flags::SYN | flags::ACK,
+        8192,
+        &o,
+        &[],
+    );
+    c.inject_packet(&synack).unwrap();
+    drain(&mut c);
+    assert_eq!(
+        c.stats().srtt_ms,
+        10,
+        "handshake RTT from the SYN's send time"
+    );
+
+    let sseq = SRV_ISS + 1;
+    send_and_ack(&mut c, sseq, 1100, 1180, 1180); // 80 ms; TSecr claims 0
+    let s = c.stats();
+    assert_eq!((s.min_rtt_ms, s.srtt_ms), (10, (7 * 10 + 80) / 8));
+    send_and_ack(&mut c, sseq, 2000, 2050, 2050u32.wrapping_sub(59_000));
+    assert!(c.stats().rto_ms < 1_000, "RTO {} ms", c.stats().rto_ms);
+
+    c.set_now(3000);
+    c.send(&[7u8; 1000]).unwrap();
+    c.tick().unwrap();
+    drain(&mut c);
+    let mut now = 3000;
+    while !drain(&mut c).iter().any(|o| o.len > 0) {
+        assert!(now < 10_000, "no retransmission");
+        now += 5;
+        c.set_now(now);
+        c.tick().unwrap();
+    }
+    let before = c.stats();
+    c.set_now(now + 30);
+    let nxt = c.debug_snapshot().snd_nxt;
+    let o = ts(10, (now + 30) as u32);
+    c.inject_packet(&pkt(SRV, CLI, sseq, nxt, flags::ACK, 8192, &o, &[]))
+        .unwrap();
+    let after = c.stats();
+    assert_eq!(
+        (after.srtt_ms, after.min_rtt_ms),
+        (before.srtt_ms, before.min_rtt_ms),
+        "a TSecr later than the retransmission was believed"
+    );
 }
 
 // ---------------------------------------------------------------------------

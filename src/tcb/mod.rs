@@ -328,6 +328,9 @@ pub struct Tcb<const BUF: usize = BUF_CAP> {
     /// segment (RFC 6937 §3 / Linux "reno SACK"): bytes counted that way,
     /// subtracted from `pipe` until the cumulative ACK covers them.
     reno_sacked: u32,
+    /// Segments reported duplicate by the D-SACKs believed so far (cf. Linux
+    /// `dsack_dups`); never more than `stats.segs_retrans`.
+    dsack_segs: u64,
     cc: Reno,
     /// Sender was cwnd-limited in the current round (gates cwnd growth).
     cwnd_limited: bool,
@@ -593,6 +596,7 @@ impl<const BUF: usize> Tcb<BUF> {
         self.tlp_is_retrans = false;
         self.dup_acks = 0;
         self.reno_sacked = 0;
+        self.dsack_segs = 0;
         self.cc = Reno::new(congestion::initial_window(u32::from(self.local_mss)));
         self.cwnd_limited = false;
         self.cwnd_limited_seq = self.iss;
