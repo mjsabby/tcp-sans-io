@@ -384,6 +384,13 @@ impl<'a> Segment<'a> {
 /// Parse a single IPv4 + TCP datagram. Validates lengths, both checksums,
 /// and rejects fragments.
 pub fn parse(packet: &[u8]) -> Result<Segment<'_>, TcpError> {
+    parse_opts(packet, true)
+}
+
+/// [`parse`] with optional TCP checksum verification. `verify_l4 = false`
+/// is for callers that already vouch for L4 integrity (checksum offload);
+/// the IPv4 header checksum is always verified.
+pub fn parse_opts(packet: &[u8], verify_l4: bool) -> Result<Segment<'_>, TcpError> {
     let ip = packet
         .get(..IPV4_HDR_LEN)
         .ok_or(TcpError::MalformedPacket)?;
@@ -439,7 +446,7 @@ pub fn parse(packet: &[u8]) -> Result<Segment<'_>, TcpError> {
     let flags = *tcp.get(13).ok_or(TcpError::MalformedPacket)?;
     let window = u16::from_be_bytes(read2(tcp, 14)?);
 
-    if tcp_checksum(&src_ip, &dst_ip, tcp) != 0 {
+    if verify_l4 && tcp_checksum(&src_ip, &dst_ip, tcp) != 0 {
         return Err(TcpError::MalformedPacket);
     }
 
