@@ -925,14 +925,18 @@ impl<const BUF: usize> Tcb<BUF> {
         self.tx_csum_offload = on;
     }
 
-    /// Reconfigure (or disable, `idle_ms == 0`) keepalive (RFC 9293 §3.8.4)
-    /// for fully idle `ESTABLISHED` connections. On by default.
+    /// Reconfigure (or disable, `idle_ms == 0`) keepalive (RFC 9293 §3.8.4).
+    /// On by default. As in Linux it probes a fully idle connection in any
+    /// synchronized state but `TIME_WAIT`: `ESTABLISHED`, and the half-closed
+    /// `CLOSE_WAIT` and `FIN_WAIT_2`, since a peer can vanish after a half
+    /// close. While data or our FIN is in flight or queued, the
+    /// retransmission, persist and USER TIMEOUT timers own liveness instead.
     pub fn set_keepalive(&mut self, idle_ms: u32, intvl_ms: u32, count: u8) {
         self.keepalive_idle_ms = idle_ms;
         self.keepalive_intvl_ms = intvl_ms.max(1);
         self.keepalive_count = count;
         self.keepalive_probes = 0;
-        self.keepalive_deadline = if idle_ms == 0 {
+        self.keepalive_deadline = if idle_ms == 0 || !self.keepalive_applies() {
             Deadline::OFF
         } else {
             Deadline::at(self.now_ms.saturating_add(u64::from(idle_ms)))
@@ -1349,6 +1353,22 @@ impl<const BUF: usize> Tcb<BUF> {
     /// Unacknowledged sequence space plus unsent data.
     fn has_send_work(&self) -> bool {
         self.snd_una != self.snd_nxt || self.unsent_bytes() > 0
+    }
+
+    /// The states keepalive runs in, as in Linux: every synchronized state
+    /// but `TIME_WAIT`. `FIN_WAIT_1`, `CLOSING` and `LAST_ACK` always have
+    /// our FIN to deliver, so only `ESTABLISHED`, `CLOSE_WAIT` and
+    /// `FIN_WAIT_2` are ever idle enough to probe.
+    fn keepalive_applies(&self) -> bool {
+        matches!(
+            self.state,
+            State::Established
+                | State::CloseWait
+                | State::FinWait1
+                | State::FinWait2
+                | State::Closing
+                | State::LastAck
+        )
     }
 
     /// RFC 6675 `pipe`.

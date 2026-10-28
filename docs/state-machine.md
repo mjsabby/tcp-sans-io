@@ -47,7 +47,7 @@ stateDiagram-v2
     FIN_WAIT_1 --> CLOSED: RST / abort() / R2, USER TIMEOUT
 
     FIN_WAIT_2 --> TIME_WAIT: recv FIN / send ACK
-    FIN_WAIT_2 --> CLOSED: RST / abort() / FIN_WAIT_2 timeout
+    FIN_WAIT_2 --> CLOSED: RST / abort() / FIN_WAIT_2 timeout, keepalive
 
     CLOSING --> TIME_WAIT: recv ACK of FIN
     CLOSING --> CLOSED: RST / abort() / R2
@@ -56,7 +56,7 @@ stateDiagram-v2
     TIME_WAIT --> LISTEN: listen()
 
     CLOSE_WAIT --> LAST_ACK: close() / send FIN
-    CLOSE_WAIT --> CLOSED: RST / abort() / R2, USER TIMEOUT
+    CLOSE_WAIT --> CLOSED: RST / abort() / R2, USER TIMEOUT, keepalive
 
     LAST_ACK --> CLOSED: recv ACK of FIN
     CLOSED --> [*]
@@ -93,6 +93,7 @@ bold purple = the SYN_RCVD → LISTEN revert, green = SYN-cookie promotion):
 | FIN_WAIT_1 | TIME_WAIT | recv FIN+ACK in one segment | send ACK, arm 2·MSL | `process_ack` + `advance_state_on_remote_fin` |
 | FIN_WAIT_2 | TIME_WAIT | recv FIN | send ACK, arm 2·MSL | `advance_state_on_remote_fin` |
 | FIN_WAIT_2 | CLOSED | FIN_WAIT_2 timeout (restarted only by the application reading) | send RST | `tick` |
+| FIN_WAIT_2 / CLOSE_WAIT | CLOSED | keepalive: an idle half-closed peer stops answering (as in Linux) | none; `ERROR` from `FIN_WAIT_2`, a clean close from `CLOSE_WAIT` (the peer's stream is complete, so unread bytes stay readable until EOF) | `tick` → `check_keepalive` |
 | CLOSING | TIME_WAIT | recv ACK of our FIN | arm 2·MSL | `process_ack` |
 | TIME_WAIT | CLOSED | 2·MSL timeout (a retransmitted FIN restarts it, at most 120 s after entry) | free the slot | `tick` |
 | TIME_WAIT | LISTEN | `listen()` | — | `Tcb::listen` |

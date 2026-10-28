@@ -252,15 +252,23 @@ impl<const BUF: usize> Tcb<BUF> {
         Ok(())
     }
 
-    /// RFC 9293 §3.8.4 keepalive for fully idle ESTABLISHED connections.
+    /// RFC 9293 §3.8.4 keepalive for fully idle connections, in the states
+    /// it runs in (see `keepalive_applies`).
     fn check_keepalive(&mut self) -> Result<(), TcpError> {
         if self.keepalive_idle_ms == 0 || !self.keepalive_deadline.due(self.now_ms) {
             return Ok(());
         }
-        if self.state != State::Established || self.has_send_work() {
-            // Not idle (retransmission / persist timers own liveness) or
-            // not probe-able: restart the idle clock instead of leaving a
-            // past deadline armed, which would spin an event-driven host.
+        if !self.keepalive_applies() {
+            // A handshake, LISTEN or TIME_WAIT: their own timers bound them,
+            // so drop the timer rather than wake the host for nothing.
+            self.keepalive_probes = 0;
+            self.keepalive_deadline = Deadline::OFF;
+            return Ok(());
+        }
+        if self.has_send_work() {
+            // Not idle: the retransmission and persist timers own liveness.
+            // Restart the idle clock instead of leaving a past deadline
+            // armed, which would spin an event-driven host.
             self.keepalive_probes = 0;
             self.keepalive_deadline = Deadline::at(
                 self.now_ms
@@ -269,7 +277,15 @@ impl<const BUF: usize> Tcb<BUF> {
             return Ok(());
         }
         if self.keepalive_probes >= self.keepalive_count {
-            self.abort_local(); // peer vanished
+            // The peer vanished. In CLOSE_WAIT its stream is complete and
+            // nothing of ours is in flight (we only probe when idle), so
+            // nothing was lost: close, keeping unread bytes readable before
+            // EOF, as Linux delivers them. Anywhere else, abort.
+            if self.state == State::CloseWait {
+                self.close_clean();
+            } else {
+                self.abort_local();
+            }
             return Ok(());
         }
         if self.emit_probe(self.snd_nxt.wrapping_sub(1))? {

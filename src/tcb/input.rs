@@ -362,10 +362,11 @@ impl<const BUF: usize> Tcb<BUF> {
         self.on_peer_alive();
     }
 
-    /// An acceptable segment arrived: the peer is alive.
+    /// An acceptable segment arrived: the peer is alive, so the keepalive
+    /// idle clock restarts (in the states keepalive runs in).
     fn on_peer_alive(&mut self) {
         self.keepalive_probes = 0;
-        if self.keepalive_idle_ms != 0 {
+        if self.keepalive_idle_ms != 0 && self.keepalive_applies() {
             self.keepalive_deadline = Deadline::at(
                 self.now_ms
                     .saturating_add(u64::from(self.keepalive_idle_ms)),

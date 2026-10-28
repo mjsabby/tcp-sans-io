@@ -83,9 +83,9 @@ digraph tcp_state_machine {
     Listen      -> Closed [label="close() / abort()"];
     Established -> Closed [label="RST / abort()\n/ R2, USER TIMEOUT, keepalive"];
     FinWait1    -> Closed [label="RST / abort()\n/ R2, USER TIMEOUT"];
-    FinWait2    -> Closed [label="RST / abort()\n/ FIN_WAIT_2 timeout"];
+    FinWait2    -> Closed [label="RST / abort()\n/ FIN_WAIT_2 timeout, keepalive"];
     Closing     -> Closed [label="RST / abort() / R2"];
-    CloseWait   -> Closed [label="RST / abort()\n/ R2, USER TIMEOUT"];
+    CloseWait   -> Closed [label="RST / abort()\n/ R2, USER TIMEOUT, keepalive"];
 
     // ---- Rank hints for a clean top-to-bottom flow ----------------------
     { rank=same; SynSent; SynRcvd; }
