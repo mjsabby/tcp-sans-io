@@ -317,46 +317,75 @@ proptest! {
 proptest! {
     #![proptest_config(ProptestConfig { cases: 2048, ..ProptestConfig::default() })]
 
-    /// The multi-hole reassembler must keep its held runs disjoint after ANY
-    /// sequence of inserts — overlapping, abutting, nested, duplicate, or
-    /// slot-exhausting. An overlap is a remotely-triggerable defect: it
-    /// double-counts `held_bytes` (a permanent advertised-window shrink) and
-    /// can strand a run below `rcv_nxt` where it can never drain (a
-    /// receive-side wedge that no timer recovers). Draining from `rcv_nxt`
-    /// must then yield strictly-forward runs and free every slot — never
-    /// leaving one orphaned behind the cursor.
+    /// The out-of-order receive path (bytes parked in the ring's free space +
+    /// the range tracker) must reassemble ANY arrival order — overlapping,
+    /// duplicated, abutting, wrapping the sequence space, or exceeding the
+    /// range budget — into exactly the original stream, never exposing a
+    /// byte early and never stranding data behind the cursor. Mirrors
+    /// `Tcb::receive_payload` step for step.
     #[test]
-    fn reassembly_inserts_stay_disjoint(
-        rcv_nxt in any::<u32>(),
-        ops in proptest::collection::vec((0u32..4096, 1usize..1024), 1..48),
+    fn ooo_reassembly_matches_model(
+        base in any::<u32>(),
+        ops in proptest::collection::vec((0usize..8192, 1usize..1500), 1..96),
     ) {
-        use crate::reassembly::{Reassembly, MAX_HOLES};
-        let mut r = Reassembly::new();
+        use crate::ooo::{Insert, OooList};
+        use crate::ring::Ring;
+        const N: usize = 8192;
+        let stream: Vec<u8> = (0..N).map(|i| (i.wrapping_mul(31) % 251) as u8).collect();
+        let mut ring: Ring<N> = Ring::new().unwrap();
+        let mut ooo = OooList::new();
+        let mut rcv_nxt = base;
+        let deliver = |ring: &mut Ring<N>, ooo: &mut OooList, rcv_nxt: &mut u32, off: usize, len: usize| {
+            let seq = base.wrapping_add(off as u32);
+            let mut data = &stream[off..off + len];
+            let mut s = seq;
+            if (s.wrapping_sub(*rcv_nxt) as i32) < 0 {
+                let lead = rcv_nxt.wrapping_sub(s) as usize;
+                if lead >= data.len() {
+                    return;
+                }
+                data = &data[lead..];
+                s = *rcv_nxt;
+            }
+            let o = s.wrapping_sub(*rcv_nxt) as usize;
+            let free = ring.free();
+            if o >= free {
+                return;
+            }
+            let data = &data[..data.len().min(free - o)];
+            if o == 0 {
+                let n = ring.write(data);
+                *rcv_nxt = rcv_nxt.wrapping_add(n as u32);
+                let new = ooo.advance(*rcv_nxt);
+                let c = ring.commit(new.wrapping_sub(*rcv_nxt) as usize);
+                *rcv_nxt = rcv_nxt.wrapping_add(c as u32);
+            } else if let Insert::Stored { .. } = ooo.insert(s, s.wrapping_add(data.len() as u32), *rcv_nxt) {
+                ring.write_at(o, data);
+            }
+        };
         for (off, len) in &ops {
-            let seq = rcv_nxt.wrapping_add(*off);
-            let payload = vec![0xABu8; *len];
-            let stored = r.insert(seq, &payload, rcv_nxt);
-            prop_assert!(stored <= *len);
-            prop_assert!(
-                r.debug_overlap_free(),
-                "overlap after insert rcv_nxt+{} len {}",
-                off,
-                len
-            );
-            prop_assert!(r.held_bytes() <= crate::REASM_CAP);
+            let len = (*len).min(N - *off);
+            if len == 0 {
+                continue;
+            }
+            deliver(&mut ring, &mut ooo, &mut rcv_nxt, *off, len);
+            prop_assert!(ooo.debug_valid(rcv_nxt), "range invariants broken");
+            // Everything readable so far is a correct prefix of the stream.
+            let readable = ring.len();
+            let mut buf = vec![0u8; readable];
+            ring.peek(&mut buf);
+            prop_assert_eq!(&buf[..], &stream[..readable]);
         }
-        // Drain from rcv_nxt: each run starts exactly at the cursor, advances
-        // it forward, and is freed — nothing is stranded behind the cursor.
-        let mut cursor = rcv_nxt;
-        let mut guard = 0usize;
-        while let Some((idx, start, len)) = r.ready_slot(cursor) {
-            prop_assert_eq!(start, cursor);
-            prop_assert!(len > 0);
-            cursor = cursor.wrapping_add(len as u32);
-            r.commit_drain(idx, len);
-            prop_assert!(r.debug_overlap_free());
-            guard += 1;
-            prop_assert!(guard <= MAX_HOLES + 2, "drain failed to terminate");
+        // Fill every hole in order; the whole stream must come out.
+        let mut off = 0;
+        while off < N {
+            let len = (N - off).min(1460);
+            deliver(&mut ring, &mut ooo, &mut rcv_nxt, off, len);
+            off += len;
         }
+        prop_assert!(ooo.is_empty(), "data stranded in the range tracker");
+        let mut all = vec![0u8; N];
+        prop_assert_eq!(ring.read(&mut all), N);
+        prop_assert_eq!(all, stream);
     }
 }

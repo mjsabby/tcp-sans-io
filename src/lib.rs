@@ -79,9 +79,30 @@
 #[cfg(feature = "heap-buffers")]
 extern crate alloc;
 
+/// Panics are unreachable by construction (Clippy denies `unwrap`/`expect`/
+/// `panic!`/indexing; arithmetic is wrapping or saturating). If one ever
+/// fires anyway, trap immediately: a crash is visible and restartable,
+/// whereas spinning would silently burn a core forever (a CPU DoS).
 #[cfg(all(not(test), not(feature = "host_panic_handler"), not(feature = "std")))]
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
+    trap()
+}
+
+#[cfg(all(not(test), not(feature = "std")))]
+#[inline(always)]
+fn trap() -> ! {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    // SAFETY: `ud2` raises an invalid-opcode exception; it never returns.
+    unsafe {
+        core::arch::asm!("ud2", options(noreturn, nomem, nostack));
+    }
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: `udf` raises an undefined-instruction exception.
+    unsafe {
+        core::arch::asm!("udf #0", options(noreturn, nomem, nostack));
+    }
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
     loop {
         core::hint::spin_loop();
     }
@@ -104,20 +125,17 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
 ))]
 #[no_mangle]
 extern "C" fn rust_eh_personality() {
-    loop {
-        core::hint::spin_loop();
-    }
+    trap()
 }
 
 pub mod congestion;
 pub mod error;
 pub mod ffi;
+pub mod ooo;
 pub mod rack;
-pub mod reassembly;
 pub mod ring;
-pub mod scoreboard;
+pub mod rtx_queue;
 pub mod selftest;
-pub mod send_queue;
 pub mod state;
 pub mod tcb;
 pub mod tx_ring;
@@ -125,7 +143,7 @@ pub mod wire;
 
 pub use error::TcpError;
 pub use state::State;
-pub use tcb::{Endpoint, Tcb, TcbConfig};
+pub use tcb::{Endpoint, Tcb, TcbConfig, TcbStats};
 
 /// Standard maximum segment size for an Ethernet-class path.
 pub const MSS: u16 = 1460;
@@ -148,20 +166,6 @@ pub const MSS: u16 = 1460;
 pub const BUF_CAP: usize = 1_048_576;
 #[cfg(feature = "small-buffers")]
 pub const BUF_CAP: usize = 32 * 1024;
-
-/// Single-hole out-of-order reassembly buffer capacity, in bytes.
-///
-/// Holds at most one contiguous run that arrived ahead of `rcv_nxt`. When
-/// the missing segment fills the gap, the held run is drained into the
-/// receive ring atomically and the application sees a single contiguous
-/// stream — i.e. the receiver doesn't force the sender to retransmit
-/// already-arrived bytes.
-///
-/// 16 KiB is ~11 MSS-sized segments, which covers typical single-drop
-/// recovery during slow start. More pathological loss patterns (multiple
-/// holes, or an OOO run larger than this buffer) fall back to per-RTO
-/// retransmission — no worse than the previous "drop-on-OOO" behaviour.
-pub const REASM_CAP: usize = 16 * 1024;
 
 /// Maximum size of a single emitted IP/TCP datagram.
 ///
@@ -218,6 +222,11 @@ mod property_tests;
 
 #[cfg(test)]
 mod server_tests;
+
+#[cfg(test)]
+mod security_tests;
+#[cfg(test)]
+mod sim_tests;
 
 #[cfg(test)]
 mod smoltcp_interop_tests;

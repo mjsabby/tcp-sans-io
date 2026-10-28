@@ -116,6 +116,31 @@ int32_t tcp_set_keepalive(TcpStreamHandle* handle, uint64_t now_ms,
 int32_t tcp_set_user_timeout(TcpStreamHandle* handle, uint64_t now_ms,
                              uint32_t user_timeout_ms);
 
+/* Install a 16-byte host secret from a CSPRNG. Keys the per-connection TCP
+ * timestamp offset (so TSval reveals neither the host clock nor a
+ * cross-connection correlator) and per-SYN ISNs on stateful listeners.
+ * Call before tcp_connect / tcp_listen. Recommended for internet-facing use. */
+int32_t tcp_set_secret(TcpStreamHandle* handle, const uint8_t* secret);
+
+/* Set the IPv4 path MTU (clamped to 576..1500) BEFORE the handshake: the MSS
+ * we advertise is mtu - 40 and no emitted datagram exceeds mtu. Use 1420
+ * behind a default WireGuard interface. Returns TCP_ERR_INVALID_STATE once
+ * the connection has left CLOSED / LISTEN. Default 1500. */
+int32_t tcp_set_mtu(TcpStreamHandle* handle, uint16_t mtu);
+
+/* Report a reduced path MTU mid-connection (e.g. from an ICMP "fragmentation
+ * needed" the host received). Shrinks the segment size for the rest of the
+ * connection and retransmits in-flight segments that no longer fit. Without
+ * ICMP the stack still clamps the MSS after repeated timeouts of large
+ * segments (path-MTU black-hole fallback). */
+int32_t tcp_update_pmtu(TcpStreamHandle* handle, uint64_t now_ms, uint16_t mtu);
+
+/* FIN_WAIT_2 timeout (0 disables; default 60 s): after our FIN is ACKed the
+ * peer must send its FIN within this long (refreshed whenever it sends data),
+ * otherwise the connection is reset. Bounds peers that half-close forever. */
+int32_t tcp_set_fin_wait2_timeout(TcpStreamHandle* handle, uint64_t now_ms,
+                                  uint32_t timeout_ms);
+
 /* ---- State / polling --------------------------------------------------- */
 uint8_t  tcp_state(const TcpStreamHandle* handle);
 uint32_t tcp_poll (const TcpStreamHandle* handle);
@@ -131,6 +156,39 @@ int32_t tcp_inject_packet (TcpStreamHandle* handle,
                            const uint8_t* packet, size_t len, uint64_t now_ms);
 int32_t tcp_extract_packet(TcpStreamHandle* handle,
                            uint8_t* buf, size_t cap, size_t* out_written);
+
+/* ---- Statistics -------------------------------------------------------- */
+/* Per-connection counters (comparable to Linux TCP_INFO). 128 bytes. */
+typedef struct TcpStats {
+    uint64_t segs_out;            /* segments emitted (all kinds)            */
+    uint64_t segs_in;             /* segments accepted for processing        */
+    uint64_t bytes_sent;          /* payload bytes sent incl. retransmits    */
+    uint64_t bytes_retrans;       /* payload bytes retransmitted             */
+    uint64_t bytes_received;      /* in-order payload bytes delivered        */
+    uint64_t dup_bytes_received;  /* duplicate payload bytes received        */
+    uint64_t segs_retrans;        /* data segments retransmitted             */
+    uint64_t dsacks_received;     /* ACKs reporting a spurious retransmit    */
+    uint32_t fast_recoveries;     /* fast-recovery episodes                  */
+    uint32_t rto_count;           /* retransmission timeouts                 */
+    uint32_t tlp_count;           /* tail loss probes                        */
+    uint32_t ooo_drops;           /* out-of-order segments not storable      */
+    uint32_t oow_suppressed;      /* rate-limited replies suppressed         */
+    uint32_t srtt_ms;
+    uint32_t rttvar_ms;
+    uint32_t min_rtt_ms;
+    uint32_t rto_ms;
+    uint32_t cwnd;                /* bytes                                   */
+    uint32_t ssthresh;            /* bytes                                   */
+    uint32_t pipe;                /* bytes in flight (RFC 6675)              */
+    uint32_t mss;                 /* payload bytes per full segment          */
+    uint32_t snd_wnd;
+    uint32_t rcv_wnd;
+    uint8_t  ca_state;            /* 0 open, 1 recovery, 2 loss, 3 cwr       */
+    uint8_t  state;               /* TCP_STATE_*                             */
+    uint8_t  _reserved[2];
+} TcpStats;
+
+int32_t tcp_get_stats(const TcpStreamHandle* handle, TcpStats* out);
 
 /* ---- Diagnostics (NOT a stable ABI) ----------------------------------- */
 typedef struct TcpDebugSnapshot {

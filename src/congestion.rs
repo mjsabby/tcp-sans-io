@@ -1,267 +1,302 @@
-//! TCP congestion control: PRR-Reno fast recovery (RFC 6937, 2013) +
-//! RFC 5681 §3 RTO collapse.
+//! Congestion control: Reno (RFC 5681) with byte counting, Proportional Rate
+//! Reduction (RFC 6937) for fast recovery and ECN/TLP reductions, and the
+//! RFC 5681 §3.1 loss window on RTO.
 //!
-//! Replaces the original Tahoe-only behavior:
-//!
-//! * **Fast retransmit** (3-dup-ACK or SACK-driven trigger) enters Proportional
-//!   Rate Reduction (PRR) Slow-Start Reduction Bound (PRR-SSRB). `cwnd` is
-//!   NOT collapsed to 1*MSS at the loss event; instead `ssthresh` is set to
-//!   `max(FlightSize/2, 2*MSS)` and a per-ACK `snd_credit` budget paces
-//!   retransmissions + new data so the connection exits recovery with
-//!   `cwnd = ssthresh`. Empirically this gives 2-5x throughput vs Tahoe on
-//!   1-5% loss paths and substantially smoother behavior at all loss rates.
-//!
-//! * **RTO** collapses `cwnd` to 1*MSS per RFC 5681 §3 — PRR explicitly does
-//!   not modify RTO behavior (RFC 6937 §6). Slow-start re-opens cwnd from 1.
-//!
-//! Outside recovery, the algorithm is RFC 5681 slow-start / congestion
-//! avoidance, with RFC 6928 IW=10*MSS as the initial window.
+//! Units are bytes. Loss *detection* lives elsewhere (RACK / dup-ACKs mark
+//! segments lost in the retransmission queue); this module only decides how
+//! much may be in flight. During a reduction episode PRR recomputes
+//! `cwnd = pipe + sndcnt` on every ACK so the sender's ordinary
+//! "send while `pipe < cwnd`" rule paces retransmissions and new data.
 
-use crate::MSS;
+/// Congestion-avoidance state (named after Linux's `tcp_ca_state`).
+#[repr(u8)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum CaState {
+    /// No reduction in progress.
+    #[default]
+    Open = 0,
+    /// Fast recovery after loss detected by RACK / dup-ACKs (PRR).
+    Recovery = 1,
+    /// Retransmission timeout: loss window, slow start back to `ssthresh`.
+    Loss = 2,
+    /// Congestion window reduction without loss (ECN-Echo, repaired tail loss).
+    Cwr = 3,
+}
 
-/// RFC 6928 (2013) Initial Window: `IW = min(10*MSS, max(2*MSS, 14600))`.
-/// For MSS=1460 this is exactly `10*MSS = 14600` bytes.
-pub const INITIAL_WINDOW: u32 = {
-    let ten_mss = 10 * MSS as u32;
-    let two_mss = 2 * MSS as u32;
-    let lower = if two_mss > 14_600 { two_mss } else { 14_600 };
-    if ten_mss < lower {
-        ten_mss
+/// RFC 6928 initial window for a given MSS: `min(10*MSS, max(2*MSS, 14600))`.
+pub const fn initial_window(mss: u32) -> u32 {
+    let ten = mss.saturating_mul(10);
+    let two = mss.saturating_mul(2);
+    let lower = if two > 14_600 { two } else { 14_600 };
+    if ten < lower {
+        ten
     } else {
         lower
     }
-};
-
-/// Per-connection congestion state. Fits inline in the [`crate::tcb::Tcb`].
-///
-/// Type name kept as `Tahoe` for source-stability with the existing TCB
-/// integration; algorithmically this is now PRR-Reno (Reno halving + PRR
-/// pacing) for fast retransmit and RFC 5681 collapse for RTO.
-#[derive(Debug, Clone, Copy)]
-pub struct Tahoe {
-    /// Congestion window in bytes. Outside recovery, governed by
-    /// slow-start / CA. During PRR recovery, frozen at its pre-loss value
-    /// (PRR uses `snd_credit` rather than cwnd to gate sends). On
-    /// recovery exit, set to `ssthresh`.
-    pub cwnd: u32,
-    /// Slow-start threshold in bytes.
-    pub ssthresh: u32,
-    /// Count of duplicate ACKs for the current `snd_una`.
-    pub dup_acks: u8,
-
-    // ---- PRR-SSRB recovery state (RFC 6937) -------------------------------
-    /// True iff we are inside a fast-recovery episode.
-    in_recovery: bool,
-    /// `snd.nxt` value at the moment recovery was entered. Recovery exits
-    /// when a cumulative ACK first crosses this point.
-    recovery_point: u32,
-    /// `FlightSize` captured at recovery entry; used as the denominator of
-    /// the PRR proportional-rate formula.
-    recover_fs: u32,
-    /// Cumulative bytes "delivered" (cum-ACKed, plus newly-SACKed in a
-    /// future RFC 6675 implementation) since recovery entry.
-    prr_delivered: u32,
-    /// Cumulative bytes the sender has emitted since recovery entry.
-    prr_out: u32,
-    /// Per-ACK send credit. Inside recovery, computed by PRR-SSRB; outside
-    /// recovery this field is meaningless and `snd_credit()` returns
-    /// `u32::MAX` (i.e. the only limits are `cwnd` and the peer window).
-    snd_credit: u32,
 }
 
-impl Tahoe {
-    /// Initial state per RFC 6928: `cwnd = INITIAL_WINDOW`, `ssthresh =
-    /// receiver window` (effectively unbounded so slow-start runs until
-    /// first loss).
-    #[inline]
-    pub const fn new(initial_rwnd: u32) -> Self {
+/// Default-MSS initial window (1460-byte MSS → 14600 bytes).
+pub const INITIAL_WINDOW: u32 = initial_window(crate::MSS as u32);
+
+#[inline]
+fn seq_ge(a: u32, b: u32) -> bool {
+    (a.wrapping_sub(b) as i32) >= 0
+}
+
+/// Reno congestion state.
+#[derive(Copy, Clone, Debug)]
+pub struct Reno {
+    pub cwnd: u32,
+    pub ssthresh: u32,
+    state: CaState,
+    /// `SND.NXT` when the current reduction episode began.
+    recovery_point: u32,
+    /// Bytes acknowledged toward the next congestion-avoidance increment.
+    ca_acc: u32,
+    prr_delivered: u64,
+    prr_out: u64,
+    recover_fs: u32,
+}
+
+impl Reno {
+    pub const fn new(initial_cwnd: u32) -> Self {
         Self {
-            cwnd: INITIAL_WINDOW,
-            ssthresh: initial_rwnd,
-            dup_acks: 0,
-            in_recovery: false,
+            cwnd: initial_cwnd,
+            ssthresh: u32::MAX / 2,
+            state: CaState::Open,
             recovery_point: 0,
-            recover_fs: 0,
+            ca_acc: 0,
             prr_delivered: 0,
             prr_out: 0,
-            snd_credit: u32::MAX,
+            recover_fs: 1,
         }
     }
 
-    /// Whether the connection is currently in PRR fast recovery.
     #[inline]
-    pub fn in_recovery(&self) -> bool {
-        self.in_recovery
+    pub fn state(&self) -> CaState {
+        self.state
     }
 
-    /// Per-ACK send budget. During PRR recovery this is the `sndcnt`
-    /// computed by the most recent `on_ack_in_recovery` call, decremented
-    /// by `on_send`. Outside recovery returns `u32::MAX`.
+    /// A PRR-paced reduction (fast recovery or CWR) is in progress.
     #[inline]
-    pub fn snd_credit(&self) -> u32 {
-        if self.in_recovery {
-            self.snd_credit
-        } else {
-            u32::MAX
-        }
+    pub fn in_reduction(&self) -> bool {
+        matches!(self.state, CaState::Recovery | CaState::Cwr)
     }
 
-    /// Called for every fresh ACK that advances `snd_una`. `acked` is the
-    /// number of newly acknowledged bytes.
-    ///
-    /// Outside recovery: standard slow-start / congestion avoidance.
-    /// Inside recovery: cwnd is frozen by PRR — this is a no-op, and the
-    /// caller must instead invoke [`Self::on_ack_in_recovery`] to update
-    /// the PRR send credit.
-    pub fn on_ack(&mut self, acked: u32) {
-        self.dup_acks = 0;
-        if self.in_recovery || acked == 0 {
+    /// Fast recovery or RTO recovery is in progress.
+    #[inline]
+    pub fn in_loss_recovery(&self) -> bool {
+        matches!(self.state, CaState::Recovery | CaState::Loss)
+    }
+
+    #[inline]
+    pub fn recovery_point(&self) -> u32 {
+        self.recovery_point
+    }
+
+    /// Window growth on an ACK that newly delivered `acked` bytes, outside a
+    /// reduction episode. `cwnd_limited` gates growth (RFC 7661 spirit, as
+    /// Linux `tcp_is_cwnd_limited`): an application-limited sender must not
+    /// inflate a window it is not using.
+    pub fn on_ack(&mut self, acked: u32, mss: u32, cwnd_limited: bool) {
+        if self.in_reduction() || acked == 0 || !cwnd_limited {
             return;
         }
-        let mss = MSS as u32;
+        let mut acked = acked;
         if self.cwnd < self.ssthresh {
-            // Slow start: exponential growth, capped at one MSS per ACK.
-            self.cwnd = self.cwnd.saturating_add(core::cmp::min(acked, mss));
-        } else {
-            // Congestion avoidance: roughly +1 MSS per RTT.
-            // cwnd += MSS*MSS/cwnd, guarding against div-by-zero.
-            let cwnd = core::cmp::max(self.cwnd, 1);
-            let inc = mss.saturating_mul(mss) / cwnd;
-            self.cwnd = self.cwnd.saturating_add(core::cmp::max(inc, 1));
+            // Slow start (counts every delivered byte, so stretch ACKs from
+            // coalescing receivers still double the window per RTT).
+            let inc = acked.min(self.ssthresh - self.cwnd);
+            self.cwnd = self.cwnd.saturating_add(inc);
+            acked -= inc;
+            if acked == 0 {
+                return;
+            }
+        }
+        // Congestion avoidance with byte counting: +1 MSS per cwnd delivered.
+        self.ca_acc = self.ca_acc.saturating_add(acked);
+        let w = self.cwnd.max(mss);
+        if self.ca_acc >= w {
+            let segs = self.ca_acc / w;
+            self.ca_acc -= segs * w;
+            self.cwnd = self.cwnd.saturating_add(segs.saturating_mul(mss));
         }
     }
 
-    /// Called when a duplicate ACK arrives. Returns `true` if the caller
-    /// should treat this as a loss event (third dup ACK).
-    pub fn on_dup_ack(&mut self) -> bool {
-        self.dup_acks = self.dup_acks.saturating_add(1);
-        self.dup_acks >= 3
-    }
-
-    /// Enter PRR Fast Recovery in response to a fast-retransmit trigger
-    /// (3 dup-ACKs or a SACK-driven loss signal). RFC 6937 §3.
-    ///
-    /// `flight_size` is `snd.nxt - snd.una` at the moment of the trigger;
-    /// `recovery_point` is `snd.nxt` (the high-water sequence number we
-    /// want a cumulative ACK to reach before declaring recovery over).
-    ///
-    /// Per RFC 6937, `cwnd` is NOT modified at recovery entry; only
-    /// `ssthresh` is set. The first send budget (`snd_credit`) is `MSS`
-    /// to allow the immediate retransmit of the lost segment.
-    pub fn enter_recovery(&mut self, flight_size: u32, recovery_point: u32) {
-        let mss = MSS as u32;
-        let half = flight_size / 2;
-        self.ssthresh = core::cmp::max(half, mss.saturating_mul(2));
-        self.in_recovery = true;
-        self.recovery_point = recovery_point;
-        self.recover_fs = core::cmp::max(flight_size, 1);
+    fn begin_reduction(&mut self, state: CaState, flight: u32, snd_nxt: u32, mss: u32) {
+        self.ssthresh = (flight / 2).max(mss.saturating_mul(2));
+        self.state = state;
+        self.recovery_point = snd_nxt;
+        self.recover_fs = flight.max(1);
         self.prr_delivered = 0;
         self.prr_out = 0;
-        self.dup_acks = 0;
-        self.snd_credit = mss;
+        self.ca_acc = 0;
     }
 
-    /// Apply the conventional RFC 5681 §3 RTO collapse: `cwnd = 1*MSS`,
-    /// `ssthresh = max(FlightSize/2, 2*MSS)`, exit any prior recovery.
-    /// RFC 6937 §6 explicitly says PRR does not modify RTO behavior.
-    pub fn on_rto_loss(&mut self, flight_size: u32) {
-        let mss = MSS as u32;
-        let half = flight_size / 2;
-        self.ssthresh = core::cmp::max(half, mss.saturating_mul(2));
-        self.cwnd = mss;
-        self.in_recovery = false;
-        self.snd_credit = u32::MAX;
-        self.prr_delivered = 0;
-        self.prr_out = 0;
-        self.dup_acks = 0;
+    /// Enter fast recovery (RFC 6937): halve `ssthresh`, pace with PRR.
+    pub fn enter_recovery(&mut self, flight: u32, snd_nxt: u32, mss: u32) {
+        self.begin_reduction(CaState::Recovery, flight, snd_nxt, mss);
     }
 
-    /// Per-ACK update during recovery. `delivered_data` is the bytes
-    /// newly acknowledged by this ACK (`new_snd_una - old_snd_una`, plus
-    /// newly-SACKed bytes once we have an RFC 6675 scoreboard). `pipe`
-    /// is the sender's estimate of bytes still in flight; without an
-    /// RFC 6675 scoreboard the caller passes the post-update
-    /// `snd.nxt - snd.una`.
-    ///
-    /// Recomputes the per-ACK `snd_credit` per RFC 6937 §3 PRR-SSRB.
-    pub fn on_ack_in_recovery(&mut self, delivered_data: u32, pipe: u32) {
-        if !self.in_recovery {
+    /// Enter CWR (RFC 3168 §6.1.2 ECN response, or RFC 8985 §7.4 repaired
+    /// tail loss): the same PRR reduction, but nothing is retransmitted.
+    pub fn enter_cwr(&mut self, flight: u32, snd_nxt: u32, mss: u32) {
+        self.begin_reduction(CaState::Cwr, flight, snd_nxt, mss);
+    }
+
+    /// Upgrade a CWR episode to fast recovery when loss is found during it
+    /// (the window was already reduced once for this round trip).
+    pub fn cwr_to_recovery(&mut self) {
+        if self.state == CaState::Cwr {
+            self.state = CaState::Recovery;
+        }
+    }
+
+    /// RFC 6937 per-ACK update. `delivered` = bytes newly cumulatively ACKed
+    /// or SACKed by this ACK; `pipe` = RFC 6675 in-flight estimate after it.
+    /// `safe_ack` = the ACK advanced `SND.UNA` and revealed no new loss
+    /// (enables PRR-SSRB's extra segment).
+    pub fn prr_update(&mut self, delivered: u32, pipe: u32, mss: u32, safe_ack: bool) {
+        if !self.in_reduction() {
             return;
         }
-        self.prr_delivered = self.prr_delivered.saturating_add(delivered_data);
-        let mss = MSS as u32;
-        let sndcnt = if pipe > self.ssthresh {
-            // Proportional Rate Reduction (the "main" PRR formula).
-            // sndcnt = ceil(prr_delivered * ssthresh / RecoverFS) - prr_out
-            let num = (self.prr_delivered as u64).saturating_mul(self.ssthresh as u64);
-            let den = self.recover_fs as u64;
-            let ceil_div = num.div_ceil(den);
-            (ceil_div.min(u32::MAX as u64) as u32).saturating_sub(self.prr_out)
+        self.prr_delivered = self.prr_delivered.saturating_add(u64::from(delivered));
+        let prr_delivered = i64::try_from(self.prr_delivered).unwrap_or(i64::MAX);
+        let prr_out = i64::try_from(self.prr_out).unwrap_or(i64::MAX);
+        let sndcnt: i64 = if pipe > self.ssthresh {
+            let num = self.prr_delivered.saturating_mul(u64::from(self.ssthresh));
+            let ceil = num.div_ceil(u64::from(self.recover_fs.max(1)));
+            i64::try_from(ceil)
+                .unwrap_or(i64::MAX)
+                .saturating_sub(prr_out)
         } else {
-            // PRR-SSRB (Slow-Start Reduction Bound): when the pipe has
-            // drained below ssthresh, use a more aggressive limit so the
-            // pipe re-fills smoothly toward ssthresh rather than stalling.
-            //
-            //   limit = max(prr_delivered - prr_out, DeliveredData) + MSS
-            //   sndcnt = min(ssthresh - pipe, limit)
-            let limit = core::cmp::max(
-                self.prr_delivered.saturating_sub(self.prr_out),
-                delivered_data,
-            )
-            .saturating_add(mss);
-            core::cmp::min(self.ssthresh.saturating_sub(pipe), limit)
+            let mut limit = prr_delivered
+                .saturating_sub(prr_out)
+                .max(i64::from(delivered));
+            if safe_ack {
+                limit = limit.saturating_add(i64::from(mss));
+            }
+            limit.min(i64::from(self.ssthresh - pipe))
         };
-        self.snd_credit = sndcnt;
+        let mut sndcnt = sndcnt.max(0);
+        // Force the fast retransmission out on the ACK that starts recovery.
+        if self.prr_out == 0 && sndcnt == 0 {
+            sndcnt = i64::from(mss);
+        }
+        let c = i64::from(pipe).saturating_add(sndcnt);
+        self.cwnd = u32::try_from(c).unwrap_or(u32::MAX).max(mss);
     }
 
-    /// Account for `bytes` that the sender has just emitted on the wire.
-    /// Decrements the PRR send credit (no-op outside recovery).
+    /// Account bytes put on the wire (PRR `prr_out`).
     pub fn on_send(&mut self, bytes: u32) {
-        if self.in_recovery {
-            self.prr_out = self.prr_out.saturating_add(bytes);
-            self.snd_credit = self.snd_credit.saturating_sub(bytes);
+        if self.in_reduction() {
+            self.prr_out = self.prr_out.saturating_add(u64::from(bytes));
         }
     }
 
-    /// If `snd_una` has crossed the recovery point, exit fast recovery
-    /// and set `cwnd = ssthresh`. Returns `true` if recovery was just
-    /// exited (caller may want to log / surface this).
-    pub fn check_exit_recovery(&mut self, snd_una: u32) -> bool {
-        if !self.in_recovery {
+    /// RFC 5681 §3.1 retransmission timeout. `ssthresh` is only reduced for
+    /// the first timeout of an episode (not again while recovering the same
+    /// window); `cwnd` collapses to one segment.
+    pub fn on_rto(&mut self, flight: u32, snd_una: u32, snd_nxt: u32, mss: u32) {
+        let episode_over = seq_ge(snd_una, self.recovery_point);
+        if matches!(self.state, CaState::Open | CaState::Cwr) || episode_over {
+            self.ssthresh = (flight / 2).max(mss.saturating_mul(2));
+        }
+        self.cwnd = mss;
+        self.ca_acc = 0;
+        self.state = CaState::Loss;
+        self.recovery_point = snd_nxt;
+    }
+
+    /// End the episode once `SND.UNA` passes the recovery point. Returns
+    /// `true` if an episode ended on this call.
+    pub fn maybe_exit(&mut self, snd_una: u32) -> bool {
+        if self.state == CaState::Open || !seq_ge(snd_una, self.recovery_point) {
             return false;
         }
-        // Wrap-aware "snd_una >= recovery_point".
-        if (snd_una.wrapping_sub(self.recovery_point) as i32) >= 0 {
+        if self.in_reduction() {
+            // RFC 6937: exit with cwnd = ssthresh.
             self.cwnd = self.ssthresh;
-            self.in_recovery = false;
-            self.snd_credit = u32::MAX;
-            return true;
         }
-        false
+        self.state = CaState::Open;
+        self.ca_acc = 0;
+        true
     }
 
-    /// Unconditionally leave fast recovery, restoring `cwnd = ssthresh` and
-    /// lifting the PRR send-credit clamp. Used as a deadlock breaker when
-    /// the pipe has drained (`flight == 0`) but PRR credit is exhausted, a
-    /// state in which recovery can otherwise never make progress because no
-    /// ACK can arrive to replenish the credit (see `maybe_send_one`). The
-    /// `ssthresh` reduction from recovery entry is retained, so the
-    /// congestion response to the loss episode is preserved.
-    pub fn force_exit_recovery(&mut self) {
-        if !self.in_recovery {
-            return;
+    /// Idle restart (RFC 5681 §4.1): after an idle period longer than one RTO
+    /// the window is reset to the restart window, `min(IW, cwnd)`.
+    pub fn on_idle_restart(&mut self, iw: u32) {
+        if self.state == CaState::Open {
+            self.cwnd = self.cwnd.min(iw);
         }
-        self.cwnd = self.ssthresh;
-        self.in_recovery = false;
-        self.snd_credit = u32::MAX;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    const M: u32 = 1000;
+
+    #[test]
+    fn slow_start_counts_bytes_then_avoids_congestion() {
+        let mut r = Reno::new(10 * M);
+        r.ssthresh = 20 * M;
+        r.on_ack(4 * M, M, true); // one stretch ACK
+        assert_eq!(r.cwnd, 14 * M);
+        r.on_ack(10 * M, M, true); // crosses ssthresh: 6 M of SS, 4 M into CA
+        assert_eq!(r.cwnd, 20 * M);
+        for _ in 0..16 {
+            r.on_ack(M, M, true);
+        }
+        assert_eq!(r.cwnd, 21 * M, "+1 MSS per cwnd's worth of ACKed bytes");
+        r.on_ack(100 * M, M, false);
+        assert_eq!(r.cwnd, 21 * M, "no growth while application-limited");
     }
 
-    /// Bytes the sender is currently authorised to keep in flight, given the
-    /// peer's advertised window. PRR's per-ACK pacing applies on top via
-    /// [`Self::snd_credit`] — the caller of `maybe_send_data` must clamp
-    /// the per-segment send to both `allowed - flight` AND `snd_credit`.
-    #[inline]
-    pub fn allowed(&self, peer_wnd: u32) -> u32 {
-        core::cmp::min(self.cwnd, peer_wnd)
+    #[test]
+    fn prr_reduces_proportionally_and_exits_at_ssthresh() {
+        let mut r = Reno::new(20 * M);
+        r.enter_recovery(20 * M, 5000, M);
+        assert_eq!(r.ssthresh, 10 * M);
+        // First ACK: one segment delivered, pipe still above ssthresh.
+        r.prr_update(M, 18 * M, M, false);
+        // ceil(1000*10000/20000) - 0 = 500 → one (rounded-up) send allowed.
+        assert_eq!(r.cwnd, 18 * M + 500);
+        r.on_send(M);
+        r.prr_update(M, 17 * M, M, false);
+        // ceil(2000*10000/20000) - 1000 = 0, and nothing is forced again.
+        assert_eq!(r.cwnd, 17 * M);
+        assert!(!r.maybe_exit(4999));
+        assert!(r.maybe_exit(5000));
+        assert_eq!(r.cwnd, 10 * M);
+        assert_eq!(r.state(), CaState::Open);
+    }
+
+    #[test]
+    fn prr_ssrb_grows_back_toward_ssthresh_when_pipe_is_low() {
+        let mut r = Reno::new(20 * M);
+        r.enter_recovery(20 * M, 5000, M);
+        r.on_send(M);
+        r.prr_update(2 * M, 2 * M, M, true);
+        // limit = max(2000-1000, 2000) + MSS = 3000; min(ssthresh-pipe=8000, 3000).
+        assert_eq!(r.cwnd, 5 * M);
+    }
+
+    #[test]
+    fn rto_collapses_window_and_reduces_ssthresh_once_per_episode() {
+        let mut r = Reno::new(40 * M);
+        r.on_rto(40 * M, 100, 9000, M);
+        assert_eq!((r.cwnd, r.ssthresh, r.state()), (M, 20 * M, CaState::Loss));
+        r.on_rto(40 * M, 100, 9000, M); // backoff of the same episode
+        assert_eq!(r.ssthresh, 20 * M, "not halved again");
+        assert!(r.maybe_exit(9000));
+        assert_eq!(r.cwnd, M, "slow start continues after RTO recovery");
+    }
+
+    #[test]
+    fn initial_window_follows_rfc6928() {
+        assert_eq!(initial_window(1460), 14_600);
+        assert_eq!(initial_window(536), 5_360);
+        assert_eq!(initial_window(9000), 18_000);
     }
 }
