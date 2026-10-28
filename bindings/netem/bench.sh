@@ -3,7 +3,7 @@
 #
 # Topology, rebuilt from scratch for every run (no cached TCP metrics):
 #
-#   tsb-tx                          tsb-mid (router)             tsb-rx
+#   $NS-tx                          $NS-mid (router)             $NS-rx
 #   tcp-sans-io ⇄ TUN tsb0 ─┐                                    kernel_peer.py
 #     (tsbench, 10.203.1.2) ├─ tx0 ══ mid0 ─[netem]─ mid1 ══ rx0  sink / source
 #   Linux TCP (10.203.0.1) ─┘        ─[netem]─                   (10.203.2.2)
