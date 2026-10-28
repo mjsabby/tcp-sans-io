@@ -19,47 +19,55 @@ async runtime** (C# / Python / Go) via a stable C ABI.
 The stack itself does no I/O. The host:
 1. Hands bytes from the WireGuard side into `tcp_inject_packet(..)`.
 2. Drains outbound bytes via `tcp_extract_packet(..)`.
-3. Calls `tcp_tick(now_ms)` periodically to drive timers.
+3. Calls `tcp_tick(now_ms)` when `tcp_next_deadline(..)` comes due (and
+   after `tcp_send`) to drive timers and transmission.
 4. Reads/writes application data via `tcp_recv(..)` / `tcp_send(..)`.
 
 ## Features (RFC matrix)
 
-The stack lands roughly at **"circa 2017-era Linux TCP"** — equivalent in
-algorithmic feature set to Linux 4.x stacks. The only major post-2017
-algorithm we don't ship is CUBIC; we use Reno-class congestion control
-with PRR and RACK-TLP loss detection.
+The loss-recovery and hardening feature set of a modern Linux TCP, minus
+CUBIC/BBR: RACK-TLP is the primary loss detector, PRR paces recovery, SACK
+and D-SACK work in both directions, timestamps carry RTT samples and PAWS,
+and the RFC 5961 / Linux-style defences and lifecycle timers are on by
+default. Congestion control is Reno (RFC 5681 + RFC 6937); *Benchmarks*
+shows what that costs against Linux CUBIC on lossy long paths.
 
-| Feature | RFC | Year | Status |
-|---|---|---|---|
-| Base state machine | RFC 9293 (793 update) | 2022 | ✅ |
-| Active + passive opens | RFC 9293 | — | ✅ both |
-| SYN cookies | RFC 4987 | 2007 | ✅ (optional) |
-| MSS option | RFC 9293 | — | ✅ |
-| Timestamps + PAWS-lite | RFC 7323 §3 | 2014 | ✅ |
-| **Window Scale** | **RFC 7323 §2** | **2014** | ✅ added in this generation |
-| SACK_PERMITTED + SACK | RFC 2018 | 1996 | ✅ multi-block, both sides |
-| Karn / RFC 6298 RTO | RFC 6298 | 2011 | ✅ |
-| Tahoe slow-start / CA | RFC 5681 | 2009 | ✅ |
-| **PRR-Reno fast recovery** | **RFC 6937** | **2013** | ✅ added in this generation |
-| **IW=10 initial window** | **RFC 6928** | **2013** | ✅ added in this generation |
-| **SACK-based selective retransmit** | **RFC 6675** | **2012** | ✅ added in this generation — scoreboard, NextSeg, multi-hole reassembly |
-| Persist (zero-window probe) | RFC 1122 §4.2.2.17 | 1989 | ✅ |
-| Delayed ACK | RFC 1122 §4.2.3.2 | 1989 | ✅ |
-| 2·MSL TIME_WAIT | RFC 793 §3.4 | 1981 | ✅ (60 s) |
-| **ECN** | **RFC 3168** | **2001** | ✅ added in this generation (ECT(0) on first data transmissions only; pure ACKs / retransmits / probes are Not-ECT per §6.1.4–6.1.6) |
-| **RACK-TLP loss detection** | **RFC 8985 + 8298** | **2021** | ✅ added in this generation — time-based loss + Tail Loss Probe |
-| **Blind-attack hardening** | **RFC 5961 §3–4** | **2010** | ✅ exact-`RCV.NXT` RST acceptance + challenge ACK; SYN-in-window challenge ACK |
-| Window-update freshness (SND.WL1/WL2) | RFC 9293 §3.10.7.4 | — | ✅ reordered stale ACKs cannot regress `snd_wnd` |
-
-### Deliberately deferred (post-2017 modernisations)
-
-| Feature | RFC | Why deferred |
+| Feature | Spec | Status |
 |---|---|---|
-| CUBIC congestion control | RFC 9438 (2024) | We use Reno-class (PRR). CUBIC is friendlier on long-fat networks; substantial state-machine change. |
-| BBR | (Google, 2016) | Bandwidth-probing CC; orthogonal architecture (model-based, not loss-triggered). |
-| TFO (TCP Fast Open) | RFC 7413 | Data-in-SYN; security model is complex. |
-| DSACK | RFC 2883 | Refinement on SACK; minor incremental win on top of RFC 6675. |
-| MPTCP | RFC 8684 | Different connection model entirely. |
+| State machine, active + passive open, simultaneous open | RFC 9293 | ✅ |
+| Half-open replacement (a new SYN recycles a stalled `SYN_RCVD` slot) | — (single-slot listener policy) | ✅ |
+| SYN cookies, keeping WS / SACK / ECN via timestamp bits | RFC 4987 | ✅ optional |
+| ISN selection | RFC 6528 | ✅ keyed by `tcp_set_secret` on passive opens; host-supplied `iss` on active |
+| MSS; MTU / PMTU (`tcp_set_mtu`, `tcp_update_pmtu`, black-hole clamp) | RFC 9293, RFC 1191, RFC 4821 (spirit) | ✅ |
+| Timestamps: RTTM, PAWS, keyed per-connection offset | RFC 7323 §3–5 | ✅ |
+| Window Scale | RFC 7323 §2 | ✅ |
+| SACK, both directions; receiver holds the whole window out of order | RFC 2018 | ✅ |
+| D-SACK, both directions (drives RACK's reordering window) | RFC 2883, RFC 3708 | ✅ |
+| RTO with Karn's algorithm | RFC 6298 | ✅ |
+| Slow start / congestion avoidance (byte counting, cwnd-limited growth) | RFC 5681, RFC 3465, RFC 7661 (spirit) | ✅ |
+| Proportional Rate Reduction | RFC 6937 | ✅ |
+| Initial window of 10 segments | RFC 6928 | ✅ |
+| RACK-TLP: time-based loss detection, tail loss probe | RFC 8985 | ✅ primary loss detection |
+| Duplicate-ACK fast retransmit (peers without SACK) | RFC 5681 §3.2 | ✅ fallback |
+| ECN (ECT(0) on new data; ECE → one CWR reduction per window) | RFC 3168 | ✅ |
+| Blind-attack hardening: RST, SYN and ACK checks, rate-limited challenge ACKs | RFC 5961 §3–5, §7 | ✅ |
+| Silly-window avoidance, sender and receiver | RFC 9293 §3.8.6.2 | ✅ |
+| Window-update rule (SND.WL1 / WL2) | RFC 9293 §3.10.7.4 | ✅ a forged future WL1 cannot freeze it |
+| Zero-window persist probes | RFC 9293 §3.8.6.1 | ✅ Linux-style probe at `SND.UNA − 1` |
+| Delayed ACK (2nd full segment / 40 ms; immediate for out-of-order and duplicates) | RFC 1122 §4.2.3.2, RFC 5681 §4.2 | ✅ |
+| R2 retransmission limit, USER TIMEOUT, keepalive | RFC 9293 §3.8.3–3.8.4 | ✅ on by default |
+| FIN_WAIT_2 timeout | Linux `tcp_fin_timeout` | ✅ 60 s |
+| TIME_WAIT, re-ACK and restart on a retransmitted FIN | RFC 9293 §3.10.7.4 | ✅ 60 s |
+
+### Deliberately deferred
+
+| Feature | Spec | Why deferred |
+|---|---|---|
+| CUBIC (+ HyStart) | RFC 9438 | The main remaining gap: on lossy long paths Linux CUBIC sustains a multiple of Reno's goodput (see *Benchmarks*). Planned as a selectable algorithm. |
+| BBR | — | Model-based congestion control; a different architecture. |
+| Pacing | — | Bursts are bounded by cwnd and PRR instead. |
+| TCP Fast Open | RFC 7413 | Data-in-SYN has a complex security model. |
+| MPTCP | RFC 8684 | A different connection model. |
 
 ### Deliberately omitted (out of scope)
 
@@ -83,27 +91,28 @@ with PRR and RACK-TLP loss detection.
 
 ### Memory footprint
 
-Per-connection: ~2.15 MiB.
+Per connection, `tcp_handle_size()` is **2,176,648 bytes (≈ 2.08 MiB)** with
+default features, or **139,272 bytes (136 KiB)** with `small-buffers`:
 
-- `BUF_CAP = 1 MiB` send ring + `1 MiB` receive ring.
-- 16 KiB out-of-order reassembly arena (4 holes × 4 KiB).
-- 24 KiB RACK send-record queue (per-segment metadata for time-based loss detection).
-- 48 KiB egress staging ring (32 packet slots × `MAX_PACKET`).
-- ~1.5 KiB SYN-cookie secret + various scalar state.
+- `BUF_CAP` send ring + receive ring (2 × 1 MiB; 2 × 32 KiB with
+  `small-buffers`). Out-of-order data is parked inside the receive ring at
+  its final offset, so the whole advertised window can be held while a hole
+  is repaired at no extra memory cost.
+- 48 KiB egress staging ring (32 × `MAX_PACKET`).
+- 24 KiB retransmission queue (1024 segment records).
+- 6 KiB out-of-order range tracker (512 ranges; 384 B / 32 ranges with
+  `small-buffers`).
+- Under 1 KiB of scalar state.
 
-Hosts that need many idle connections can shrink `BUF_CAP` (must be a power
-of two) — this is the only knob. The 1 MiB default is chosen so the receive
-window is large enough to fill the BDP of typical WAN paths (e.g. 50 ms RTT
-at 160 Mbit/s).
+The 1 MiB default lets the receive window fill typical WAN paths (1 MiB per
+RTT ≈ 168 Mbit/s at 50 ms); raise `BUF_CAP` (a power of two) for fatter
+pipes or use `small-buffers` for many mostly-idle connections.
 
-The Rust thread stack default (1 MiB on Windows, 8 MiB on Linux) is **too
-small** for a Tcb constructed as a stack local — between the 2 MiB rings,
-the 24 KiB RACK send-queue, and the 48 KiB egress ring, a Tcb is ~2.15 MiB.
-The included `.cargo/config.toml` sets `RUST_MIN_STACK = 33554432` (32 MiB)
-for the build/test environment, which comfortably fits multiple Tcbs (e.g.
-loopback tests with peer + client) per thread. Production callers route
-through the C ABI (`tcp_init`) which writes into host-provided heap
-storage, so this only affects pure-Rust users and tests.
+`tcp_init` / `Tcb::init_in_place` build the TCB directly in its storage and
+need under 32 KiB of the calling thread's stack. `Tcb::new` returns the
+whole TCB by value, so pure-Rust callers should box it (or use
+`init_in_place`); the repository's `.cargo/config.toml` raises
+`RUST_MIN_STACK` for tests that keep TCBs on the stack.
 
 ## Connection state machine
 
@@ -135,98 +144,82 @@ mis-ordering, corruption, a panic, or an unbounded loop.
 
 | Bound | Value | Where | What it limits |
 |---|---|---|---|
-| `BUF_CAP` | 1 MiB (32 KiB w/ `small-buffers`) | `lib.rs` | Send + receive ring capacity; also the un-scaled receive window = in-flight ceiling per RTT. Power of two; window-scale shift derived from it (5 at 1 MiB). |
-| `MSS` / `MAX_PACKET` | 1460 / 1500 B | `lib.rs` | Largest payload / largest emitted datagram. |
-| `REASM_CAP` / `MAX_HOLES` / `SLOT_CAP` | 16 KiB / 4 / 4 KiB | `reassembly.rs` | Out-of-order data held while waiting for gaps to fill: at most 4 disjoint runs, 4 KiB each. |
-| `SCOREBOARD_CAP` | 16 | `scoreboard.rs` | Sender-side SACK ranges tracked for RFC 6675 retransmit. |
-| `SEND_QUEUE_CAP` | 1024 | `send_queue.rs` | In-flight segment records RACK can time-based-loss-detect (≈ `BUF_CAP / MSS` with margin). Oldest evicted on overflow. |
-| `TX_RING_CAP` | 32 | `tx_ring.rs` | Egress packets staged per emit burst before the host must drain. |
-| SACK blocks emitted | ≤ 4 (≤ 3 with TS) | `tcb.rs` | Bounded by the 40-byte TCP option area. |
-| `INITIAL_WINDOW` | 10·MSS (14600 B) | `congestion.rs` | RFC 6928 initial cwnd. |
-| `RTO_MIN` / `RTO_MAX` | 200 ms / 60 s | `tcb.rs` | RTO clamp; exponential backoff is capped at `RTO_MAX`. |
-| `TLP_MIN_PTO` / `DELAYED_ACK` / `TIME_WAIT` | 10 ms / 40 ms / 60 s | `tcb.rs` | Tail-loss-probe floor, delayed-ACK timer (every 2nd segment), 2·MSL wait. |
-| `MAX_SYN_RCVD_RETRIES` | 5 | `tcb.rs` | SYN-ACK retransmits before a half-open reverts to `LISTEN` (one half-open per TCB). |
-| `MAX_RETRANSMITS` | 10 | `tcb.rs` | RFC 9293 §3.8.3 "R2": consecutive RTO timeouts (data / SYN / FIN / zero-window probe) with no proof of life before a connection aborts (~200 s at `RTO_MIN`); resets on any inbound ACK. |
-| `DEFAULT_USER_TIMEOUT_MS` | 300 s | `tcb.rs` | RFC 9293 §3.8.3 USER TIMEOUT: max time with no forward progress (`snd_una` advancing) while send data is outstanding before abort; defends the zero-window / dribbled-ACK DoS. On by default; `set_user_timeout(0)` disables. |
-| Cookie validity | 128 s | `tcb.rs` | `2 × COOKIE_TIME_BUCKET_MS`; MAC truncated to 29 bits (2⁻²⁹ blind forgery). |
+| `BUF_CAP` | 1 MiB (32 KiB w/ `small-buffers`) | `lib.rs` | Send + receive ring capacity: the receive window, out-of-order storage and the in-flight ceiling per RTT. Power of two; the window-scale shift derives from it (5 at 1 MiB). |
+| `MSS` / `MAX_PACKET` | 1460 / 1500 B | `lib.rs` | Largest payload / datagram. `tcp_set_mtu` lowers both (576–1500). |
+| `OOO_MAX_RANGES` | 512 (32 w/ `small-buffers`) | `ooo.rs` | Disjoint out-of-order ranges held in the receive ring: one per two full segments of buffer, enough for a full window with every other segment lost. |
+| `RTX_QUEUE_CAP` | 1024 | `rtx_queue.rs` | Segments in flight. When full, new data waits for ACKs; nothing is evicted, so every in-flight segment keeps SACK/RACK coverage. |
+| `TX_RING_CAP` | 32 | `tx_ring.rs` | Egress packets staged before the host must drain. |
+| SACK blocks emitted | ≤ 4 (≤ 3 with timestamps) | `tcb/output.rs` | Bounded by the 40-byte option area; dropped from full-sized data segments rather than shrinking the payload. |
+| `INITIAL_WINDOW` | 10 × SMSS (14,480 B with timestamps) | `congestion.rs` | RFC 6928 initial cwnd. |
+| `MIN_PEER_MSS` | 64 B | `tcb/mod.rs` | Floor on a peer-requested MSS (bounds per-byte header and queue cost). |
+| `RTO_MIN` / `RTO_MAX` | 200 ms / 60 s | `tcb/mod.rs` | RTO clamp; exponential backoff is capped at `RTO_MAX`. |
+| TLP PTO floor / delayed ACK / `TIME_WAIT` | 10 ms / 40 ms / 60 s | `tcb/mod.rs` | Probe timeout floor, delayed-ACK timer, 2·MSL. |
+| `MAX_SYN_RETRIES` / `MAX_SYN_RCVD_RETRIES` | 6 / 5 | `tcb/mod.rs` | SYN retransmissions before an active open fails; SYN-ACK retransmissions before a half-open reverts to `LISTEN`. |
+| `MAX_RETRANSMITS` | 10 | `tcb/mod.rs` | RFC 9293 §3.8.3 "R2": consecutive timeouts (data, FIN or unanswered zero-window probes) with no proof of life before abort. |
+| USER TIMEOUT | 300 s | `tcb/mod.rs` | Max time with outstanding send work but less than one full segment acknowledged; defeats slow-reader and zero-window pinning. `set_user_timeout(0)` disables. |
+| Keepalive | 600 s idle / 60 s / 4 probes | `tcb/mod.rs` | Reaps a vanished peer on an idle connection. `set_keepalive(0, …)` disables. |
+| FIN_WAIT_2 timeout | 60 s | `tcb/mod.rs` | Time a peer may leave its half open after ACKing our FIN (refreshed by its data). |
+| Out-of-window reply rate | 1 per 500 ms | `tcb/mod.rs` | Challenge ACKs, dup ACKs for unacceptable segments and RSTs to stray segments, per connection. |
+| Cookie validity | 64–128 s | `tcb/cookie.rs` | Two 64 s buckets; 29-bit SipHash MAC (2⁻²⁹ blind forgery per attempt). |
 
 ### Why the bounds are sound
 
 The receiver only ever delivers a **contiguous prefix** starting at
 `rcv_nxt`, and only ever cumulatively ACKs / SACKs data it is actually
 holding. So any byte the stack cannot store is simply never acknowledged,
-and the peer retransmits it (via RACK/fast-retransmit once the gap is
-visible, or the RTO safety net). Concretely:
+and the peer retransmits it. Concretely:
 
-- **Reassembly overflow** (a 5th simultaneous hole, or a run that
-  outgrows its 4 KiB slot) → the un-storable segment is **dropped**, not
-  mis-filed. `rcv_nxt` doesn't advance over a gap, the dropped range is
-  never SACKed, and the sender resends it. The application can never
-  observe a gap or out-of-order bytes.
-- **`SEND_QUEUE_CAP` overflow** → the *oldest* record is evicted. That
-  segment loses RACK time-based detection but is still covered by RTO, so
-  it is recovered, just later.
-- **`SCOREBOARD_CAP`** comfortably exceeds the ≤ 4 SACK blocks a
-  compliant peer can send (option-space limited); crafted excess is
-  merged, never overflowed.
-- **`TX_RING_CAP` full** → emit returns "ring full", the caller drains
-  and re-ticks; bookkeeping (`snd_nxt`, FIN state) is *not* advanced, so
-  nothing is skipped.
-- **Receive ring full** (app not draining) → `drain_reassembly` stops and
-  the advertised window shrinks toward zero. The peer stalls on flow
-  control (correct backpressure), and the zero-window persist timer keeps
-  the connection alive.
+- **Out-of-order tracker full** (a 513th disjoint range) → the segment is
+  dropped, never SACKed, and resent by the peer. Nothing already SACKed is
+  ever discarded (no reneging). The application can never observe a gap.
+- **Retransmission queue full** → no new segment is sent until an ACK frees
+  a record; recovery state is never lost.
+- **`TX_RING_CAP` full** → emit returns "ring full" and bookkeeping
+  (`snd_nxt`, FIN state) is not advanced, so nothing is skipped; the host
+  drains and ticks again.
+- **Receive ring full** (application not reading) → the advertised window
+  shrinks to zero, the peer stalls on flow control, and persist probes keep
+  the connection alive until the USER TIMEOUT applies.
 
-In other words, shrinking `BUF_CAP` to 32 KiB or `MAX_HOLES` to 1 changes
-throughput under loss, never the bytes the application sees.
+Shrinking `BUF_CAP` changes throughput, never the bytes the application
+sees.
 
-### What "4 reassembly holes" actually costs
+### Out-of-order capacity
 
-`MAX_HOLES = 4` × `SLOT_CAP = 4 KiB` means the receiver can absorb up to
-four disjoint loss gaps (or ~16 KiB of out-of-order data) per window and
-recover them in a single RTT via SACK-driven selective retransmit:
-
-- **Light/moderate loss** (the WireGuard-tunnel target): a window rarely
-  has more than one or two holes, so 4 is ample and recovery is
-  one-RTT — indistinguishable from a 16-hole Linux receiver.
-- **Heavy/bursty loss** (> 4 gaps in one window, e.g. a long burst drop):
-  the 5th+ gap's data is dropped and re-fetched only after an earlier
-  hole drains, so recovery for the excess degrades from "one RTT" toward
-  RTO-paced, go-back-N-like behaviour. Throughput drops; **correctness is
-  untouched.**
-- **`SLOT_CAP = 4 KiB`**: an individual TCP segment (≤ MSS = 1460 B)
-  always fits; the cap only limits how large a single *accumulated*
-  contiguous out-of-order run can grow before it needs a second slot.
-
-Raising `MAX_HOLES` improves heavy-loss throughput at a linear memory
-cost (`MAX_HOLES × SLOT_CAP`) and a small constant per-segment CPU cost
-(insert/merge and SACK generation are O(`MAX_HOLES`)). It is a deliberate
-footprint-vs-loss-resilience trade, not a correctness decision.
+Out-of-order bytes are written straight into the receive ring at their
+final offset, so the receiver holds everything inside its advertised window
+while holes are repaired, as Linux does. Only the number of disjoint ranges
+is bounded. 512 covers the worst realistic pattern: a slow-start overshoot
+into a tail-drop queue that loses every other segment of a full window. (A
+32-range tracker could not; the link simulation in `src/sim_tests.rs`
+caught it forcing 66 avoidable retransmissions in a single overshoot.) An arriving
+segment costs a binary search, plus an O(ranges) shift of 12-byte records
+when a hole closes.
 
 ### Termination and resource safety
 
-These bounds are also what make the stack **DoS-resistant and
-hang-free** against a hostile peer:
+These bounds also make the stack **DoS-resistant and hang-free** against a
+hostile peer:
 
 - **No unbounded loops.** Every loop reachable from `inject_packet` /
-  `tick` / `send` is bounded by one of: a fixed-capacity array, a
-  strictly-advancing index ≤ a slice length (e.g. TCP-option parsing), a
-  strictly-decreasing variant (merge passes), or an explicit
-  `loop_budget_exhausted` guard on the four invariant-dependent loops
-  (send-emit, reassembly drain, SACK `next_seg` / `first_unsacked`).
-  Those guards `panic!` under test/fuzz builds (caught immediately) and
-  degrade to a graceful stop in the shipped `no_std` build (no CPU-spin
-  DoS). See `fuzz/` for the livelock and bounded-output oracles.
-- **No amplification.** One inbound segment stages at most a bounded
-  burst (≤ `TX_RING_CAP`) before the host must drain; there is no
-  reflection multiplier.
-- **No state exhaustion.** One half-open per TCB with a 5-retransmit
-  budget, or stateless SYN cookies; no allocator to drain.
+  `tick` / `send` is bounded by a fixed-capacity structure, a
+  strictly-advancing index, or (for the transmit loop) an explicit
+  `loop_budget_exhausted` guard that panics under test/fuzz builds and
+  stops gracefully in the shipped build.
+- **No busy timers.** After `tick()` at `now`, `tcp_next_deadline()` is
+  always later than `now`, so an event-driven host never spins (checked by
+  the link simulation on every step).
+- **No amplification.** One inbound segment stages at most `TX_RING_CAP`
+  packets, and replies to unacceptable segments are rate-limited per
+  connection.
+- **No state exhaustion inside a TCB.** One half-open per listener TCB
+  with a bounded SYN-ACK budget, or stateless SYN cookies; no allocator to
+  drain. (Bounding the *number* of TCBs is the host's job.)
 - **No information disclosure.** Emitted packets are built in
-  zero-initialised scratch with headers `fill(0)`'d and exactly the
-  payload bytes copied; the egress ring returns exactly the emitted
-  length; `tcp_init` writes a fresh, zeroed `Tcb` over reused host
-  storage. A peer cannot read uninitialised or prior-connection memory.
+  zero-initialised scratch with exactly the payload bytes copied;
+  `tcp_init` zeroes reused storage; timestamps are offset per connection
+  by a keyed hash (with `tcp_set_secret`) so they reveal neither the host
+  clock nor a cross-connection correlator.
 
 ## Clock model and tick cadence
 
@@ -235,8 +228,8 @@ Probe (TLP), delayed-ACK, `TIME_WAIT`, zero-window persist probing, and
 RACK's reordering window are all driven by elapsed time, not by packets
 alone. This stack handles that without owning a clock, threads, or
 syscalls: **`now_ms` (`u64` milliseconds) is supplied by the host** on
-every `tcp_tick`, `tcp_inject_packet`, `tcp_send`, `tcp_close`, and
-`tcp_abort` call. The stack has no other notion of time.
+every `tcp_tick`, `tcp_inject_packet`, `tcp_connect` / `tcp_listen`,
+`tcp_close` and `tcp_abort` call. The stack has no other notion of time.
 
 That is the core reason the library is shaped this way. A sans-I/O stack
 with an **external clock source** is a pure, deterministic function of
@@ -246,29 +239,36 @@ gVisor chaos harness advances a virtual clock by hand to reproduce loss
 and reordering byte-for-byte. The same code path runs in production
 against a real monotonic clock. There is no hidden timer thread to mock.
 
-**What needs a periodic `tick()`.** Responses to events — an ACK or data
-segment triggered by an inbound packet, or by an application `send()` —
-are emitted *inline* during `inject`/`send`. But timer *expiry* (RTO
-retransmit, TLP probe, `TIME_WAIT` reaping, persist probe, a delayed-ACK
-that didn't get piggybacked) is evaluated only inside `tick()`. So the
-host must call `tcp_tick(now_ms)` **periodically even when no packets are
-arriving**, or those timers never fire.
+**What drives output.** Responses to inbound packets (ACKs,
+retransmissions, newly permitted data) are staged *inline* during
+`inject`; `close` stages the FIN and `recv` may stage a window update.
+`send` only buffers: the next `tick` (or inbound ACK) turns the bytes into
+segments. Timer *expiry* (RTO, TLP, RACK reorder timer, persist,
+keepalive, delayed ACK, FIN_WAIT_2, `TIME_WAIT`, USER TIMEOUT) is evaluated
+only inside `tick()`.
+
+**When to tick.** `tcp_next_deadline()` (`Tcb::next_deadline`) returns the
+absolute `now_ms` at which `tick()` next has timer work, or `UINT64_MAX`
+when nothing is armed. An event-driven host sleeps until the earlier of
+that deadline and the next datagram, then ticks — idle connections cost
+nothing, and after a tick the deadline is always in the future (no
+spinning). Also tick right after `send`, and after draining a full egress
+ring. Hosts that cannot track deadlines tick every ~10 ms instead.
 
 **How fast does the clock need to drive?** The timer floors are:
 
 | Timer | Floor | Effect of a coarse/late tick |
 |---|---|---|
-| RACK reorder window | `max(SRTT/4, 1 ms)` | Loss declared slightly later on low-RTT reordering paths. |
+| RACK reorder window | `min_RTT/4` (× D-SACK multiplier, ≤ SRTT) | Loss declared slightly later on low-RTT reordering paths. |
 | TLP PTO | `max(2·SRTT, 10 ms)` | Tail-loss probe fires up to one tick late. |
 | Delayed ACK | 40 ms | ACK latency rises by up to one tick. |
 | RTO | `200 ms … 60 s` | Negligible: a 10 ms tick is 20× finer than the floor. |
 | `TIME_WAIT` | 60 s | Irrelevant to cadence. |
 
-A **~10 ms periodic tick with 1–2 ms of jitter is more than adequate** —
-it matches the TLP floor and is far finer than `RTO_MIN`. Driving finer
-(1–2 ms) only helps RACK on very-low-RTT LAN paths where `SRTT/4` dips
-below 10 ms; on WAN/tunnel paths the reorder window is already ≥ 10 ms,
-so 10 ms loses nothing. **Cadence and jitter affect only loss-recovery
+Without deadline tracking, a **~10 ms periodic tick with 1–2 ms of jitter
+is adequate** — it matches the TLP floor and is far finer than `RTO_MIN`.
+Finer only helps RACK on very-low-RTT LAN paths where `min_RTT/4` dips
+below 10 ms. **Cadence and jitter affect only loss-recovery
 latency and ACK timing — never correctness** (per the bounds invariant
 above): a coarse or jittery clock makes recovery slower, never wrong.
 
@@ -278,146 +278,183 @@ above): a coarse or jittery clock makes recovery slower, never wrong.
   `clock_gettime(CLOCK_MONOTONIC)`, `QueryPerformanceCounter` — not
   wall-clock. A backward step just postpones timers and a large forward
   jump fires them early; both are harmless but best avoided.
-- The recommended driving pattern is **event + periodic**: call `tick()`
-  with a fresh `now_ms` right after a batch of injects (so responses are
-  clocked correctly) and from a periodic timer at your finest affordable
-  cadence (1–10 ms) for the idle case. Pass the *same* `now_ms` you read
-  for that turn into every call in the turn.
+- The recommended driving pattern is **event-driven**: tick with a fresh
+  `now_ms` after a batch of injects and sends, and sleep until
+  `tcp_next_deadline()` otherwise. Pass the *same* `now_ms` you read for
+  that turn into every call in the turn.
 
-## How will it perform in 2026?
+## How does it perform?
 
-Honest assessment by path profile (in-process numbers; see *Benchmarks*
-below for real-network):
+Measured against Linux on the same emulated paths (next section), as a
+sender and as a receiver:
 
-| Path | How we'd do |
+| Path | Result |
 |---|---|
-| LAN / datacenter, low loss | ✅ Fine. PRR + RFC 6675 + WS + IW=10 give modern-class behavior. |
-| Typical Internet WAN (50 ms RTT, 0.1-1 % loss) | ✅ Workable, close to CUBIC for steady-state bulk. RFC 6675 selective retransmit handles multi-loss episodes in one RTT. RACK-TLP catches tail losses without waiting for RTO. |
-| Wireless / cellular (1-5 % loss, reordering) | ✅ RACK-TLP handles reordering-prone paths well; reo_wnd grows with SRTT. Without CUBIC the per-ACK growth is slower at very high BDPs. |
-| High-BDP (transcontinental 10G) | 🟡 Capped by `BUF_CAP`: ~`1 MiB / RTT` ≈ 160 Mbit/s at 50 ms. Bump `BUF_CAP` to lift the ceiling. CUBIC would help fill the larger pipe faster. |
+| Clean LAN / WAN | Line rate, indistinguishable from Linux. |
+| Random loss (0.1–5 %) | Reno-class, as the Mathis model predicts: at or above Linux Reno; at these RTTs Linux CUBIC is in its Reno-friendly region and does no better. |
+| Shallow bottleneck buffers | Slightly above Linux Reno, about 10 % below Linux CUBIC. |
+| Slow-start exit | Overshoots like Linux Reno (no HyStart): a queue's worth of drops, repaired by SACK + RACK without a timeout. CUBIC's HyStart avoids most of them. |
+| Reordering | Learned via D-SACK; spurious reductions are undone. |
+| As a receiver | Linux CUBIC reaches the same goodput sending to tcp-sans-io as to Linux. |
+| Long fat pipes | Capped by `BUF_CAP` (1 MiB per RTT ≈ 168 Mbit/s at 50 ms) and Reno's linear growth; CUBIC would help here. |
 
-The remaining algorithmic gap vs. Linux 5.x/6.x is **CUBIC** as the
-default CC algorithm. PRR-Reno is adequate at moderate BDPs; CUBIC's
-bigger win shows up on long-fat networks where Reno's per-RTT cwnd
-increase paces too slowly.
+In every measured cell each retransmission repaired a real drop and no RTO
+fired.
 
 ## Benchmarks
 
-End-to-end against the **real Linux kernel TCP stack** via a TUN device +
-`tc-netem` for controlled loss/latency. 32 MiB unidirectional transfer
-(cdylib sender → kernel listener). Single-core, Linux 7.0 / Ubuntu, on a
-fast desktop CPU. See `bindings/netem/bench_test.go`.
+### Method
 
-### Headline numbers
+`bindings/netem/bench.sh` compares tcp-sans-io with Linux TCP on the
+**same path**. Every run builds three network namespaces from scratch: a
+sender (tcp-sans-io behind a TUN device, IP-forwarded, or a Linux socket),
+a router, and a receiver whose Linux socket measures goodput the same way
+for every stack. The router shapes both directions: data gets netem delay
+(RTT/2), random loss and a rate-limited bottleneck with a tail-drop queue;
+ACKs get the other RTT/2. Each run records goodput (connection established
+→ last byte), the sender's retransmitted segments (`tcp_get_stats` /
+`TCP_INFO`), the router's drops and the receiver's duplicates (D-SACKs).
+Five runs per cell; medians with min–max.
 
-| Profile | RTT (perceived) | Throughput |
-|---|---|---|
-| Baseline (no qdisc) | <1 ms | **607 MiB/s** (4.86 Gbit/s) |
-| LAN: 1 ms each-way delay | 1 ms | **549 MiB/s** (4.39 Gbit/s) |
-| WAN: 25 ms each-way delay | ~25 ms | **32 MiB/s** (255 Mbit/s) |
-| High-BDP: 100 ms each-way delay† | ~100 ms | **8 MiB/s** (64 Mbit/s) |
-| Lossy: 1% loss + 5 ms delay | ~5 ms | **157 MiB/s** (1.25 Gbit/s) |
-| Lossy: 5% loss + 5 ms delay | ~5 ms | **157 MiB/s** (1.25 Gbit/s) |
+The harness avoids four traps that each distorted an earlier set of
+numbers (including this README's previous table):
 
-† requires kernel-side `tcp_rmem` tuned to ≥ 1 MiB initial (see "Tuning"
-below); with the default Linux ~87 KiB initial receive buffer the same
-profile is bound to ~7 Mbit/s by kernel auto-tuning, not by our stack.
+1. **Shaping the TUN's root qdisc shapes only kernel egress** — for an
+   upload that is the ACK path, so "1 % loss" runs had a lossless data
+   path (the old 157 MiB/s at 1 % loss).
+2. **Linux TCP builds GSO super-packets even with `ethtool -K … gso off`**
+   and segments them after the qdisc, so netem drops multi-segment bursts
+   as one packet. `gso_max_segs 1` on every veth makes all stacks' packets
+   alike.
+3. **A qdisc on the sender's own interface reports tail drops to local TCP
+   synchronously**, which resends without counting a loss — flattering
+   Linux senders. The bottleneck therefore sits on a router.
+4. **TUN writes from a thread that migrates between CPUs** land on
+   different CPUs' backlogs and can be forwarded out of order — reordering
+   no Linux sender sees. The sending endpoint is pinned to one CPU.
 
-### What this tells you
+Host: AMD Ryzen 9 9950X, Linux 7.3, Ubuntu 26.04. tcp-sans-io uses its
+default 1 MiB buffers; Linux uses the host's `tcp_rmem` / `tcp_wmem`.
 
-1. **The cdylib is fast.** Single-core, single-flow, the stack sustains
-   ~5 Gbit/s of TCP wire processing — well above what any realistic
-   WireGuard tunnel will push at it.
-2. **PRR handles loss gracefully.** 1% and 5% loss give *the same*
-   throughput (1.25 Gbit/s, ~25% of clean baseline). This is the PRR
-   payoff vs Tahoe's "collapse to 1 MSS on every loss event."
-3. **Throughput tracks BDP at high RTT.** At 25 ms perceived RTT we hit
-   32 MiB/s, close to the `BUF_CAP / RTT` = 40 MiB/s BDP ceiling. At
-   100 ms we hit 8 MiB/s, close to 10 MiB/s BDP. **The stack's window
-   scaling + 1 MiB BUF_CAP is what makes this possible** — without WS
-   we'd cap at 64 KiB / RTT = 640 KiB/s at 100 ms RTT, ~12× worse.
-4. **The kernel-side recv buffer matters.** Linux defaults
-   `tcp_rmem = 4096 87380 6291456` (4 KiB min, 87 KiB initial, 6 MiB
-   max). At 100 ms RTT the kernel's slow auto-tune of the receive
-   window is the bottleneck, not us; tuning the initial value to 1 MiB
-   lifts throughput 10×.
+| Profile | RTT | Bottleneck | Loss | Queue | Transfer |
+|---|---|---|---|---|---|
+| lan | 1 ms | 1 Gbit/s | 0 | 200 pkts | 512 MiB |
+| wan | 40 ms | 100 Mbit/s | 0 | 160 pkts | 128 MiB |
+| wan-0.1 | 40 ms | 100 Mbit/s | 0.1 % | 160 pkts | 32 MiB |
+| wan-1 | 40 ms | 100 Mbit/s | 1 % | 160 pkts | 8 MiB |
+| metro-0.1 | 10 ms | 200 Mbit/s | 0.1 % | 80 pkts | 64 MiB |
+| lossy-5 | 20 ms | 50 Mbit/s | 5 % | 80 pkts | 4 MiB |
+| shallow | 20 ms | 100 Mbit/s | 0 | 16 pkts | 128 MiB |
 
-### Bottleneck analysis (test harness ≠ stack)
+### Results
 
-An earlier version of the test harness used a dedicated goroutine for
-TUN reads + a channel to the main pump. That serialised badly under Go's
-scheduler and gave a *misleading* 10 Mbit/s ceiling (the kind of number
-that makes you think "1.3 MiB/s, why is this stack so slow?"). Running
-under `strace` happened to fix it by forcing context switches at every
-syscall, which made the goroutines interleave properly.
+Upload — the compared stack sends to a Linux receiver. Goodput in MiB/s,
+median (min–max) of 5 runs; retransmitted segments / router drops, medians.
 
-**The current harness** inlines non-blocking TUN reads in the main pump
-(no goroutine, no channel) and the numbers above are what falls out.
-Under `perf stat`: 139 ms CPU time for a 108 ms wall transfer
-(≈ 1.3 cores busy), low cache-miss rate, ~640 M instructions per 32 MiB
-= ~20 instr/byte. CPU-bound but reasonably so.
+| Profile | tcp-sans-io | Linux Reno | Linux CUBIC | Retransmits / drops: tcp-sans-io · Reno · CUBIC |
+|---|---|---|---|---|
+| lan | 113.78 (113.71–113.86) | 113.82 (113.82–113.83) | 113.82 (113.82–113.83) | 230 / 230 · 193 / 193 · 41 / 41 |
+| wan | 10.80 (10.80–10.80) | 10.77 (10.77–10.77) | 11.22 (11.21–11.23) | 236 / 236 · 449 / 449 · 20 / 20 |
+| wan-0.1 | 1.62 (1.28–2.08) | 1.57 (1.46–2.69) | 1.66 (1.09–2.14) | 197 / 197 · 23 / 23 · 37 / 37 |
+| wan-1 | 0.50 (0.45–0.61) | 0.41 (0.36–0.55) | 0.44 (0.40–0.59) | 56 / 57 · 58 / 58 · 55 / 55 |
+| metro-0.1 | 5.95 (5.54–6.91) | 5.63 (4.95–6.07) | 5.06 (5.05–5.69) | 278 / 278 · 270 / 270 · 69 / 69 |
+| lossy-5 | 0.41 (0.41–0.45) | 0.32 (0.30–0.33) | 0.25 (0.23–0.29) | 152 / 152 · 150 / 150 · 145 / 145 |
+| shallow | 9.26 (9.26–9.73) | 9.13 (9.13–9.13) | 10.24 (10.24–10.24) | 160 / 160 · 155 / 155 · 145 / 145 |
 
-The remaining cost is dominated by:
-- ~1 cgo crossing per emitted/injected packet (~150 ns each).
-- 1 `write(2)` + 1 `read(2)` syscall per packet on the TUN fd (~1 µs each).
-- The stack's own per-packet work (parse/emit + state update) is in the
-  noise: < 200 ns per packet.
+Download — Linux CUBIC sends; the compared stack receives (5 runs for
+tcp-sans-io; 10 for Linux, 15 on `lan`).
 
-### FFI batching (Phase 8: tx_ring)
+| Profile | tcp-sans-io receiver | Linux receiver | Sender retransmits / drops: to tcp-sans-io · to Linux |
+|---|---|---|---|
+| lan | 113.79 (113.78–113.80) | 113.79 (113.79–113.80) | 44 / 43 · 43 / 41 |
+| wan | 11.17 (11.17–11.17) | 11.19 (11.19–11.19) | 26 / 26 · 20 / 20 |
+| wan-0.1 | 1.80 (1.73–1.91) | 1.85 (1.44–2.84) | 46 / 46 · 37 / 37 |
+| wan-1 | 0.41 (0.38–0.50) | 0.43 (0.35–0.53) | 58 / 58 · 58 / 58 |
+| metro-0.1 | 5.57 (4.95–5.72) | 5.33 (4.50–6.30) | 62 / 62 · 60 / 60 |
+| lossy-5 | 0.24 (0.24–0.25) | 0.26 (0.21–0.30) | 159 / 157 · 146 / 146 |
+| shallow | 10.25 (10.25–10.25) | 10.23 (10.19–10.36) | 158 / 158 · 145 / 145 |
 
-The egress staging used to be a single-packet slot (`tx_buf`,
-`tx_len`), so `maybe_send_data` could only queue one segment per call
-and the host had to do one extract per packet. Concretely, a 32 MiB LAN
-transfer drove these FFI call counts (measured via the `bindings/bpf`
-uprobes):
+CPU: the tcp-sans-io endpoint process (stack, cgo, Go runtime and one TUN read/write syscall per packet) used 1.95 CPU-seconds per GiB sent at 1 Gbit/s.
 
-| FFI entry point | Before (single-slot) | After (tx_ring) | Change |
-|---|---:|---:|---:|
-| `tcp_tick` | 23,935 | 1,821 | −92 % |
-| `tcp_send` | 22,704 | 1,390 | −94 % |
-| `tcp_extract_packet` | 47,115 | 25,351 | −46 % |
-| `tcp_inject_packet` | 23,175 | 22,048 | (peer ACK rate; unchanged) |
+Reading the numbers:
 
-`maybe_send_data` is now a loop that drains as many segments as cwnd /
-PRR-credit / peer-window allow, staging them into a 32-slot `TxRing`
-(48 KiB per connection). The host still pops them one at a time via
-`tcp_extract_packet`, but a single tick / inject round amortises the
-~150 ns cgo crossing across an entire IW=10 burst (or RACK / RFC 6675
-fan-out during recovery). LAN throughput moved modestly (~549 MiB/s →
-~560 MiB/s) because the harness was already syscall-bound; the bigger
-win is that per-connection CPU cost is now sub-linear in segment count,
-which matters for multi-connection scaling.
+- **Clean paths**: line rate, the same as Linux.
+- **Random loss**: Reno-class goodput, at or above Linux Reno. At these
+  RTTs Linux CUBIC runs in its Reno-friendly region and is no faster; the
+  0.1 % profiles vary most because the first random loss decides when slow
+  start ends.
+- **Efficiency**: tcp-sans-io's retransmissions match router drops in
+  every cell, and no stack needed an RTO. The extra retransmissions in the
+  `lan` and `lossy-5` download rows are Linux's; on `lan`, packet captures
+  show it reacting to our ACKs being reordered on the harness's TUN path
+  (their IP IDs arrive out of order). The same effect on data packets is
+  why `bench.sh` pins the sending endpoint to one CPU.
+- **Slow-start overshoot**: like Linux Reno, tcp-sans-io (no HyStart)
+  overflows the queue once at the end of slow start (`wan`: 236 drops; Reno
+  449) and repairs it without a timeout; CUBIC's HyStart exits early
+  (20 drops).
+- **As a receiver**, tcp-sans-io lets Linux CUBIC reach the same goodput as
+  a Linux receiver does.
 
-Lifting the ~5 Gbit/s ceiling further would require:
-1. Batched FFI (multiple packets per cgo crossing).
-2. Or `sendmmsg(2)` / `recvmmsg(2)` for the TUN fd (batch syscalls).
-3. Or skipping cgo entirely (e.g. native Rust host).
+### Before and after the hardening
 
-### Tuning the kernel for high-BDP tests
+The same harness driving the pre-hardening library (commit `7dfe00b`),
+upload direction (3 runs; 1 run for `wan` and `shallow`, where the old
+stack needs minutes):
 
-```sh
-sudo sysctl -w net.ipv4.tcp_rmem='4096 1048576 16777216' \
-                net.ipv4.tcp_wmem='4096 1048576 16777216'
-```
+| Profile | Before: goodput MiB/s | Before: router drops / receiver duplicates | After: goodput MiB/s | After: router drops / receiver duplicates |
+|---|---|---|---|---|
+| wan | 1.00 | 14314 / 27354 | 10.80 (10.80–10.80) | 236 / 0 |
+| wan-0.1 | 1.21 (1.15–1.22) | 449 / 4961 | 1.62 (1.28–2.08) | 197 / 0 |
+| wan-1 | 0.33 (0.33–0.41) | 146 / 1251 | 0.50 (0.45–0.61) | 57 / 0 |
+| lossy-5 | 0.23 (0.21–0.24) | 312 / 781 | 0.41 (0.41–0.45) | 152 / 0 |
+| shallow | 0.67 | 9671 / 24215 | 9.26 (9.26–9.73) | 160 / 0 |
+
+The old stack retransmitted data the receiver already held (tens of
+thousands of duplicates) until its own retransmissions overflowed the
+queue; a single slow-start overshoot was enough to collapse a clean path.
+
+### Deterministic link simulation
+
+`src/sim_tests.rs` runs two TCBs against each other over a seeded
+discrete-event link and asserts efficiency, not just completion
+(`cargo test --release --lib sim_tests -- --nocapture` prints one line per
+scenario):
+
+| Scenario | Goodput | Retransmits / drops | RTOs | TLPs | Duplicates at receiver |
+|---|---|---|---|---|---|
+| 50 Mbit/s, 20 ms, 64-packet queue (slow-start overshoot) | 5.73 MB/s (95 % of line rate) | 129 / 129 | 0 | 0 | 0 |
+| 1 % random loss, 20 ms | 0.97 MB/s (1.09 × Mathis) | 34 / 34 | 0 | 0 | 0 |
+| 1 % random loss, 50 ms | 0.35 MB/s (0.99 × Mathis) | 34 / 34 | 0 | 0 | 0 |
+| 0.1 % random loss, 20 ms | 9.43 MB/s | 1 / 1 | 0 | 0 | 0 |
+| 40 consecutive packets lost in one window | 9.62 MB/s | 40 / 40 | 0 | 0 | 0 |
+| Last 3 of 10 segments lost | repaired in 150 ms | 3 / 3 | 0 | 1 | 0 |
+| 2 % reordering (+4 ms), no loss | 5.69 MB/s (94 % of line rate) | 1 / 0 | 0 | 0 | 1 (learned via D-SACK, reduction undone) |
+| 20 % ACK loss | 5.56 MB/s | 0 / 0 | 0 | 0 | 0 |
+| Both directions, 1 % loss each way | 1.15 MB/s | 9 / 9 | 0 | 0 | 0 |
+| Slow reader (500 KB/s) | 0.50 MB/s | 0 / 0 | 0 | 0 | 0 |
+| 6 chaos seeds: 2 % loss + 3 % reordering both ways, sequence wrap | 1.5–3.3 MB/s | 102 / 88 | 0 | 0 | 8 (reordering) |
 
 ### Reproducing
 
 ```sh
-cargo build --release --lib
-cd bindings/netem
-sudo -E env PATH=$PATH go test -v -timeout 300s -run TestNetem_ ./...
+sudo -v                                   # the script re-execs under sudo
+bindings/netem/bench.sh                   # all profiles, 5 runs, both directions
+bindings/netem/bench.sh --profiles "wan-1 shallow" --runs 3 --dir up \
+    --stacks "tcp-sans-io reno cubic"
+bindings/netem/bench.sh --profiles wan-1 --baseline-lib /path/to/old/target/release
 ```
 
-Requires root for `/dev/net/tun` + `ip(8)` + `tc(8)`. Tests self-skip
-otherwise. Sequential runs can race on the listener port being in
-`TIME_WAIT`; the easy workaround is one test per `go test -run` invocation
-with a short sleep between.
+Requires root, `ip`, `tc` (netem), `ethtool`, `taskset`, Go and Python 3.
+Results go to `bindings/netem/results-*.jsonl`; `summarize.py` renders the
+tables. `TSB_PCAP=dir` captures each run's packet headers at the receiver;
+`TSB_CPU=n` picks the CPU the sending endpoint is pinned to (default 2).
 
 ## Building
 
 ```sh
 cargo build --release --lib       # cdylib + staticlib + rlib
-cargo test  --release --lib       # 116 tests (loopback + conformance + property + server + RACK/send-queue/tx-ring units + smoltcp interop)
+cargo test  --release --lib       # 207 tests: unit, conformance, loopback, property, server, security regressions, link simulation, smoltcp interop
 cargo clippy --release --lib --no-deps -- -D warnings
 ```
 
@@ -468,14 +505,23 @@ to put on the wire and hands you back the bytes the peer sent.
    The stack hands you complete IP datagrams to send and expects complete
    IP datagrams back.
 4. **A driver loop** that pumps the four interaction points (inject /
-   tick / extract / send-recv) and calls `tick()` **periodically even when
-   idle**.
-5. **A high-entropy `iss`** (RFC 6528) per connection — derive it from a
-   CSPRNG, never a counter. Servers that want stateless SYN-cookie flood
-   resistance also pass a 16-byte CSPRNG secret to `tcp_set_cookie_secret`.
-6. **5-tuple demux** — route each inbound datagram to the TCB that owns
+   tick / extract / send-recv) and ticks when `tcp_next_deadline()` comes
+   due (or periodically) **even when idle**.
+5. **Secrets and ISNs** — a high-entropy `iss` (RFC 6528) per active open
+   from a CSPRNG, never a counter; and, for anything internet-facing, a
+   16-byte CSPRNG secret via `tcp_set_secret` (keys timestamp offsets and
+   passive-open ISNs). Listeners exposed to SYN floods also install a
+   cookie secret with `tcp_set_cookie_secret` and rotate it.
+6. **The path MTU** — `tcp_set_mtu` before the handshake when the tunnel
+   MTU is below 1500 (1420 for a default WireGuard interface), and
+   `tcp_update_pmtu` if you receive ICMP "fragmentation needed".
+7. **5-tuple demux** — route each inbound datagram to the TCB that owns
    its 4-tuple. The stack rejects mismatches with `NOT_FOR_US`, but you
    shouldn't rely on that for routing N connections.
+8. **Admission control** — a cap on concurrent TCBs (including those in
+   `TIME_WAIT`, which hold their storage for 60 s) and on half-open
+   listeners per source; the stack bounds each connection, never the
+   count.
 
 ### The canonical pump loop
 
@@ -489,12 +535,14 @@ if (tcp_selftest() != 0) abort();      // smoke-test linkage/ABI/health first
 void* mem = aligned_alloc(tcp_handle_align(), tcp_handle_size());
 tcp_init(mem, local_ip, local_port, remote_ip, remote_port,
          csprng_u32(), /*initial_rto_ms=*/1000);
+tcp_set_secret(mem, host_secret16);    // 16 CSPRNG bytes, shared host-wide
+tcp_set_mtu(mem, 1420);                // e.g. behind a default WireGuard link
 tcp_connect(mem, now_ms());            // or tcp_listen(mem, now_ms())
 
 uint8_t pkt[1500];                     // MUST be >= tcp_max_packet()
 size_t  n;
 
-// --- per turn (run on packet arrival AND on a ~1-10 ms periodic timer) ---
+// --- per turn: on packet arrival, app activity, or tcp_next_deadline() ---
 uint64_t now = now_ms();               // one clock read; reuse all turn
 
 // 1. Feed every inbound datagram, draining responses after each.
@@ -517,6 +565,7 @@ if (ev & TCP_EV_WRITABLE) {
 if (ev & TCP_EV_READABLE) {
     size_t r;
     int rc = tcp_recv(mem, app_in, sizeof app_in, &r);  // rc == CONNECTION_CLOSED ⇒ peer EOF
+    // (recv may stage a window update; step 3 drains it.)
 }
 
 // 3. Drive timers (RTO / TLP / TIME_WAIT / persist / delayed-ACK) AND flush
@@ -524,6 +573,10 @@ if (ev & TCP_EV_READABLE) {
 tcp_tick(mem, now);
 while (tcp_extract_packet(mem, pkt, sizeof pkt, &n) == 0 && n > 0)
     wire_send(pkt, n);
+
+// 4. Sleep until the next datagram or timer, whichever is first.
+uint64_t due = tcp_next_deadline(mem); // UINT64_MAX: no timer armed
+wait_for_datagram_or_until(due);       // e.g. epoll_wait(.., due - now_ms())
 
 // --- shutdown ---
 tcp_close(mem, now_ms());              // then keep pumping turns until
@@ -538,23 +591,29 @@ free(mem);                             // you own the memory
 - Size every `extract_packet` buffer to **≥ `tcp_max_packet()`** (1500). A
   smaller buffer returns `BUFFER_TOO_SMALL` and leaves the packet staged.
 - **Drain `extract_packet` in a loop until it returns 0** after every
-  `inject_packet`, `tick`, and `close`. The egress ring holds only
+  `inject_packet`, `tick`, `close` and `recv`. The egress ring holds only
   `TX_RING_CAP` (32) packets; not draining stalls emission. (`send` stages
   nothing itself — it buffers; the next `tick` flushes it.)
-- Call **`tick()` periodically even when no packets arrive** — timers only
-  fire there (see *Clock model*).
+- **Tick when `tcp_next_deadline()` comes due**, even when no packets
+  arrive (or on a ~10 ms timer) — timers only fire there (see *Clock
+  model*).
 - Pass a **monotonic, non-decreasing `now_ms`**; use the same value for
   every call within a turn.
-- Seed `iss` from a **CSPRNG** (per connection). Servers: cookie secret
-  from a CSPRNG too.
+- Seed `iss` from a **CSPRNG** (per connection), and install a CSPRNG
+  secret with `tcp_set_secret` on internet-facing TCBs. Servers: cookie
+  secret from a CSPRNG too, rotated periodically.
+- **Set the MTU** (`tcp_set_mtu`) to the tunnel's real MTU before the
+  handshake — 1420 behind a default WireGuard interface — so no datagram
+  needs fragmenting.
 - After `tcp_close`, **keep pumping** until `tcp_state` is `CLOSED`; only
   then `tcp_destroy` + free.
 - **Bound the number of concurrent TCBs** and refuse/evict past that budget.
-  Each TCB is independent and costs ≈ `2 * BUF_CAP` (~2 MiB default, ~64 KiB
-  under `small-buffers`); the per-connection reapers (R2 / USER TIMEOUT /
-  keepalive, all on by default) bound each connection's *lifetime*, never the
-  aggregate *count* — only the host can do that. On `PEER_CLOSED` you **must**
-  eventually `close`; keepalive does not probe `CLOSE_WAIT`.
+  Each TCB is independent and costs `tcp_handle_size()` (~2.08 MiB default,
+  136 KiB under `small-buffers`) — including for the 60 s it spends in
+  `TIME_WAIT`; the per-connection reapers (R2 / USER TIMEOUT / keepalive /
+  FIN_WAIT_2, all on by default) bound each connection's *lifetime*, never
+  the aggregate *count* — only the host can do that. On `PEER_CLOSED` you
+  **must** eventually `close`; keepalive does not probe `CLOSE_WAIT`.
 
 **SHOULD**
 - Treat `inject_packet` errors (`NOT_FOR_US`, `MALFORMED_PACKET`,
@@ -563,8 +622,8 @@ free(mem);                             // you own the memory
 - Treat `WOULD_BLOCK` from `send` as backpressure (the send ring is full);
   retry after a later turn drains it. Treat `CONNECTION_CLOSED` from `recv`
   as EOF and `CONNECTION_RESET` as an aborted peer.
-- Drive `tick()` *event + periodic*: right after a batch of injects, and on
-  a 1–10 ms timer for the idle case.
+- Drive `tick()` *event-driven*: right after a batch of injects or sends,
+  and when `tcp_next_deadline()` comes due.
 
 **DON'T**
 - Don't touch one handle from two threads at once — the stack has **no
@@ -625,10 +684,10 @@ loop {
 ```
 
 `Tcb<const BUF>` is generic over ring capacity (default `BUF_CAP` = 1 MiB).
-A `Tcb` is ~2.15 MiB, so **box it** (or use the `heap-buffers` feature, or
-the `small-buffers` feature for many idle TCBs) rather than holding it as a
-stack local — see *Memory footprint*. Pure-Rust callers also need the
-larger `RUST_MIN_STACK` from `.cargo/config.toml` for stack-allocated TCBs.
+A `Tcb` is ~2.08 MiB, so build it in place in heap storage
+(`Tcb::init_in_place`, as `tcp_init` does) or box it, rather than holding it
+as a stack local (or use `small-buffers` for many idle TCBs) — see *Memory
+footprint*. Event-driven Rust hosts sleep until `tcb.next_deadline()`.
 
 ### How do you know you got it right? (canonical conformance)
 
@@ -676,22 +735,26 @@ proof.
 
 | Layer | What it covers | Files |
 |---|---|---|
-| **Property tests** | Wire codec round-trips; checksum integrity; serial-arithmetic | `src/property_tests.rs` (proptest, 4096 cases each) |
+| **Property tests** | Wire codec round-trips; checksum integrity; serial-arithmetic; out-of-order reassembly vs a model | `src/property_tests.rs` (proptest, 4096 cases each) |
+| **Security regressions** | One test per finding of the public-deployment review: blind injection, RFC 5961 challenge/rate limits, forged zero window, PAWS, ACK storms, listener RSTs, SYN-SENT RST, simultaneous open, half-open replacement, cookie options, keyed timestamps, FIN_WAIT_2, slow-reader / zero-window stalls, no SACKed retransmits, ECE handling, no sequence rewinds, full-window out-of-order, D-SACK, MTU / PMTU / black-hole, FFI stack use, NULL / zero-length / misaligned FFI arguments | `src/security_tests.rs` |
+| **Link simulation** | Two real TCBs over a seeded discrete-event link (bottleneck queue, delay, loss, reordering, ACK loss, burst and tail loss, slow reader, chaos with sequence wrap). Asserts retransmissions equal drops, goodput vs the Mathis bound, TLP before RTO, clean closes, and that `next_deadline()` never leaves a host spinning | `src/sim_tests.rs` |
+| **TCB internals** | R2 / SYN retry limits, keepalive, USER TIMEOUT, lost FIN, TIME_WAIT restart, in-place init, liveness oracles, deadline reporting | `src/tcb/tests.rs` |
 | **Conformance tests** | Exact wire bytes per spec scenario | `src/conformance_tests.rs` |
 | **Loopback tests** | End-to-end behavioral tests via in-memory peer | `src/loopback_tests.rs` |
 | **Server / adversarial** | LISTEN/SYN_RCVD hardening (cookies, SYN flood, blind RST/ACK) | `src/server_tests.rs` |
 | **gVisor interop** | Against Google's reference netstack | `bindings/gvisor/*_test.go` |
 | **smoltcp interop** | Against smoltcp (the dominant no_std Rust TCP stack, used in embedded). In-memory channel between two userspace stacks — completely independent codebases negotiating options + sequencing data. | `src/smoltcp_interop_tests.rs` |
 | **Real Linux TUN** | Against the Linux kernel TCP stack via TUN | `bindings/gvisor/tun_test.go` |
-| **netem benchmark** | Throughput under controlled loss / delay | `bindings/netem/bench_test.go` |
+| **Fuzzing** | Codec and full-TCB sessions under libFuzzer with invariant, no-burst and liveness oracles | `fuzz/fuzz_targets/` |
+| **Same-path benchmark** | tcp-sans-io vs Linux Reno / CUBIC through one netem-shaped router to the same kernel peer, both directions, retransmissions vs router drops | `bindings/netem/bench.sh` |
 | **packetdrill-DSL runner** | Per-packet conformance scripts in packetdrill syntax | `bindings/packetdrill/*.go` + `scripts/*.pkt` |
-| **eBPF uprobe observability** | bpftrace uprobes on the cdylib's FFI entry points (counts + latency histograms); kernel-side `tcpretrans` comparison during the iperf3 baseline | `bindings/bpf/` |
-| **perf flamegraphs (CI)** | `perf record` wrapping the netem benchmark → `inferno-flamegraph` SVG; kernel-TCP iperf3 baseline through netns + veth + netem | `.github/workflows/perf-bench.yml` |
+| **eBPF uprobe observability** | bpftrace uprobes on the cdylib's FFI entry points (counts + latency histograms) | `bindings/bpf/` |
+| **perf flamegraphs (CI)** | `perf record` wrapping a same-path benchmark run → `inferno-flamegraph` SVG | `.github/workflows/perf-bench.yml` |
 | **Real-world HTTP/curl/wrk** | cdylib hosts an HTTP/1.1 echo server through a TUN; real `curl` + `wrk` exchange messages. Covers GET / POST / 1 MiB bodies, slow uploaders (`--limit-rate`), sequential connections (LISTEN re-arm), wrk load, TIME_WAIT churn (50 sequential), and N-way concurrent connections (10 + 50 parallel TCBs sharing the TUN with port-keyed demux). | `bindings/realworld/http_test.go`, `concurrent_test.go` |
 | **Real TLS over the cdylib** | Go's `crypto/tls.Server` wraps a custom `net.Conn` backed by the cdylib + TUN pair; real `curl --insecure` does HTTPS round-trips. Validates TCP behaviour under handshake-sensitive workloads (small writes, half-close timing, MAC-validated bulk transfer) — anything our stack mis-orders or corrupts surfaces as a TLS alert, not silent corruption. | `bindings/realworld/tls_test.go` |
 | **h2spec HTTP/2 conformance** | `h2spec` (nghttp2's official HTTP/2 conformance suite) runs all 44 generic tests against an HTTP/2 server hosted on our TCP stack via TLS + ALPN. Each test case is a fresh TCP+TLS+HTTP/2 connection — exercises the LISTEN re-arm cycle at scale plus framing-sensitive H2 traffic. All 44/44 generic tests pass. | `bindings/realworld/h2spec_test.go` |
 | **git clone over HTTPS** | Real `git clone https://…/repo.git` against a bare repository served by `http.FileServer` over the cdylib's TLS listener. Exercises chatty HTTP/1.1 traffic (many small pkt-line writes interleaved with variable-length pack/object body reads). End-to-end signal: the cloned working tree's bytes must match the source repo exactly. | `bindings/realworld/git_test.go` |
-| **Userspace UDP server stress** | A standalone Rust harness (`bindings/wgserver-rs/`) hosts N TCBs in LISTEN on a single UDP socket. A pure-Go driver (`bindings/wgserver/`) — no cgo, no kernel TUN, no root — runs adversarial scenarios (SYN flood ±cookies, blind RST/ACK, cookie forgery, bare-ACK reflection check, malformed-packet spray, wrong-IP rejection, in-window RST in SYN_RCVD, …) and a 10 000-connection functional scale test (≈ 1.5 GiB RSS with `--features small-buffers`, p99 ≈ 80 ms loopback). | `bindings/wgserver-rs/src/server.rs`, `bindings/wgserver/{scale,adversary}_test.go` |
+| **Userspace UDP server stress** | A standalone Rust harness (`bindings/wgserver-rs/`) hosts N TCBs in LISTEN on a single UDP socket. A pure-Go driver (`bindings/wgserver/`) — no cgo, no kernel TUN, no root — runs adversarial scenarios (SYN flood ±cookies, blind RST/ACK, cookie forgery, bare-ACK reflection check, malformed-packet spray, wrong-IP rejection, in-window RST in SYN_RCVD, …) and a 10 000-connection functional scale test (≈ 1.3 GiB with `--features small-buffers`, 100 % success, p99 ≈ 18 ms loopback). | `bindings/wgserver-rs/src/server.rs`, `bindings/wgserver/{scale,adversary}_test.go` |
 
 ### packetdrill scripts
 
@@ -701,8 +764,8 @@ kernel's POSIX socket layer. Each `.pkt` file becomes a Go subtest.
 
 Currently 17 scripts cover handshake (active + passive), full-options
 SYN, Window Scale negotiation, ECN-Setup, IW=10 burst, SACK negotiation,
-PRR fast retransmit, RFC 6675 selective retransmit (single + multi-block
-+ multi-hole), TLP probe before RTO, data transfer + pattern
+PRR fast retransmit, RACK selective retransmit (single + multi-block
++ multi-hole receive), TLP probe before RTO, data transfer + pattern
 verification, active / passive close, plus TBIT-style RFC compliance
 probes (ECN CE → ECE echo, asymmetric WSCALE drop, SACK without
 SACK_PERMITTED ignored). Example:
@@ -719,12 +782,12 @@ Run all: `cd bindings/packetdrill && go test ./...`
 
 ### Perf benchmarking + flamegraphs (manual or PR)
 
-`.github/workflows/perf-bench.yml` runs the netem suite under `perf
-record` and renders a CPU flamegraph SVG. Same workflow also runs a
-kernel-TCP iperf3 baseline through a veth + netem with the matching
-profile, plus the `bpftrace` uprobe trace described below.
-Artifacts (flamegraph, uprobe histograms, iperf3 JSON, kernel
-retransmit log) are uploaded for offline inspection. Trigger:
+`.github/workflows/perf-bench.yml` runs `bindings/netem/bench.sh` for
+one profile (tcp-sans-io, Linux Reno and Linux CUBIC on the same path,
+both directions), then one run under `perf record` rendered as a CPU
+flamegraph SVG, plus the `bpftrace` uprobe trace described below.
+Artifacts (results JSON, flamegraph, uprobe histograms) are uploaded for
+offline inspection. Trigger:
 manual via `workflow_dispatch` or by a PR touching `src/**`,
 `bindings/netem/**`, or `bindings/bpf/**`.
 
@@ -740,20 +803,30 @@ Use locally with the bundled runner:
 
 ```sh
 sudo bindings/bpf/trace.sh target/release/libtcp_sans_io.so \
-    -c "./bindings/netem/netem.test -test.run=^TestNetem_LAN_NoLoss_1msDelay$"
+    -c "bindings/netem/bench.sh --profiles lan --runs 1 --dir up --stacks tcp-sans-io"
 ```
 
 The companion Go test (build tag `bpftrace`) wraps this and
 asserts the expected symbols are observed at non-zero rates,
-catching accidental `#[no_mangle]` removals. The CI workflow uses
-`bpfcc-tools`' `tcpretrans` against the kernel iperf3 baseline so
-the artifact set has apples-to-apples retransmit counts on both
-sides. See `bindings/bpf/README.md` for the full toolkit.
+catching accidental `#[no_mangle]` removals. See
+`bindings/bpf/README.md` for the full toolkit.
+
+### Coverage-guided fuzzing (`fuzz/`)
+
+Six `cargo-fuzz` targets: `wire_parse` and `wire_parse_emit_roundtrip`
+(the codec), `tcb_inject_sequence` (arbitrary datagram streams into one
+TCB), `tcb_client_session` (a scripted peer with state-transition,
+sequence-monotonicity, no-burst and liveness oracles) and `tcb_loopback` /
+`tcb_loopback_small` (two TCBs over a fuzzer-controlled channel). Each ran
+10 minutes clean on this code (≈ 300 M executions for the codec targets,
+0.1–1.3 M for the TCB targets):
+
+```sh
+cargo +nightly fuzz run tcb_client_session -- -max_total_time=600 -timeout=60
+```
 
 ### Other canonical suites not (yet) integrated
 
-- **AFL fuzzing** of `wire::parse` — the entire adversarial surface from
-  hostile peers. Cheap to add.
 - **Upstream packetdrill scripts** (Google's Linux TCP test corpus) —
   our DSL runner is compatible in shape but uses `--connect`/`--send`-
   style directives instead of socket syscalls, so existing scripts need
@@ -763,29 +836,40 @@ sides. See `bindings/bpf/README.md` for the full toolkit.
 
 ```
 src/
-├── lib.rs               # crate-level constants (BUF_CAP, MSS, MAX_PACKET)
+├── lib.rs               # crate-level constants (BUF_CAP, MSS, MAX_PACKET), host contract
 ├── error.rs             # TcpError + FFI error codes
 ├── state.rs             # RFC 9293 state machine enum
 ├── wire.rs              # IPv4 + TCP codec (parse/emit, options, checksums)
-├── ring.rs              # Fixed-capacity SPSC byte ring
-├── reassembly.rs        # RFC 6675 multi-hole receive reassembler
-├── scoreboard.rs        # RFC 6675 sender-side SACK scoreboard + NextSeg
-├── congestion.rs        # PRR-Reno + slow-start / CA (was Tahoe)
-├── tcb.rs               # The state machine itself (~2 kloc)
+├── ring.rs              # Fixed-capacity byte ring (+ positional writes for out-of-order data)
+├── ooo.rs               # Out-of-order range tracker (SACK block generation)
+├── rtx_queue.rs         # Per-segment retransmission queue / SACK scoreboard / pipe
+├── rack.rs              # RACK-TLP loss detection (RFC 8985), windowed min RTT
+├── congestion.rs        # Reno slow start / CA + PRR (RFC 6937), CWR, RTO reduction
+├── tx_ring.rs           # Multi-slot egress staging ring (32 packets)
+├── tcb/
+│   ├── mod.rs           # Tcb struct, public API, timers' deadlines, stats, invariants
+│   ├── input.rs         # Segment acceptance (RFC 5961, PAWS), per-state processing, receive path
+│   ├── ack.rs           # ACK / SACK / D-SACK processing, loss recovery, window updates
+│   ├── output.rs        # Transmission, SWS avoidance, options, windows, emitters
+│   ├── timers.rs        # tick(): TLP, RTO, RACK, persist, keepalive, user timeout, ...
+│   ├── cookie.rs        # SYN cookies, keyed ISN / timestamp offsets, SipHash-2-4
+│   └── tests.rs         # TCB-internal timer / lifecycle tests
 ├── ffi.rs               # Stable C ABI
+├── selftest.rs          # tcp_selftest(): in-process two-stack conformance check
 ├── loopback_tests.rs    # End-to-end behavioral tests
 ├── conformance_tests.rs # Per-spec wire-byte assertions
-├── property_tests.rs    # proptest fuzzing
-├── rack.rs              # RACK loss detector (RFC 8985)
-├── send_queue.rs        # Per-segment send metadata (RACK / TLP)
-├── tx_ring.rs           # Multi-slot egress staging ring (32 packets)
-└── server_tests.rs      # Passive-open + adversarial inputs
+├── server_tests.rs      # Passive-open + adversarial inputs
+├── security_tests.rs    # Regression tests for the public-deployment review
+├── sim_tests.rs         # Deterministic two-TCB link simulation (efficiency guards)
+├── smoltcp_interop_tests.rs # Interop against smoltcp
+└── property_tests.rs    # proptest fuzzing
 
 bindings/
 ├── csharp/              # .NET integration test + wrapper
 ├── python/              # CPython ctypes wrapper + unittest suite
 ├── gvisor/              # Go: gVisor netstack interop + real-kernel TUN test
-├── netem/               # Go: TUN + tc-netem throughput benchmark
+├── netem/               # Same-path benchmark: bench.sh (namespaces + netem router),
+│                        #   tsbench (Go endpoint over TUN), kernel_peer.py, summarize.py
 ├── bpf/                 # bpftrace uprobe template + Go test wrapper
 │   ├── scripts/         # trace_cdylib.bt template
 │   ├── trace.sh         # LIBPATH-substituting runner
@@ -818,47 +902,48 @@ include/
 
 ## Threat model
 
-The stack assumes the host is friendly but the peer is hostile.
+The stack assumes the host is friendly but the peer — and anyone who can
+put packets on the path — is hostile.
 
-- **Resource exhaustion**: bounded SYN_RCVD retransmits (default 5),
-  optional stateless SYN cookies, no allocator to be drained. Three layered
-  timeouts keep a single connection from pinning a TCB indefinitely:
-  - **R2 vanished-peer abort** (RFC 9293 §3.8.3, always on, `MAX_RETRANSMITS`
-    = 10). Consecutive RTO timeouts with *no proof of life* abort the
-    connection (no RST — the peer is presumed gone and we never reflect resets
-    at a silent endpoint). Covers data, SYN, FIN and zero-window persist
-    probes; resets on *any* inbound ACK.
-  - **USER TIMEOUT no-progress abort** (RFC 9293 §3.8.3, **on by default**,
-    300 s, `set_user_timeout` / `tcp_set_user_timeout`). Because R2 resets on
-    any sign of life, a peer that is *alive but stalling* — endlessly ACKing
-    zero-window persist probes (or dribbling duplicate ACKs) while never
-    opening its window — would otherwise pin the TCB and its buffers forever
-    (the classic zero-window / "Sockstress" DoS). The USER TIMEOUT closes this:
-    it resets **only** on real forward progress (`snd_una` advancing), so such
-    a peer is aborted after 300 s regardless of proof of life. Set to `0` to
-    disable.
-  - **Keepalive** (RFC 9293 §3.8.4, **on by default**, `set_keepalive` /
-    `tcp_set_keepalive`; balanced profile = 10 min idle / 60 s interval / 4
-    probes ≈ 14 min to reap). For a fully *idle* connection (nothing in flight
-    or queued — the one shape neither timeout above looks at, since both key on
-    outstanding send work), it probes for a vanished peer and aborts after an
-    unanswered run. This closes the idle-connection memory-pinning DoS (complete
-    a handshake, then go silent) out of the box. A *live* idle peer answers each
-    probe and survives, so the steady-state cost is one probe per idle period.
-    Set `idle_ms = 0` to disable.
-- **Off-path injection**: 5-tuple filter on `inject_packet`; RFC 5961
-  acceptability checks on synchronized connections — a RST is honoured only
-  at exactly `RCV.NXT` (in-window-but-inexact elicits a challenge ACK,
-  out-of-window is dropped), and a SYN at any sequence elicits a challenge
-  ACK rather than a teardown; SYN-cookie path is keyed by a caller-supplied
-  128-bit secret (we ship a no_std SipHash-2-4 impl, with RFC test vectors).
-- **Reflection / amplification**: a bare ACK in `LISTEN` is silently
-  dropped (RFC 793 would RST; the spec response would let an attacker use
-  us as a reflector), spoofed cookie ACKs face a 1-in-2²⁹ blind-forgery
-  rate per attempt.
-- **Malformed inputs**: every parser path is bounds-checked + returns
-  `Result`; `parse_never_panics` + `parse_never_panics_iplike` proptests
-  cover 4096+ cases each per run.
+- **Connection pinning.** Every way a peer can hold a TCB is bounded by
+  default: R2 (10 unanswered timeouts), USER TIMEOUT (300 s without a full
+  segment of progress — defeats zero-window and slow-reader "Sockstress"
+  stalls, which a proof-of-life-based timer cannot), keepalive (reaps
+  vanished idle peers), FIN_WAIT_2 (60 s), bounded SYN / SYN-ACK
+  retransmission, and half-open replacement so one spoofed SYN cannot lock
+  a stateful listener. The host must still cap the *number* of TCBs
+  (including `TIME_WAIT` ones) — see the contract above.
+- **Off-path injection (RFC 5961).** Data and FINs need the ACK bit and an
+  acceptable sequence; a RST is honoured only at exactly `RCV.NXT`, a SYN
+  in a synchronized state draws a challenge ACK, and ACKs outside
+  `[SND.UNA − MAX.SND.WND, SND.NXT]` are dropped with a challenge ACK. PAWS
+  drops old-timestamp data, the window update rule ignores a forged future
+  WL1, and the passive ISN plus timestamp offset are keyed per 4-tuple
+  (`tcp_set_secret`), so neither the host clock nor sequence numbers leak.
+- **Reflection and ACK storms.** Replies to unacceptable segments
+  (challenge ACKs, dup ACKs for out-of-window data, RSTs to stray ACKs or
+  SYN-ACKs) are limited to one per 500 ms per connection and are never
+  larger than the segment that triggered them; a bare ACK to a listener
+  draws at most one such RST, addressed to the segment's source.
+- **SYN floods.** Stateless SYN cookies (29-bit SipHash MAC, 64 s buckets)
+  that keep window scaling, SACK and ECN when the client uses timestamps.
+- **Malformed and adversarial segments.** Every parser path is
+  bounds-checked and returns `Result`; peer MSS is floored at 64 B; option
+  processing, SACK and D-SACK handling, and out-of-order insertion are
+  bounded per segment; nothing SACKed is ever retransmitted and nothing
+  received is ever reneged. Fuzz targets under `fuzz/` exercise the parser
+  and full TCB sessions with invariant and liveness oracles.
+- **Host safety.** The C ABI validates handles (magic guard), rejects
+  NULL pointers with a length and misaligned storage, accepts NULL for
+  zero-length buffers, and builds the TCB in place (no multi-MiB stack
+  frame). A Rust panic — which the code is designed never to reach —
+  traps (`ud2` / `udf`) instead of spinning or unwinding across the FFI.
+
+Residual risks the host owns: the number of concurrent TCBs and their
+memory (≈ 2.08 MiB each by default, held through `TIME_WAIT`), CPU spent
+per inbound packet (bounded per segment, but proportional to packet rate),
+and secret management (rotate the cookie secret; keep `tcp_set_secret`
+secret).
 
 ## Licence
 

@@ -81,18 +81,19 @@ func runOne(t *testing.T, drv *Transport, port uint16, srcPort uint16, msg strin
 }
 
 // TestWGServer_SynFlood_NoCookies fires a SYN flood with forged
-// random sources. Single-Tcb-per-port design locks the first SYN
-// into SYN_RCVD; subsequent SYNs (legit or otherwise) are rejected
-// until the bounded retransmit budget runs out (~63 s with default
-// exponential RTO backoff capped at RTO_MAX=60s).
+// random sources. The single-TCB-per-port listener holds the first SYN
+// in SYN_RCVD and rejects other 4-tuples meanwhile, but once that
+// half-open has retransmitted its SYN-ACK unanswered, a SYN from a new
+// 4-tuple replaces it — so a legitimate client gets through after about
+// one SYN-ACK timeout (~1 s) instead of waiting out the whole SYN-ACK
+// budget (~63 s).
 //
-// This test asserts the *bounded* lifetime property — namely that
-// the server is NOT permanently DoS'd by a flood. It is slow (~75s)
-// and gated by STRESS=1; the production defense for fast availability
-// after a flood is SYN cookies (covered in TestWGServer_SynFlood_Cookies).
+// This asserts the server is not held hostage by a flood. Gated by
+// STRESS=1; the production defense for floods is SYN cookies (covered in
+// TestWGServer_SynFlood_Cookies).
 func TestWGServer_SynFlood_NoCookies(t *testing.T) {
 	if os.Getenv("STRESS") == "" {
-		t.Skip("set STRESS=1 to run the slow (~40s) no-cookies flood test")
+		t.Skip("set STRESS=1 to run the no-cookies flood test")
 	}
 	drv, h, cleanup := adversarySetup(t, "none", 1, 31000)
 	defer cleanup()
@@ -123,11 +124,10 @@ func TestWGServer_SynFlood_NoCookies(t *testing.T) {
 		}
 		_ = drv.SendTo(pkt)
 	}
-	// SYN_RCVD lifetime: 5 retries with Karn's exponential backoff
-	// (RTO starts at 1s, doubles each retransmit, capped at RTO_MAX=60s).
-	// Total elapsed before reset to LISTEN: 1+2+4+8+16+32 ≈ 63s. Give
-	// the legit client a 90 s deadline so it can re-handshake once the
-	// half-open clears.
+	// The legitimate client's SYN retransmissions replace the forged
+	// half-open once it has retransmitted its SYN-ACK (~1 s). The 90 s
+	// deadline still covers the worst case of waiting out the whole
+	// SYN-ACK budget (1+2+4+8+16+32 ≈ 63 s).
 	clientIP, _ := ParseIP4(advClientIP)
 	res := RunMini(drv, MiniClientConfig{
 		SrcIP: clientIP, SrcPort: 50000,

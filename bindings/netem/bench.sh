@@ -25,6 +25,10 @@
 #
 # --baseline-lib DIR adds a "tcp-sans-io@base" stack driven by an older build
 # of the library in DIR (built with `go build -tags oldabi`).
+#
+# TSB_PCAP=DIR captures packet headers at the receiver's interface for every
+# run into DIR/<profile>-<dir>-<stack>-<run>.pcap. TSB_CPU=N picks the CPU a
+# sending tcp-sans-io endpoint is pinned to (default 2).
 set -euo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -72,7 +76,7 @@ if [[ $EUID -ne 0 ]]; then
     fi
     args=(--profiles "$profiles" --runs "$runs" --dir "$dir" --stacks "$stacks" --out "$out")
     [[ -n "$baseline_lib" ]] && args+=(--baseline-lib "$baseline_lib")
-    exec sudo "$0" "${args[@]}"
+    exec sudo env TSB_PCAP="${TSB_PCAP:-}" TSB_CPU="${TSB_CPU:-2}" "$0" "${args[@]}"
 fi
 [[ -n "$baseline_lib" ]] && stacks="$stacks tcp-sans-io@base"
 [[ -x "$HERE/tsbench" ]] || { echo "build $HERE/tsbench first" >&2; exit 1; }
@@ -182,14 +186,29 @@ one_run() { # profile direction stack run rtt rate loss queue mib
     fi
     local srv=$!
     pids=($srv)
+    local cap=""
+    if [[ -n "${TSB_PCAP:-}" ]]; then
+        mkdir -p "$TSB_PCAP"
+        ip netns exec $RX tcpdump -i rx0 -s 128 -U -w \
+            "$TSB_PCAP/$profile-$direction-$stack-$run.pcap" tcp 2>/dev/null &
+        cap=$!
+        pids+=($cap)
+        sleep 0.3
+    fi
     wait_ready "$TMP/ready"
     local mode=upload; [[ $direction == down ]] && mode=download
     local ok=1
     case $stack in
         tcp-sans-io|tcp-sans-io@base)
             local bin=$HERE/tsbench; [[ $stack == *@base ]] && bin=$HERE/tsbench-base
-            ip netns exec $TX "$bin" -mode $mode -tun tsb0 -tun-addr 10.203.1.1/30 \
-                -local $OUR_IP -remote $RX_IP:$PORT -bytes $bytes -timeout 600s >"$cli_out" || ok=0 ;;
+            # When sending, pin to one CPU: TUN writes from a migrating thread
+            # land on different CPUs' backlogs and can be forwarded out of
+            # order (reordering no Linux sender would see).
+            local pin=()
+            [[ $mode == upload ]] && pin=(taskset -c "${TSB_CPU:-2}")
+            ip netns exec $TX "${pin[@]}" "$bin" -mode $mode -tun tsb0 \
+                -tun-addr 10.203.1.1/30 -local $OUR_IP -remote $RX_IP:$PORT -bytes $bytes \
+                -timeout 600s >"$cli_out" || ok=0 ;;
         *)
             if [[ $direction == up ]]; then
                 ip netns exec $TX python3 "$HERE/kernel_peer.py" send --connect $RX_IP:$PORT \
@@ -200,6 +219,11 @@ one_run() { # profile direction stack run rtt rate loss queue mib
             fi ;;
     esac
     wait $srv || ok=0
+    if [[ -n "$cap" ]]; then
+        sleep 0.2
+        kill -INT "$cap" 2>/dev/null || true
+        wait "$cap" 2>/dev/null || true
+    fi
     pids=()
     local link tx_ns rx_ns
     link=$(qdisc_json); tx_ns=$(nstat_json $TX); rx_ns=$(nstat_json $RX)
