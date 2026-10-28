@@ -189,7 +189,7 @@ fn build_in_full_ws(
     payload: &[u8],
 ) -> Vec<u8> {
     let sack: SackBlocks = sack.into();
-    let mut buf = vec![0u8; MAX_PACKET];
+    let mut buf = vec![0u8; MAX_PACKET + payload.len()];
     let opts = TcpOptions {
         mss,
         wscale,
@@ -807,6 +807,42 @@ fn corrupt_checksum_is_rejected_silently() {
     tcb.set_now(now + 100);
     tcb.tick().expect("tick");
     assert!(try_pop(&mut tcb).is_none(), "no egress for bad packet");
+}
+
+/// Checksum-offload path: `inject_packet_l4_csum_trusted` accepts a segment
+/// whose TCP checksum is unfinished (a multi-MSS TSO-style super-segment with a
+/// bogus checksum field), but still enforces the IPv4 header checksum.
+#[test]
+fn l4_csum_trusted_inject_skips_tcp_checksum_only() {
+    let mut tcb = make_tcb();
+    let mut now = 0u64;
+    let _ = handshake_with_ts(&mut tcb, &mut now);
+
+    let payload = vec![0x42u8; 16_000];
+    let mut pkt = build_in(
+        flags::ACK | flags::PSH,
+        PSS.wrapping_add(1),
+        ISS.wrapping_add(1),
+        PEER_WIN,
+        None,
+        Some((60, 0)),
+        &payload,
+    );
+    let ihl = (pkt[0] & 0x0F) as usize * 4;
+    pkt[ihl + 16] ^= 0xFF; // corrupt the TCP checksum field
+
+    assert!(tcb.inject_packet(&pkt.clone()).is_err(), "strict path rejects");
+
+    let mut bad_ip = pkt.clone();
+    bad_ip[10] ^= 0xFF; // corrupt the IPv4 header checksum
+    assert!(tcb.inject_packet_l4_csum_trusted(&bad_ip).is_err(), "IP csum still verified");
+
+    now += 1;
+    tcb.set_now(now);
+    tcb.inject_packet_l4_csum_trusted(&pkt).expect("trusted inject");
+    let mut buf = vec![0u8; payload.len()];
+    assert_eq!(tcb.recv(&mut buf).expect("recv"), payload.len());
+    assert_eq!(buf, payload);
 }
 
 /// Peer RST while ESTABLISHED transitions us straight to CLOSED, sets the
