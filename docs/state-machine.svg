@@ -98,7 +98,7 @@
 <path fill="none" stroke="#7b2fbe" stroke-width="2" d="M226.06,-414.4C225.29,-425.96 225.29,-441.37 228.75,-454.5 229.27,-456.48 229.93,-458.47 230.69,-460.44"/>
 <polygon fill="#7b2fbe" stroke="#7b2fbe" stroke-width="2" points="227.46,-461.8 234.92,-469.32 233.77,-458.78 227.46,-461.8"/>
 <text xml:space="preserve" text-anchor="middle" x="291.38" y="-445.95" font-family="Helvetica,sans-Serif" font-size="9.00" fill="#7b2fbe">SYN&#45;ACK budget exhausted</text>
-<text xml:space="preserve" text-anchor="middle" x="291.38" y="-434.7" font-family="Helvetica,sans-Serif" font-size="9.00" fill="#7b2fbe">or in&#45;window RST (listener)</text>
+<text xml:space="preserve" text-anchor="middle" x="291.38" y="-434.7" font-family="Helvetica,sans-Serif" font-size="9.00" fill="#7b2fbe">or exact RST (listener)</text>
 </g>
 <!-- SynRcvd&#45;&gt;Established -->
 <g id="edge5" class="edge">

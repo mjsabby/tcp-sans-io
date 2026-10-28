@@ -159,7 +159,7 @@ mis-ordering, corruption, a panic, or an unbounded loop.
 | USER TIMEOUT | 300 s | `tcb/mod.rs` | Max time with outstanding send work but less than one full segment acknowledged; defeats slow-reader and zero-window pinning. `set_user_timeout(0)` disables. |
 | Keepalive | 600 s idle / 60 s / 4 probes | `tcb/mod.rs` | Reaps a vanished peer on an idle connection. `set_keepalive(0, …)` disables. |
 | FIN_WAIT_2 timeout | 60 s | `tcb/mod.rs` | Time a peer may leave its half open after ACKing our FIN (refreshed by its data). |
-| Out-of-window reply rate | 1 per 500 ms | `tcb/mod.rs` | Challenge ACKs, dup ACKs for unacceptable segments and RSTs to stray segments, per connection. |
+| Out-of-window reply rate | 1 per 500 ms | `tcb/mod.rs` | Challenge ACKs, dup ACKs for unacceptable segments and RSTs to stray segments, per connection. Exempt: one immediate ACK (D-SACK) per data / FIN segment that could be the peer's own retransmission — acceptable ACK, plus a timestamp when negotiated — since the peer's loss recovery depends on it. |
 | Cookie validity | 64–128 s | `tcb/cookie.rs` | Two 64 s buckets; 29-bit SipHash MAC (2⁻²⁹ blind forgery per attempt). |
 
 ### Why the bounds are sound
@@ -211,7 +211,8 @@ hostile peer:
   the link simulation on every step).
 - **No amplification.** One inbound segment stages at most `TX_RING_CAP`
   packets, and replies to unacceptable segments are rate-limited per
-  connection.
+  connection; only a data or FIN segment carrying an acceptable ACK (and a
+  timestamp when negotiated) is answered at once, with a single ACK.
 - **No state exhaustion inside a TCB.** One half-open per listener TCB
   with a bounded SYN-ACK budget, or stateless SYN cookies; no allocator to
   drain. (Bounding the *number* of TCBs is the host's job.)
@@ -581,7 +582,7 @@ wait_for_datagram_or_until(due);       // e.g. epoll_wait(.., due - now_ms())
 // --- shutdown ---
 tcp_close(mem, now_ms());              // then keep pumping turns until
 // tcp_state(mem) == TCP_STATE_CLOSED  (FIN handshake + TIME_WAIT complete);
-tcp_destroy(mem);                      // flips the magic guard (no free)
+tcp_destroy(mem);                      // releases what the TCB owns (not mem)
 free(mem);                             // you own the memory
 ```
 
@@ -646,7 +647,7 @@ inspecting state directly:
 | `WRITABLE` | `send` will accept bytes (Established/CloseWait + ring has room). |
 | `ESTABLISHED` | Handshake complete; bulk data may flow. |
 | `PEER_CLOSED` | Peer sent FIN — keep draining `recv`, then `close` your side. |
-| `CLOSED` | Fully torn down; safe to `destroy`. |
+| `CLOSED` | Fully torn down; safe to `destroy`. After a clean close, bytes the peer sent before its FIN stay readable (`READABLE`) until `recv` drains them and reports EOF. |
 | `TX_PENDING` | Egress ring non-empty — you must `extract_packet`. |
 | `ERROR` | A terminal error latched; `recv` surfaces the code (`RESET`/`CLOSED`). |
 | `LISTENING` / `HALF_OPEN` | Server: in `LISTEN` / mid-handshake (`SYN_RCVD`). |
@@ -736,9 +737,10 @@ proof.
 | Layer | What it covers | Files |
 |---|---|---|
 | **Property tests** | Wire codec round-trips; checksum integrity; serial-arithmetic; out-of-order reassembly vs a model | `src/property_tests.rs` (proptest, 4096 cases each) |
-| **Security regressions** | One test per finding of the public-deployment review: blind injection, RFC 5961 challenge/rate limits, forged zero window, PAWS, ACK storms, listener RSTs, SYN-SENT RST, simultaneous open, half-open replacement, cookie options, keyed timestamps, FIN_WAIT_2, slow-reader / zero-window stalls, no SACKed retransmits, ECE handling, no sequence rewinds, full-window out-of-order, D-SACK, MTU / PMTU / black-hole, FFI stack use, NULL / zero-length / misaligned FFI arguments | `src/security_tests.rs` |
+| **Security regressions** | One test per finding of the public-deployment review: blind injection, RFC 5961 challenge/rate limits, forged zero window, PAWS, timestamp poisoning by a rejected ACK, ACK storms, old-data reflection, listener RSTs, SYN-SENT RST, simultaneous open, half-open replacement, cookie options, keyed timestamps, FIN_WAIT_2, slow-reader / zero-window stalls, no SACKed retransmits, ECE handling, no sequence rewinds, full-window out-of-order, D-SACK, MTU / PMTU / black-hole, FFI stack use, NULL / zero-length / misaligned FFI arguments | `src/security_tests.rs` |
 | **Link simulation** | Two real TCBs over a seeded discrete-event link (bottleneck queue, delay, loss, reordering, ACK loss, burst and tail loss, slow reader, chaos with sequence wrap). Asserts retransmissions equal drops, goodput vs the Mathis bound, TLP before RTO, clean closes, and that `next_deadline()` never leaves a host spinning | `src/sim_tests.rs` |
-| **TCB internals** | R2 / SYN retry limits, keepalive, USER TIMEOUT, lost FIN, TIME_WAIT restart, in-place init, liveness oracles, deadline reporting | `src/tcb/tests.rs` |
+| **TCB internals** | R2 / SYN retry limits, keepalive, USER TIMEOUT, lost FIN, TIME_WAIT restart (and no restart by a forged FIN), unread data across the final close, byte-exact data after SND.UNA laps back to ISS (4 GiB; release builds), in-place init, liveness oracles, deadline reporting | `src/tcb/tests.rs` |
+| **C ABI ownership** | `tcp_destroy` releases the `heap-buffers` rings (counting allocator, own binary): `cargo test --release --features std,heap-buffers --test ffi_heap_buffers` | `tests/ffi_heap_buffers.rs` |
 | **Conformance tests** | Exact wire bytes per spec scenario | `src/conformance_tests.rs` |
 | **Loopback tests** | End-to-end behavioral tests via in-memory peer | `src/loopback_tests.rs` |
 | **Server / adversarial** | LISTEN/SYN_RCVD hardening (cookies, SYN flood, blind RST/ACK) | `src/server_tests.rs` |
@@ -864,6 +866,9 @@ src/
 ├── smoltcp_interop_tests.rs # Interop against smoltcp
 └── property_tests.rs    # proptest fuzzing
 
+tests/
+└── ffi_heap_buffers.rs  # tcp_destroy frees heap-buffers rings (own binary: counting allocator)
+
 bindings/
 ├── csharp/              # .NET integration test + wrapper
 ├── python/              # CPython ctypes wrapper + unittest suite
@@ -914,17 +919,23 @@ put packets on the path — is hostile.
   a stateful listener. The host must still cap the *number* of TCBs
   (including `TIME_WAIT` ones) — see the contract above.
 - **Off-path injection (RFC 5961).** Data and FINs need the ACK bit and an
-  acceptable sequence; a RST is honoured only at exactly `RCV.NXT`, a SYN
-  in a synchronized state draws a challenge ACK, and ACKs outside
-  `[SND.UNA − MAX.SND.WND, SND.NXT]` are dropped with a challenge ACK. PAWS
+  acceptable sequence; a RST is honoured only at exactly `RCV.NXT` (in
+  SYN-RECEIVED too), a SYN in a synchronized state draws a challenge ACK,
+  and segments whose ACK falls outside `[SND.UNA − MAX.SND.WND, SND.NXT]`
+  are dropped with a challenge ACK before they can update TS.Recent or
+  count as proof of life. PAWS
   drops old-timestamp data, the window update rule ignores a forged future
   WL1, and the passive ISN plus timestamp offset are keyed per 4-tuple
   (`tcp_set_secret`), so neither the host clock nor sequence numbers leak.
 - **Reflection and ACK storms.** Replies to unacceptable segments
   (challenge ACKs, dup ACKs for out-of-window data, RSTs to stray ACKs or
-  SYN-ACKs) are limited to one per 500 ms per connection and are never
-  larger than the segment that triggered them; a bare ACK to a listener
-  draws at most one such RST, addressed to the segment's source.
+  SYN-ACKs) are limited to one per 500 ms per connection, each a single
+  header-only packet of at most 80 bytes; a bare ACK to a listener draws
+  at most one such RST, addressed to the segment's source. Only data or a
+  FIN that could be the peer's own retransmission — an acceptable ACK and,
+  when negotiated, a timestamp — is answered outside that budget (one ACK,
+  with a D-SACK, per segment), because the peer's loss recovery depends on
+  it; a forger must first guess an acceptable ACK.
 - **SYN floods.** Stateless SYN cookies (29-bit SipHash MAC, 64 s buckets)
   that keep window scaling, SACK and ECN when the client uses timestamps.
 - **Malformed and adversarial segments.** Every parser path is

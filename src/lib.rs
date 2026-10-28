@@ -66,7 +66,8 @@
 //!    is pinned until the host acts. On `ERROR` / `CLOSED` (including the
 //!    RST-less local aborts from R2 / USER TIMEOUT / keepalive) drop the TCB or
 //!    [`Tcb::reinit`] it for reuse; the slot is reclaimed only when the host
-//!    releases it.
+//!    releases it. After a clean close, first `recv` any bytes the peer sent
+//!    before its FIN (`READABLE` stays set until they are drained).
 //!
 //! 7. **Don't disable the idle/stall reapers without a replacement.** Keepalive
 //!    and the USER TIMEOUT are **on by default** and are what bound an idle or

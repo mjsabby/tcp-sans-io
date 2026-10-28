@@ -315,6 +315,10 @@ pub struct Tcb<const BUF: usize = BUF_CAP> {
     /// Time of the SYN / SYN-ACK transmission (handshake RTT sample).
     syn_xmit_ms: u64,
     syn_retransmitted: bool,
+    /// Our SYN (or SYN-ACK) occupies sequence number ISS and is not yet
+    /// acknowledged. Tracked explicitly: `SND.UNA == ISS` alone cannot tell,
+    /// because SND.UNA returns to ISS after every 2^32 bytes sent.
+    syn_unacked: bool,
 
     // ---- Buffers.
     send_ring: Ring<BUF>,
@@ -455,8 +459,12 @@ impl<const BUF: usize> Tcb<BUF> {
             core::ptr::addr_of_mut!((*p).cc).write(Reno::new(congestion::INITIAL_WINDOW));
             #[cfg(feature = "heap-buffers")]
             {
-                core::ptr::addr_of_mut!((*p).send_ring).write(Ring::new()?);
-                core::ptr::addr_of_mut!((*p).recv_ring).write(Ring::new()?);
+                // Allocate both before writing either, so a failed second
+                // allocation drops the first instead of leaking it.
+                let send_ring = Ring::new()?;
+                let recv_ring = Ring::new()?;
+                core::ptr::addr_of_mut!((*p).send_ring).write(send_ring);
+                core::ptr::addr_of_mut!((*p).recv_ring).write(recv_ring);
             }
             (*p).setup(cfg);
         }
@@ -540,6 +548,7 @@ impl<const BUF: usize> Tcb<BUF> {
         self.last_data_send_ms = self.now_ms;
         self.syn_xmit_ms = 0;
         self.syn_retransmitted = false;
+        self.syn_unacked = false;
         self.send_ring.clear();
         self.recv_ring.clear();
         self.ooo.clear();
@@ -642,6 +651,9 @@ impl<const BUF: usize> Tcb<BUF> {
     pub fn debug_validate_invariants(&self) -> Result<(), &'static str> {
         if seq_lt(self.snd_nxt, self.snd_una) {
             return Err("snd_nxt is behind snd_una");
+        }
+        if self.syn_unacked && (self.snd_una != self.iss || self.snd_nxt == self.iss) {
+            return Err("SYN marked unacknowledged but SND.UNA/SND.NXT disagree");
         }
         let syn_phantom = u32::from(self.syn_outstanding());
         let data_una = self.snd_una.wrapping_add(syn_phantom);
@@ -898,6 +910,7 @@ impl<const BUF: usize> Tcb<BUF> {
         self.syn_xmit_ms = self.now_ms;
         if self.emit_syn()? {
             self.snd_nxt = self.iss.wrapping_add(1);
+            self.syn_unacked = true;
             self.arm_rto();
         }
         Ok(())
@@ -1013,22 +1026,29 @@ impl<const BUF: usize> Tcb<BUF> {
     fn abort_local(&mut self) {
         self.state = State::Closed;
         self.error = Some(TcpError::ConnectionReset);
+        self.recv_ring.clear();
         self.release_buffers_and_timers();
     }
 
-    /// Enter `CLOSED` cleanly (no error) — e.g. our FIN ACKed in `LAST_ACK`.
+    /// Enter `CLOSED` cleanly (no error): our FIN ACKed in `LAST_ACK`, or a
+    /// RST in `CLOSING` / `LAST_ACK` / `TIME_WAIT`. The peer's FIN has been
+    /// received in each of these, so its byte stream is complete: bytes
+    /// already received stay readable (as after `TIME_WAIT` expiry), and
+    /// `recv` reports EOF only once they are drained.
     fn close_clean(&mut self) {
         self.state = State::Closed;
         self.release_buffers_and_timers();
     }
 
+    /// Drop all send-side and timer state, and anything parked beyond
+    /// `RCV.NXT`. In-order received bytes are left to the caller.
     fn release_buffers_and_timers(&mut self) {
         self.send_ring.clear();
-        self.recv_ring.clear();
         self.ooo.clear();
         self.ooo_fin = None;
         self.rtx.clear();
         self.snd_nxt = self.snd_una;
+        self.syn_unacked = false;
         self.fin_sent = false;
         self.rto_deadline = Deadline::OFF;
         self.time_wait_deadline = Deadline::OFF;
@@ -1112,7 +1132,7 @@ impl<const BUF: usize> Tcb<BUF> {
     /// Our SYN (or SYN-ACK) is still unacknowledged.
     #[inline]
     fn syn_outstanding(&self) -> bool {
-        self.snd_una == self.iss && self.snd_nxt != self.iss
+        self.syn_unacked
     }
 
     /// Sequence number of the first byte in the send ring.

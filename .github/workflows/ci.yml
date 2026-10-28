@@ -31,6 +31,9 @@ jobs:
       - name: cargo test --release (loopback + conformance + properties)
         run: cargo test --release --lib --verbose
 
+      - name: cargo test --release (heap-buffers C ABI ownership)
+        run: cargo test --release --features std,heap-buffers --test ffi_heap_buffers --verbose
+
       - name: cargo clippy
         run: cargo clippy --release --lib --no-deps -- -D warnings
 

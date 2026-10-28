@@ -78,7 +78,8 @@ pump loop*. The non-obvious rules that bindings get wrong:
 - Treat `NOT_FOR_US` / `MALFORMED_PACKET` from `inject` as drop-and-continue,
   `WOULD_BLOCK` from `send` as backpressure, `CONNECTION_CLOSED` from `recv`
   as EOF.
-- After `close`, keep pumping until `tcp_state` is `CLOSED`, then `destroy`.
+- After `close`, keep pumping until `tcp_state` is `CLOSED`, `recv` any bytes
+  still `READABLE` (the peer's data before its FIN), then `destroy`.
 - One handle is single-threaded — the stack has no internal locking.
 
 ## Step 3 — Tier-1 certification: self-loopback hash test (REQUIRED)

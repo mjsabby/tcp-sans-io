@@ -143,22 +143,29 @@ pub unsafe extern "C" fn tcp_init(
     0
 }
 
-/// Tear down a handle: invalidates the magic guard (storage stays owned by
-/// the host). Safe to call with NULL.
+/// Tear down a handle: invalidates the magic guard and releases anything the
+/// TCB itself owns (the rings under the `heap-buffers` feature; nothing in
+/// the default inline build). The storage block stays owned by the host,
+/// which frees it afterwards. Safe to call with NULL.
 ///
 /// # Safety
 /// `handle` must be NULL or have been initialised by [`tcp_init`].
 #[no_mangle]
 pub unsafe extern "C" fn tcp_destroy(handle: *mut TcpStreamHandle) -> i32 {
-    // SAFETY: caller contract.
-    let Some(h) = (unsafe { handle.as_mut() }) else {
+    if handle.is_null() {
         return 0;
-    };
-    if h.magic != MAGIC_LIVE {
+    }
+    // SAFETY: non-null, and initialised by `tcp_init` (caller contract).
+    if unsafe { magic(handle) } != MAGIC_LIVE {
         return TcpError::InvalidState.as_code();
     }
-    h.magic = MAGIC_DEAD;
-    // `Tcb` holds only plain data (no drop glue in the default build).
+    // SAFETY: the live magic proves `inner` was initialised by `tcp_init`
+    // and not dropped since; the dead magic written first keeps every entry
+    // point (a second `tcp_destroy` included) from touching it again.
+    unsafe {
+        core::ptr::addr_of_mut!((*handle).magic).write(MAGIC_DEAD);
+        core::ptr::drop_in_place(core::ptr::addr_of_mut!((*handle).inner));
+    }
     0
 }
 
@@ -643,12 +650,26 @@ unsafe fn write_out(p: *mut usize, v: usize) {
     }
 }
 
+/// The handle's magic word, read without forming a reference to the handle:
+/// after `tcp_destroy` its `inner` has been dropped.
+///
+/// # Safety
+/// `handle` must be non-null and point to storage initialised by
+/// [`tcp_init`].
+unsafe fn magic(handle: *const TcpStreamHandle) -> u32 {
+    // SAFETY: caller contract; `magic` is a plain `u32` field.
+    unsafe { core::ptr::addr_of!((*handle).magic).read() }
+}
+
 /// # Safety
 /// `handle` must be NULL or point to storage initialised by [`tcp_init`].
 unsafe fn validate<'a>(handle: *const TcpStreamHandle) -> Option<&'a TcpStreamHandle> {
+    // SAFETY: caller contract; only a live handle is borrowed.
+    if handle.is_null() || unsafe { magic(handle) } != MAGIC_LIVE {
+        return None;
+    }
     // SAFETY: caller contract.
-    let h = unsafe { handle.as_ref() }?;
-    (h.magic == MAGIC_LIVE).then_some(h)
+    unsafe { handle.as_ref() }
 }
 
 /// # Safety
@@ -658,13 +679,14 @@ unsafe fn with_handle<F>(handle: *mut TcpStreamHandle, f: F) -> i32
 where
     F: FnOnce(&mut Tcb) -> Result<(), TcpError>,
 {
+    // SAFETY: caller contract; only a live handle is borrowed.
+    if handle.is_null() || unsafe { magic(handle) } != MAGIC_LIVE {
+        return TcpError::NullPointer.as_code();
+    }
     // SAFETY: caller contract.
     let Some(h) = (unsafe { handle.as_mut() }) else {
         return TcpError::NullPointer.as_code();
     };
-    if h.magic != MAGIC_LIVE {
-        return TcpError::NullPointer.as_code();
-    }
     match f(&mut h.inner) {
         Ok(()) => 0,
         Err(e) => e.as_code(),

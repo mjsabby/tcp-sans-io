@@ -405,6 +405,56 @@ fn paws_drops_data_with_old_timestamp() {
     assert_eq!(&buf[..n], b"new");
 }
 
+/// RFC 5961 §5.2 drops a segment with an unacceptable ACK whole. Its
+/// timestamp used to be absorbed first, so one forged pure ACK of unsent
+/// data (ACK = SND.NXT + 1) with a far-future TSval made PAWS discard all
+/// of the peer's genuine data until the peer's clock caught up, and also
+/// counted as proof of life for keepalive.
+#[test]
+fn rejected_ack_cannot_poison_ts_recent() {
+    let (mut c, sseq, iss) = established(1000, true, false);
+    c.set_now(1100);
+    let idle = c.next_deadline();
+    c.inject_packet(&pkt(
+        SRV,
+        CLI,
+        sseq,
+        iss + 2,
+        flags::ACK,
+        8192,
+        &ts(600_000, 0),
+        &[],
+    ))
+    .unwrap();
+    let out = drain(&mut c);
+    assert_eq!(out.len(), 1, "challenge ACK");
+    assert_eq!(
+        out[0].opts.ts.unwrap().1,
+        1,
+        "TSecr must not echo the forgery"
+    );
+    assert_eq!(
+        c.next_deadline(),
+        idle,
+        "a dropped segment is no proof of life"
+    );
+    c.set_now(1110);
+    c.inject_packet(&pkt(
+        SRV,
+        CLI,
+        sseq,
+        iss + 1,
+        flags::ACK | flags::PSH,
+        8192,
+        &ts(2, 0),
+        b"genuine",
+    ))
+    .unwrap();
+    let mut buf = [0u8; 16];
+    let n = c.recv(&mut buf).unwrap();
+    assert_eq!(&buf[..n], b"genuine", "PAWS discarded the peer's data");
+}
+
 // ---------------------------------------------------------------------------
 // ACK storms / reflection
 // ---------------------------------------------------------------------------
@@ -480,6 +530,54 @@ fn injected_segment_cannot_start_an_ack_storm() {
         storm <= 30,
         "{storm} packets in 5 s after one injected segment"
     );
+}
+
+/// Old data is answered at once (with a D-SACK) only if it could be the
+/// peer's own retransmission: an acceptable ACK, plus a timestamp when
+/// negotiated. Forged 1-byte old segments used to bypass the 500 ms budget,
+/// drawing one 60-byte D-SACK ACK each (1.46x byte amplification) and
+/// D-SACKs that could talk the peer out of a congestion response.
+#[test]
+fn forged_old_data_cannot_bypass_the_reply_rate_limit() {
+    let (mut c, sseq, iss) = established(1000, true, false);
+    c.set_now(1020);
+    let data = pkt(
+        SRV,
+        CLI,
+        sseq,
+        iss + 1,
+        flags::ACK,
+        0xffff,
+        &ts(5, 0),
+        &[1u8; 500],
+    );
+    c.inject_packet(&data).unwrap();
+    drain(&mut c);
+    let forged = pkt(
+        SRV,
+        CLI,
+        sseq,
+        iss + 1 + 65_536,
+        flags::ACK,
+        0xffff,
+        &TcpOptions::NONE,
+        b"X",
+    );
+    let mut replies = Vec::new();
+    for _ in 0..100 {
+        c.inject_packet(&forged).unwrap();
+        replies.extend(drain(&mut c));
+    }
+    assert_eq!(replies.len(), 1, "forged old data shares the rate limit");
+    assert!(replies[0].opts.sack.is_empty(), "no D-SACK for a forgery");
+    assert_eq!(c.stats().dup_bytes_received, 0);
+    // The peer's genuine retransmissions are still each D-SACKed at once.
+    for _ in 0..2 {
+        c.inject_packet(&data).unwrap();
+        let out = drain(&mut c);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].opts.sack.as_slice(), &[(sseq, sseq + 500)]);
+    }
 }
 
 /// A SYN-ACK arriving at a listener draws a RST addressed to its sender (it

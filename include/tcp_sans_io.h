@@ -76,6 +76,9 @@ int32_t tcp_init(TcpStreamHandle* storage,
                  const uint8_t* local_ip,  uint16_t local_port,
                  const uint8_t* remote_ip, uint16_t remote_port,
                  uint32_t iss, uint32_t initial_rto_ms);
+/* Invalidate a handle and release anything the TCB itself owns (its rings,
+ * in heap-buffers builds); the host frees the storage block afterwards.
+ * NULL is a no-op; a second destroy returns TCP_ERR_INVALID_STATE. */
 int32_t tcp_destroy(TcpStreamHandle* handle);
 
 /* ---- Connection control ----------------------------------------------- */

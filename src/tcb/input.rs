@@ -2,9 +2,12 @@
 //!
 //! Synchronized states follow the RFC's check order: sequence
 //! acceptability (+ PAWS), RST (RFC 5961 §3), SYN (RFC 5961 §4), the ACK
-//! bit (segments without ACK are dropped), ACK processing (RFC 5961 §5 —
-//! see [`super::ack`]), segment text, FIN. Responses to unacceptable or
-//! suspicious segments are rate limited per connection.
+//! bit (segments without ACK are dropped), ACK acceptability (RFC 5961 §5 —
+//! checked before the segment may update any state), ACK processing (see
+//! [`super::ack`]), segment text, FIN. Responses to unacceptable or
+//! suspicious segments are rate limited per connection, except an immediate
+//! ACK to data or a FIN that could be the peer's own retransmission (see
+//! `may_answer_at_once`).
 
 use super::{
     seq_ge, seq_gt, seq_in_range, seq_le, seq_lt, Deadline, Endpoint, Tcb, DELAYED_ACK_MS,
@@ -15,14 +18,6 @@ use crate::error::TcpError;
 use crate::ooo::Insert;
 use crate::state::State;
 use crate::wire::{ecn, flags, Segment};
-
-/// Result of ACK-field processing.
-pub(super) enum AckVerdict {
-    /// Continue with the rest of the segment.
-    Accept,
-    /// The segment was answered (if at all) and must be dropped.
-    Drop,
-}
 
 impl<const BUF: usize> Tcb<BUF> {
     pub(super) fn inject_segment(&mut self, seg: &Segment<'_>) -> Result<(), TcpError> {
@@ -118,6 +113,7 @@ impl<const BUF: usize> Tcb<BUF> {
         self.syn_xmit_ms = self.now_ms;
         let _ = self.emit_synack()?;
         self.snd_nxt = self.iss.wrapping_add(1);
+        self.syn_unacked = true;
         self.arm_rto();
         Ok(())
     }
@@ -191,6 +187,7 @@ impl<const BUF: usize> Tcb<BUF> {
         // RFC 3168 §6.1.1: ECN is on iff the SYN-ACK has ECE without CWR.
         self.ecn_enabled = seg.has(flags::ECE) && !seg.has(flags::CWR);
         self.snd_una = seg.ack;
+        self.syn_unacked = false;
         self.rtx_count = 0;
         self.handshake_rtt_sample(seg);
         self.rto_deadline = Deadline::OFF;
@@ -237,8 +234,16 @@ impl<const BUF: usize> Tcb<BUF> {
 
     fn on_syn_rcvd(&mut self, seg: &Segment<'_>) -> Result<(), TcpError> {
         if seg.has(flags::RST) {
+            // RFC 9293 §3.10.7.4 applies RFC 5961 §3.2 here too: a RST
+            // outside the window is dropped, only one exactly at RCV.NXT
+            // resets, and any other in-window RST draws a (rate-limited)
+            // challenge ACK, so a guessed in-window sequence cannot abort
+            // the handshake.
             if !self.acceptable(seg.seq, 0) {
                 return Ok(()); // blind RST outside the window
+            }
+            if seg.seq != self.rcv_nxt {
+                return self.send_oow_ack();
             }
             if self.is_listener {
                 self.reset_to_listen_or_closed();
@@ -283,6 +288,7 @@ impl<const BUF: usize> Tcb<BUF> {
     fn complete_passive_open(&mut self, seg: &Segment<'_>) -> Result<(), TcpError> {
         let is_syn = seg.has(flags::SYN);
         self.snd_una = seg.ack;
+        self.syn_unacked = false;
         self.snd_wnd = if is_syn {
             u32::from(seg.window)
         } else {
@@ -362,7 +368,9 @@ impl<const BUF: usize> Tcb<BUF> {
             return self.on_unacceptable(seg, payload_len, fin);
         }
         if self.paws_reject(seg) {
-            return if payload_len > 0 || fin {
+            // RFC 7323 §5.3 R1: ACK and drop (paws_reject implies data or
+            // a FIN; the ACK is immediate only if `may_answer_at_once`).
+            return if self.may_answer_at_once(seg) {
                 self.send_pure_ack()
             } else {
                 self.send_oow_ack()
@@ -385,6 +393,13 @@ impl<const BUF: usize> Tcb<BUF> {
         if !seg.has(flags::ACK) {
             return Ok(());
         }
+        // An unacceptable ACK drops the whole segment, so it is checked
+        // before anything in the segment may update TS.Recent, the ECN echo
+        // state or the keepalive clock: a forged far-future TSval riding on
+        // a rejected ACK would otherwise make PAWS discard the peer's data.
+        if !self.ack_acceptable(seg.ack) {
+            return self.send_oow_ack();
+        }
         self.update_ts_recent(seg);
         if self.ecn_enabled {
             if seg.ecn == ecn::CE {
@@ -396,9 +411,7 @@ impl<const BUF: usize> Tcb<BUF> {
         }
         self.on_peer_alive();
 
-        if let AckVerdict::Drop = self.process_ack(seg)? {
-            return Ok(());
-        }
+        self.process_ack(seg)?;
         if self.state == State::Closed {
             return Ok(()); // our FIN was ACKed in LAST-ACK
         }
@@ -432,7 +445,9 @@ impl<const BUF: usize> Tcb<BUF> {
         self.maybe_send_data()
     }
 
-    /// Step 1 failed: reply per RFC 9293 (ACK) unless it is a RST.
+    /// Step 1 failed: reply per RFC 9293 (ACK) unless it is a RST. Only a
+    /// segment that [`Self::may_answer_at_once`] gets an immediate reply;
+    /// every other reply comes out of the rate-limited budget.
     fn on_unacceptable(
         &mut self,
         seg: &Segment<'_>,
@@ -442,7 +457,7 @@ impl<const BUF: usize> Tcb<BUF> {
         if seg.has(flags::RST) {
             return Ok(());
         }
-        if seg.has(flags::SYN) {
+        if !self.may_answer_at_once(seg) {
             return self.send_oow_ack();
         }
         let end = seg.seq.wrapping_add(payload_len);
@@ -452,25 +467,42 @@ impl<const BUF: usize> Tcb<BUF> {
             self.time_wait_deadline = Deadline::at(self.now_ms.saturating_add(TIME_WAIT_MS));
             return self.send_pure_ack();
         }
-        if payload_len > 0 || fin {
-            // Duplicate data: answer at once, with a D-SACK (RFC 2883) so the
-            // sender learns the retransmission was spurious.
-            if payload_len > 0 && seq_le(end, self.rcv_nxt) {
-                self.stats.dup_bytes_received = self
-                    .stats
-                    .dup_bytes_received
-                    .saturating_add(u64::from(payload_len));
-                if self.sack_enabled {
-                    self.dsack = Some((seg.seq, end));
-                }
-                return self.send_pure_ack();
+        // Duplicate data: answer at once, with a D-SACK (RFC 2883) so the
+        // sender learns the retransmission was spurious.
+        if payload_len > 0 && seq_le(end, self.rcv_nxt) {
+            self.stats.dup_bytes_received = self
+                .stats
+                .dup_bytes_received
+                .saturating_add(u64::from(payload_len));
+            if self.sack_enabled {
+                self.dsack = Some((seg.seq, end));
             }
-            // Beyond the window: a peer probing a zero window, or junk.
-            if seq_ge(seg.seq, self.rcv_nxt) && self.recv_ring.free() == 0 {
-                return self.send_pure_ack();
-            }
+            return self.send_pure_ack();
+        }
+        // Beyond the window: the peer probing our zero window.
+        if seq_ge(seg.seq, self.rcv_nxt) && self.recv_ring.free() == 0 {
+            return self.send_pure_ack();
         }
         self.send_oow_ack()
+    }
+
+    /// Whether an unacceptable data or FIN segment could be the peer's own
+    /// (re)transmission — bytes we already hold, a zero-window probe, a FIN
+    /// whose ACK was lost — rather than blind injection: ACK bit set with an
+    /// acceptable SEG.ACK (RFC 5961 §5.2) and, once negotiated, a timestamp
+    /// (RFC 7323 §3.2 puts one on every segment). The peer's loss recovery
+    /// needs these answered at once (D-SACK undo counts every spurious
+    /// retransmission), so only they bypass the out-of-window rate limiter;
+    /// anything else could be a reflection attempt. PAWS freshness is not
+    /// required: a late original legitimately carries an older TSval than
+    /// its retransmission, and its D-SACK is what reveals the spurious one.
+    fn may_answer_at_once(&self, seg: &Segment<'_>) -> bool {
+        (!seg.payload.is_empty() || seg.has(flags::FIN))
+            && seg.has(flags::ACK)
+            && !seg.has(flags::SYN)
+            && !seg.has(flags::RST)
+            && self.ack_acceptable(seg.ack)
+            && (!self.ts_enabled || seg.options.ts.is_some())
     }
 
     /// RFC 7323 §5 PAWS: drop a data-bearing segment whose timestamp is

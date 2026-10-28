@@ -602,7 +602,7 @@ fn syn_rcvd_off_path_rst_with_wrong_seq_is_dropped() {
 }
 
 #[test]
-fn syn_rcvd_in_window_rst_reverts_to_listen() {
+fn syn_rcvd_exact_rst_reverts_to_listen() {
     let mut s = make_listener();
     s.set_now(0);
     s.listen().expect("listen");
@@ -620,7 +620,8 @@ fn syn_rcvd_in_window_rst_reverts_to_listen() {
     s.inject_packet(&syn).expect("inject SYN");
     let _ = pop(&mut s);
 
-    // In-window RST from the pinned peer — abort half-open, return to LISTEN.
+    // Exact-match RST (SEQ = RCV.NXT) from the pinned peer — abort the
+    // half-open, return to LISTEN.
     let rst = build_in(
         flags::RST,
         CLIENT_ISS.wrapping_add(1),
@@ -633,6 +634,66 @@ fn syn_rcvd_in_window_rst_reverts_to_listen() {
     );
     s.inject_packet(&rst).expect("inject RST");
     assert_eq!(s.state(), State::Listen, "listener recycles back to LISTEN");
+}
+
+/// RFC 9293 §3.10.7.4 applies RFC 5961 §3.2 to SYN-RECEIVED too: an
+/// in-window RST that is not exactly at RCV.NXT draws a rate-limited
+/// challenge ACK and leaves the half-open intact. It used to erase it, so
+/// the genuine third ACK then landed on a bare LISTEN and was lost.
+#[test]
+fn syn_rcvd_non_exact_in_window_rst_is_challenged() {
+    let mut s = make_listener();
+    s.set_now(0);
+    s.listen().expect("listen");
+    let syn = build_in(
+        flags::SYN,
+        CLIENT_ISS,
+        0,
+        PEER_WIN,
+        Some(1460),
+        None,
+        false,
+        &[],
+    );
+    s.inject_packet(&syn).expect("inject SYN");
+    let synack = pop(&mut s);
+
+    let rst = build_in(
+        flags::RST,
+        CLIENT_ISS.wrapping_add(2),
+        0,
+        PEER_WIN,
+        None,
+        None,
+        false,
+        &[],
+    );
+    s.set_now(10);
+    s.inject_packet(&rst).expect("inject RST");
+    assert_eq!(s.state(), State::SynRcvd, "half-open must survive");
+    let challenge = pop(&mut s);
+    assert_eq!(challenge.flags, flags::ACK);
+    assert_eq!(
+        (challenge.seq, challenge.ack),
+        (synack.seq.wrapping_add(1), CLIENT_ISS.wrapping_add(1)),
+        "challenge ACK is <SEQ=SND.NXT><ACK=RCV.NXT>"
+    );
+    s.inject_packet(&rst).expect("inject RST again");
+    assert!(try_pop(&mut s).is_none(), "challenge ACKs are rate limited");
+
+    let ack = build_in(
+        flags::ACK,
+        CLIENT_ISS.wrapping_add(1),
+        synack.seq.wrapping_add(1),
+        PEER_WIN,
+        None,
+        None,
+        false,
+        &[],
+    );
+    s.set_now(20);
+    s.inject_packet(&ack).expect("inject final ACK");
+    assert_eq!(s.state(), State::Established);
 }
 
 // ---------------------------------------------------------------------------

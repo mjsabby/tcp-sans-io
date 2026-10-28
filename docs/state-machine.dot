@@ -42,9 +42,10 @@ digraph tcp_state_machine {
     SynRcvd  -> Established  [label="recv ACK (3rd)"];
 
     // Stateful flood resistance: at most one half-open slot, bounded
-    // SYN-ACK retransmits, then the slot is recycled back to LISTEN. An
-    // in-window RST in SYN_RCVD recycles it the same way.
-    SynRcvd  -> Listen      [label="SYN-ACK budget exhausted\nor in-window RST (listener)",
+    // SYN-ACK retransmits, then the slot is recycled back to LISTEN. A RST
+    // exactly at RCV.NXT in SYN_RCVD recycles it the same way (any other
+    // in-window RST only draws a challenge ACK, RFC 5961).
+    SynRcvd  -> Listen      [label="SYN-ACK budget exhausted\nor exact RST (listener)",
                              color="#7b2fbe", fontcolor="#7b2fbe", penwidth=2.0];
 
     // ---- Active close (we call close() first) ---------------------------

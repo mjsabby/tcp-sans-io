@@ -12,7 +12,7 @@ extern crate std;
 use std::boxed::Box;
 use std::vec::Vec;
 
-use super::{Endpoint, Tcb, TcbConfig, MAX_RETRANSMITS, MAX_SYN_RETRIES};
+use super::{events, Endpoint, Tcb, TcbConfig, MAX_RETRANSMITS, MAX_SYN_RETRIES};
 use crate::wire::{self, flags, SackBlocks, TcpOptions};
 use crate::{State, TcpError, MAX_PACKET};
 
@@ -263,12 +263,115 @@ fn retransmitted_fin_restarts_time_wait() {
     .unwrap();
     let re = drain(&mut t);
     assert_eq!(re.len(), 1, "re-ACK the FIN");
+    // A FIN with an unacceptable ACK may be blind injection: it must not
+    // restart 2·MSL, which would let a forger pin the TCB indefinitely.
+    t.set_now(55_000);
+    t.inject_packet(&peer_pkt(
+        PEER_ISS + 1,
+        1002 + 100_000,
+        flags::ACK | flags::FIN,
+        65535,
+        &TcpOptions::NONE,
+        &[],
+    ))
+    .unwrap();
     t.set_now(100 + 60_001);
     t.tick().unwrap();
     assert_eq!(t.state(), State::TimeWait, "2*MSL restarted");
     t.set_now(50_100 + 60_001);
     t.tick().unwrap();
     assert_eq!(t.state(), State::Closed);
+}
+
+/// Our FIN ACKed in LAST_ACK used to wipe the receive ring, so bytes the
+/// peer sent (and we ACKed) before its FIN vanished and `recv` reported a
+/// clean EOF. Neither that nor a RST may drop them: the peer's stream was
+/// already complete, exactly as when TIME_WAIT expires.
+#[test]
+fn unread_data_survives_the_close_from_last_ack() {
+    for closing_flag in [flags::ACK, flags::RST] {
+        let mut t = established();
+        t.set_now(20);
+        t.inject_packet(&peer_pkt(
+            PEER_ISS + 1,
+            1001,
+            flags::ACK | flags::FIN,
+            65535,
+            &TcpOptions::NONE,
+            b"unread response",
+        ))
+        .unwrap();
+        t.close().unwrap();
+        assert_eq!(t.state(), State::LastAck);
+        drain(&mut t);
+        t.inject_packet(&peer_pkt(
+            PEER_ISS + 17,
+            1002,
+            closing_flag,
+            65535,
+            &TcpOptions::NONE,
+            &[],
+        ))
+        .unwrap();
+        assert_eq!(t.state(), State::Closed);
+        assert_eq!(t.poll() & events::ERROR, 0);
+        let mut buf = [0u8; 64];
+        assert_eq!(t.recv(&mut buf), Ok(15));
+        assert_eq!(&buf[..15], b"unread response");
+        assert_eq!(t.recv(&mut buf), Err(TcpError::ConnectionClosed));
+    }
+}
+
+/// SND.UNA returns to ISS after every 2^32 bytes. A SYN inferred from
+/// `SND.UNA == ISS` then shifted every send-ring offset by one: a 4096-byte
+/// write went out as 4097 bytes, the wrong ones, and the ACK consumed the
+/// queue off by one. Moves 4 GiB through the public API, so release only.
+#[test]
+#[cfg_attr(debug_assertions, ignore = "moves 4 GiB; run with --release")]
+fn data_is_byte_exact_after_snd_una_laps_back_to_iss() {
+    let mut t = established();
+    let fill = [0x5a_u8; 64 * 1024];
+    let mut buf = [0u8; MAX_PACKET];
+    // Data starts at ISS + 1, so 2^32 - 1 bytes bring SND.UNA back to ISS.
+    let lap = u64::from(u32::MAX);
+    let (mut queued, mut now) = (0u64, 10u64);
+    while queued < lap || t.snd_una != t.snd_nxt {
+        now += 1;
+        t.set_now(now);
+        let n = (lap - queued).min(fill.len() as u64) as usize;
+        if let Ok(w) = t.send(&fill[..n]) {
+            queued += w as u64;
+        }
+        t.tick().unwrap();
+        while t.extract_packet(&mut buf).unwrap() != 0 {}
+        let nxt = t.snd_nxt;
+        ack(&mut t, nxt, 65535);
+    }
+    assert_eq!((t.snd_una, t.snd_nxt), (t.iss, t.iss), "one full lap");
+
+    let pattern: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+    assert_eq!(t.send(&pattern), Ok(pattern.len()));
+    t.tick().unwrap();
+    let mut sent = Vec::new();
+    loop {
+        let n = t.extract_packet(&mut buf).unwrap();
+        if n == 0 {
+            break;
+        }
+        let s = wire::parse(&buf[..n]).unwrap();
+        assert_eq!(s.seq, t.iss.wrapping_add(sent.len() as u32));
+        sent.extend_from_slice(s.payload);
+    }
+    assert_eq!(sent, pattern, "the lap must not invent or shift bytes");
+    t.debug_validate_invariants().unwrap();
+    let end = t.iss.wrapping_add(4096);
+    ack(&mut t, end, 65535);
+    assert_eq!(
+        t.send_ring.len(),
+        0,
+        "the ACK consumes exactly what was sent"
+    );
+    t.debug_validate_invariants().unwrap();
 }
 
 #[test]
