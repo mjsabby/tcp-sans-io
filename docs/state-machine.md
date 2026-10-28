@@ -29,7 +29,7 @@ stateDiagram-v2
     SYN_SENT --> CLOSED: RST / reset()
 
     SYN_RCVD --> ESTABLISHED: recv ACK (3rd)
-    SYN_RCVD --> LISTEN: SYN-ACK budget spent / in-window RST
+    SYN_RCVD --> LISTEN: SYN-ACK budget spent / exact RST
     SYN_RCVD --> FIN_WAIT_1: close() / send FIN
     SYN_RCVD --> CLOSED: RST (non-listener) / reset()
 
@@ -73,7 +73,7 @@ bold purple = the SYN_RCVD → LISTEN revert):
 | SYN_SENT | ESTABLISHED | recv SYN-ACK | send ACK | `on_segment_syn_sent` |
 | SYN_SENT | CLOSED | recv RST / `reset()` | surface `ConnectionReset` | `handle_rst` / `reset` |
 | SYN_RCVD | ESTABLISHED | recv 3rd ACK | — | `on_segment_syn_rcvd` |
-| SYN_RCVD | LISTEN | SYN-ACK retransmit budget exhausted, or in-window RST | recycle the half-open slot | `tick` / `handle_rst` → `reset_to_listen_or_closed` |
+| SYN_RCVD | LISTEN | SYN-ACK retransmit budget exhausted, or a RST exactly at `RCV.NXT` | recycle the half-open slot | `tick` / `handle_rst` → `reset_to_listen_or_closed` |
 | SYN_RCVD | FIN_WAIT_1 | `close()` | send FIN | `Tcb::close` |
 | SYN_RCVD | CLOSED | recv RST (non-listener) / `reset()` | surface `ConnectionReset` | `handle_rst` |
 | ESTABLISHED | FIN_WAIT_1 | `close()` | send FIN | `Tcb::close` |
@@ -92,8 +92,10 @@ bold purple = the SYN_RCVD → LISTEN revert):
 
 - **SYN_RCVD → LISTEN** (bold purple). The stateful passive path keeps at most
   one half-open slot. Each SYN-ACK is retransmitted at most
-  `MAX_SYN_RCVD_RETRIES` times; once that budget is spent — or an in-window RST
-  arrives — the slot is recycled straight back to LISTEN instead of leaking.
+  `MAX_SYN_RCVD_RETRIES` times; once that budget is spent — or a RST exactly
+  at `RCV.NXT` arrives (any other in-window RST only draws a rate-limited
+  challenge ACK, per RFC 5961 §3.2 as RFC 9293 §3.10.7.4 applies it to
+  SYN-RECEIVED) — the slot is recycled straight back to LISTEN instead of leaking.
   This is the whole flood-resistance argument for the non-cookie path, and the
   reason the loopback fuzzer withholds chaos until both ends are ESTABLISHED (a
   dropped third ACK that trips this revert is a legitimate half-open, not a
@@ -101,8 +103,8 @@ bold purple = the SYN_RCVD → LISTEN revert):
 - **FIN_WAIT_1 → TIME_WAIT** (direct). When a single segment both ACKs our FIN
   and carries the peer's FIN, the two single-step edges collapse into one. The
   oracle's `allowed_transition` permits it explicitly.
-- **Abort edges → CLOSED** (dashed grey). A received RST (validated in-window
-  per RFC 5961), a local `abort()`, or a host `reset()` can drop almost any
+- **Abort edges → CLOSED** (dashed grey). A received RST (exactly at
+  `RCV.NXT`, per RFC 5961), a local `abort()`, or a host `reset()` can drop almost any
   synchronized state to CLOSED. Drawn from the representative states to keep the
   graph legible.
 

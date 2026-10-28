@@ -29,6 +29,11 @@ small-buffers = []
 # no_std / C-FFI inline POD layout untouched when off.
 heap-buffers = []
 
+# Needs its own binary (counting global allocator) and the boxed rings.
+[[test]]
+name = "ffi_heap_buffers"
+required-features = ["std", "heap-buffers"]
+
 [profile.release]
 panic = "abort"
 lto = "fat"

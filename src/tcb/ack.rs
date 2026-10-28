@@ -7,7 +7,6 @@
 //! then let congestion control react: PRR during a reduction, slow start /
 //! congestion avoidance otherwise.
 
-use super::input::AckVerdict;
 use super::{seq_ge, seq_gt, seq_le, seq_lt, Deadline, Tcb, TLP_MIN_PTO_MS, TLP_WC_DELACK_MS};
 use crate::congestion::CaState;
 use crate::error::TcpError;
@@ -16,24 +15,24 @@ use crate::state::State;
 use crate::wire::{flags, Segment};
 
 impl<const BUF: usize> Tcb<BUF> {
-    pub(super) fn process_ack(&mut self, seg: &Segment<'_>) -> Result<AckVerdict, TcpError> {
-        let ack = seg.ack;
-        // RFC 9293: an ACK of something not yet sent draws an ACK; drop.
-        if seq_gt(ack, self.snd_nxt) {
-            self.send_oow_ack()?;
-            return Ok(AckVerdict::Drop);
-        }
-        // RFC 5961 §5.2: SEG.ACK must be within MAX.SND.WND of SND.UNA,
-        // otherwise a blind injector only needs any old sequence number.
+    /// RFC 9293 §3.10.7.4 step 5 hardened by RFC 5961 §5.2: SEG.ACK is
+    /// acceptable within `[SND.UNA − MAX.SND.WND, SND.NXT]`. Outside it (an
+    /// ACK of unsent data, or so old that a blind injector needs only some
+    /// stale sequence number) the whole segment is dropped after a
+    /// rate-limited ACK, so callers check this before the segment may touch
+    /// any state (TS.Recent, the ECN echo, the keepalive clock, …).
+    pub(super) fn ack_acceptable(&self, ack: u32) -> bool {
         let max_wnd = self.max_snd_wnd.max(u32::from(self.local_mss));
-        if seq_lt(ack, self.snd_una.wrapping_sub(max_wnd)) {
-            self.send_oow_ack()?;
-            return Ok(AckVerdict::Drop);
-        }
+        !seq_gt(ack, self.snd_nxt) && !seq_lt(ack, self.snd_una.wrapping_sub(max_wnd))
+    }
+
+    /// Process the ACK field of a segment that passed [`Self::ack_acceptable`].
+    pub(super) fn process_ack(&mut self, seg: &Segment<'_>) -> Result<(), TcpError> {
+        let ack = seg.ack;
         // Any acceptable ACK is proof of life (RFC 9293 §3.8.3 R2).
         self.rtx_count = 0;
         if seq_lt(ack, self.snd_una) {
-            return Ok(AckVerdict::Accept); // old ACK: ignore the field
+            return Ok(()); // old ACK: ignore the field
         }
 
         let prior_una = self.snd_una;
@@ -122,6 +121,7 @@ impl<const BUF: usize> Tcb<BUF> {
                 .saturating_sub(u32::from(syn_acked));
             self.send_ring.consume(data_acked as usize);
             self.snd_una = ack;
+            self.syn_unacked = false;
             self.dup_acks = 0;
             // RTT: RFC 7323 RTTM when timestamps are on, else Karn.
             let sample = match tsecr_ms {
@@ -220,7 +220,7 @@ impl<const BUF: usize> Tcb<BUF> {
                 _ => {}
             }
         }
-        Ok(AckVerdict::Accept)
+        Ok(())
     }
 
     /// Window update. RFC 9293's SND.WL1/WL2 test keeps reordered stale
