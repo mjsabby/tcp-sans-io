@@ -245,6 +245,51 @@ fn ack_far_below_snd_una_is_rejected_with_challenge() {
     assert_eq!(out[0].ack, sseq);
 }
 
+/// RFC 5961 §5.2 accepts an ACK down to `SND.UNA − MAX.SND.WND`. On a
+/// connection that has sent less than that, the range reaches below its
+/// ISS, so a blind injector could use any ACK within the peer's window. As
+/// in Linux, an ACK of bytes we never sent is unacceptable: once data has
+/// been acknowledged, a reordered segment ACKing part of it is accepted,
+/// but never one ACKing bytes before our ISS.
+#[test]
+fn ack_of_bytes_never_sent_is_rejected() {
+    let (mut c, sseq, iss) = established(1000, true, false);
+    c.set_now(1100);
+    let inject = |c: &mut Tcb, seq: u32, ack: u32, tsval: u32, payload: &[u8]| {
+        c.inject_packet(&pkt(
+            SRV,
+            CLI,
+            seq,
+            ack,
+            flags::ACK,
+            8192,
+            &ts(tsval, 0),
+            payload,
+        ))
+        .unwrap();
+    };
+    // Only our SYN has been acknowledged: SND.UNA = SND.NXT = iss + 1.
+    for back in [2u32, 1_000] {
+        inject(&mut c, sseq, (iss + 1).wrapping_sub(back), 5, b"evil");
+        assert!(
+            recv_all(&mut c).is_empty(),
+            "ACK {back} below SND.UNA accepted"
+        );
+    }
+    drain(&mut c);
+
+    let sent = send_burst(&mut c, 1200, 3000);
+    let end = sent.last().unwrap().1;
+    inject(&mut c, sseq, end, 6, &[]);
+    inject(&mut c, sseq, iss + 1 + 1000, 7, b"late");
+    assert_eq!(recv_all(&mut c), b"late", "a reordered segment is fine");
+    inject(&mut c, sseq + 4, iss.wrapping_sub(500), 8, b"evil");
+    assert!(
+        recv_all(&mut c).is_empty(),
+        "ACK of bytes before our ISS accepted"
+    );
+}
+
 /// RFC 5961 §3: only an exact-match RST resets; in-window RSTs draw at most
 /// one challenge ACK per rate-limit interval (no RST-driven ACK flood).
 #[test]

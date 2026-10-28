@@ -17,14 +17,18 @@ use crate::wire::{flags, Segment};
 
 impl<const BUF: usize> Tcb<BUF> {
     /// RFC 9293 §3.10.7.4 step 5 hardened by RFC 5961 §5.2: SEG.ACK is
-    /// acceptable within `[SND.UNA − MAX.SND.WND, SND.NXT]`. Outside it (an
-    /// ACK of unsent data, or so old that a blind injector needs only some
-    /// stale sequence number) the whole segment is dropped after a
-    /// rate-limited ACK, so callers check this before the segment may touch
-    /// any state (TS.Recent, the ECN echo, the keepalive clock, …).
+    /// acceptable within `[SND.UNA − MAX.SND.WND, SND.NXT]`, and, as in
+    /// Linux, never below the sequence space acknowledged so far: an ACK of
+    /// bytes we never sent is bogus, so on a connection that has sent
+    /// little a blind injector must guess SND.UNA almost exactly. Outside
+    /// it (an ACK of unsent data, or so old that a blind injector needs
+    /// only some stale sequence number) the whole segment is dropped after
+    /// a rate-limited ACK, so callers check this before the segment may
+    /// touch any state (TS.Recent, the ECN echo, the keepalive clock, …).
     pub(super) fn ack_acceptable(&self, ack: u32) -> bool {
         let max_wnd = self.max_snd_wnd.max(u32::from(self.local_mss));
-        !seq_gt(ack, self.snd_nxt) && !seq_lt(ack, self.snd_una.wrapping_sub(max_wnd))
+        let back = u32::try_from(self.snd_acked).map_or(max_wnd, |a| a.min(max_wnd));
+        !seq_gt(ack, self.snd_nxt) && !seq_lt(ack, self.snd_una.wrapping_sub(back))
     }
 
     /// Process the ACK field of a segment that passed [`Self::ack_acceptable`].
@@ -128,6 +132,7 @@ impl<const BUF: usize> Tcb<BUF> {
                 .saturating_sub(u32::from(syn_acked));
             self.send_ring.consume(data_acked as usize);
             self.snd_una = ack;
+            self.snd_acked = self.snd_acked.saturating_add(u64::from(acked));
             self.syn_unacked = false;
             self.dup_acks = 0;
             // RTT, preferring our own send times as Linux does: the peer and

@@ -301,6 +301,7 @@ impl<const BUF: usize> Tcb<BUF> {
         self.irs = peer_seq;
         self.rcv_nxt = peer_seq.wrapping_add(1);
         self.snd_una = seg.ack;
+        self.snd_acked = u64::from(seg.ack.wrapping_sub(cookie));
         self.snd_nxt = seg.ack;
         self.peer_mss = opts.mss.max(MIN_PEER_MSS);
         if let Some(ws) = opts.wscale {

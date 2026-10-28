@@ -346,6 +346,9 @@ pub struct Tcb<const BUF: usize = BUF_CAP> {
     /// acknowledged. Tracked explicitly: `SND.UNA == ISS` alone cannot tell,
     /// because SND.UNA returns to ISS after every 2^32 bytes sent.
     syn_unacked: bool,
+    /// Sequence space acknowledged since ISS (SYN, data and FIN), like
+    /// Linux's `bytes_acked`: an acceptable ACK never reaches below it.
+    snd_acked: u64,
 
     // ---- Buffers.
     send_ring: Ring<BUF>,
@@ -617,6 +620,7 @@ impl<const BUF: usize> Tcb<BUF> {
         self.syn_xmit_ms = 0;
         self.syn_retransmitted = false;
         self.syn_unacked = false;
+        self.snd_acked = 0;
         self.send_ring.clear();
         self.recv_ring.clear();
         self.ooo.clear();

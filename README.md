@@ -955,8 +955,9 @@ put packets on the path — is hostile.
 - **Off-path injection (RFC 5961).** Data and FINs need the ACK bit and an
   acceptable sequence; a RST is honoured only at exactly `RCV.NXT` (in
   SYN_RCVD too), a SYN in a synchronized state draws a challenge ACK, and
-  ACKs outside `[SND.UNA − MAX.SND.WND, SND.NXT]` are dropped with a
-  challenge ACK — and leave no trace: a segment failing that check cannot
+  ACKs outside `[SND.UNA − MAX.SND.WND, SND.NXT]`, or below what has
+  actually been acknowledged (an ACK of bytes never sent, as in Linux), are
+  dropped with a challenge ACK — and leave no trace: a segment failing that check cannot
   move TS.Recent (which would let PAWS discard the peer's real data), echo
   CE or count as proof of life. PAWS drops old-timestamp data, the window
   update rule ignores a forged future WL1, and the passive ISN plus

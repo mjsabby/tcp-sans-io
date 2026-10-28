@@ -127,6 +127,7 @@ impl<const BUF: usize> Tcb<BUF> {
         };
         self.iss = self.passive_iss(self.remote, seg.seq);
         self.snd_una = self.iss;
+        self.snd_acked = 0;
         self.snd_nxt = self.iss;
         self.ts_offset = self.ts_offset_for(self.remote);
         self.absorb_syn_options(seg);
@@ -210,6 +211,7 @@ impl<const BUF: usize> Tcb<BUF> {
         // RFC 3168 §6.1.1: ECN is on iff the SYN-ACK has ECE without CWR.
         self.ecn_enabled = seg.has(flags::ECE) && !seg.has(flags::CWR);
         self.snd_una = seg.ack;
+        self.snd_acked = u64::from(seg.ack.wrapping_sub(self.iss));
         self.syn_unacked = false;
         self.rtx_count = 0;
         self.handshake_rtt_sample(seg);
@@ -321,6 +323,7 @@ impl<const BUF: usize> Tcb<BUF> {
     fn complete_passive_open(&mut self, seg: &Segment<'_>) -> Result<(), TcpError> {
         let is_syn = seg.has(flags::SYN);
         self.snd_una = seg.ack;
+        self.snd_acked = u64::from(seg.ack.wrapping_sub(self.iss));
         self.syn_unacked = false;
         self.snd_wnd = if is_syn {
             u32::from(seg.window)
