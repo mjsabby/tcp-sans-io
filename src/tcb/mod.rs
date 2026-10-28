@@ -352,8 +352,11 @@ pub struct Tcb<const BUF: usize = BUF_CAP> {
     recv_ring: Ring<BUF>,
     /// Out-of-order ranges parked in `recv_ring`'s free space.
     ooo: OooList,
-    /// A FIN seen beyond `RCV.NXT` (processed when the gap closes).
-    ooo_fin: Option<u32>,
+    /// The peer's FIN while it lies beyond `RCV.NXT`. RFC 9293 processes
+    /// segments in SEG.SEQ order, so it takes effect only once `RCV.NXT`
+    /// reaches it, and data processed ahead of it that covers its sequence
+    /// number overrides it (see `input.rs`).
+    ooo_fin: Option<HeldFin>,
     /// D-SACK block to report on the next ACK (RFC 2883).
     dsack: Option<(u32, u32)>,
 
@@ -454,6 +457,15 @@ pub(crate) fn seq_lt(a: u32, b: u32) -> bool {
 #[inline]
 pub(crate) fn seq_in_range(x: u32, lo: u32, hi_exclusive: u32) -> bool {
     x.wrapping_sub(lo) < hi_exclusive.wrapping_sub(lo)
+}
+
+/// A FIN that arrived beyond `RCV.NXT`, with the first sequence number of
+/// the segment that carried it (the FIN itself for a bare FIN), which is
+/// its place in SEG.SEQ processing order.
+#[derive(Clone, Copy, Debug)]
+struct HeldFin {
+    start: u32,
+    seq: u32,
 }
 
 impl<const BUF: usize> Tcb<BUF> {
@@ -761,12 +773,12 @@ impl<const BUF: usize> Tcb<BUF> {
                 return Err("out-of-order data beyond the receive buffer");
             }
         }
-        if let Some(f) = self.ooo_fin {
-            if !self.state.can_recv() || !seq_gt(f, self.rcv_nxt) {
+        if let Some(h) = self.ooo_fin {
+            if !self.state.can_recv() || !seq_gt(h.seq, self.rcv_nxt) {
                 return Err("stale out-of-order FIN");
             }
-            if self.ooo_last_end().is_some_and(|e| seq_gt(e, f)) {
-                return Err("out-of-order data beyond the peer's FIN");
+            if seq_gt(h.start, h.seq) {
+                return Err("out-of-order FIN precedes its own segment");
             }
         }
         if let Some(n) = self.tx_ring.peek_head_len() {

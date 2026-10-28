@@ -477,6 +477,86 @@ fn time_wait_expiry_leaves_no_timer_after_peer_segments() {
     }
 }
 
+/// RFC 9293 processes segments in SEG.SEQ order, so a FIN held beyond
+/// RCV.NXT takes effect only when RCV.NXT reaches it. Data processed ahead
+/// of it that covers its sequence number shows it was not the end of the
+/// stream (a forged FIN, say), and the FIN is dropped, as Linux drops a
+/// fully covered FIN: in-order data, or out-of-order data from a segment
+/// that starts no later than the FIN's, whichever arrives first.
+#[test]
+fn held_fin_is_overridden_by_data_processed_ahead_of_it() {
+    let d = PEER_ISS + 1;
+    let mut buf = [0u8; 512];
+
+    let mut t = established();
+    peer_seg(&mut t, d + 50, 1001, flags::FIN, &[]);
+    peer_seg(&mut t, d, 1001, 0, &[1; 100]);
+    assert_eq!((t.state(), t.rcv_nxt), (State::Established, d + 100));
+    assert_eq!(t.recv(&mut buf), Ok(100));
+    t.debug_validate_invariants().unwrap();
+    peer_seg(&mut t, d + 100, 1001, flags::FIN, &[]);
+    assert_eq!(t.state(), State::CloseWait, "the real FIN still closes");
+
+    // A bare FIN at d+150 and a FIN after text from d+120, against data
+    // [d+100, d+200) arriving before or after the FIN.
+    for (fin_start, data_first) in [(150, false), (150, true), (120, false), (120, true)] {
+        let mut t = established();
+        let fin_text = std::vec![3u8; 150 - fin_start as usize];
+        if data_first {
+            peer_seg(&mut t, d + 100, 1001, 0, &[2; 100]);
+        }
+        peer_seg(&mut t, d + fin_start, 1001, flags::FIN, &fin_text);
+        if !data_first {
+            peer_seg(&mut t, d + 100, 1001, 0, &[2; 100]);
+        }
+        t.debug_validate_invariants().unwrap();
+        peer_seg(&mut t, d, 1001, 0, &[1; 100]);
+        assert_eq!(
+            (t.state(), t.rcv_nxt),
+            (State::Established, d + 200),
+            "FIN segment from d+{fin_start}, data first: {data_first}"
+        );
+        t.debug_validate_invariants().unwrap();
+    }
+}
+
+/// The other half of SEG.SEQ order: data from a segment that starts after
+/// the FIN's segment is processed after the FIN, so the FIN ends the stream
+/// and the data past it is purged, in either arrival order. That includes
+/// an in-order FIN segment and data parked beyond its FIN, where the FIN
+/// used to be lost.
+#[test]
+fn fin_segment_wins_over_data_that_starts_after_it() {
+    let d = PEER_ISS + 1;
+    let mut buf = [0u8; 512];
+    for data_first in [false, true] {
+        let mut t = established();
+        if data_first {
+            peer_seg(&mut t, d + 130, 1001, 0, &[9; 100]);
+        }
+        peer_seg(&mut t, d + 100, 1001, flags::FIN, &[2; 50]);
+        if !data_first {
+            peer_seg(&mut t, d + 130, 1001, 0, &[9; 100]);
+        }
+        peer_seg(&mut t, d, 1001, 0, &[1; 100]);
+        assert_eq!(
+            (t.state(), t.rcv_nxt),
+            (State::CloseWait, d + 151),
+            "data first: {data_first}"
+        );
+        assert_eq!(t.recv(&mut buf), Ok(150));
+        t.debug_validate_invariants().unwrap();
+    }
+
+    let mut t = established();
+    peer_seg(&mut t, d + 50, 1001, 0, &[9; 100]);
+    peer_seg(&mut t, d, 1001, flags::FIN, &[1; 100]);
+    assert_eq!((t.state(), t.rcv_nxt), (State::CloseWait, d + 101));
+    assert_eq!(t.recv(&mut buf), Ok(100));
+    assert_eq!(&buf[..100], &[1u8; 100][..]);
+    t.debug_validate_invariants().unwrap();
+}
+
 /// An out-of-order FIN is consumed once, when the gap closes: with a
 /// single ACK (it used to be two, or one plus a redundant delayed ACK for a
 /// bare FIN), never skipped by bytes queued past it (they were delivered

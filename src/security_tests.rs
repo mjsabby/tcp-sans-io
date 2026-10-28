@@ -1906,9 +1906,10 @@ fn fin_before_parked_out_of_order_data_purges_it() {
     assert_eq!(recv_all(&mut c), [2u8; 10]);
 }
 
-/// Out-of-order data beyond a FIN that is itself still out of order cannot
-/// belong to the stream either: it is never stored, so filling the hole
-/// delivers exactly the data before the FIN, then the FIN.
+/// Out-of-order data from segments that start after a FIN's own segment is
+/// processed after the FIN (RFC 9293 SEG.SEQ order), so it never extends
+/// the stream: filling the hole delivers exactly the data before the FIN,
+/// then the FIN, and the rest is purged.
 #[test]
 fn data_beyond_an_out_of_order_fin_is_never_delivered() {
     let (mut c, sseq, iss) = established(1000, true, false);
