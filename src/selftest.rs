@@ -13,10 +13,12 @@
 //! regressions in a single call. The check is deterministic: a failure is
 //! always reproducible.
 //!
-//! Stack cost: two `Tcb<SELFTEST_BUF>` plus small scratch — roughly
-//! 256 KiB of stack while running. The host calls this on its own stack
-//! (e.g. once at start-up); virtually every platform default (≥ 1 MiB)
-//! accommodates it.
+//! Stack cost: two `Tcb<SELFTEST_BUF>` built in place plus small scratch —
+//! under 256 KiB of stack while running (pinned by a test). The host calls
+//! this on its own stack (e.g. once at start-up); virtually every platform
+//! default (≥ 1 MiB) accommodates it.
+
+use core::mem::MaybeUninit;
 
 use crate::tcb::{Endpoint, Tcb, TcbConfig};
 use crate::State;
@@ -84,23 +86,35 @@ fn pat(stream: u32, offset: u32) -> u8 {
 /// Pure: no I/O, no allocation, no panics. Safe to call from any thread at
 /// any time; it operates only on its own stack-local TCBs.
 pub fn self_conformance() -> i32 {
-    let mut cli: Tcb<SELFTEST_BUF> = match Tcb::new(cfg(
-        0x1111_1111,
-        ([10, 0, 0, 1], 40000),
-        ([10, 0, 0, 2], 80),
-    )) {
-        Ok(t) => t,
-        Err(_) => return result::INIT_FAILED,
-    };
-    let mut srv: Tcb<SELFTEST_BUF> = match Tcb::new(cfg(
-        0x9999_9999,
-        ([10, 0, 0, 2], 80),
-        ([10, 0, 0, 1], 40000),
-    )) {
-        Ok(t) => t,
-        Err(_) => return result::INIT_FAILED,
-    };
+    // Built in place: `Tcb::new` returns by value, and the moves would
+    // double the stack footprint of these two TCBs.
+    let mut cli = MaybeUninit::<Tcb<SELFTEST_BUF>>::uninit();
+    let mut srv = MaybeUninit::<Tcb<SELFTEST_BUF>>::uninit();
+    let c = cfg(0x1111_1111, ([10, 0, 0, 1], 40000), ([10, 0, 0, 2], 80));
+    // SAFETY: `cli` is a valid, exclusively owned slot for a `Tcb`.
+    if unsafe { Tcb::init_in_place(cli.as_mut_ptr(), c) }.is_err() {
+        return result::INIT_FAILED;
+    }
+    let s = cfg(0x9999_9999, ([10, 0, 0, 2], 80), ([10, 0, 0, 1], 40000));
+    // SAFETY: as above, for `srv`.
+    if unsafe { Tcb::init_in_place(srv.as_mut_ptr(), s) }.is_err() {
+        // SAFETY: `cli` was initialised above and is dropped exactly once.
+        unsafe { cli.assume_init_drop() };
+        return result::INIT_FAILED;
+    }
+    // SAFETY: both slots were initialised above.
+    let rc = run(unsafe { cli.assume_init_mut() }, unsafe {
+        srv.assume_init_mut()
+    });
+    // SAFETY: initialised and not yet dropped; neither is used afterwards.
+    unsafe {
+        cli.assume_init_drop();
+        srv.assume_init_drop();
+    }
+    rc
+}
 
+fn run(cli: &mut Tcb<SELFTEST_BUF>, srv: &mut Tcb<SELFTEST_BUF>) -> i32 {
     let mut now: u64 = 0;
     cli.set_now(now);
     srv.set_now(now);
@@ -236,5 +250,18 @@ mod tests {
     #[test]
     fn self_conformance_passes() {
         assert_eq!(self_conformance(), result::OK);
+    }
+
+    /// `tcp_selftest` is documented to need ~256 KiB of the caller's stack.
+    /// (Optimised builds only: unoptimised frames are far larger.)
+    #[test]
+    #[cfg(not(debug_assertions))]
+    fn self_conformance_fits_in_256_kib_of_stack() {
+        extern crate std;
+        let rc = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(self_conformance)
+            .map(|h| h.join());
+        assert!(matches!(rc, Ok(Ok(result::OK))));
     }
 }

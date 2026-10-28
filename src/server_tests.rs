@@ -670,19 +670,22 @@ fn cookie_handshake_round_trip() {
     assert_eq!(synack.ack, CLIENT_ISS.wrapping_add(1));
     let cookie = synack.seq;
     assert_eq!(s.state(), State::Listen, "stateless cookies stay in LISTEN");
+    // SACK-permitted survives the stateless handshake: it is encoded in the
+    // low bits of our TSval (the peer offered timestamps).
     assert!(
-        !synack.sack_permitted,
-        "cookie SYN-ACK does not negotiate SACK"
+        synack.sack_permitted,
+        "cookie SYN-ACK negotiates SACK via TS"
     );
+    let (synack_tsval, _) = synack.ts.expect("TS echoed in the cookie SYN-ACK");
 
-    // Client final ACK echoing cookie+1.
+    // Client final ACK echoing cookie+1 and our TSval.
     let ack = build_in(
         flags::ACK,
         CLIENT_ISS.wrapping_add(1),
         cookie.wrapping_add(1),
         PEER_WIN,
         None,
-        Some((101, 0)),
+        Some((101, synack_tsval)),
         false,
         &[],
     );

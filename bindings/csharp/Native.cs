@@ -109,6 +109,58 @@ internal static class Native
         IntPtr buf,
         UIntPtr cap,
         out UIntPtr written);
+
+    // ---- Deployment knobs / observability ----------------------------------
+
+    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int tcp_set_secret(IntPtr handle, IntPtr secret);
+
+    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int tcp_set_mtu(IntPtr handle, ushort mtu);
+
+    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int tcp_update_pmtu(IntPtr handle, ulong nowMs, ushort mtu);
+
+    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int tcp_set_fin_wait2_timeout(IntPtr handle, ulong nowMs, uint timeoutMs);
+
+    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern ulong tcp_next_deadline(IntPtr handle);
+
+    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int tcp_get_stats(IntPtr handle, out TcpStats stats);
+}
+
+/// <summary>Mirror of the C <c>TcpStats</c> (128 bytes).</summary>
+[StructLayout(LayoutKind.Sequential)]
+internal struct TcpStats
+{
+    public ulong SegsOut;
+    public ulong SegsIn;
+    public ulong BytesSent;
+    public ulong BytesRetrans;
+    public ulong BytesReceived;
+    public ulong DupBytesReceived;
+    public ulong SegsRetrans;
+    public ulong DsacksReceived;
+    public uint FastRecoveries;
+    public uint RtoCount;
+    public uint TlpCount;
+    public uint OooDrops;
+    public uint OowSuppressed;
+    public uint SrttMs;
+    public uint RttvarMs;
+    public uint MinRttMs;
+    public uint RtoMs;
+    public uint Cwnd;
+    public uint Ssthresh;
+    public uint Pipe;
+    public uint Mss;
+    public uint SndWnd;
+    public uint RcvWnd;
+    public byte CaState;
+    public byte State;
+    public ushort Reserved;
 }
 
 internal enum TcpState : byte

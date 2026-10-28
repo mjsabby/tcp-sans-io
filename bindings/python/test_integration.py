@@ -438,6 +438,33 @@ class IntegrationTests(unittest.TestCase):
 
     # ---- helpers ------------------------------------------------------
 
+    def test_deployment_knobs_stats_and_deadline(self) -> None:
+        client = make_client()
+        peer = TestPeer()
+        try:
+            self.assertIsNone(client.next_deadline(), "no timer armed when CLOSED")
+            client.set_secret(os.urandom(16))
+            client.set_mtu(1420)
+            client.set_fin_wait2_timeout(1000, 30_000)
+            client.connect(1000)
+            self.assertEqual(client.next_deadline(), 2000, "SYN retransmission timer")
+            pkts = drain(client, 1000)
+            peer.now_ms = 1005
+            replies = peer.handle(pkts[0])
+            self.assertEqual(peer.peer_mss, 1380, "MSS follows set_mtu(1420)")
+            client.inject_packet(replies[0], 1010)
+            for p in drain(client, 1010):
+                peer.handle(p)
+            self.assertEqual(client.state(), tcp_sans_io.State.ESTABLISHED)
+            st = client.stats()
+            self.assertEqual(st.mss, 1380 - 12, "payload per segment with timestamps")
+            self.assertEqual(st.state, tcp_sans_io.State.ESTABLISHED)
+            self.assertGreaterEqual(st.segs_out, 2)
+            # Idle and established: only keepalive (10 min idle) is armed.
+            self.assertEqual(client.next_deadline(), 1010 + 600_000)
+        finally:
+            client.destroy()
+
     def _handshake(self, client: tcp_sans_io.TcpStream, peer: TestPeer, now: int) -> int:
         """Drive the 3-way handshake. Returns the advanced clock so callers
         stay monotonic (the stack last saw ``now + 10``; reusing the caller's

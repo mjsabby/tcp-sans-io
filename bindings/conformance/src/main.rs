@@ -58,24 +58,29 @@ impl Handle {
     }
 
     fn state(&self) -> u8 {
-        tcp_state(self.ptr)
+        // SAFETY: `self.ptr` is a live handle owned by this wrapper.
+        unsafe { tcp_state(self.ptr) }
     }
 
     fn connect(&self, now: u64) {
-        assert_eq!(tcp_connect(self.ptr, now), 0);
+        // SAFETY: live handle owned by this wrapper.
+        assert_eq!(unsafe { tcp_connect(self.ptr, now) }, 0);
     }
 
     fn listen(&self, now: u64) {
-        assert_eq!(tcp_listen(self.ptr, now), 0);
+        // SAFETY: live handle owned by this wrapper.
+        assert_eq!(unsafe { tcp_listen(self.ptr, now) }, 0);
     }
 
     fn tick(&self, now: u64) {
-        let rc = tcp_tick(self.ptr, now);
+        // SAFETY: live handle owned by this wrapper.
+        let rc = unsafe { tcp_tick(self.ptr, now) };
         assert!(rc == 0, "tcp_tick returned {rc}");
     }
 
     fn close(&self, now: u64) {
-        let rc = tcp_close(self.ptr, now);
+        // SAFETY: live handle owned by this wrapper.
+        let rc = unsafe { tcp_close(self.ptr, now) };
         assert!(rc == 0, "tcp_close returned {rc}");
     }
 

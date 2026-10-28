@@ -158,6 +158,45 @@ impl<const N: usize> Ring<N> {
         n
     }
 
+    /// Write `src` into the free region at `offset` bytes past the write
+    /// cursor **without** making it readable. Used to park out-of-order
+    /// receive data at its final position: the receive window is exactly the
+    /// free region, so any in-window segment has a slot here. Bytes that
+    /// would fall past the free region are clipped. Returns bytes written.
+    pub fn write_at(&mut self, offset: usize, src: &[u8]) -> usize {
+        let free = self.free();
+        if offset >= free {
+            return 0;
+        }
+        let n = core::cmp::min(src.len(), free - offset);
+        if n == 0 {
+            return 0;
+        }
+        let mask = N - 1;
+        let start = self.tail.wrapping_add(offset) & mask;
+        let first = core::cmp::min(n, N - start);
+        if let (Some(dst), Some(s)) = (self.buf.get_mut(start..start + first), src.get(..first)) {
+            dst.copy_from_slice(s);
+        }
+        if n > first {
+            let rem = n - first;
+            if let (Some(dst), Some(s)) = (self.buf.get_mut(..rem), src.get(first..first + rem)) {
+                dst.copy_from_slice(s);
+            }
+        }
+        n
+    }
+
+    /// Make `n` bytes past the write cursor readable. They must already hold
+    /// valid data (written by [`Self::write_at`]). Clipped to free space;
+    /// returns the number of bytes committed.
+    pub fn commit(&mut self, n: usize) -> usize {
+        let n = core::cmp::min(n, self.free());
+        self.tail = self.tail.wrapping_add(n);
+        self.len += n;
+        n
+    }
+
     /// Drop `n` bytes from the head. Saturates at `len`.
     pub fn consume(&mut self, n: usize) {
         let n = core::cmp::min(n, self.len);
@@ -174,5 +213,46 @@ impl<const N: usize> Ring<N> {
         self.head = 0;
         self.tail = 0;
         self.len = 0;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
+    use super::Ring;
+
+    #[test]
+    fn write_at_then_commit_reassembles_across_wrap() {
+        let mut r: Ring<16> = Ring::new().unwrap();
+        // Advance the cursors so the free region wraps the end of storage.
+        assert_eq!(r.write(&[0u8; 12]), 12);
+        let mut sink = [0u8; 12];
+        assert_eq!(r.read(&mut sink), 12);
+        // Park bytes 4..10 out of order, then fill 0..4 in order.
+        assert_eq!(r.write_at(4, &[4, 5, 6, 7, 8, 9]), 6);
+        assert_eq!(r.len(), 0, "parked bytes are not readable yet");
+        assert_eq!(r.write(&[0, 1, 2, 3]), 4);
+        assert_eq!(r.commit(6), 6);
+        let mut out = [0u8; 10];
+        assert_eq!(r.read(&mut out), 10);
+        assert_eq!(out, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    }
+
+    #[test]
+    fn write_at_clips_to_free_space() {
+        let mut r: Ring<8> = Ring::new().unwrap();
+        assert_eq!(r.write(&[1, 2, 3]), 3);
+        assert_eq!(
+            r.write_at(4, &[9; 10]),
+            1,
+            "only offset 4 of 5 free bytes fits"
+        );
+        assert_eq!(
+            r.write_at(5, &[9]),
+            0,
+            "offset at/after free space is rejected"
+        );
+        assert_eq!(r.commit(100), 5, "commit is clipped to free space");
+        assert_eq!(r.free(), 0);
     }
 }

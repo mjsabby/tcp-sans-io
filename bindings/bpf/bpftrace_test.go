@@ -1,5 +1,5 @@
 // Optional BPF trace test: runs the bpftrace uprobes against the
-// tcp-sans-io cdylib while it drives a short netem benchmark, then
+// tcp-sans-io cdylib while it drives one bench.sh benchmark run, then
 // asserts that the expected FFI functions were observed at non-zero
 // rates. Skips unless run as root on Linux with bpftrace available.
 //
@@ -53,19 +53,16 @@ func TestBpftraceUprobes(t *testing.T) {
 		t.Fatalf("cdylib not built (%s): %v — run `cargo build --release --lib` first", cdylib, err)
 	}
 
-	// Build the netem test binary (host of the cdylib).
-	netemBin, err := filepath.Abs("../netem")
+	// Build the benchmark endpoint (host of the cdylib) where bench.sh
+	// expects it.
+	netemDir, err := filepath.Abs("../netem")
 	if err != nil {
 		t.Fatalf("resolve netem dir: %v", err)
 	}
-	binPath := filepath.Join(t.TempDir(), "netem.test")
-	build := exec.Command("go", "test", "-c", "-o", binPath, "./...")
-	build.Dir = netemBin
-	build.Env = append(os.Environ(),
-		"CGO_LDFLAGS=-L"+filepath.Dir(cdylib)+" -ltcp_sans_io -Wl,-rpath,"+filepath.Dir(cdylib),
-	)
+	build := exec.Command("go", "build", "-o", "tsbench", ".")
+	build.Dir = netemDir
 	if out, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("build netem.test: %v\n%s", err, out)
+		t.Fatalf("build tsbench: %v\n%s", err, out)
 	}
 
 	// Render the bpftrace template with the absolute cdylib path.
@@ -79,23 +76,22 @@ func TestBpftraceUprobes(t *testing.T) {
 		t.Fatalf("write rendered bpftrace: %v", err)
 	}
 
-	// Run bpftrace as the parent, with the netem benchmark as the
-	// traced child via `-c`. bpftrace attaches uprobes before exec,
-	// runs the child to completion, then prints maps + exits.
+	// Run bpftrace as the parent, with one benchmark run as the traced
+	// child via `-c`. bpftrace attaches uprobes before exec, runs the child
+	// to completion, then prints maps + exits.
 	//
 	// The benchmark profile is selectable via TCPSANSIO_BPF_PROFILE so
 	// the CI workflow can keep the uprobe trace in sync with whichever
-	// netem profile the perf-bench run is targeting.
+	// bench.sh profile the perf-bench run is targeting.
 	profile := os.Getenv("TCPSANSIO_BPF_PROFILE")
 	if profile == "" {
-		profile = "LAN_NoLoss_1msDelay"
+		profile = "lan"
 	}
-	runArg := fmt.Sprintf("^TestNetem_%s$", profile)
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	child := fmt.Sprintf("%s --profiles %s --runs 1 --dir up --stacks tcp-sans-io --out %s",
+		filepath.Join(netemDir, "bench.sh"), profile, filepath.Join(t.TempDir(), "results.jsonl"))
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "bpftrace", btPath,
-		"-c", binPath+" -test.v -test.timeout=90s -test.run="+runArg,
-	)
+	cmd := exec.CommandContext(ctx, "bpftrace", btPath, "-c", child)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("bpftrace: %v\n%s", err, out)
@@ -110,7 +106,7 @@ func TestBpftraceUprobes(t *testing.T) {
 		t.Logf("wrote trace artifact: %s (%d bytes)", artifact, len(out))
 	}
 
-	// Sanity-check: the netem benchmark should have driven the cdylib
+	// Sanity-check: the benchmark should have driven the cdylib
 	// hard enough that each major FFI function was called many times.
 	// We're not asserting exact numbers — just that the symbols
 	// resolved and the host loop is exercising them.

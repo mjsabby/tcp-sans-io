@@ -432,17 +432,30 @@ fuzz_target!(|data: &[u8]| {
                 acked = new_ack;
             }
 
-            // Duplicate pure ACK idempotence: one duplicate ACK with no SACK
-            // must not advance sequence state or consume send bytes. Restrict
-            // to dup_ack_count=0 so this oracle doesn't intentionally become
-            // the third dup-ACK fast-retransmit trigger.
+            // Duplicate pure ACK: one duplicate ACK with no SACK must not
+            // move SND.UNA, the window, the send ring or the state, and
+            // SND.NXT never retreats. It may release new data, but no burst:
+            // one segment (RFC 3042 Limited Transmit, or the segment PRR
+            // credits as delivered during recovery) plus less than a
+            // segment of PRR credit banked by earlier odd-sized sends.
+            // Restrict to dup_ack_count=0 so this oracle doesn't
+            // intentionally become the third dup-ACK fast-retransmit trigger.
             let before_dup = tcb.debug_snapshot();
             if before_dup.dup_ack_count == 0 {
                 if let Some(p) = ack_packet(acked, SackBlocks::EMPTY) {
                     no_internal(tcb.inject_packet(&p));
                     observe_state(&mut prev_state, &tcb);
                     let after_dup = tcb.debug_snapshot();
-                    assert_sender_core_unchanged(before_dup, after_dup, "duplicate pure ACK");
+                    let advanced = after_dup.snd_nxt.wrapping_sub(before_dup.snd_nxt);
+                    assert!(
+                        advanced <= 2 * u32::from(tcp_sans_io::MSS),
+                        "duplicate pure ACK: snd_nxt moved by {advanced} (a burst, or backwards)",
+                    );
+                    let unchanged_nxt = DebugSnapshot {
+                        snd_nxt: before_dup.snd_nxt,
+                        ..after_dup
+                    };
+                    assert_sender_core_unchanged(before_dup, unchanged_nxt, "duplicate pure ACK");
                     drain(&mut tcb, &mut hi, &mut prev_state);
                 }
             }
