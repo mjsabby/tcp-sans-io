@@ -717,6 +717,17 @@ until one PTO after the resume instead of being queued behind the data it
 probes for). Resume with `set_now`, `set_egress_paused(false)` and a
 `tick()`. (Rust API only.)
 
+**Checksum offload and borrowed extraction.** If something downstream
+computes TCP checksums (a NIC with TX checksum offload, or a virtio-net guest
+that negotiated `VIRTIO_NET_F_GUEST_CSUM` and is handed
+`VIRTIO_NET_HDR_F_NEEDS_CSUM` frames), call `tcb.set_tx_csum_offload(true)`.
+Segments then carry only the pseudo-header sum in the TCP checksum field
+(Linux `CHECKSUM_PARTIAL`: `csum_start` is the TCP header, `csum_offset` is
+16), which skips a pass over every payload byte. IPv4 header checksums stay
+complete. `tcb.extract_packet_with(|dgram| ...)` lends the staged datagram to
+the closure instead of copying it into your buffer. The inbound counterpart is
+`inject_packet_l4_csum_trusted`. (Rust API only.)
+
 ### How do you know you got it right? (canonical conformance)
 
 There is a canonical, executable answer: **drive a hash-verified

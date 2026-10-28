@@ -3101,6 +3101,57 @@ fn egress_pause_still_sends_rst_on_abort() {
 }
 
 // ---------------------------------------------------------------------------
+// Host checksum offload and zero-copy extraction.
+// ---------------------------------------------------------------------------
+
+/// A TCB that has just staged one 1000-byte data segment.
+fn tcb_with_staged_data(csum_offload: bool) -> Tcb {
+    let mut tcb = make_tcb();
+    let mut now = 0u64;
+    let _ = handshake_with_ts(&mut tcb, &mut now);
+    tcb.set_tx_csum_offload(csum_offload);
+    tcb.send(&[0x5a; 1000]).expect("send");
+    tcb.tick().expect("tick");
+    tcb
+}
+
+/// With checksum offload the TCB leaves the TCP checksum to the host
+/// (CHECKSUM_PARTIAL): completing it the way a NIC does yields exactly the
+/// datagram a full emit stages.
+#[test]
+fn tx_csum_offload_leaves_a_partial_checksum() {
+    let (full, seg) = pop(&mut tcb_with_staged_data(false));
+    assert_eq!(seg.payload.len(), 1000);
+    let mut buf = [0u8; MAX_PACKET];
+    let n = tcb_with_staged_data(true)
+        .extract_packet(&mut buf)
+        .expect("extract");
+    let mut part = buf[..n].to_vec();
+    assert_ne!(part, full);
+    assert!(wire::parse(&part).is_err(), "not a complete checksum");
+    // Sum the TCP segment, the partial field included; store the complement.
+    let tcp = &mut part[20..];
+    let mut sum: u32 = 0;
+    for pair in tcp.chunks(2) {
+        sum += (u32::from(pair[0]) << 8) | u32::from(*pair.get(1).unwrap_or(&0));
+    }
+    while sum > 0xFFFF {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    tcp[16..18].copy_from_slice(&(!(sum as u16)).to_be_bytes());
+    assert_eq!(part, full);
+}
+
+/// `extract_packet_with` lends the datagram `extract_packet` would copy out.
+#[test]
+fn extract_packet_with_lends_the_staged_datagram() {
+    let (copied, _) = pop(&mut tcb_with_staged_data(false));
+    let mut tcb = tcb_with_staged_data(false);
+    assert_eq!(tcb.extract_packet_with(<[u8]>::to_vec), Some(copied));
+    assert_eq!(tcb.extract_packet_with(|_| ()), None);
+}
+
+// ---------------------------------------------------------------------------
 // Sequence-number wraparound soak.
 //
 // TCP sequence numbers are u32 (4 GiB). On a fast link that's only ~30s

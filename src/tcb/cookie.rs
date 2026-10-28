@@ -202,8 +202,9 @@ impl<const BUF: usize> Tcb<BUF> {
         let fl = flags::SYN | flags::ACK | if ecn { flags::ECE } else { 0 };
         let (local_ip, local_port, ip_id) = (self.local.ip, self.local.port, self.ip_id);
         let ack = seg.seq.wrapping_add(1);
+        let full_csum = !self.tx_csum_offload;
         let queued = self.tx_ring.push_with(|buf| {
-            wire::emit(
+            wire::emit_with(
                 buf,
                 local_ip,
                 remote.ip,
@@ -214,9 +215,11 @@ impl<const BUF: usize> Tcb<BUF> {
                 fl,
                 win,
                 &opts,
-                &[],
+                0,
+                |_| true,
                 ip_id,
                 wire::ecn::NOT_ECT,
+                full_csum,
             )
         })?;
         if queued {

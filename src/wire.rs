@@ -492,12 +492,56 @@ pub fn emit(
     ip_id: u16,
     ecn: u8,
 ) -> Result<usize, TcpError> {
+    emit_with(
+        out,
+        src_ip,
+        dst_ip,
+        src_port,
+        dst_port,
+        seq,
+        ack,
+        flags,
+        window,
+        options,
+        payload.len(),
+        |dst| {
+            dst.copy_from_slice(payload);
+            true
+        },
+        ip_id,
+        ecn,
+        true,
+    )
+}
+
+/// [`emit`] for the TCB's own segments: `fill` writes the `payload_len`
+/// payload bytes straight into the datagram (returning false if it could
+/// not), and with `full_csum == false` the TCP checksum field carries only
+/// the pseudo-header sum for the host to complete (CHECKSUM_PARTIAL).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_with(
+    out: &mut [u8],
+    src_ip: [u8; 4],
+    dst_ip: [u8; 4],
+    src_port: u16,
+    dst_port: u16,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    window: u16,
+    options: &TcpOptions,
+    payload_len: usize,
+    fill: impl FnOnce(&mut [u8]) -> bool,
+    ip_id: u16,
+    ecn: u8,
+    full_csum: bool,
+) -> Result<usize, TcpError> {
     let opt_len = options.encoded_len();
     if !opt_len.is_multiple_of(4) || opt_len > 40 {
         return Err(TcpError::Overflow);
     }
     let tcp_hdr_len = TCP_HDR_LEN + opt_len;
-    let total = IPV4_HDR_LEN + tcp_hdr_len + payload.len();
+    let total = IPV4_HDR_LEN + tcp_hdr_len + payload_len;
     if out.len() < total {
         return Err(TcpError::BufferTooSmall);
     }
@@ -523,7 +567,7 @@ pub fn emit(
     put_u16(ip, 10, ip_csum)?;
 
     // ---- TCP header --------------------------------------------------------
-    let tcp_end = IPV4_HDR_LEN + tcp_hdr_len + payload.len();
+    let tcp_end = IPV4_HDR_LEN + tcp_hdr_len + payload_len;
     let tcp = out
         .get_mut(IPV4_HDR_LEN..tcp_end)
         .ok_or(TcpError::BufferTooSmall)?;
@@ -549,14 +593,21 @@ pub fn emit(
         }
     }
 
-    if let Some(dst) = body.get_mut(..payload.len()) {
-        dst.copy_from_slice(payload);
+    let dst = body
+        .get_mut(..payload_len)
+        .ok_or(TcpError::BufferTooSmall)?;
+    if !fill(dst) {
+        return Err(TcpError::Overflow);
     }
 
     let tcp_segment = out
         .get(IPV4_HDR_LEN..tcp_end)
         .ok_or(TcpError::BufferTooSmall)?;
-    let tcp_csum = tcp_checksum(&src_ip, &dst_ip, tcp_segment);
+    let tcp_csum = if full_csum {
+        tcp_checksum(&src_ip, &dst_ip, tcp_segment)
+    } else {
+        tcp_partial_checksum(&src_ip, &dst_ip, tcp_segment.len() as u32)
+    };
     let tcp_mut = out
         .get_mut(IPV4_HDR_LEN..tcp_end)
         .ok_or(TcpError::BufferTooSmall)?;
@@ -569,41 +620,71 @@ pub fn emit(
 // Checksums
 // ---------------------------------------------------------------------------
 
+/// Internet checksum (RFC 1071): the complemented ones' complement sum of
+/// `data` as big-endian 16-bit words plus `seed`, a sum of such words.
+#[inline]
 fn checksum(data: &[u8], seed: u32) -> u16 {
-    let mut sum = seed;
-    let mut i = 0;
-    while i + 1 < data.len() {
-        let hi = match data.get(i) {
-            Some(b) => *b as u32,
-            None => break,
-        };
-        let lo = match data.get(i + 1) {
-            Some(b) => *b as u32,
-            None => break,
-        };
-        sum = sum.wrapping_add((hi << 8) | lo);
-        i += 2;
-    }
-    if i < data.len() {
-        if let Some(b) = data.get(i) {
-            sum = sum.wrapping_add((*b as u32) << 8);
-        }
-    }
-    while (sum >> 16) != 0 {
-        sum = (sum & 0xFFFF) + (sum >> 16);
-    }
-    !(sum as u16)
+    !fold(u64::from(ones_sum(data)) + u64::from(seed))
 }
 
-fn tcp_checksum(src_ip: &[u8; 4], dst_ip: &[u8; 4], tcp_segment: &[u8]) -> u16 {
-    let len = tcp_segment.len() as u32;
-    let pseudo: u32 = (((src_ip[0] as u32) << 8) | src_ip[1] as u32)
+/// Ones' complement sum of `data` as big-endian 16-bit words, folded to 16
+/// bits. Adds native-endian 32-bit words into a 64-bit accumulator, which
+/// vectorizes: a 32-bit word folds to the sum of its 16-bit halves, and byte
+/// order only swaps the bytes of the folded sum (RFC 1071 §2(B)).
+#[inline]
+fn ones_sum(data: &[u8]) -> u16 {
+    let (words, tail) = data.as_chunks::<4>();
+    let mut acc: u64 = 0;
+    for w in words {
+        acc += u64::from(u32::from_ne_bytes(*w));
+    }
+    let mut last = [0u8; 4];
+    if let Some(dst) = last.get_mut(..tail.len()) {
+        dst.copy_from_slice(tail);
+    }
+    acc += u64::from(u32::from_ne_bytes(last));
+    let sum = fold(acc);
+    if cfg!(target_endian = "little") {
+        sum.swap_bytes()
+    } else {
+        sum
+    }
+}
+
+/// Fold a ones' complement sum to 16 bits with end-around carries.
+#[inline]
+fn fold(mut acc: u64) -> u16 {
+    while acc > 0xFFFF {
+        acc = (acc & 0xFFFF) + (acc >> 16);
+    }
+    acc as u16
+}
+
+/// Sum of the IPv4 pseudo-header's 16-bit words for a TCP segment of
+/// `tcp_len` bytes.
+#[inline]
+fn pseudo_sum(src_ip: &[u8; 4], dst_ip: &[u8; 4], tcp_len: u32) -> u32 {
+    (((src_ip[0] as u32) << 8) | src_ip[1] as u32)
         .wrapping_add(((src_ip[2] as u32) << 8) | src_ip[3] as u32)
         .wrapping_add(((dst_ip[0] as u32) << 8) | dst_ip[1] as u32)
         .wrapping_add(((dst_ip[2] as u32) << 8) | dst_ip[3] as u32)
         .wrapping_add(IPPROTO_TCP as u32)
-        .wrapping_add(len & 0xFFFF);
-    checksum(tcp_segment, pseudo)
+        .wrapping_add(tcp_len & 0xFFFF)
+}
+
+fn tcp_checksum(src_ip: &[u8; 4], dst_ip: &[u8; 4], tcp_segment: &[u8]) -> u16 {
+    checksum(
+        tcp_segment,
+        pseudo_sum(src_ip, dst_ip, tcp_segment.len() as u32),
+    )
+}
+
+/// What CHECKSUM_PARTIAL leaves in the TCP checksum field: the folded,
+/// uncomplemented pseudo-header sum. Completing it means summing the whole
+/// TCP segment, this field included, and storing the complement.
+#[inline]
+fn tcp_partial_checksum(src_ip: &[u8; 4], dst_ip: &[u8; 4], tcp_len: u32) -> u16 {
+    !checksum(&[], pseudo_sum(src_ip, dst_ip, tcp_len))
 }
 
 // ---------------------------------------------------------------------------
@@ -645,4 +726,58 @@ fn put4(buf: &mut [u8], off: usize, v: [u8; 4]) -> Result<(), TcpError> {
     let dst = buf.get_mut(off..off + 4).ok_or(TcpError::BufferTooSmall)?;
     dst.copy_from_slice(&v);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
+    use super::*;
+
+    /// RFC 1071, one big-endian 16-bit word at a time.
+    fn checksum_ref(data: &[u8], seed: u32) -> u16 {
+        let mut sum = u64::from(seed);
+        for pair in data.chunks(2) {
+            sum += (u64::from(pair[0]) << 8) | u64::from(*pair.get(1).unwrap_or(&0));
+        }
+        while sum > 0xFFFF {
+            sum = (sum & 0xFFFF) + (sum >> 16);
+        }
+        !(sum as u16)
+    }
+
+    #[test]
+    fn checksum_matches_rfc1071_reference() {
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut buf = vec![0u8; 1600];
+        for len in 0..buf.len() {
+            for b in buf.iter_mut() {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                *b = x as u8;
+            }
+            let seed = (x >> 40) as u32 & 0x7_FFFF;
+            assert_eq!(
+                checksum(&buf[..len], seed),
+                checksum_ref(&buf[..len], seed),
+                "len {len}"
+            );
+        }
+        for byte in [0x00u8, 0xFF] {
+            let data = vec![byte; 65_535];
+            for len in [0, 1, 2, 3, 4, 5, 1448, 65_535] {
+                for seed in [0, 0xFFFF, 0x7_FFFF] {
+                    assert_eq!(
+                        checksum(&data[..len], seed),
+                        checksum_ref(&data[..len], seed)
+                    );
+                }
+            }
+        }
+    }
 }

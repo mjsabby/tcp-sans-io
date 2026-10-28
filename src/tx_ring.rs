@@ -159,6 +159,19 @@ impl TxRing {
         self.len -= 1;
         Ok(n)
     }
+
+    /// Pop the head packet and lend its bytes to `f`; `None` if the ring
+    /// is empty.
+    pub fn pop_with<R>(&mut self, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
+        if self.len == 0 {
+            return None;
+        }
+        let slot = self.slots.get(self.head)?;
+        let r = f(slot.buf.get(..slot.len as usize)?);
+        self.head = (self.head + 1) % TX_RING_CAP;
+        self.len -= 1;
+        Some(r)
+    }
 }
 
 impl Default for TxRing {
