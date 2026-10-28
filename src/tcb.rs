@@ -3576,17 +3576,14 @@ fn siphash24(key: &[u8; 16], data: &[u8]) -> u64 {
     let mut v2 = 0x6c79_6765_6e65_7261u64 ^ k0;
     let mut v3 = 0x7465_6462_7974_6573u64 ^ k1;
 
-    let mut chunks = data.chunks_exact(8);
-    for chunk in chunks.by_ref() {
-        let mut arr = [0u8; 8];
-        arr.copy_from_slice(chunk);
-        let m = u64::from_le_bytes(arr);
+    let (chunks, rem) = data.as_chunks::<8>();
+    for chunk in chunks {
+        let m = u64::from_le_bytes(*chunk);
         v3 ^= m;
         sipround(&mut v0, &mut v1, &mut v2, &mut v3);
         sipround(&mut v0, &mut v1, &mut v2, &mut v3);
         v0 ^= m;
     }
-    let rem = chunks.remainder();
     let mut tail = [0u8; 8];
     if let Some(dst) = tail.get_mut(..rem.len()) {
         dst.copy_from_slice(rem);
