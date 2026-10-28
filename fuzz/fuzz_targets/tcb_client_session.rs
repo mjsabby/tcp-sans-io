@@ -435,20 +435,30 @@ fuzz_target!(|data: &[u8]| {
             // Duplicate pure ACK: one duplicate ACK with no SACK must not
             // move SND.UNA, the window, the send ring or the state, and
             // SND.NXT never retreats. It may release new data, but no burst:
-            // one segment (RFC 3042 Limited Transmit, or the segment PRR
-            // credits as delivered during recovery) plus less than a
-            // segment of PRR credit banked by earlier odd-sized sends.
+            // outside a reduction, one segment (RFC 3042 Limited Transmit)
+            // plus less than a segment of credit banked by earlier odd-sized
+            // sends. During a PRR reduction (RFC 6937) the credit earned by
+            // earlier ACKs while the application had nothing to send is
+            // legitimately released by a later ACK, so the bound there is
+            // the episode's whole budget: ssthresh plus one segment.
             // Restrict to dup_ack_count=0 so this oracle doesn't
             // intentionally become the third dup-ACK fast-retransmit trigger.
             let before_dup = tcb.debug_snapshot();
+            let in_reduction = tcb.stats().ca_state != 0;
             if before_dup.dup_ack_count == 0 {
                 if let Some(p) = ack_packet(acked, SackBlocks::EMPTY) {
                     no_internal(tcb.inject_packet(&p));
                     observe_state(&mut prev_state, &tcb);
                     let after_dup = tcb.debug_snapshot();
                     let advanced = after_dup.snd_nxt.wrapping_sub(before_dup.snd_nxt);
+                    let mss = u32::from(tcp_sans_io::MSS);
+                    let limit = if in_reduction {
+                        before_dup.ssthresh.saturating_add(mss).max(2 * mss)
+                    } else {
+                        2 * mss
+                    };
                     assert!(
-                        advanced <= 2 * u32::from(tcp_sans_io::MSS),
+                        advanced <= limit,
                         "duplicate pure ACK: snd_nxt moved by {advanced} (a burst, or backwards)",
                     );
                     let unchanged_nxt = DebugSnapshot {

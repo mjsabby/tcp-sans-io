@@ -1250,3 +1250,332 @@ fn tcp_init_rejects_misaligned_storage() {
     // SAFETY: matching dealloc.
     unsafe { std::alloc::dealloc(base, layout) };
 }
+
+// ---------------------------------------------------------------------------
+// Second review: state that must only follow an ACK-validated segment
+// ---------------------------------------------------------------------------
+
+/// Like [`pkt`] but with an IPv4 ECN codepoint.
+#[allow(clippy::too_many_arguments)]
+fn pkt_ecn(
+    src: ([u8; 4], u16),
+    dst: ([u8; 4], u16),
+    seq: u32,
+    ack: u32,
+    fl: u8,
+    opts: &TcpOptions,
+    payload: &[u8],
+    ecn: u8,
+) -> Vec<u8> {
+    let mut b = vec![0u8; 20 + 60 + payload.len()];
+    let n = wire::emit(
+        &mut b, src.0, dst.0, src.1, dst.1, seq, ack, fl, 8192, opts, payload, 7, ecn,
+    )
+    .unwrap();
+    b.truncate(n);
+    b
+}
+
+/// A blind injector who knows only the 4-tuple can land a data segment that
+/// overlaps the left window edge (seq in `[RCV.NXT - len + 1, RCV.NXT]`)
+/// without guessing the ACK number. Before the fix that segment updated
+/// TS.Recent before the RFC 5961 §5 ACK check ran, so one far-future TSval
+/// made PAWS drop every later genuine segment: a 2^32/len connection kill.
+#[test]
+fn blind_segment_with_unacceptable_ack_cannot_poison_ts_recent() {
+    let (mut c, sseq, iss) = established(1000, true, false);
+    c.set_now(1100);
+    c.inject_packet(&pkt(
+        SRV,
+        CLI,
+        sseq,
+        iss + 1,
+        flags::ACK,
+        1000,
+        &ts(100, 0),
+        b"a",
+    ))
+    .unwrap();
+    drain(&mut c);
+    // Overlaps the left edge by 700 bytes; ACK far outside the window.
+    let poison = pkt(
+        SRV,
+        CLI,
+        sseq + 1 - 700,
+        iss + 1 - 0x4000_0000,
+        flags::ACK,
+        1000,
+        &ts(100 + 0x3000_0000, 0),
+        &[0xEE; 1400],
+    );
+    c.inject_packet(&poison).unwrap();
+    let out = drain(&mut c);
+    assert!(
+        out.iter().all(|o| o.len == 0),
+        "nothing but a challenge ACK"
+    );
+    // The genuine peer continues with its own clock.
+    c.inject_packet(&pkt(
+        SRV,
+        CLI,
+        sseq + 1,
+        iss + 1,
+        flags::ACK,
+        1000,
+        &ts(101, 0),
+        b"b",
+    ))
+    .unwrap();
+    let mut buf = [0u8; 8];
+    let n = c.recv(&mut buf).unwrap();
+    assert_eq!(
+        &buf[..n],
+        b"ab",
+        "genuine data PAWS-rejected: TS.Recent was poisoned"
+    );
+}
+
+/// RFC 3168: CE is a property of data segments. A CE-marked pure ACK with
+/// a bogus ACK number (a 1-in-4096 blind guess at a 1 MiB window) must not
+/// make us echo ECE and halve the peer's window; CE on accepted data must.
+#[test]
+fn ce_mark_is_honoured_only_on_ack_validated_data() {
+    let (mut c, sseq, iss) = established(1000, true, true);
+    c.set_now(1100);
+    let blind = pkt_ecn(
+        SRV,
+        CLI,
+        sseq + 4000,
+        iss + 1 - 0x4000_0000,
+        flags::ACK,
+        &ts(100, 0),
+        &[],
+        wire::ecn::CE,
+    );
+    c.inject_packet(&blind).unwrap();
+    drain(&mut c);
+    c.inject_packet(&pkt(
+        SRV,
+        CLI,
+        sseq,
+        iss + 1,
+        flags::ACK,
+        1000,
+        &ts(101, 0),
+        b"x",
+    ))
+    .unwrap();
+    c.inject_packet(&pkt(
+        SRV,
+        CLI,
+        sseq + 1,
+        iss + 1,
+        flags::ACK,
+        1000,
+        &ts(102, 0),
+        b"y",
+    ))
+    .unwrap();
+    let out = drain(&mut c);
+    assert!(
+        !out.is_empty() && out.iter().all(|o| o.flags & flags::ECE == 0),
+        "ECE from a blind CE"
+    );
+    // Genuine CE-marked data.
+    let ce = pkt_ecn(
+        SRV,
+        CLI,
+        sseq + 2,
+        iss + 1,
+        flags::ACK,
+        &ts(103, 0),
+        b"z",
+        wire::ecn::CE,
+    );
+    c.inject_packet(&ce).unwrap();
+    c.inject_packet(&pkt(
+        SRV,
+        CLI,
+        sseq + 3,
+        iss + 1,
+        flags::ACK,
+        1000,
+        &ts(104, 0),
+        b"w",
+    ))
+    .unwrap();
+    let out = drain(&mut c);
+    assert!(
+        out.iter().any(|o| o.flags & flags::ECE != 0),
+        "CE on data must be echoed"
+    );
+}
+
+/// Keepalive proof of life must come from an ACK-validated segment, not
+/// from any in-window sequence number.
+#[test]
+fn keepalive_is_not_refreshed_by_a_segment_with_an_unacceptable_ack() {
+    let (mut c, sseq, iss) = established(1000, false, false);
+    let before = c.next_deadline().expect("keepalive armed");
+    c.set_now(50_000);
+    c.inject_packet(&pkt(
+        SRV,
+        CLI,
+        sseq,
+        iss + 1 - 0x4000_0000,
+        flags::ACK,
+        1000,
+        &ts(5, 0),
+        &[],
+    ))
+    .unwrap();
+    drain(&mut c);
+    assert_eq!(
+        c.next_deadline(),
+        Some(before),
+        "rejected ACK counted as proof of life"
+    );
+    c.inject_packet(&pkt(
+        SRV,
+        CLI,
+        sseq,
+        iss + 1,
+        flags::ACK,
+        1000,
+        &ts(6, 0),
+        &[],
+    ))
+    .unwrap();
+    assert!(
+        c.next_deadline().unwrap() > before,
+        "genuine ACK is proof of life"
+    );
+}
+
+/// A FIN at RCV.NXT ends the stream: anything parked beyond it is bogus
+/// and is purged (Linux drops its OFO queue too), so the out-of-order
+/// tracker never holds a range starting at RCV.NXT.
+#[test]
+fn fin_purges_parked_out_of_order_data() {
+    let (mut c, sseq, iss) = established(1000, true, false);
+    c.set_now(1100);
+    c.inject_packet(&pkt(
+        SRV,
+        CLI,
+        sseq + 1,
+        iss + 1,
+        flags::ACK,
+        1000,
+        &ts(5, 0),
+        &[1; 100],
+    ))
+    .unwrap();
+    drain(&mut c);
+    assert_eq!(c.debug_snapshot().oo_len, 100);
+    c.inject_packet(&pkt(
+        SRV,
+        CLI,
+        sseq,
+        iss + 1,
+        flags::ACK | flags::FIN,
+        1000,
+        &ts(6, 0),
+        &[],
+    ))
+    .unwrap();
+    assert_eq!(c.state(), State::CloseWait);
+    assert_eq!(c.debug_snapshot().oo_len, 0, "data beyond the FIN kept");
+    c.debug_validate_invariants().unwrap();
+}
+
+/// RFC 1122 §4.2.2.13: data arriving after the peer's FIN can never be
+/// delivered; it is answered with a RST (as Linux does) rather than ACKed
+/// forever.
+#[test]
+fn new_data_after_peer_fin_is_reset() {
+    let (mut c, sseq, iss) = established(1000, true, false);
+    c.set_now(1100);
+    c.inject_packet(&pkt(
+        SRV,
+        CLI,
+        sseq,
+        iss + 1,
+        flags::ACK | flags::FIN,
+        1000,
+        &ts(5, 0),
+        &[],
+    ))
+    .unwrap();
+    assert_eq!(c.state(), State::CloseWait);
+    drain(&mut c);
+    c.inject_packet(&pkt(
+        SRV,
+        CLI,
+        sseq + 1,
+        iss + 1,
+        flags::ACK,
+        1000,
+        &ts(6, 0),
+        b"late",
+    ))
+    .unwrap();
+    let out = drain(&mut c);
+    assert_eq!(out.len(), 1);
+    assert_eq!(
+        out[0].flags & (flags::RST | flags::ACK),
+        flags::RST | flags::ACK
+    );
+    assert_eq!(c.state(), State::Closed);
+    assert_eq!(c.recv(&mut [0u8; 4]), Err(TcpError::ConnectionReset));
+}
+
+/// Segments accepted during TIME_WAIT used to re-arm keepalive, which then
+/// outlived the 2·MSL expiry: `next_deadline()` pointed into the past on a
+/// CLOSED TCB and an event-driven host woke for nothing.
+#[test]
+fn time_wait_expiry_leaves_no_timer_armed() {
+    let (mut c, sseq, iss) = established(1000, true, false);
+    c.set_now(1100);
+    c.close().unwrap();
+    drain(&mut c);
+    c.inject_packet(&pkt(
+        SRV,
+        CLI,
+        sseq,
+        iss + 2,
+        flags::ACK | flags::FIN,
+        1000,
+        &ts(5, 0),
+        &[],
+    ))
+    .unwrap();
+    assert_eq!(c.state(), State::TimeWait);
+    drain(&mut c);
+    c.set_now(1200);
+    c.inject_packet(&pkt(
+        SRV,
+        CLI,
+        sseq + 1,
+        iss + 2,
+        flags::ACK,
+        1000,
+        &ts(6, 0),
+        &[],
+    ))
+    .unwrap();
+    drain(&mut c);
+    assert_eq!(
+        c.next_deadline(),
+        Some(1100 + 60_000),
+        "only 2·MSL is armed"
+    );
+    c.set_now(1100 + 60_000);
+    c.tick().unwrap();
+    assert_eq!(c.state(), State::Closed);
+    assert_eq!(c.next_deadline(), None);
+    assert_eq!(
+        c.debug_next_deadline(),
+        None,
+        "a timer survived into CLOSED"
+    );
+}

@@ -320,10 +320,12 @@ impl<const BUF: usize> Tcb<BUF> {
         self.on_peer_alive();
     }
 
-    /// An acceptable segment arrived: the peer is alive.
+    /// An acceptable segment arrived: the peer is alive. Only `ESTABLISHED`
+    /// arms the keepalive idle timer; every other state is bounded by its
+    /// own timer (R2 / FIN_WAIT_2 / 2·MSL) or by the host's `close`.
     fn on_peer_alive(&mut self) {
         self.keepalive_probes = 0;
-        if self.keepalive_idle_ms != 0 {
+        if self.keepalive_idle_ms != 0 && self.state == State::Established {
             self.keepalive_deadline = Deadline::at(
                 self.now_ms
                     .saturating_add(u64::from(self.keepalive_idle_ms)),
@@ -385,8 +387,18 @@ impl<const BUF: usize> Tcb<BUF> {
         if !seg.has(flags::ACK) {
             return Ok(());
         }
+        if let AckVerdict::Drop = self.process_ack(seg)? {
+            return Ok(());
+        }
+        // Only a segment whose ACK field also passed the RFC 5961 §5 check
+        // may touch connection state that is not sequence-protected:
+        // TS.Recent (a forged in-window TSval would PAWS-reject every later
+        // genuine segment), the ECN echo, and the keepalive proof of life.
+        // Otherwise a blind injector needs only a near-left-edge sequence
+        // number, not the ACK number as well.
         self.update_ts_recent(seg);
-        if self.ecn_enabled {
+        if self.ecn_enabled && payload_len > 0 {
+            // RFC 3168 §6.1.2–6.1.3: CE and CWR are carried by data segments.
             if seg.ecn == ecn::CE {
                 self.ce_observed = true;
             }
@@ -395,12 +407,22 @@ impl<const BUF: usize> Tcb<BUF> {
             }
         }
         self.on_peer_alive();
-
-        if let AckVerdict::Drop = self.process_ack(seg)? {
-            return Ok(());
-        }
         if self.state == State::Closed {
             return Ok(()); // our FIN was ACKed in LAST-ACK
+        }
+
+        // RFC 1122 §4.2.2.13: new data after the peer's FIN (CLOSE_WAIT,
+        // CLOSING, LAST_ACK) can never be delivered; reset, as Linux does.
+        if payload_len > 0
+            && matches!(
+                self.state,
+                State::CloseWait | State::Closing | State::LastAck
+            )
+            && seq_gt(seg.seq.wrapping_add(payload_len), self.rcv_nxt)
+        {
+            let _ = self.emit_ctl(flags::RST | flags::ACK, self.snd_nxt, self.rcv_nxt)?;
+            self.abort_local();
+            return Ok(());
         }
 
         let prev_rcv_nxt = self.rcv_nxt;
@@ -613,6 +635,10 @@ impl<const BUF: usize> Tcb<BUF> {
     }
 
     fn advance_state_on_remote_fin(&mut self) {
+        // Nothing can follow the FIN: anything parked beyond it came from a
+        // confused or hostile peer (Linux purges its OFO queue here too).
+        self.ooo.clear();
+        self.ooo_fin = None;
         self.state = match self.state {
             State::Established => State::CloseWait,
             State::FinWait1 => {

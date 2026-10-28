@@ -91,8 +91,8 @@ shows what that costs against Linux CUBIC on lossy long paths.
 
 ### Memory footprint
 
-Per connection, `tcp_handle_size()` is **2,176,648 bytes (≈ 2.08 MiB)** with
-default features, or **139,272 bytes (136 KiB)** with `small-buffers`:
+Per connection, `tcp_handle_size()` is **2,176,696 bytes (≈ 2.08 MiB)** with
+default features, or **139,320 bytes (136 KiB)** with `small-buffers`:
 
 - `BUF_CAP` send ring + receive ring (2 × 1 MiB; 2 × 32 KiB with
   `small-buffers`). Out-of-order data is parked inside the receive ring at
@@ -160,7 +160,7 @@ mis-ordering, corruption, a panic, or an unbounded loop.
 | Keepalive | 600 s idle / 60 s / 4 probes | `tcb/mod.rs` | Reaps a vanished peer on an idle connection. `set_keepalive(0, …)` disables. |
 | FIN_WAIT_2 timeout | 60 s | `tcb/mod.rs` | Time a peer may leave its half open after ACKing our FIN (refreshed by its data). |
 | Out-of-window reply rate | 1 per 500 ms | `tcb/mod.rs` | Challenge ACKs, dup ACKs for unacceptable segments and RSTs to stray segments, per connection. |
-| Cookie validity | 64–128 s | `tcb/cookie.rs` | Two 64 s buckets; 29-bit SipHash MAC (2⁻²⁹ blind forgery per attempt). |
+| Cookie validity | 64–128 s | `tcb/cookie.rs` | Two 64 s buckets; 29-bit SipHash MAC (two valid buckets ⇒ 2⁻²⁸ blind forgery per attempt). The previous secret stays valid for 128 s after `tcp_set_cookie_secret` rotates it. |
 
 ### Why the bounds are sound
 
@@ -454,7 +454,7 @@ tables. `TSB_PCAP=dir` captures each run's packet headers at the receiver;
 
 ```sh
 cargo build --release --lib       # cdylib + staticlib + rlib
-cargo test  --release --lib       # 207 tests: unit, conformance, loopback, property, server, security regressions, link simulation, smoltcp interop
+cargo test  --release --lib       # 213 tests: unit, conformance, loopback, property, server, security regressions, link simulation, smoltcp interop
 cargo clippy --release --lib --no-deps -- -D warnings
 ```
 
@@ -813,16 +813,28 @@ catching accidental `#[no_mangle]` removals. See
 
 ### Coverage-guided fuzzing (`fuzz/`)
 
-Six `cargo-fuzz` targets: `wire_parse` and `wire_parse_emit_roundtrip`
+Seven `cargo-fuzz` targets: `wire_parse` and `wire_parse_emit_roundtrip`
 (the codec), `tcb_inject_sequence` (arbitrary datagram streams into one
-TCB), `tcb_client_session` (a scripted peer with state-transition,
-sequence-monotonicity, no-burst and liveness oracles) and `tcb_loopback` /
-`tcb_loopback_small` (two TCBs over a fuzzer-controlled channel). Each ran
-10 minutes clean on this code (≈ 300 M executions for the codec targets,
-0.1–1.3 M for the TCB targets):
+TCB — chunks are addressed to the TCB and given a valid IPv4 header
+checksum, then injected through the checksum-trusting entry point, so the
+acceptance paths and not just the parser's reject branch are reached),
+`tcb_adversary` (structured off-path-style segments — fuzzer-chosen flags,
+sequence/ACK numbers around the live window edges, timestamps, SACK
+blocks, ECN bits and payload, interleaved with application calls and clock
+jumps — against an established TCB; this is the target that covers the
+RFC 5961 / PAWS / ECN acceptance order), `tcb_client_session` (a scripted
+peer with state-transition, sequence-monotonicity, no-burst and liveness
+oracles) and `tcb_loopback` / `tcb_loopback_small` (two TCBs over a
+fuzzer-controlled channel). The TCB targets share the oracles: internal
+invariants after every call, no internal error code escaping, bounded
+output per step, a future `next_deadline()` after every `tick()`, and
+quiescence at a fixed clock. The oracles are deliberately strict: a
+failure is either a stack bug or an oracle that needs a documented
+relaxation (the no-burst bound, for instance, admits PRR credit banked
+while the application was idle), never something to ignore.
 
 ```sh
-cargo +nightly fuzz run tcb_client_session -- -max_total_time=600 -timeout=60
+cargo +nightly fuzz run tcb_adversary -- -max_total_time=600 -timeout=60
 ```
 
 ### Other canonical suites not (yet) integrated
@@ -916,17 +928,30 @@ put packets on the path — is hostile.
 - **Off-path injection (RFC 5961).** Data and FINs need the ACK bit and an
   acceptable sequence; a RST is honoured only at exactly `RCV.NXT`, a SYN
   in a synchronized state draws a challenge ACK, and ACKs outside
-  `[SND.UNA − MAX.SND.WND, SND.NXT]` are dropped with a challenge ACK. PAWS
-  drops old-timestamp data, the window update rule ignores a forged future
-  WL1, and the passive ISN plus timestamp offset are keyed per 4-tuple
+  `[SND.UNA − MAX.SND.WND, SND.NXT]` are dropped with a challenge ACK.
+  State that is not protected by the sequence check — `TS.Recent` (PAWS),
+  the ECN echo and the keepalive proof of life — is updated only by
+  segments whose ACK field also passed that check, and CE marks count only
+  on data segments, so a blind sender needs both numbers, not just a
+  sequence number near the left window edge. PAWS drops old-timestamp
+  data, the window update rule ignores a forged future WL1, and the
+  passive ISN plus timestamp offset are keyed per 4-tuple
   (`tcp_set_secret`), so neither the host clock nor sequence numbers leak.
 - **Reflection and ACK storms.** Replies to unacceptable segments
   (challenge ACKs, dup ACKs for out-of-window data, RSTs to stray ACKs or
-  SYN-ACKs) are limited to one per 500 ms per connection and are never
-  larger than the segment that triggered them; a bare ACK to a listener
-  draws at most one such RST, addressed to the segment's source.
+  SYN-ACKs) are limited to one per 500 ms per connection and carry no
+  payload (at most 76 bytes with timestamps and SACK blocks); a bare ACK
+  to a listener is dropped silently and a SYN-ACK to one draws at most
+  one RST, addressed to the segment's source. New data arriving after
+  the peer's FIN is answered with a RST (RFC 1122 §4.2.2.13) rather than
+  an ACK per segment.
 - **SYN floods.** Stateless SYN cookies (29-bit SipHash MAC, 64 s buckets)
   that keep window scaling, SACK and ECN when the client uses timestamps.
+  Rotating the secret keeps the previous one valid for 128 s so
+  handshakes in flight still complete. Cookie mode is per listener TCB
+  and always on once a secret is installed: clients without timestamps
+  (the Windows default) then get neither window scaling nor SACK, so
+  hosts that can detect a flood may prefer to enable cookies only then.
 - **Malformed and adversarial segments.** Every parser path is
   bounds-checked and returns `Result`; peer MSS is floored at 64 B; option
   processing, SACK and D-SACK handling, and out-of-order insertion are

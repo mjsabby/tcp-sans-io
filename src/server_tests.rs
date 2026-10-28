@@ -24,7 +24,7 @@ extern crate std;
 use std::vec;
 use std::vec::Vec;
 
-use crate::tcb::{events, Endpoint, Tcb, TcbConfig};
+use crate::tcb::{events, Endpoint, Tcb, TcbConfig, COOKIE_TIME_BUCKET_MS};
 use crate::wire::{self, flags, SackBlocks, Segment, TcpOptions};
 use crate::{State, MAX_PACKET};
 
@@ -844,48 +844,79 @@ fn cookie_handshake_survives_one_time_bucket_rollover() {
     assert_eq!(s.state(), State::Established);
 }
 
+/// Rotating the cookie secret must not fail handshakes already in flight:
+/// a cookie minted under the previous secret stays valid for two time
+/// buckets after the rotation, and is rejected once that grace period (or
+/// a second rotation) has passed.
 #[test]
-fn cookie_rejects_third_ack_after_secret_rotation() {
+fn cookie_rotation_keeps_in_flight_cookies_valid_for_a_grace_period() {
+    let third_ack = |cookie: u32| {
+        build_in(
+            flags::ACK,
+            CLIENT_ISS.wrapping_add(1),
+            cookie.wrapping_add(1),
+            PEER_WIN,
+            None,
+            None,
+            false,
+            &[],
+        )
+    };
+    let mint = |s: &mut Tcb| {
+        let syn = build_in(
+            flags::SYN,
+            CLIENT_ISS,
+            0,
+            PEER_WIN,
+            Some(1460),
+            None,
+            false,
+            &[],
+        );
+        s.inject_packet(&syn).expect("inject SYN");
+        pop(s).seq
+    };
+
+    // In flight across one rotation: accepted.
     let mut s = make_listener();
     s.set_cookie_secret(&COOKIE_SECRET);
     s.set_now(0);
     s.listen().expect("listen");
-
-    let syn = build_in(
-        flags::SYN,
-        CLIENT_ISS,
-        0,
-        PEER_WIN,
-        Some(1460),
-        None,
-        false,
-        &[],
-    );
-    s.inject_packet(&syn).expect("inject SYN");
-    let synack = pop(&mut s);
-    let cookie = synack.seq;
-
-    // Operator rotates the secret — outstanding cookies become invalid.
-    let new_secret = [0xAAu8; 16];
-    s.set_cookie_secret(&new_secret);
-
-    let ack = build_in(
-        flags::ACK,
-        CLIENT_ISS.wrapping_add(1),
-        cookie.wrapping_add(1),
-        PEER_WIN,
-        None,
-        None,
-        false,
-        &[],
-    );
+    let cookie = mint(&mut s);
     s.set_now(1);
-    s.inject_packet(&ack).expect("inject ACK");
+    s.set_cookie_secret(&[0xAAu8; 16]);
+    s.set_now(2);
+    s.inject_packet(&third_ack(cookie)).expect("inject ACK");
     assert_eq!(
         s.state(),
-        State::Listen,
-        "rotated secret invalidates old cookies"
+        State::Established,
+        "a cookie minted just before a rotation must still complete"
     );
+
+    // Past the grace period: rejected.
+    let mut s = make_listener();
+    s.set_cookie_secret(&COOKIE_SECRET);
+    s.set_now(0);
+    s.listen().expect("listen");
+    let cookie = mint(&mut s);
+    s.set_now(1);
+    s.set_cookie_secret(&[0xAAu8; 16]);
+    s.set_now(1 + 2 * COOKIE_TIME_BUCKET_MS);
+    s.inject_packet(&third_ack(cookie)).expect("inject ACK");
+    assert_eq!(s.state(), State::Listen, "old secret expired");
+
+    // Two rotations: only the immediately preceding secret is kept.
+    let mut s = make_listener();
+    s.set_cookie_secret(&COOKIE_SECRET);
+    s.set_now(0);
+    s.listen().expect("listen");
+    let cookie = mint(&mut s);
+    s.set_now(1);
+    s.set_cookie_secret(&[0xAAu8; 16]);
+    s.set_cookie_secret(&[0xBBu8; 16]);
+    s.set_now(2);
+    s.inject_packet(&third_ack(cookie)).expect("inject ACK");
+    assert_eq!(s.state(), State::Listen, "secret two rotations old");
 }
 
 // ---------------------------------------------------------------------------

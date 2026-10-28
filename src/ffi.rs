@@ -198,6 +198,8 @@ pub unsafe extern "C" fn tcp_listen(handle: *mut TcpStreamHandle, now_ms: u64) -
 }
 
 /// Install a 128-bit secret enabling stateless SYN cookies (RFC 4987).
+/// Calling it again rotates the secret; cookies minted under the previous
+/// one stay valid for 128 s so handshakes in flight still complete.
 ///
 /// # Safety
 /// `handle` as above; `secret` must point to 16 readable bytes.

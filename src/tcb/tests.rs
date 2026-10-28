@@ -496,7 +496,8 @@ fn sack_blocks_never_push_a_segment_over_the_mss() {
 fn next_deadline_is_never_stale_after_tick() {
     // Keepalive comes due while the connection is not probe-able (peer
     // closed its half; we hold CLOSE_WAIT with unsent data): tick must not
-    // leave a past deadline armed, or an event-driven host would spin.
+    // leave a past deadline armed, or an event-driven host would spin. The
+    // zero-window persist probes then go unanswered until R2 aborts.
     let mut t = established();
     t.set_keepalive(1_000, 100, 3);
     t.set_user_timeout(0);
@@ -511,15 +512,18 @@ fn next_deadline_is_never_stale_after_tick() {
     .unwrap();
     assert_eq!(t.state(), State::CloseWait);
     t.send(&[1; 10]).unwrap();
-    for _ in 0..50 {
-        let d = t.next_deadline().expect("persist / keepalive armed");
+    let mut wakeups = 0;
+    while let Some(d) = t.next_deadline() {
         t.set_now(d);
         t.tick().unwrap();
         drain(&mut t);
-        let next = t.next_deadline().unwrap();
-        assert!(next > d, "deadline {next} not after tick at {d}");
+        if let Some(next) = t.next_deadline() {
+            assert!(next > d, "deadline {next} not after tick at {d}");
+        }
+        wakeups += 1;
+        assert!(wakeups < 50, "no progress toward R2 abort");
     }
-    assert_eq!(t.state(), State::CloseWait);
+    assert_eq!(t.state(), State::Closed, "unanswered probes abort (R2)");
 }
 
 #[test]

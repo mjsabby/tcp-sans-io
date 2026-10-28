@@ -53,8 +53,9 @@
 //!
 //! 5. **Use SYN cookies on untrusted listeners.** Before exposing a listener to
 //!    hostile traffic, call [`Tcb::set_cookie_secret`] with 16 bytes from a
-//!    CSPRNG and rotate it periodically (old cookies stay valid ~64–128 s after
-//!    rotation). Without cookies the stateful path is still flood-bounded (one
+//!    CSPRNG and rotate it periodically (cookies minted under the previous
+//!    secret stay valid for 128 s after a rotation, so handshakes in flight
+//!    complete). Without cookies the stateful path is still flood-bounded (one
 //!    half-open per TCB, capped SYN-ACK retransmits); cookies let one listener
 //!    absorb a SYN flood holding *zero* per-connection state until the third
 //!    ACK validates. A predictable or leaked secret defeats the protection.

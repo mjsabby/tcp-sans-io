@@ -13,7 +13,7 @@ use crate::wire::{self, flags, SackBlocks, Segment, TcpOptions};
 
 /// SYN-cookie time-bucket width; cookies validate for the current and the
 /// previous bucket (64–128 s).
-pub(super) const COOKIE_TIME_BUCKET_MS: u64 = 64_000;
+pub(crate) const COOKIE_TIME_BUCKET_MS: u64 = 64_000;
 
 /// Quantised peer-MSS values selectable by the cookie's top 3 bits.
 const COOKIE_MSS_TABLE: [u16; 8] = [536, 1300, 1440, 1452, 1460, 1480, 9000, 65495];
@@ -80,9 +80,13 @@ impl<const BUF: usize> Tcb<BUF> {
     /// untrusted peers should call [`Tcb::set_secret`].
     pub(super) fn ts_offset_for(&self, remote: Endpoint) -> u32 {
         match self.host_key() {
-            Some(k) => Self::tuple_hash(k, self.local, remote, b'T', 0) as u32,
+            Some(k) => self.ts_offset_with(k, remote),
             None => 0,
         }
+    }
+
+    fn ts_offset_with(&self, key: &[u8; 16], remote: Endpoint) -> u32 {
+        Self::tuple_hash(key, self.local, remote, b'T', 0) as u32
     }
 
     /// RFC 6528 ISN for a passive open when a host secret is installed:
@@ -99,8 +103,15 @@ impl<const BUF: usize> Tcb<BUF> {
         }
     }
 
-    /// 32-bit cookie: top 3 bits = MSS index, low 29 bits = MAC.
-    fn compute_cookie(&self, bucket: u64, remote: Endpoint, mss_idx: u8, peer_seq: u32) -> u32 {
+    /// 32-bit cookie: top 3 bits = MSS index, low 29 bits = MAC under `key`.
+    fn compute_cookie(
+        &self,
+        key: &[u8; 16],
+        bucket: u64,
+        remote: Endpoint,
+        mss_idx: u8,
+        peer_seq: u32,
+    ) -> u32 {
         let mut buf = [0u8; 25];
         let fields: [&[u8]; 7] = [
             &bucket.to_be_bytes(),
@@ -118,9 +129,18 @@ impl<const BUF: usize> Tcb<BUF> {
             }
             at += f.len();
         }
-        let mac = siphash24(&self.cookie_secret, &buf);
+        let mac = siphash24(key, &buf);
         let macbits = (mac as u32) & 0x1FFF_FFFF;
         ((u32::from(mss_idx) & 0x7) << 29) | macbits
+    }
+
+    /// The cookie secret that was current before the last rotation, while
+    /// cookies minted under it can still be valid (two time buckets).
+    fn prev_cookie_key(&self) -> Option<&[u8; 16]> {
+        match self.prev_cookie_until.get() {
+            Some(until) if self.now_ms < until => Some(&self.prev_cookie_secret),
+            _ => None,
+        }
     }
 
     /// Answer a SYN in `LISTEN` statelessly with a cookie SYN-ACK.
@@ -139,7 +159,7 @@ impl<const BUF: usize> Tcb<BUF> {
             .max(MIN_PEER_MSS);
         let mss_idx = cookie_mss_index(peer_mss);
         let bucket = self.now_ms / COOKIE_TIME_BUCKET_MS;
-        let cookie = self.compute_cookie(bucket, remote, mss_idx, seg.seq);
+        let cookie = self.compute_cookie(&self.cookie_secret, bucket, remote, mss_idx, seg.seq);
 
         // Options can only be preserved through the cookie via TSval bits.
         let ts_off = self.ts_offset_for(remote);
@@ -218,12 +238,17 @@ impl<const BUF: usize> Tcb<BUF> {
         let mss_idx = ((cookie >> 29) & 0x7) as u8;
         let peer_seq = seg.seq.wrapping_sub(1);
         let now_bucket = self.now_ms / COOKIE_TIME_BUCKET_MS;
-        let valid = [now_bucket, now_bucket.wrapping_sub(1)]
-            .iter()
-            .any(|&b| self.compute_cookie(b, remote, mss_idx, peer_seq) == cookie);
-        if !valid {
+        let buckets = [now_bucket, now_bucket.wrapping_sub(1)];
+        // Current secret first, then (within its grace period) the one it
+        // replaced, so a rotation does not fail handshakes already in flight.
+        let keys = [Some(&self.cookie_secret), self.prev_cookie_key()];
+        let Some(key) = keys.into_iter().flatten().find(|k| {
+            buckets
+                .iter()
+                .any(|&b| self.compute_cookie(k, b, remote, mss_idx, peer_seq) == cookie)
+        }) else {
             return Ok(false);
-        }
+        };
         let opts = match decode_ts_opts(seg.options.ts) {
             Some(o) => CookieOpts {
                 mss: cookie_mss_from_index(mss_idx),
@@ -231,10 +256,18 @@ impl<const BUF: usize> Tcb<BUF> {
             },
             None => return Ok(false), // malformed option bits
         };
+        // The SYN-ACK's TSval was offset under the key that minted the
+        // cookie; keep that offset so our timestamps stay monotonic for the
+        // peer's PAWS.
+        let ts_offset = if self.secret_set {
+            self.ts_offset_for(remote)
+        } else {
+            self.ts_offset_with(key, remote)
+        };
 
         self.reset_connection_state();
         self.remote = remote;
-        self.ts_offset = self.ts_offset_for(remote);
+        self.ts_offset = ts_offset;
         self.iss = cookie;
         self.irs = peer_seq;
         self.rcv_nxt = peer_seq.wrapping_add(1);

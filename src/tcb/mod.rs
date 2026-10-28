@@ -23,6 +23,9 @@ mod output;
 mod tests;
 mod timers;
 
+#[cfg(test)]
+pub(crate) use cookie::COOKIE_TIME_BUCKET_MS;
+
 use crate::congestion::{self, Reno};
 use crate::error::TcpError;
 use crate::ooo::OooList;
@@ -382,6 +385,10 @@ pub struct Tcb<const BUF: usize = BUF_CAP> {
     // ---- Secrets.
     cookie_secret: [u8; 16],
     cookie_secret_set: bool,
+    /// Secret replaced by the last [`Tcb::set_cookie_secret`] call; cookies
+    /// minted under it stay valid until `prev_cookie_until` (two buckets).
+    prev_cookie_secret: [u8; 16],
+    prev_cookie_until: Deadline,
     secret: [u8; 16],
     secret_set: bool,
 
@@ -476,6 +483,8 @@ impl<const BUF: usize> Tcb<BUF> {
         self.is_listener = false;
         self.cookie_secret = [0; 16];
         self.cookie_secret_set = false;
+        self.prev_cookie_secret = [0; 16];
+        self.prev_cookie_until = Deadline::OFF;
         self.secret = [0; 16];
         self.secret_set = false;
         self.now_ms = 0;
@@ -734,6 +743,9 @@ impl<const BUF: usize> Tcb<BUF> {
     /// by [`Self::send`], and resuming output after a full egress ring was
     /// drained.
     pub fn next_deadline(&self) -> Option<u64> {
+        if self.state == State::Closed {
+            return None;
+        }
         let ack = if self.pending_ack {
             self.ack_deadline
         } else {
@@ -794,7 +806,7 @@ impl<const BUF: usize> Tcb<BUF> {
         self.keepalive_intvl_ms = intvl_ms.max(1);
         self.keepalive_count = count;
         self.keepalive_probes = 0;
-        self.keepalive_deadline = if idle_ms == 0 {
+        self.keepalive_deadline = if idle_ms == 0 || self.state != State::Established {
             Deadline::OFF
         } else {
             Deadline::at(self.now_ms.saturating_add(u64::from(idle_ms)))
@@ -876,7 +888,19 @@ impl<const BUF: usize> Tcb<BUF> {
     /// Configure a 128-bit secret that switches a listener into stateless
     /// SYN-cookie mode (RFC 4987). Also used as the host secret if
     /// [`Tcb::set_secret`] was not called.
+    ///
+    /// Calling it again rotates the secret: cookies minted under the
+    /// previous one stay valid for two time buckets (128 s, longer than any
+    /// cookie's own lifetime), so handshakes in flight across a rotation
+    /// still complete. Only the immediately preceding secret is kept.
     pub fn set_cookie_secret(&mut self, secret: &[u8; 16]) {
+        if self.cookie_secret_set && self.cookie_secret != *secret {
+            self.prev_cookie_secret = self.cookie_secret;
+            self.prev_cookie_until = Deadline::at(
+                self.now_ms
+                    .saturating_add(2 * cookie::COOKIE_TIME_BUCKET_MS),
+            );
+        }
         self.cookie_secret = *secret;
         self.cookie_secret_set = true;
     }
@@ -1030,6 +1054,12 @@ impl<const BUF: usize> Tcb<BUF> {
         self.rtx.clear();
         self.snd_nxt = self.snd_una;
         self.fin_sent = false;
+        self.disarm_timers();
+    }
+
+    /// Disarm every timer, so `next_deadline()` reports nothing for a TCB
+    /// that has no further work (`CLOSED`).
+    pub(super) fn disarm_timers(&mut self) {
         self.rto_deadline = Deadline::OFF;
         self.time_wait_deadline = Deadline::OFF;
         self.fin_wait2_deadline = Deadline::OFF;

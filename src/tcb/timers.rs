@@ -13,9 +13,10 @@ impl<const BUF: usize> Tcb<BUF> {
     pub(super) fn run_timers(&mut self) -> Result<(), TcpError> {
         let now = self.now_ms;
         if self.time_wait_deadline.due(now) {
-            // 2·MSL over. Unread received data stays readable.
+            // 2·MSL over. Unread received data stays readable; every timer
+            // is disarmed so an event-driven host is not woken again.
             self.state = State::Closed;
-            self.time_wait_deadline = Deadline::OFF;
+            self.disarm_timers();
             return Ok(());
         }
         if self.state == State::FinWait2 && self.fin_wait2_deadline.due(now) {
@@ -240,10 +241,18 @@ impl<const BUF: usize> Tcb<BUF> {
         if self.keepalive_idle_ms == 0 || !self.keepalive_deadline.due(self.now_ms) {
             return Ok(());
         }
-        if self.state != State::Established || self.has_send_work() {
-            // Not idle (retransmission / persist timers own liveness) or
-            // not probe-able: restart the idle clock instead of leaving a
-            // past deadline armed, which would spin an event-driven host.
+        if self.state != State::Established {
+            // Keepalive only guards fully idle ESTABLISHED connections; the
+            // other states have their own bound (R2, FIN_WAIT_2, 2·MSL, or
+            // the host's `close`), so drop the timer rather than re-arm it.
+            self.keepalive_probes = 0;
+            self.keepalive_deadline = Deadline::OFF;
+            return Ok(());
+        }
+        if self.has_send_work() {
+            // Not idle (retransmission / persist timers own liveness):
+            // restart the idle clock instead of leaving a past deadline
+            // armed, which would spin an event-driven host.
             self.keepalive_probes = 0;
             self.keepalive_deadline = Deadline::at(
                 self.now_ms

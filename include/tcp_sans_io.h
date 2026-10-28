@@ -92,7 +92,9 @@ int32_t tcp_abort  (TcpStreamHandle* handle, uint64_t now_ms);
 int32_t tcp_tick   (TcpStreamHandle* handle, uint64_t now_ms);
 
 /* Install a 16-byte secret enabling stateless SYN cookies (RFC 4987).
- * `secret` must point to exactly 16 readable bytes from a CSPRNG. */
+ * `secret` must point to exactly 16 readable bytes from a CSPRNG. Calling it
+ * again rotates the secret; cookies minted under the previous one stay valid
+ * for 128 s, so handshakes in flight across the rotation still complete. */
 int32_t tcp_set_cookie_secret(TcpStreamHandle* handle, const uint8_t* secret);
 
 /* Reconfigure/disable TCP keepalive (RFC 9293 3.8.4). After `idle_ms` of
