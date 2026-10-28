@@ -145,6 +145,14 @@ int32_t tcp_set_fin_wait2_timeout(TcpStreamHandle* handle, uint64_t now_ms,
 uint8_t  tcp_state(const TcpStreamHandle* handle);
 uint32_t tcp_poll (const TcpStreamHandle* handle);
 
+/* Absolute now_ms at which tcp_tick next has timer work; UINT64_MAX when no
+ * timer is armed (or the handle is invalid). Event-driven hosts sleep until
+ * the earlier of this and the next inbound packet, then call tcp_tick; after
+ * a tick at `now` the value is always later than `now`. Not timer events —
+ * call tcp_tick yourself: data just queued with tcp_send, and output that
+ * was blocked by a full egress ring you have just drained. */
+uint64_t tcp_next_deadline(const TcpStreamHandle* handle);
+
 /* ---- App ⇄ TCP buffers ------------------------------------------------- */
 int32_t tcp_send(TcpStreamHandle* handle,
                  const uint8_t* data, size_t len, size_t* out_written);

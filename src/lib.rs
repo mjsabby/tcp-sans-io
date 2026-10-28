@@ -24,29 +24,34 @@
 //!
 //! 1. **Advance the clock and tick.** Call [`Tcb::set_now`] with a monotonic
 //!    millisecond clock before each [`Tcb::inject_packet`] / [`Tcb::tick`], and
-//!    call `tick()` regularly — at least as often as the soonest armed timer
-//!    (`debug_next_deadline()` reports it; event-driving off that deadline is
-//!    ideal). If the clock stops advancing or `tick()` is not called, **none**
+//!    call `tick()` when [`Tcb::next_deadline`] comes due (event-driven), after
+//!    [`Tcb::send`], and after draining a full egress ring — or simply every
+//!    ~10 ms. If the clock stops advancing or `tick()` is not called, **none**
 //!    of the timer-based defenses fire: retransmits stall, and zero-window,
 //!    stalling, or vanished-idle peers are never reaped. A frozen clock is a
 //!    disabled safety net.
 //!
-//! 2. **Drain the egress ring after every call.** After each `inject_packet`
-//!    and `tick`, call [`Tcb::extract_packet`] (buffer ≥ [`MAX_PACKET`])
+//! 2. **Drain the egress ring after every call.** After each `inject_packet`,
+//!    `tick`, `recv` and `close`, call [`Tcb::extract_packet`] (buffer ≥ [`MAX_PACKET`])
 //!    repeatedly until it returns 0 and transmit those bytes, *before* the next
 //!    `inject_packet`. Replies (ACKs, retransmits, keepalive/persist probes)
 //!    stage there; an undrained ring silently drops them and can wedge the
 //!    connection.
 //!
 //! 3. **Bound the number of connections.** Only the host can: each TCB is
-//!    independent and unaware of the others, and costs ≈ `2 * BUF_CAP` (~2 MiB
-//!    by default, ~64 KiB under the `small-buffers` feature). The per-connection
-//!    timers bound each connection's *lifetime*, never the aggregate *count*.
-//!    Cap concurrent TCBs and refuse/evict past the budget, or an attacker who
-//!    merely opens many connections exhausts memory regardless of any
-//!    per-connection defense.
+//!    independent and unaware of the others, and costs ≈ 2.08 MiB by default
+//!    (136 KiB under the `small-buffers` feature) — including the 60 s it spends
+//!    in `TIME_WAIT`. The per-connection timers bound each connection's
+//!    *lifetime*, never the aggregate *count*. Cap concurrent TCBs and
+//!    refuse/evict past the budget, or an attacker who merely opens many
+//!    connections exhausts memory regardless of any per-connection defense.
 //!
-//! 4. **Use SYN cookies on untrusted listeners.** Before exposing a listener to
+//! 4. **Install secrets.** On internet-facing TCBs call [`Tcb::set_secret`]
+//!    with 16 CSPRNG bytes (keys timestamp offsets and passive-open ISNs), and
+//!    set the path MTU with [`Tcb::set_mtu`] (1420 behind a default WireGuard
+//!    interface).
+//!
+//! 5. **Use SYN cookies on untrusted listeners.** Before exposing a listener to
 //!    hostile traffic, call [`Tcb::set_cookie_secret`] with 16 bytes from a
 //!    CSPRNG and rotate it periodically (old cookies stay valid ~64–128 s after
 //!    rotation). Without cookies the stateful path is still flood-bounded (one
@@ -54,7 +59,7 @@
 //!    absorb a SYN flood holding *zero* per-connection state until the third
 //!    ACK validates. A predictable or leaked secret defeats the protection.
 //!
-//! 5. **Act on lifecycle signals and release the TCB.** Read [`Tcb::poll`] and
+//! 6. **Act on lifecycle signals and release the TCB.** Read [`Tcb::poll`] and
 //!    react: on `PEER_CLOSED` (peer FIN → `CLOSE_WAIT`) the host **must**
 //!    eventually call [`Tcb::close`] — keepalive does *not* probe `CLOSE_WAIT`
 //!    (the peer didn't vanish, it closed its half), so an un-closed connection
@@ -63,7 +68,7 @@
 //!    [`Tcb::reinit`] it for reuse; the slot is reclaimed only when the host
 //!    releases it.
 //!
-//! 6. **Don't disable the idle/stall reapers without a replacement.** Keepalive
+//! 7. **Don't disable the idle/stall reapers without a replacement.** Keepalive
 //!    and the USER TIMEOUT are **on by default** and are what bound an idle or
 //!    stalling peer's hold on a TCB. A host that turns either off
 //!    ([`Tcb::set_keepalive`]`(0, …)` / [`Tcb::set_user_timeout`]`(0)`) must

@@ -9,11 +9,11 @@
 //!
 //! The implementation is split by concern:
 //!
-//! * [`input`]  — segment acceptance and the per-state receive logic,
-//! * [`ack`]    — acknowledgment processing, SACK/D-SACK, RACK, recovery,
-//! * [`output`] — transmission (new data, retransmissions, FIN, probes),
-//! * [`timers`] — `tick()`: RTO, TLP, RACK reorder, persist, keepalive, …,
-//! * [`cookie`] — SYN cookies, keyed hashing, timestamp offsets.
+//! * `input`  — segment acceptance and the per-state receive logic,
+//! * `ack`    — acknowledgment processing, SACK/D-SACK, RACK, recovery,
+//! * `output` — transmission (new data, retransmissions, FIN, probes),
+//! * `timers` — `tick()`: RTO, TLP, RACK reorder, persist, keepalive, …,
+//! * `cookie` — SYN cookies, keyed hashing, timestamp offsets.
 
 mod ack;
 mod cookie;
@@ -724,6 +724,42 @@ impl<const BUF: usize> Tcb<BUF> {
         Ok(())
     }
 
+    /// Absolute host time (ms) at which [`Self::tick`] next has timer work,
+    /// or `None` when nothing is armed. Event-driven hosts sleep until the
+    /// earlier of this and the next inbound packet, then call `tick()`.
+    /// Only timers `tick()` will act on are reported, so after a `tick()`
+    /// at `now` the result is always later than `now` (no busy-looping).
+    ///
+    /// Not timer-driven (call `tick()` yourself): transmitting data queued
+    /// by [`Self::send`], and resuming output after a full egress ring was
+    /// drained.
+    pub fn next_deadline(&self) -> Option<u64> {
+        let ack = if self.pending_ack {
+            self.ack_deadline
+        } else {
+            Deadline::OFF
+        };
+        let fin2 = if self.state == State::FinWait2 {
+            self.fin_wait2_deadline
+        } else {
+            Deadline::OFF
+        };
+        [
+            self.time_wait_deadline,
+            fin2,
+            self.rto_deadline,
+            self.tlp_deadline,
+            self.rack_deadline,
+            self.persist_deadline,
+            ack,
+            self.keepalive_deadline,
+            self.user_timeout_deadline,
+        ]
+        .into_iter()
+        .filter_map(Deadline::get)
+        .min()
+    }
+
     /// Earliest output-producing armed deadline (excludes TIME_WAIT expiry).
     #[cfg(any(test, feature = "std"))]
     pub fn debug_next_deadline(&self) -> Option<u64> {
@@ -1064,7 +1100,7 @@ impl<const BUF: usize> Tcb<BUF> {
         self.inject_segment(&seg)
     }
 
-    /// Drive timers and push more data (see [`timers`]).
+    /// Drive timers and push more data (see [`Self::next_deadline`]).
     pub fn tick(&mut self) -> Result<(), TcpError> {
         self.run_timers()
     }

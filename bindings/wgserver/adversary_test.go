@@ -286,13 +286,9 @@ func TestWGServer_Listen_DropsRstSilently(t *testing.T) {
 // TestWGServer_Listen_RstOnSynAck verifies that a SYN+ACK to LISTEN
 // causes the cdylib to emit a RST packet (RFC 9293 §3.10.7.2).
 //
-// Quirk worth documenting: the LISTEN-RST is emitted to `self.remote`,
-// which is wildcarded to (0.0.0.0, 0) while the TCB is in LISTEN (see
-// `Tcb::listen`). Real WireGuard / real kernels would drop the
-// resulting (0.0.0.0:0) destination as unroutable; the integration
-// test observes the RST by registering a "wildcard" inbox at the
-// (0.0.0.0, 0) key. The critical-path assertion is the *behavioral*
-// one — server emits exactly one packet and stays in LISTEN.
+// The RST is addressed to the offending segment's source (the listener's
+// own remote is wildcarded while in LISTEN) and is rate-limited, so a
+// flood of forged SYN-ACKs cannot turn the listener into a reflector.
 func TestWGServer_Listen_RstOnSynAck(t *testing.T) {
 	drv, h, cleanup := adversarySetup(t, "none", 1, 31500)
 	defer cleanup()
@@ -300,10 +296,10 @@ func TestWGServer_Listen_RstOnSynAck(t *testing.T) {
 
 	clientIP, _ := ParseIP4(advClientIP)
 	serverIP, _ := ParseIP4(advServerIP)
-	// Wildcard inbox — the cdylib addresses the LISTEN-RST to the
-	// wildcarded `remote` (0.0.0.0:0).
-	wildcardBox := drv.RegisterInbox([4]byte{0, 0, 0, 0}, 0, 16)
-	defer wildcardBox.Close()
+	// RFC 9293 §3.10.7.2: the RST goes back to the segment's source with
+	// <SEQ=SEG.ACK> — not to the listener's wildcarded remote.
+	box := drv.RegisterInbox(clientIP, 50500, 16)
+	defer box.Close()
 
 	spec := PacketSpec{
 		SrcIP:   clientIP,
@@ -317,14 +313,10 @@ func TestWGServer_Listen_RstOnSynAck(t *testing.T) {
 	}
 	pkt, _ := Encode(spec)
 	_ = drv.SendTo(pkt)
-	got, err := wildcardBox.Recv(500 * time.Millisecond)
+	got, err := box.Recv(500 * time.Millisecond)
 	if err != nil {
-		t.Fatalf("expected RST emitted (to wildcard 0.0.0.0:0), got timeout")
+		t.Fatalf("expected RST to the sender, got timeout")
 	}
-	// We can't fully Parse() — IP dst is 0.0.0.0 which is fine for
-	// our wildcard reader but the TCP checksum verification still
-	// holds (the cdylib computed it against 0.0.0.0). Parse should
-	// succeed.
 	pp, err := Parse(got)
 	if err != nil {
 		t.Fatalf("parse RST: %v", err)
@@ -332,10 +324,14 @@ func TestWGServer_Listen_RstOnSynAck(t *testing.T) {
 	if pp.Flags&FlagRST == 0 {
 		t.Fatalf("expected RST flag, got %#x", pp.Flags)
 	}
-	// No further packets — drop any subsequent burst.
-	if g2, err2 := wildcardBox.Recv(100 * time.Millisecond); err2 == nil {
+	if pp.Seq != 0x200 {
+		t.Fatalf("expected RST seq = SEG.ACK (0x200), got %#x", pp.Seq)
+	}
+	// No further packets — a repeat within the rate-limit window is silent.
+	_ = drv.SendTo(pkt)
+	if g2, err2 := box.Recv(100 * time.Millisecond); err2 == nil {
 		pp2, _ := Parse(g2)
-		t.Fatalf("expected exactly one RST, got a second packet %+v", pp2)
+		t.Fatalf("expected exactly one (rate-limited) RST, got a second packet %+v", pp2)
 	}
 }
 

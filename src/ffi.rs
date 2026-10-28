@@ -386,6 +386,23 @@ pub unsafe extern "C" fn tcp_state(handle: *const TcpStreamHandle) -> u8 {
     }
 }
 
+/// Absolute time (on the host's `now_ms` clock) at which [`tcp_tick`] next
+/// has timer work, or `UINT64_MAX` when no timer is armed (or the handle is
+/// invalid). Event-driven hosts sleep until the earlier of this and the next
+/// inbound packet. After `tcp_send`, or after draining a full egress ring,
+/// call `tcp_tick` directly: those are not timer events.
+///
+/// # Safety
+/// `handle` must be NULL or a live handle from [`tcp_init`].
+#[no_mangle]
+pub unsafe extern "C" fn tcp_next_deadline(handle: *const TcpStreamHandle) -> u64 {
+    // SAFETY: forwarded caller contract.
+    match unsafe { validate(handle) } {
+        Some(h) => h.inner.next_deadline().unwrap_or(u64::MAX),
+        None => u64::MAX,
+    }
+}
+
 /// Bitmask of `TCP_EV_*` flags; `0` for an invalid handle.
 ///
 /// # Safety

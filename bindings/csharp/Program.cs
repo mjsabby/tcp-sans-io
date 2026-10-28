@@ -35,6 +35,7 @@ internal static class Program
         Run("rst_aborts", TestRstAborts);
         Run("abort_emits_rst", TestAbortEmitsRst);
         Run("passive_open_listen", TestPassiveOpenListen);
+        Run("deployment_knobs", TestDeploymentKnobs);
 
         Console.WriteLine();
         Console.WriteLine(_failed == 0
@@ -153,6 +154,31 @@ internal static class Program
     private static void TestAbiVersion()
     {
         AssertEqual(2u, Native.tcp_abi_version(), "abi version");
+    }
+
+    private static void TestDeploymentKnobs()
+    {
+        AssertEqual(128, System.Runtime.InteropServices.Marshal.SizeOf<TcpStats>(), "TcpStats size");
+        using var client = MakeClient();
+        var peer = new TestPeer();
+        Assert(client.NextDeadline() is null, "no timer armed when CLOSED");
+        client.SetSecret(System.Security.Cryptography.RandomNumberGenerator.GetBytes(16));
+        client.SetMtu(1420);
+        client.SetFinWait2Timeout(1000, 30_000);
+        client.Connect(1000);
+        AssertEqual((ulong?)2000, client.NextDeadline(), "SYN retransmission timer");
+        var pkts = Drain(client, 1000);
+        peer.NowMs = 1005;
+        var replies = peer.Handle(pkts[0]);
+        AssertEqual((ushort)1380, peer.PeerMss, "MSS follows SetMtu(1420)");
+        client.InjectPacket(replies[0], 1010);
+        foreach (var p in Drain(client, 1010)) peer.Handle(p);
+        AssertEqual(TcpState.Established, client.State(), "ESTABLISHED");
+        var st = client.Stats();
+        AssertEqual(1380u - 12u, st.Mss, "payload per segment with timestamps");
+        AssertEqual((byte)TcpState.Established, st.State, "stats state");
+        Assert(st.SegsOut >= 2, "segments counted");
+        AssertEqual((ulong?)(1010 + 600_000), client.NextDeadline(), "keepalive deadline");
     }
 
     private static void TestHandshake()

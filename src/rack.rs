@@ -128,6 +128,11 @@ pub struct Rack {
     /// Highest delivered end sequence (`RACK.fack`).
     fack: u32,
     fack_valid: bool,
+    /// `fack` as it stood before the ACK being processed: reordering is
+    /// judged against it, so a cumulative ACK and SACK blocks arriving
+    /// together are not mistaken for each other's reordering.
+    prior_fack: u32,
+    prior_fack_valid: bool,
     /// Reordering has been observed on this connection.
     pub reordering_seen: bool,
     /// `RACK.reo_wnd_mult` minus one (so all-zero means a multiplier of 1).
@@ -147,6 +152,8 @@ impl Rack {
             min_rtt: WinMin::new(),
             fack: 0,
             fack_valid: false,
+            prior_fack: 0,
+            prior_fack_valid: false,
             reordering_seen: false,
             reo_wnd_extra: 0,
             reo_wnd_persist: 0,
@@ -160,13 +167,23 @@ impl Rack {
         self.min_rtt.update(MIN_RTT_WINDOW_MS, now, rtt);
     }
 
+    /// Call once per ACK, before its [`Self::on_delivered`] calls.
+    pub fn on_ack_start(&mut self) {
+        self.prior_fack = self.fack;
+        self.prior_fack_valid = self.fack_valid;
+    }
+
     /// Steps 2 and 3 for one newly delivered (cumulatively ACKed or SACKed)
     /// segment. `tsecr_ms` is the ACK's TSecr mapped back onto the host
     /// clock (TSecr − TS offset), if timestamps are in use.
     pub fn on_delivered(&mut self, seg: &Seg, now: u64, tsecr_ms: Option<u32>) {
         // Step 3: reordering — a never-retransmitted segment delivered below
-        // the highest delivered sequence arrived out of order.
-        if self.fack_valid && !seg.has(seg_flags::EVER_RETRANS) && seq_gt(self.fack, seg.end) {
+        // the highest sequence delivered by *earlier* ACKs arrived out of
+        // order (Linux compares with `prior_fack` likewise).
+        if self.prior_fack_valid
+            && !seg.has(seg_flags::EVER_RETRANS)
+            && seq_gt(self.prior_fack, seg.end)
+        {
             self.reordering_seen = true;
         }
         if !self.fack_valid || seq_gt(seg.end, self.fack) {
@@ -324,6 +341,33 @@ mod tests {
         r.on_delivered(&seg0, 260, Some(200));
         assert!(r.valid);
         assert_eq!(r.rtt, 60);
+    }
+
+    #[test]
+    fn cumulative_ack_and_sack_in_one_ack_are_not_reordering() {
+        // A delayed ACK covers in-order segments 0-1 and SACKs segment 3
+        // (segment 2 lost). Whatever order the ACK's parts are processed in,
+        // nothing arrived out of order.
+        let mut q = queue(&[100, 100, 100, 100]);
+        let mut r = Rack::new();
+        r.on_ack_start();
+        let s3 = *q.get(3).unwrap();
+        q.sack(s3.start, s3.end, |s| r.on_delivered(s, 120, None));
+        q.ack_to(1200, |s, newly| {
+            if newly {
+                r.on_delivered(s, 120, None);
+            }
+        });
+        assert!(!r.reordering_seen);
+        // A later ACK delivering segment 2 (never retransmitted) below the
+        // previously delivered segment 3 *is* reordering.
+        r.on_ack_start();
+        q.ack_to(1400, |s, newly| {
+            if newly {
+                r.on_delivered(s, 125, None);
+            }
+        });
+        assert!(r.reordering_seen);
     }
 
     #[test]

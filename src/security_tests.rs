@@ -1197,6 +1197,8 @@ fn tcp_init_runs_on_a_small_thread_stack() {
             // SAFETY: live handle; NULL with zero length is permitted.
             unsafe {
                 assert_eq!(tcp_connect(mem, 0), 0);
+                assert_eq!(tcp_next_deadline(mem), 1000, "SYN retransmission timer");
+                assert_eq!(tcp_next_deadline(core::ptr::null()), u64::MAX);
                 let mut n = 99usize;
                 assert_eq!(
                     tcp_send(mem, core::ptr::null(), 0, &mut n),

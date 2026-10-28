@@ -6,11 +6,10 @@
 # both endpoints can recover from multi-hole loss patterns in one RTT
 # instead of waiting for retransmit-timeout per hole.
 #
-# Window math (BUF_CAP=1 MiB, LOCAL_WS_SHIFT=5):
-#   * Empty ring: advertised = 1_048_576, scaled = 32_768.
-#   * 10 bytes held: advertised = 1_048_566, scaled = 32_767 (rounded down).
-#   * 20 bytes held: advertised = 1_048_556, scaled = 32_767.
-#   * 30 bytes held: advertised = 1_048_546, scaled = 32_767.
+# Window math (BUF_CAP=1 MiB, LOCAL_WS_SHIFT=5): out-of-order bytes are
+# parked inside the receive ring at their final offsets, i.e. inside the
+# window already advertised, so holding them does not shrink the window:
+# it stays 1_048_576 >> 5 = 32_768 throughout.
 
 --connect 10.0.0.1:49152 10.0.0.2:80
 +0 > SEW 0:0(0) win 65535 <mss 1460, wscale 5, sackOK, TS val * ecr 0>
@@ -24,16 +23,23 @@
 # Our receiver buffers all three and emits SACK blocks for them
 # (most-recently-changed first, per RFC 2018 §4). Emit order is
 # TS first then SACK (matches the wire encoder's option ordering).
+# TSecr stays 1: out-of-order segments do not update TS.Recent, so the
+# ACKs echo the last segment that advanced the left edge (RFC 7323 §4.3).
 
 +.005 < P. 11:21(10) ack 1 win 32768 <TS val 2 ecr *>
 # Dup-ACK at rcv_nxt=1 with 1 SACK block describing the held run.
-+0 > . 1:1(0) ack 1 win 32767 <TS val * ecr 2, sack 11:21>
++0 > . 1:1(0) ack 1 win 32768 <TS val * ecr 1, sack 11:21>
 
 +.001 < P. 31:41(10) ack 1 win 32768 <TS val 3 ecr *>
 # Dup-ACK with 2 SACK blocks. Most-recent-first ordering: B then A.
-+0 > . 1:1(0) ack 1 win 32767 <TS val * ecr 3, sack 31:41 11:21>
++0 > . 1:1(0) ack 1 win 32768 <TS val * ecr 1, sack 31:41 11:21>
 
 +.001 < P. 51:61(10) ack 1 win 32768 <TS val 4 ecr *>
 # Dup-ACK with 3 SACK blocks (TS option caps us at 3, not the full 4).
 # Most-recent first: C, B, A.
-+0 > . 1:1(0) ack 1 win 32767 <TS val * ecr 4, sack 51:61 31:41 11:21>
++0 > . 1:1(0) ack 1 win 32768 <TS val * ecr 1, sack 51:61 31:41 11:21>
+
+# The first hole fills: run A becomes in-order and the left edge advances,
+# so TS.Recent (and TSecr) moves to this segment's TSval.
++.001 < P. 1:11(10) ack 1 win 32768 <TS val 5 ecr *>
++0 > . 1:1(0) ack 21 win 32768 <TS val * ecr 5, sack 51:61 31:41>

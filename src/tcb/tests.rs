@@ -491,3 +491,138 @@ fn sack_blocks_never_push_a_segment_over_the_mss() {
         );
     }
 }
+
+#[test]
+fn next_deadline_is_never_stale_after_tick() {
+    // Keepalive comes due while the connection is not probe-able (peer
+    // closed its half; we hold CLOSE_WAIT with unsent data): tick must not
+    // leave a past deadline armed, or an event-driven host would spin.
+    let mut t = established();
+    t.set_keepalive(1_000, 100, 3);
+    t.set_user_timeout(0);
+    t.inject_packet(&peer_pkt(
+        PEER_ISS + 1,
+        1001,
+        flags::ACK | flags::FIN,
+        0,
+        &TcpOptions::NONE,
+        &[],
+    ))
+    .unwrap();
+    assert_eq!(t.state(), State::CloseWait);
+    t.send(&[1; 10]).unwrap();
+    for _ in 0..50 {
+        let d = t.next_deadline().expect("persist / keepalive armed");
+        t.set_now(d);
+        t.tick().unwrap();
+        drain(&mut t);
+        let next = t.next_deadline().unwrap();
+        assert!(next > d, "deadline {next} not after tick at {d}");
+    }
+    assert_eq!(t.state(), State::CloseWait);
+}
+
+#[test]
+fn next_deadline_covers_time_wait_and_is_none_when_closed() {
+    let mut t = established();
+    t.close().unwrap();
+    drain(&mut t);
+    t.set_now(100);
+    t.inject_packet(&peer_pkt(
+        PEER_ISS + 1,
+        1002,
+        flags::ACK | flags::FIN,
+        65535,
+        &TcpOptions::NONE,
+        &[],
+    ))
+    .unwrap();
+    assert_eq!(t.state(), State::TimeWait);
+    let d = t.next_deadline().unwrap();
+    assert_eq!(d, 100 + 60_000);
+    t.set_now(d);
+    t.tick().unwrap();
+    assert_eq!(t.state(), State::Closed);
+    assert_eq!(t.next_deadline(), None);
+}
+
+/// Established client that negotiated SACK (no timestamps).
+fn established_sack() -> Box<Tcb> {
+    let mut t = Box::new(Tcb::new(cfg(1000)).unwrap());
+    t.set_now(0);
+    t.connect().unwrap();
+    drain(&mut t);
+    let o = TcpOptions {
+        mss: Some(1460),
+        sack_permitted: true,
+        ..TcpOptions::NONE
+    };
+    t.set_now(10);
+    t.inject_packet(&peer_pkt(
+        PEER_ISS,
+        1001,
+        flags::SYN | flags::ACK,
+        65535,
+        &o,
+        &[],
+    ))
+    .unwrap();
+    drain(&mut t);
+    assert_eq!(t.state(), State::Established);
+    t
+}
+
+#[test]
+fn recovery_started_by_a_large_cumulative_ack_does_not_overshoot_prr() {
+    // Eight segments in flight. One ACK cumulatively acknowledges three of
+    // them and SACKs four more, so segment 3 is lost at once (DupThresh
+    // segments SACKed above it). PRR must size the reduction from the
+    // flight *before* that ACK, because it also counts the ACK's delivered
+    // bytes; otherwise prr_delivered / RecoverFS exceeds 1 and later ACKs
+    // release unearned data.
+    let mut t = established_sack();
+    t.send(&[5; 8 * 1460]).unwrap();
+    t.set_now(20);
+    t.tick().unwrap();
+    assert_eq!(drain(&mut t).len(), 8);
+    t.send(&[6; 8 * 1460]).unwrap(); // plenty of new data to tempt it
+    let seg = |k: u32| 1001 + k * 1460;
+    let sack = TcpOptions {
+        sack: SackBlocks::one(seg(4), seg(8)),
+        ..TcpOptions::NONE
+    };
+    t.set_now(60);
+    t.inject_packet(&peer_pkt(
+        PEER_ISS + 1,
+        seg(3),
+        flags::ACK,
+        65535,
+        &sack,
+        &[],
+    ))
+    .unwrap();
+    let first = drain(&mut t);
+    assert!(
+        first.iter().any(|p| p.0 == seg(3) && p.3 == 1460),
+        "fast retransmit: {first:?} {:?}",
+        t.stats()
+    );
+    assert_eq!(t.stats().ssthresh, 4 * 1460, "half of the 8-segment flight");
+    // The same ACK again carries no new information: nothing may be sent.
+    t.set_now(61);
+    t.inject_packet(&peer_pkt(
+        PEER_ISS + 1,
+        seg(3),
+        flags::ACK,
+        65535,
+        &sack,
+        &[],
+    ))
+    .unwrap();
+    let again = drain(&mut t);
+    assert!(
+        again.iter().all(|p| p.3 == 0),
+        "information-free duplicate ACK released data: {again:?}"
+    );
+    t.debug_validate_invariants().unwrap();
+}

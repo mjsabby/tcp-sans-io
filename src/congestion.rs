@@ -7,6 +7,12 @@
 //! much may be in flight. During a reduction episode PRR recomputes
 //! `cwnd = pipe + sndcnt` on every ACK so the sender's ordinary
 //! "send while `pipe < cwnd`" rule paces retransmissions and new data.
+//!
+//! A loss-triggered reduction (fast recovery or RTO) is undone if D-SACKs
+//! later show that every retransmission of the episode was needless
+//! (RFC 3708 detection with an Eifel-style response, as Linux
+//! `tcp_try_undo_dsack`): reordering or a delay spike must not cost the
+//! window.
 
 /// Congestion-avoidance state (named after Linux's `tcp_ca_state`).
 #[repr(u8)]
@@ -56,6 +62,15 @@ pub struct Reno {
     prr_delivered: u64,
     prr_out: u64,
     recover_fs: u32,
+    /// Window before the current loss episode, restored on undo.
+    prior_cwnd: u32,
+    prior_ssthresh: u32,
+    /// The episode may still be undone.
+    undo_valid: bool,
+    /// `SND.UNA` when the episode began; only D-SACKs above it count.
+    undo_marker: u32,
+    /// Retransmissions of the episode not yet shown needless by a D-SACK.
+    undo_retrans: u32,
 }
 
 impl Reno {
@@ -69,6 +84,11 @@ impl Reno {
             prr_delivered: 0,
             prr_out: 0,
             recover_fs: 1,
+            prior_cwnd: 0,
+            prior_ssthresh: 0,
+            undo_valid: false,
+            undo_marker: 0,
+            undo_retrans: 0,
         }
     }
 
@@ -133,14 +153,26 @@ impl Reno {
         self.ca_acc = 0;
     }
 
+    /// Remember the window a loss episode starting now could be undone to.
+    fn arm_undo(&mut self, snd_una: u32) {
+        self.prior_cwnd = self.cwnd;
+        self.prior_ssthresh = self.ssthresh;
+        self.undo_valid = true;
+        self.undo_marker = snd_una;
+        self.undo_retrans = 0;
+    }
+
     /// Enter fast recovery (RFC 6937): halve `ssthresh`, pace with PRR.
-    pub fn enter_recovery(&mut self, flight: u32, snd_nxt: u32, mss: u32) {
+    pub fn enter_recovery(&mut self, flight: u32, snd_una: u32, snd_nxt: u32, mss: u32) {
+        self.arm_undo(snd_una);
         self.begin_reduction(CaState::Recovery, flight, snd_nxt, mss);
     }
 
     /// Enter CWR (RFC 3168 §6.1.2 ECN response, or RFC 8985 §7.4 repaired
     /// tail loss): the same PRR reduction, but nothing is retransmitted.
+    /// Congestion was signalled explicitly, so it is never undone.
     pub fn enter_cwr(&mut self, flight: u32, snd_nxt: u32, mss: u32) {
+        self.undo_valid = false;
         self.begin_reduction(CaState::Cwr, flight, snd_nxt, mss);
     }
 
@@ -150,6 +182,36 @@ impl Reno {
         if self.state == CaState::Cwr {
             self.state = CaState::Recovery;
         }
+    }
+
+    /// Count a retransmission against the current loss episode.
+    pub fn on_retransmit(&mut self) {
+        if self.undo_valid && self.in_loss_recovery() {
+            self.undo_retrans = self.undo_retrans.saturating_add(1);
+        }
+    }
+
+    /// A D-SACK reported `[start, end)` as received twice. Once every
+    /// retransmission of the episode has been reported so, the reduction
+    /// was spurious: restore the prior window and leave recovery. Returns
+    /// `true` when the episode was undone.
+    pub fn on_dsack(&mut self, start: u32, end: u32, mss: u32) -> bool {
+        if !self.undo_valid || self.undo_retrans == 0 || !seq_ge(start, self.undo_marker) {
+            return false;
+        }
+        let segs = end.wrapping_sub(start).div_ceil(mss.max(1)).max(1);
+        self.undo_retrans = self.undo_retrans.saturating_sub(segs);
+        if self.undo_retrans > 0 {
+            return false;
+        }
+        self.cwnd = self.cwnd.max(self.prior_cwnd);
+        self.ssthresh = self.ssthresh.max(self.prior_ssthresh);
+        if self.in_loss_recovery() {
+            self.state = CaState::Open;
+        }
+        self.ca_acc = 0;
+        self.undo_valid = false;
+        true
     }
 
     /// RFC 6937 per-ACK update. `delivered` = bytes newly cumulatively ACKed
@@ -200,6 +262,11 @@ impl Reno {
     pub fn on_rto(&mut self, flight: u32, snd_una: u32, snd_nxt: u32, mss: u32) {
         let episode_over = seq_ge(snd_una, self.recovery_point);
         if matches!(self.state, CaState::Open | CaState::Cwr) || episode_over {
+            if self.state == CaState::Cwr {
+                self.undo_valid = false;
+            } else {
+                self.arm_undo(snd_una);
+            }
             self.ssthresh = (flight / 2).max(mss.saturating_mul(2));
         }
         self.cwnd = mss;
@@ -256,7 +323,7 @@ mod tests {
     #[test]
     fn prr_reduces_proportionally_and_exits_at_ssthresh() {
         let mut r = Reno::new(20 * M);
-        r.enter_recovery(20 * M, 5000, M);
+        r.enter_recovery(20 * M, 0, 5000, M);
         assert_eq!(r.ssthresh, 10 * M);
         // First ACK: one segment delivered, pipe still above ssthresh.
         r.prr_update(M, 18 * M, M, false);
@@ -275,11 +342,60 @@ mod tests {
     #[test]
     fn prr_ssrb_grows_back_toward_ssthresh_when_pipe_is_low() {
         let mut r = Reno::new(20 * M);
-        r.enter_recovery(20 * M, 5000, M);
+        r.enter_recovery(20 * M, 0, 5000, M);
         r.on_send(M);
         r.prr_update(2 * M, 2 * M, M, true);
         // limit = max(2000-1000, 2000) + MSS = 3000; min(ssthresh-pipe=8000, 3000).
         assert_eq!(r.cwnd, 5 * M);
+    }
+
+    #[test]
+    fn dsack_for_every_retransmission_undoes_the_episode() {
+        let mut r = Reno::new(20 * M);
+        r.ssthresh = 30 * M;
+        r.enter_recovery(20 * M, 1000, 21_000, M);
+        r.on_retransmit();
+        r.on_retransmit();
+        r.prr_update(M, 18 * M, M, false);
+        assert!(
+            !r.on_dsack(500, 1500, M),
+            "below the episode start: ignored"
+        );
+        assert!(!r.on_dsack(1000, 2000, M), "one of two retransmissions");
+        assert!(r.on_dsack(2000, 3000, M), "the last one: undo");
+        assert_eq!(
+            (r.cwnd, r.ssthresh, r.state()),
+            (20 * M, 30 * M, CaState::Open)
+        );
+        assert!(!r.on_dsack(3000, 4000, M), "nothing left to undo");
+    }
+
+    #[test]
+    fn late_dsack_undoes_after_recovery_ended_and_rto_too() {
+        let mut r = Reno::new(20 * M);
+        r.enter_recovery(20 * M, 1000, 21_000, M);
+        r.on_retransmit();
+        assert!(r.maybe_exit(21_000));
+        assert_eq!(r.cwnd, 10 * M);
+        r.on_retransmit(); // outside the episode: not counted
+        assert!(r.on_dsack(1000, 2000, M));
+        assert_eq!(r.cwnd, 20 * M);
+
+        let mut r = Reno::new(40 * M);
+        r.on_rto(40 * M, 100, 9000, M);
+        r.on_retransmit();
+        assert!(r.on_dsack(100, 1100, M), "spurious timeout");
+        assert_eq!((r.cwnd, r.state()), (40 * M, CaState::Open));
+    }
+
+    #[test]
+    fn ecn_reductions_are_never_undone() {
+        let mut r = Reno::new(20 * M);
+        r.enter_cwr(20 * M, 21_000, M);
+        r.cwr_to_recovery();
+        r.on_retransmit();
+        assert!(!r.on_dsack(0, 1000, M));
+        assert_eq!(r.ssthresh, 10 * M);
     }
 
     #[test]

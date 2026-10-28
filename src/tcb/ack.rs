@@ -37,6 +37,11 @@ impl<const BUF: usize> Tcb<BUF> {
         }
 
         let prior_una = self.snd_una;
+        // FlightSize before this ACK. A reduction this ACK starts (loss or
+        // ECE) is sized from it, because PRR counts this ACK's delivered
+        // bytes too: RecoverFS must include them (RFC 6937 §3) or
+        // prr_delivered / RecoverFS overshoots and PRR releases a burst.
+        let prior_flight = self.snd_nxt.wrapping_sub(self.data_una());
         let now = self.now_ms;
         let mss = self.mss_payload();
         let tsecr_ms = match (self.ts_enabled, seg.options.ts) {
@@ -44,6 +49,7 @@ impl<const BUF: usize> Tcb<BUF> {
             _ => None,
         };
         let mut delivered: u32 = 0;
+        self.rack.on_ack_start();
 
         // ---- SACK / D-SACK (RFC 2018, RFC 2883) ------------------------
         let mut dsack: Option<(u32, u32)> = None;
@@ -60,6 +66,12 @@ impl<const BUF: usize> Tcb<BUF> {
                     dsack = Some((l0, r0));
                     self.stats.dsacks_received = self.stats.dsacks_received.saturating_add(1);
                     self.rack.on_dsack(self.snd_una, self.snd_nxt);
+                    if self.cc.on_dsack(l0, r0, mss) {
+                        // Spurious episode: restore the window (done) and drop
+                        // loss marks that were never acted on.
+                        self.rtx.unmark_lost();
+                        self.rack.on_recovery_exit();
+                    }
                 }
                 let rack = &mut self.rack;
                 let rtx = &mut self.rtx;
@@ -135,8 +147,7 @@ impl<const BUF: usize> Tcb<BUF> {
             && self.cc.state() == CaState::Open
             && self.snd_una != self.snd_nxt
         {
-            let flight = self.snd_nxt.wrapping_sub(self.data_una());
-            self.cc.enter_cwr(flight, self.snd_nxt, mss);
+            self.cc.enter_cwr(prior_flight, self.snd_nxt, mss);
             self.send_cwr_pending = true;
         }
 
@@ -159,7 +170,7 @@ impl<const BUF: usize> Tcb<BUF> {
         let outstanding = self.snd_nxt.wrapping_sub(self.data_una());
         self.reno_sacked = self.reno_sacked.min(outstanding);
         if self.rtx.lost_bytes() > 0 && !self.cc.in_loss_recovery() {
-            self.enter_fast_recovery();
+            self.enter_fast_recovery(prior_flight);
         }
 
         // ---- Tail loss probe outcome (RFC 8985 §7.4.2) -----------------
@@ -303,13 +314,15 @@ impl<const BUF: usize> Tcb<BUF> {
         (false, false)
     }
 
-    pub(super) fn enter_fast_recovery(&mut self) {
+    /// Start fast recovery. `flight` is the FlightSize the reduction is
+    /// based on (RecoverFS): before the triggering ACK, if there is one.
+    pub(super) fn enter_fast_recovery(&mut self, flight: u32) {
         let mss = self.mss_payload();
         if self.cc.state() == CaState::Cwr {
             self.cc.cwr_to_recovery();
         } else {
-            let flight = self.snd_nxt.wrapping_sub(self.data_una());
-            self.cc.enter_recovery(flight, self.snd_nxt, mss);
+            self.cc
+                .enter_recovery(flight, self.snd_una, self.snd_nxt, mss);
         }
         self.stats.fast_recoveries = self.stats.fast_recoveries.saturating_add(1);
         self.tlp_end_seq = None;

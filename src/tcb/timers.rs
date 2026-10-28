@@ -44,7 +44,8 @@ impl<const BUF: usize> Tcb<BUF> {
             self.rack_deadline = Deadline::OFF;
             if self.rack_detect() {
                 if !self.cc.in_loss_recovery() {
-                    self.enter_fast_recovery();
+                    let flight = self.snd_nxt.wrapping_sub(self.data_una());
+                    self.enter_fast_recovery(flight);
                 }
                 // No ACK clocked this: credit one segment so PRR may send.
                 let (pipe, mss) = (self.pipe(), self.mss_payload());
@@ -236,11 +237,18 @@ impl<const BUF: usize> Tcb<BUF> {
 
     /// RFC 9293 §3.8.4 keepalive for fully idle ESTABLISHED connections.
     fn check_keepalive(&mut self) -> Result<(), TcpError> {
-        if self.keepalive_idle_ms == 0
-            || self.state != State::Established
-            || self.has_send_work()
-            || !self.keepalive_deadline.due(self.now_ms)
-        {
+        if self.keepalive_idle_ms == 0 || !self.keepalive_deadline.due(self.now_ms) {
+            return Ok(());
+        }
+        if self.state != State::Established || self.has_send_work() {
+            // Not idle (retransmission / persist timers own liveness) or
+            // not probe-able: restart the idle clock instead of leaving a
+            // past deadline armed, which would spin an event-driven host.
+            self.keepalive_probes = 0;
+            self.keepalive_deadline = Deadline::at(
+                self.now_ms
+                    .saturating_add(u64::from(self.keepalive_idle_ms)),
+            );
             return Ok(());
         }
         if self.keepalive_probes >= self.keepalive_count {

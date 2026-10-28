@@ -400,7 +400,7 @@ impl Sim {
             if self.deliver_due() {
                 continue;
             }
-            let tcb = [self.a.debug_next_deadline(), self.b.debug_next_deadline()]
+            let tcb = [self.a.next_deadline(), self.b.next_deadline()]
                 .into_iter()
                 .flatten()
                 .min()

@@ -399,6 +399,19 @@ impl RtxQueue {
         self.lost_hint = 0;
     }
 
+    /// Clear `LOST` from segments not yet retransmitted (a loss episode was
+    /// shown to be spurious); RACK or the RTO re-detects any real loss.
+    pub fn unmark_lost(&mut self) {
+        for i in 0..self.len {
+            if let Some(s) = self.get(i).copied() {
+                if s.has(LOST) && !s.has(RETRANS) {
+                    self.set_flags(i, s.flags & !LOST);
+                }
+            }
+        }
+        self.lost_hint = 0;
+    }
+
     /// Forget all SACK state (the receiver reneged).
     pub fn clear_sacked(&mut self) {
         for i in 0..self.len {
