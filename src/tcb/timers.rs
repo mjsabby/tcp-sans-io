@@ -166,9 +166,14 @@ impl<const BUF: usize> Tcb<BUF> {
         let eligible = self.sack_enabled
             && self.cc.state() == crate::congestion::CaState::Open
             && self.tlp_end_seq.is_none()
-            && self.snd_una != self.snd_nxt
-            && !self.tx_ring.is_full();
+            && self.snd_una != self.snd_nxt;
         if !eligible {
+            return Ok(());
+        }
+        if self.egress_full() {
+            // Silence while egress is held is local queueing, not loss:
+            // re-arm rather than probe into the host's queue.
+            self.maybe_arm_tlp();
             return Ok(());
         }
         let unsent = self.unsent_bytes();
@@ -206,7 +211,7 @@ impl<const BUF: usize> Tcb<BUF> {
         if unsent == 0 || self.snd_una != self.snd_nxt {
             return Ok(());
         }
-        if self.tx_ring.is_full() {
+        if self.egress_full() {
             self.persist_deadline =
                 Deadline::at(self.now_ms.saturating_add(u64::from(self.rto_ms)));
             return Ok(());
