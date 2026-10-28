@@ -91,8 +91,8 @@ shows what that costs against Linux CUBIC on lossy long paths.
 
 ### Memory footprint
 
-Per connection, `tcp_handle_size()` is **2,176,856 bytes (≈ 2.08 MiB)** with
-default features, or **139,480 bytes (136 KiB)** with `small-buffers`:
+Per connection, `tcp_handle_size()` is **2,176,864 bytes (≈ 2.08 MiB)** with
+default features, or **139,488 bytes (136 KiB)** with `small-buffers`:
 
 - `BUF_CAP` send ring + receive ring (2 × 1 MiB; 2 × 32 KiB with
   `small-buffers`). Out-of-order data is parked inside the receive ring at
