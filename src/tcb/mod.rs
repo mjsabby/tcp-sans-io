@@ -397,6 +397,8 @@ pub struct Tcb<const BUF: usize = BUF_CAP> {
     tx_ring: TxRing,
     /// Host back-pressure (see [`Tcb::set_egress_paused`]).
     egress_paused: bool,
+    /// Leave TCP checksums to the host (see [`Tcb::set_tx_csum_offload`]).
+    tx_csum_offload: bool,
     ip_id: u16,
 
     // ---- Passive open.
@@ -550,6 +552,7 @@ impl<const BUF: usize> Tcb<BUF> {
         self.secret_set = false;
         self.now_ms = 0;
         self.egress_paused = false;
+        self.tx_csum_offload = false;
         self.ip_id = (cfg.iss >> 16) as u16 ^ cfg.iss as u16;
         self.keepalive_idle_ms = DEFAULT_KEEPALIVE_IDLE_MS;
         self.keepalive_intvl_ms = DEFAULT_KEEPALIVE_INTVL_MS;
@@ -905,6 +908,21 @@ impl<const BUF: usize> Tcb<BUF> {
             self.maybe_arm_tlp();
         }
         self.egress_paused = paused;
+    }
+
+    /// TCP checksum offload: segments staged from now on carry only the
+    /// pseudo-header sum in the TCP checksum field (Linux's
+    /// CHECKSUM_PARTIAL) instead of the full checksum, saving a pass over
+    /// every payload byte. The host must complete it before a peer that
+    /// verifies sees the segment (sum the TCP header and payload, this field
+    /// included, and store the complement: what a NIC with checksum offload
+    /// does), or hand the segment to a receiver that accepts partial
+    /// checksums, such as a virtio-net driver told
+    /// `VIRTIO_NET_HDR_F_NEEDS_CSUM`. IPv4 header checksums stay complete.
+    /// Off by default and after [`Self::reinit`].
+    #[inline]
+    pub fn set_tx_csum_offload(&mut self, on: bool) {
+        self.tx_csum_offload = on;
     }
 
     /// Reconfigure (or disable, `idle_ms == 0`) keepalive (RFC 9293 §3.8.4)
@@ -1270,6 +1288,12 @@ impl<const BUF: usize> Tcb<BUF> {
     /// `out` must hold at least [`crate::MAX_PACKET`] bytes.
     pub fn extract_packet(&mut self, out: &mut [u8]) -> Result<usize, TcpError> {
         self.tx_ring.pop_into(out)
+    }
+
+    /// Pop one staged outbound datagram and lend it to `f` instead of
+    /// copying it out (`None` when none is pending).
+    pub fn extract_packet_with<R>(&mut self, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
+        self.tx_ring.pop_with(f)
     }
 
     /// Feed an inbound IPv4+TCP datagram (checksums verified).

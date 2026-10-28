@@ -15,6 +15,15 @@ use crate::tx_ring::TX_RING_CAP;
 use crate::wire::{self, flags, SackBlocks, Segment, TcpOptions};
 use crate::MSS;
 
+/// A segment's payload: `len` bytes at `off` past the start of the send ring.
+#[derive(Clone, Copy)]
+struct RingSlice {
+    off: usize,
+    len: usize,
+}
+
+const NO_PAYLOAD: RingSlice = RingSlice { off: 0, len: 0 };
+
 impl<const BUF: usize> Tcb<BUF> {
     /// Emit as many segments as the congestion window, the peer's window
     /// and the egress ring allow; then (re)arm the persist timer if data is
@@ -160,10 +169,11 @@ impl<const BUF: usize> Tcb<BUF> {
     /// Transmit `len` new bytes at `SND.NXT` (plus a FIN if `fin`).
     pub(super) fn emit_new(&mut self, len: u32, fin: bool) -> Result<bool, TcpError> {
         let seq = self.snd_nxt;
-        let off = seq.wrapping_sub(self.data_una()) as usize;
-        let mut tmp = [0u8; MSS as usize];
-        let payload = tmp.get_mut(..len as usize).ok_or(TcpError::Overflow)?;
-        if self.send_ring.peek_at(off, payload) != len as usize {
+        let payload = RingSlice {
+            off: seq.wrapping_sub(self.data_una()) as usize,
+            len: len as usize,
+        };
+        if len > u32::from(MSS) {
             return Err(TcpError::Overflow);
         }
         let fl =
@@ -219,10 +229,11 @@ impl<const BUF: usize> Tcb<BUF> {
             }
         }
         let plen = s.payload_len().min(mss);
-        let off = s.start.wrapping_sub(self.data_una()) as usize;
-        let mut tmp = [0u8; MSS as usize];
-        let payload = tmp.get_mut(..plen as usize).ok_or(TcpError::Overflow)?;
-        if self.send_ring.peek_at(off, payload) != plen as usize {
+        let payload = RingSlice {
+            off: s.start.wrapping_sub(self.data_una()) as usize,
+            len: plen as usize,
+        };
+        if plen > u32::from(MSS) {
             return Err(TcpError::Overflow);
         }
         let fin = s.has(seg_flags::FIN) && plen == s.payload_len();
@@ -312,10 +323,10 @@ impl<const BUF: usize> Tcb<BUF> {
         &mut self,
         fl: u8,
         seq: u32,
-        payload: &[u8],
+        payload: RingSlice,
         ect: bool,
     ) -> Result<bool, TcpError> {
-        let opts = self.segment_options(payload.len() as u32);
+        let opts = self.segment_options(payload.len as u32);
         let queued = self.emit_segment(fl, seq, self.rcv_nxt, &opts, payload, ect)?;
         if queued {
             // The ACK rides on this segment.
@@ -335,7 +346,14 @@ impl<const BUF: usize> Tcb<BUF> {
             return Ok(());
         }
         let opts = self.segment_options(0);
-        if self.emit_segment(flags::ACK, self.snd_nxt, self.rcv_nxt, &opts, &[], false)? {
+        if self.emit_segment(
+            flags::ACK,
+            self.snd_nxt,
+            self.rcv_nxt,
+            &opts,
+            NO_PAYLOAD,
+            false,
+        )? {
             self.pending_ack = false;
             self.delayed_ack_count = 0;
             self.ack_deadline = Deadline::OFF;
@@ -352,7 +370,7 @@ impl<const BUF: usize> Tcb<BUF> {
         if self.ts_enabled {
             opts.ts = Some((self.ts_val(), self.ts_recent));
         }
-        self.emit_segment(flags::ACK, seq, self.rcv_nxt, &opts, &[], false)
+        self.emit_segment(flags::ACK, seq, self.rcv_nxt, &opts, NO_PAYLOAD, false)
     }
 
     pub(super) fn emit_syn(&mut self) -> Result<bool, TcpError> {
@@ -369,7 +387,7 @@ impl<const BUF: usize> Tcb<BUF> {
             self.iss,
             0,
             &opts,
-            &[],
+            NO_PAYLOAD,
             false,
         )
     }
@@ -391,12 +409,12 @@ impl<const BUF: usize> Tcb<BUF> {
             sack: SackBlocks::EMPTY,
         };
         let fl = flags::SYN | flags::ACK | if self.ecn_enabled { flags::ECE } else { 0 };
-        self.emit_segment(fl, self.iss, self.rcv_nxt, &opts, &[], false)
+        self.emit_segment(fl, self.iss, self.rcv_nxt, &opts, NO_PAYLOAD, false)
     }
 
     /// Option-less control segment to the connected peer (RST / RST+ACK).
     pub(super) fn emit_ctl(&mut self, fl: u8, seq: u32, ack: u32) -> Result<bool, TcpError> {
-        self.emit_segment(fl, seq, ack, &TcpOptions::NONE, &[], false)
+        self.emit_segment(fl, seq, ack, &TcpOptions::NONE, NO_PAYLOAD, false)
     }
 
     /// RST addressed to the *sender* of `seg` (used where the TCB has no or
@@ -410,8 +428,9 @@ impl<const BUF: usize> Tcb<BUF> {
     ) -> Result<(), TcpError> {
         let (lip, lport, ip_id) = (self.local.ip, self.local.port, self.ip_id);
         let (rip, rport) = (seg.src_ip, seg.src_port);
+        let full_csum = !self.tx_csum_offload;
         let queued = self.tx_ring.push_with(|buf| {
-            wire::emit(
+            wire::emit_with(
                 buf,
                 lip,
                 rip,
@@ -422,9 +441,11 @@ impl<const BUF: usize> Tcb<BUF> {
                 fl,
                 0,
                 &TcpOptions::NONE,
-                &[],
+                0,
+                |_| true,
                 ip_id,
                 wire::ecn::NOT_ECT,
+                full_csum,
             )
         })?;
         if queued {
@@ -440,7 +461,7 @@ impl<const BUF: usize> Tcb<BUF> {
         seq: u32,
         ack: u32,
         options: &TcpOptions,
-        payload: &[u8],
+        payload: RingSlice,
         ect: bool,
     ) -> Result<bool, TcpError> {
         // Handshake and reset segments are exempt from host back-pressure:
@@ -470,10 +491,26 @@ impl<const BUF: usize> Tcb<BUF> {
         let (src_ip, dst_ip) = (self.local.ip, self.remote.ip);
         let (src_port, dst_port) = (self.local.port, self.remote.port);
         let ip_id = self.ip_id;
+        let full_csum = !self.tx_csum_offload;
+        // The payload goes straight from the send ring into the slot.
+        let ring = &self.send_ring;
         let queued = self.tx_ring.push_with(|buf| {
-            wire::emit(
-                buf, src_ip, dst_ip, src_port, dst_port, seq, ack, fl, window, options, payload,
-                ip_id, ecn_cp,
+            wire::emit_with(
+                buf,
+                src_ip,
+                dst_ip,
+                src_port,
+                dst_port,
+                seq,
+                ack,
+                fl,
+                window,
+                options,
+                payload.len,
+                |dst| ring.peek_at(payload.off, dst) == dst.len(),
+                ip_id,
+                ecn_cp,
+                full_csum,
             )
         })?;
         if queued {
