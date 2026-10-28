@@ -49,7 +49,7 @@ shows what that costs against Linux CUBIC on lossy long paths.
 | Initial window of 10 segments | RFC 6928 | ✅ |
 | RACK-TLP: time-based loss detection, tail loss probe | RFC 8985 | ✅ primary loss detection |
 | Duplicate-ACK fast retransmit (peers without SACK) | RFC 5681 §3.2 | ✅ fallback |
-| ECN (ECT(0) on new data; ECE → one CWR reduction per window) | RFC 3168 | ✅ |
+| ECN (ECT(0) on new data; CE echoed only from data segments; ECE → one CWR reduction per window) | RFC 3168 | ✅ |
 | Blind-attack hardening: RST, SYN and ACK checks, rate-limited challenge ACKs | RFC 5961 §3–5, §7 | ✅ |
 | Silly-window avoidance, sender and receiver | RFC 9293 §3.8.6.2 | ✅ |
 | Window-update rule (SND.WL1 / WL2) | RFC 9293 §3.10.7.4 | ✅ a forged future WL1 cannot freeze it |
@@ -463,7 +463,7 @@ tables. `TSB_PCAP=dir` captures each run's packet headers at the receiver;
 
 ```sh
 cargo build --release --lib       # cdylib + staticlib + rlib
-cargo test  --release --lib       # 207 tests: unit, conformance, loopback, property, server, security regressions, link simulation, smoltcp interop
+cargo test  --release --lib       # 250 tests: unit, conformance, loopback, property, server, security regressions, link simulation, smoltcp interop
 cargo clippy --release --lib --no-deps -- -D warnings
 ```
 
