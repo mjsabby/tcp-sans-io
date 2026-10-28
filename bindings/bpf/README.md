@@ -32,7 +32,7 @@ you:
 
 ```sh
 sudo bindings/bpf/trace.sh target/release/libtcp_sans_io.so \
-    -c "./bindings/netem/netem.test -test.run=^TestNetem_LAN_NoLoss"
+    -c "bindings/netem/bench.sh --profiles lan --runs 1 --dir up --stacks tcp-sans-io"
 ```
 
 Or attach to an already-running host program:
@@ -65,22 +65,15 @@ cargo build --release --lib
 sudo -E env PATH=$PATH go test -v -tags bpftrace -run TestBpftraceUprobes ./bindings/bpf/
 ```
 
-## 2. Kernel-side TCP comparison (`tcpretrans` etc.)
+## 2. Kernel-side TCP comparison
 
-The companion piece — measuring how the **kernel's** TCP stack
-behaves over the same netem profile — uses the `bpfcc-tools`
-package (apt: `bpfcc-tools` or `bcc-tools` on older releases).
-The `perf-bench` GHA workflow runs:
-
-- **`tcpretrans`** during the kernel iperf3 baseline to count
-  retransmits the kernel emits over each netem profile. These
-  numbers serve as the apples-to-apples comparison point against
-  our stack's retransmit behaviour (which the uprobe trace above
-  surfaces via inject/extract counts).
-- **`tcpconnlat`** for connection-establishment latency.
-
-Both tools dump their output to text artifacts uploaded with the
-workflow run.
+Retransmission behaviour is compared directly by
+`bindings/netem/bench.sh`: tcp-sans-io and Linux Reno / CUBIC cross the
+same netem-shaped router, and every run records the sender's retransmitted
+segments (`tcp_get_stats` for tcp-sans-io, `TCP_INFO` for Linux) next to the
+router's drop count and the receiver's duplicate (D-SACK) count. For
+per-event detail on the kernel side, run `bpfcc-tools`' `tcpretrans`
+alongside a kernel run.
 
 ## Interpreting the output
 

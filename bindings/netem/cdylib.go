@@ -1,18 +1,16 @@
-// Cgo bridge to the tcp-sans-io cdylib for the netem throughput benchmark.
+// Cgo bridge to the tcp-sans-io cdylib for the benchmark endpoint.
 //
-// This is a slim copy of bindings/gvisor/cdylib.go (just the entry points
-// we need) so the netem package can build without dragging in the gvisor
-// netstack module — which has Go-version-sensitive build constraints that
-// make CI brittle on rolling-release distros.
+// Only the entry points present in every ABI-v2 build are used here, so the
+// same endpoint can also drive an older build of the library (see
+// cdylib_stats.go / cdylib_oldabi.go and `bench.sh --baseline-lib`).
 
-package netem
+package main
 
 /*
 #cgo CFLAGS: -I${SRCDIR}/../../include
 #cgo LDFLAGS: -L${SRCDIR}/../../target/release -ltcp_sans_io -Wl,-rpath,${SRCDIR}/../../target/release
 #include <stdint.h>
 #include <stdlib.h>
-#include <string.h>
 #include "tcp_sans_io.h"
 */
 import "C"
@@ -25,20 +23,13 @@ import (
 )
 
 const (
-	StateClosed      uint8 = 0
-	StateSynSent     uint8 = 1
-	StateEstablished uint8 = 2
-	StateFinWait1    uint8 = 3
-	StateFinWait2    uint8 = 4
-	StateClosing     uint8 = 5
-	StateTimeWait    uint8 = 6
-	StateCloseWait   uint8 = 7
-	StateLastAck     uint8 = 8
-	StateListen      uint8 = 9
-	StateSynRcvd     uint8 = 10
+	stateClosed      = 0
+	stateEstablished = 2
+	stateFinWait2    = 4
+	stateTimeWait    = 6
+	stateCloseWait   = 7
+	stateLastAck     = 8
 )
-
-const MaxPacket = 1500
 
 const (
 	errInvalidState     = -3
@@ -50,168 +41,92 @@ const (
 )
 
 var (
-	ErrConnectionClosed = errors.New("tcp_recv: connection closed")
-	ErrConnectionReset  = errors.New("tcp_recv: connection reset")
-	ErrWouldBlock       = errors.New("tcp_send: would block")
-	ErrMalformedPacket  = errors.New("tcp_inject_packet: malformed")
-	ErrNotForUs         = errors.New("tcp_inject_packet: not for us")
-	ErrInvalidState     = errors.New("tcp_inject_packet: invalid state")
+	errClosed = errors.New("connection closed by peer")
+	errReset  = errors.New("connection reset")
 )
 
-type TcpHandle struct {
+// handle owns one TCB in C-heap storage (never moved by the Go GC).
+type handle struct {
 	storage unsafe.Pointer
-	handle  *C.struct_TcpStreamHandle
-	start   time.Time
+	h       *C.struct_TcpStreamHandle
+	epoch   time.Time
 }
 
-// now returns milliseconds from a monotonic origin. The FFI contract
-// requires a monotonic, non-decreasing now_ms; time.Now().UnixMilli()
-// is wall clock (Go strips the monotonic reading in UnixMilli) and can
-// step backwards under NTP, stalling every stack timer for the size of
-// the step. time.Since uses the monotonic reading.
-func (h *TcpHandle) now() C.uint64_t {
-	return C.uint64_t(time.Since(h.start).Milliseconds())
-}
+// nowMs is the monotonic host clock handed to the stack.
+func (t *handle) nowMs() uint64 { return uint64(time.Since(t.epoch).Milliseconds()) }
 
-func NewTcpHandle(localIP []byte, localPort uint16, remoteIP []byte, remotePort uint16,
-	iss uint32, initialRtoMs uint32) (*TcpHandle, error) {
-	if len(localIP) != 4 || len(remoteIP) != 4 {
-		return nil, fmt.Errorf("IP must be 4 bytes")
-	}
-	size := C.tcp_handle_size()
-	storage := C.calloc(1, C.size_t(size))
+func newHandle(local, remote [4]byte, lport, rport uint16, iss uint32) (*handle, error) {
+	storage := C.aligned_alloc(C.tcp_handle_align(), C.tcp_handle_size())
 	if storage == nil {
-		return nil, fmt.Errorf("oom for handle storage")
+		return nil, errors.New("out of memory")
 	}
-	rc := C.tcp_init(
-		(*C.struct_TcpStreamHandle)(storage),
-		(*C.uchar)(unsafe.Pointer(&localIP[0])),
-		C.uint16_t(localPort),
-		(*C.uchar)(unsafe.Pointer(&remoteIP[0])),
-		C.uint16_t(remotePort),
-		C.uint32_t(iss),
-		C.uint32_t(initialRtoMs),
-	)
+	rc := C.tcp_init((*C.struct_TcpStreamHandle)(storage),
+		(*C.uint8_t)(unsafe.Pointer(&local[0])), C.uint16_t(lport),
+		(*C.uint8_t)(unsafe.Pointer(&remote[0])), C.uint16_t(rport),
+		C.uint32_t(iss), 1000)
 	if rc != 0 {
 		C.free(storage)
 		return nil, fmt.Errorf("tcp_init: %d", rc)
 	}
-	return &TcpHandle{
-		storage: storage,
-		handle:  (*C.struct_TcpStreamHandle)(storage),
-		start:   time.Now(),
-	}, nil
+	return &handle{storage: storage, h: (*C.struct_TcpStreamHandle)(storage), epoch: time.Now()}, nil
 }
 
-func (h *TcpHandle) Free() {
-	if h.storage != nil {
-		C.tcp_destroy(h.handle)
-		C.free(h.storage)
-		h.storage = nil
-		h.handle = nil
-	}
+func (t *handle) free() {
+	C.tcp_destroy(t.h)
+	C.free(t.storage)
 }
 
-func (h *TcpHandle) Connect() error {
-	rc := C.tcp_connect(h.handle, h.now())
+func check(name string, rc C.int32_t) error {
 	if rc != 0 {
-		return fmt.Errorf("tcp_connect: %d", rc)
+		return fmt.Errorf("%s: %d", name, rc)
 	}
 	return nil
 }
 
-// Listen transitions CLOSED → LISTEN (passive open). The remote endpoint
-// given to NewTcpHandle is wildcarded; the next inbound SYN pins it.
-func (h *TcpHandle) Listen() error {
-	rc := C.tcp_listen(h.handle, h.now())
-	if rc != 0 {
-		return fmt.Errorf("tcp_listen: %d", rc)
-	}
-	return nil
-}
+func (t *handle) connect() error { return check("tcp_connect", C.tcp_connect(t.h, C.uint64_t(t.nowMs()))) }
+func (t *handle) close() error   { return check("tcp_close", C.tcp_close(t.h, C.uint64_t(t.nowMs()))) }
+func (t *handle) tick() error    { return check("tcp_tick", C.tcp_tick(t.h, C.uint64_t(t.nowMs()))) }
+func (t *handle) state() uint8   { return uint8(C.tcp_state(t.h)) }
 
-func (h *TcpHandle) Close() error {
-	rc := C.tcp_close(h.handle, h.now())
-	if rc != 0 {
-		return fmt.Errorf("tcp_close: %d", rc)
-	}
-	return nil
-}
-
-func (h *TcpHandle) State() uint8 {
-	return uint8(C.tcp_state(h.handle))
-}
-
-func (h *TcpHandle) Tick() error {
-	rc := C.tcp_tick(h.handle, h.now())
-	if rc != 0 {
-		return fmt.Errorf("tcp_tick: %d", rc)
-	}
-	return nil
-}
-
-func (h *TcpHandle) Send(b []byte) (int, error) {
-	if len(b) == 0 {
+func (t *handle) send(b []byte) (int, error) {
+	var n C.size_t
+	rc := C.tcp_send(t.h, (*C.uint8_t)(unsafe.Pointer(&b[0])), C.size_t(len(b)), &n)
+	if rc == errWouldBlock {
 		return 0, nil
 	}
-	var written C.size_t
-	rc := C.tcp_send(h.handle, (*C.uchar)(unsafe.Pointer(&b[0])), C.size_t(len(b)), &written)
-	switch rc {
-	case 0:
-		return int(written), nil
-	case errWouldBlock:
-		return 0, ErrWouldBlock
-	default:
-		return 0, fmt.Errorf("tcp_send: %d", rc)
-	}
+	return int(n), check("tcp_send", rc)
 }
 
-func (h *TcpHandle) Recv(b []byte) (int, error) {
-	if len(b) == 0 {
-		return 0, nil
-	}
-	var read C.size_t
-	rc := C.tcp_recv(h.handle, (*C.uchar)(unsafe.Pointer(&b[0])), C.size_t(len(b)), &read)
-	switch rc {
+func (t *handle) recv(b []byte) (int, error) {
+	var n C.size_t
+	switch rc := C.tcp_recv(t.h, (*C.uint8_t)(unsafe.Pointer(&b[0])), C.size_t(len(b)), &n); rc {
 	case 0:
-		return int(read), nil
+		return int(n), nil
 	case errConnectionClosed:
-		return 0, ErrConnectionClosed
+		return 0, errClosed
 	case errConnectionReset:
-		return 0, ErrConnectionReset
+		return 0, errReset
 	default:
 		return 0, fmt.Errorf("tcp_recv: %d", rc)
 	}
 }
 
-func (h *TcpHandle) ExtractPacket(buf []byte) (int, error) {
-	if len(buf) == 0 {
-		return 0, nil
-	}
-	var written C.size_t
-	rc := C.tcp_extract_packet(h.handle, (*C.uchar)(unsafe.Pointer(&buf[0])), C.size_t(len(buf)), &written)
-	if rc != 0 {
-		return 0, fmt.Errorf("tcp_extract_packet: %d", rc)
-	}
-	return int(written), nil
+func (t *handle) extract(buf []byte) (int, error) {
+	var n C.size_t
+	rc := C.tcp_extract_packet(t.h, (*C.uint8_t)(unsafe.Pointer(&buf[0])), C.size_t(len(buf)), &n)
+	return int(n), check("tcp_extract_packet", rc)
 }
 
-func (h *TcpHandle) InjectPacket(pkt []byte) error {
-	if len(pkt) == 0 {
-		return nil
-	}
-	rc := C.tcp_inject_packet(h.handle, (*C.uchar)(unsafe.Pointer(&pkt[0])), C.size_t(len(pkt)),
-		h.now())
-	switch rc {
+// inject feeds one datagram; segments that are not ours or malformed are
+// counted by the caller and otherwise ignored, as a real host would.
+func (t *handle) inject(pkt []byte) (accepted bool, err error) {
+	switch rc := C.tcp_inject_packet(t.h, (*C.uint8_t)(unsafe.Pointer(&pkt[0])), C.size_t(len(pkt)),
+		C.uint64_t(t.nowMs())); rc {
 	case 0:
-		return nil
-	case errMalformedPacket:
-		return ErrMalformedPacket
-	case errNotForUs:
-		return ErrNotForUs
-	case errInvalidState:
-		return ErrInvalidState
+		return true, nil
+	case errMalformedPacket, errNotForUs, errInvalidState:
+		return false, nil
 	default:
-		return fmt.Errorf("tcp_inject_packet: %d", rc)
+		return false, fmt.Errorf("tcp_inject_packet: %d", rc)
 	}
 }

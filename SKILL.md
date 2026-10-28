@@ -41,23 +41,26 @@ transfer entirely inside the library — it needs no storage, transport, clock,
 or peer. If this fails, nothing downstream can work. (Cost: ~256 KiB of the
 calling thread's stack for <1 ms.)
 
-## Step 1 — Provide the five host responsibilities
+## Step 1 — Provide the six host responsibilities
 
-1. **Storage**: `tcp_handle_size()` bytes at `tcp_handle_align()` alignment,
-   one block per connection, owned and freed by you. NOTE: `tcp_init`
-   materialises a full ~2.15 MiB `Tcb` (default 1 MiB rings) on the *calling
-   thread's stack* — call it from a thread with a few MiB of stack, or build
-   the cdylib with the `small-buffers` / `heap-buffers` feature.
+1. **Storage**: `tcp_handle_size()` bytes (≈ 2.08 MiB by default, 136 KiB
+   with `small-buffers`) at `tcp_handle_align()` alignment, one block per
+   connection, owned and freed by you. `tcp_init` builds the TCB in place
+   and needs only a few KiB of the calling thread's stack; it rejects
+   misaligned storage.
 2. **A monotonic millisecond clock** (`Instant` / `CLOCK_MONOTONIC` /
    `QueryPerformanceCounter`). Read it once per turn; pass the same `now_ms`
    to every call that turn.
 3. **A datagram transport** moving complete IPv4+TCP datagrams to/from the
    peer.
-4. **A driver loop** (Step 2) that also calls `tick()` periodically even when
-   idle.
-5. **A CSPRNG `iss`** per connection (RFC 6528); servers also pass a 16-byte
-   CSPRNG secret to `tcp_set_cookie_secret` for stateless SYN-cookie flood
+4. **A driver loop** (Step 2) that ticks when `tcp_next_deadline()` comes
+   due — even when idle.
+5. **Secrets**: a CSPRNG `iss` per connection (RFC 6528); for anything
+   internet-facing a 16-byte CSPRNG secret via `tcp_set_secret`; servers
+   also pass one to `tcp_set_cookie_secret` for stateless SYN-cookie flood
    resistance.
+6. **The path MTU** via `tcp_set_mtu` before the handshake if the tunnel is
+   below 1500 (1420 for a default WireGuard interface).
 
 ## Step 2 — Implement the canonical pump loop
 
@@ -66,11 +69,12 @@ pump loop*. The non-obvious rules that bindings get wrong:
 
 - Size every `extract_packet` buffer to **≥ `tcp_max_packet()`** (1500).
 - **Drain `extract_packet` until it returns 0** after every `inject_packet`,
-  `tick`, and `close` (the egress ring holds only 32 packets).
+  `tick`, `recv` and `close` (the egress ring holds only 32 packets).
 - `tcp_send` only **buffers**; the next `tick` turns it into segments.
-- Call `tick()` **periodically even when idle** — RTO / TLP / TIME_WAIT /
-  persist / delayed-ACK only fire there. ~10 ms cadence is plenty (matches
-  the TLP floor; 20× finer than `RTO_MIN`).
+- **Tick when `tcp_next_deadline()` comes due** (it returns the absolute
+  `now_ms` of the next timer, `UINT64_MAX` if none) — RTO / TLP /
+  TIME_WAIT / persist / delayed-ACK only fire there. Without deadline
+  tracking, a ~10 ms periodic tick is adequate.
 - Treat `NOT_FOR_US` / `MALFORMED_PACKET` from `inject` as drop-and-continue,
   `WOULD_BLOCK` from `send` as backpressure, `CONNECTION_CLOSED` from `recv`
   as EOF.
@@ -139,9 +143,9 @@ proof.
 | Symptom | Likely cause |
 |---|---|
 | `tcp_selftest()` ≠ 0 / segfault on any call | Wrong struct layout, calling convention, or ABI version mismatch. Recheck the header against `tcp_abi_version()`. |
-| Stack overflow inside `tcp_init` | Calling thread stack too small for the ~2.15 MiB `Tcb`; use a bigger stack or `small-buffers`/`heap-buffers`. |
+| `tcp_init` fails | `TCP_ERR_NULL_POINTER`: NULL storage or address pointer. `TCP_ERR_INVALID_STATE`: storage not aligned to `tcp_handle_align()`. |
 | Handshake never completes | Not draining `extract_packet` to 0, or not delivering the SYN/SYN-ACK both ways, or 5-tuple demux routing to the wrong handle. |
-| Transfer stalls mid-stream | Not calling `tick()` periodically (timers never fire), or not draining the egress ring (32-packet cap), or feeding a non-monotonic clock. |
+| Transfer stalls mid-stream | Not ticking when `tcp_next_deadline()` comes due (timers never fire), not ticking after `tcp_send`, not draining the egress ring (32-packet cap), or feeding a non-monotonic clock. |
 | `recv` returns 0 forever but peer sent data | A gap the receiver is waiting on; ensure you deliver *all* inbound datagrams and keep ticking so retransmits flow. |
 | `BUFFER_TOO_SMALL` from `extract_packet` | Extract buffer smaller than `tcp_max_packet()` (1500). |
 | `OVERFLOW` (`-9`) from any call | Internal invariant bug — should be impossible; please file it with the input. |

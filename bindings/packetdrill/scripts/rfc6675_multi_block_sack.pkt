@@ -12,11 +12,10 @@
 #   seg #4 = [4345, 5793)   ← SACKed
 #   seg #5 = [5793, 7241)
 #
-# Sacked above 1 = 2*1448 = 2896 bytes. 3*MSS threshold (3*1460 = 4380)?
-# 2896 < 4380 → NOT lost. So NextSeg won't fire.
-# But our trigger logic enters recovery on the FIRST SACK-bearing ACK
-# (more aggressive than RFC 6675), and the "initial retransmit at snd_una"
-# fires unconditionally on entry.
+# Only 2 segments are SACKed (fewer than DupThresh), so RACK (RFC 8985)
+# waits one reordering window (min_RTT/4 = 1 ms here) before declaring
+# loss. Then every unacknowledged segment sent before the most recently
+# SACKed one (#4) is lost: #1 and #3. #5 was sent after #4 and is not.
 
 --connect 10.0.0.1:49152 10.0.0.2:80
 +0 > SEW 0:0(0) win 65535 <mss 1460, wscale 5, sackOK, TS val * ecr 0>
@@ -35,5 +34,10 @@
 # Peer SACKs #2 and #4 in a single ACK with two blocks.
 +.005 < . 1:1(0) ack 1 win 32768 <sack 1449:2897 4345:5793, TS val 2 ecr *>
 
-# Initial retransmit at snd_una=1 (the first gap).
-+0 > P. 1:1449(1448) ack 1 win 32768 <TS val * ecr 2>
+# PRR (RFC 6937) clocks recovery by delivered data; the timer-driven entry
+# is credited one segment, so the lowest hole goes first (as Linux does).
++.002 > P. 1:1449(1448) ack 1 win 32768 <TS val * ecr 2>
+
+# Its ACK covers #1 and #2 and still SACKs #4: the next hole follows.
++.010 < . 1:1(0) ack 2897 win 32768 <sack 4345:5793, TS val 3 ecr *>
++0 > P. 2897:4345(1448) ack 1 win 32768 <TS val * ecr 3>

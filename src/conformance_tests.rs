@@ -74,6 +74,26 @@ fn pop(tcb: &mut Tcb) -> (Vec<u8>, ParsedOut) {
     (bytes, parsed)
 }
 
+/// Sender MSS with the timestamp option: 1460 - 12.
+const SMSS: u32 = 1448;
+/// RFC 6928 initial window for that SMSS (10 segments, as Linux).
+const IW: u32 = crate::congestion::initial_window(SMSS);
+
+/// Tick 1 ms at a time until the stack emits a packet (or `max_ms` pass).
+/// RACK (RFC 8985) waits a reordering window before declaring a lone hole
+/// lost, so a retransmission is not necessarily immediate.
+fn tick_until_packet(tcb: &mut Tcb, now: &mut u64, max_ms: u64) -> Option<ParsedOut> {
+    for _ in 0..=max_ms {
+        tcb.set_now(*now);
+        tcb.tick().expect("tick");
+        if let Some(p) = try_pop(tcb) {
+            return Some(p);
+        }
+        *now += 1;
+    }
+    None
+}
+
 /// Try to pop a packet; return None if the staging buffer is empty.
 fn try_pop(tcb: &mut Tcb) -> Option<ParsedOut> {
     let mut buf = [0u8; MAX_PACKET];
@@ -1098,9 +1118,8 @@ fn piggybacked_acks_are_not_dup_acks() {
 
     let snap = tcb.debug_snapshot();
     assert_eq!(
-        snap.cwnd,
-        crate::congestion::INITIAL_WINDOW,
-        "piggybacked ACKs must NOT trigger Tahoe loss; cwnd should stay at slow-start value",
+        snap.cwnd, IW,
+        "piggybacked ACKs must NOT trigger loss recovery; cwnd should stay at slow-start value",
     );
     // snd_nxt should still be one MSS past snd_una (one segment in flight,
     // never rewound).
@@ -1135,7 +1154,9 @@ fn pure_dup_acks_trigger_fast_retransmit() {
     let _first = pop(&mut tcb);
 
     let snd_una_at_loss = tcb.debug_snapshot().snd_una;
+    let snd_nxt_at_loss = tcb.debug_snapshot().snd_nxt;
 
+    let mut retx = 0;
     for i in 0..3 {
         now += 1;
         let pkt = build_in(
@@ -1149,31 +1170,21 @@ fn pure_dup_acks_trigger_fast_retransmit() {
         );
         tcb.set_now(now);
         tcb.inject_packet(&pkt).expect("inject dup-ack");
-        while try_pop(&mut tcb).is_some() {}
+        while let Some(p) = try_pop(&mut tcb) {
+            if p.seq == snd_una_at_loss && !p.payload.is_empty() {
+                retx += 1;
+            }
+        }
     }
 
     let snap = tcb.debug_snapshot();
-    // PRR: ssthresh = max(flight/2, 2*MSS) = 2920 for flight ≤ MSS.
+    // ssthresh = max(FlightSize/2, 2*SMSS) with FlightSize = 1460 bytes.
+    assert_eq!(snap.ssthresh, 2 * SMSS, "RFC 5681 / 6937 ssthresh on loss");
     assert_eq!(
-        snap.ssthresh, 2920,
-        "PRR loss event sets ssthresh = max(flight/2, 2*MSS)",
+        retx, 1,
+        "exactly one fast retransmit of SND.UNA on the 3rd dup ACK"
     );
-    // PRR: cwnd is NOT collapsed; stays at the pre-loss value (here, the
-    // initial window since we haven't grown past it yet).
-    assert_eq!(
-        snap.cwnd,
-        crate::congestion::INITIAL_WINDOW,
-        "PRR does NOT collapse cwnd to 1*MSS (that's Tahoe behavior)",
-    );
-    // After fast retransmit, exactly one segment is in flight: snd_credit=MSS
-    // at recovery entry caps the retransmit to a single MSS-payload (which
-    // is MSS minus the 12-byte TS option = 1448).
-    let flight = snap.snd_nxt.wrapping_sub(snap.snd_una);
-    assert!(
-        flight > 0 && flight <= 1460,
-        "PRR initial retransmit ≤ 1 MSS; got flight={}",
-        flight,
-    );
+    assert_eq!(snap.snd_nxt, snd_nxt_at_loss, "SND.NXT is never rewound");
 }
 
 // ---------------------------------------------------------------------------
@@ -1268,10 +1279,11 @@ fn sack_block_triggers_fast_retransmit_after_one_ack() {
 
     let snd_una_at_loss = tcb.debug_snapshot().snd_una;
 
-    // One ACK at snd_una with a SACK block describing 1460 bytes received
-    // ABOVE snd_una (i.e. the second segment landed; the first was lost).
-    let sack_left = snd_una_at_loss.wrapping_add(1460);
-    let sack_right = sack_left.wrapping_add(1460);
+    // One ACK at snd_una with a SACK block describing the second segment
+    // (the first was lost).
+    let snd_nxt_at_loss = tcb.debug_snapshot().snd_nxt;
+    let sack_left = snd_una_at_loss.wrapping_add(SMSS);
+    let sack_right = snd_nxt_at_loss;
     now += 1;
     let pkt = build_in_full(
         flags::ACK,
@@ -1286,40 +1298,29 @@ fn sack_block_triggers_fast_retransmit_after_one_ack() {
     );
     tcb.set_now(now);
     tcb.inject_packet(&pkt).expect("inject SACK");
-    // Drain & inspect: the first packet should be the retransmit.
-    let retx = pop(&mut tcb).1;
+    // RACK declares the hole lost once a reordering window has passed.
+    let retx = tick_until_packet(&mut tcb, &mut now, 50).expect("retransmission");
     while try_pop(&mut tcb).is_some() {}
 
     let snap = tcb.debug_snapshot();
-    // PRR: ssthresh = max(flight/2, 2*MSS) = 2920 (clamped to 2*MSS floor
-    // since flight is ~2*1448 = 2896 < 4*MSS).
+    // ssthresh = max(FlightSize/2, 2*SMSS); FlightSize = 2920.
     assert_eq!(
-        snap.ssthresh, 2920,
-        "ssthresh = max(flight/2, 2*MSS) at SACK-driven loss event",
+        snap.ssthresh,
+        2 * SMSS,
+        "ssthresh = max(flight/2, 2*SMSS) at SACK-driven loss event",
     );
-    assert_eq!(
-        snap.cwnd,
-        crate::congestion::INITIAL_WINDOW,
-        "PRR does NOT collapse cwnd at recovery entry",
-    );
-    // RFC 6675 selective retransmit: the lost segment is retransmitted at
-    // snd_una. Unlike Tahoe / our pre-RFC-6675 code, snd_nxt is NOT
-    // rewound — retransmits travel "below" snd_nxt without disturbing it.
     assert_eq!(
         retx.seq, snd_una_at_loss,
-        "first retransmit must be at snd_una (the obvious hole)",
+        "first retransmit must be at snd_una (the hole)",
     );
-    assert!(
-        !retx.payload.is_empty() && retx.payload.len() <= 1460,
-        "retransmit must carry ≤ 1 MSS of payload",
+    assert_eq!(
+        retx.payload.len() as u32,
+        SMSS,
+        "the whole lost segment is resent"
     );
-    // snd_nxt stays at its pre-loss high-water mark (2 segments × 1448 = 2896,
-    // since TS option shrinks effective payload from MSS=1460 by 12 bytes).
-    let flight_visible = snap.snd_nxt.wrapping_sub(snap.snd_una);
-    assert!(
-        flight_visible >= 2880 && flight_visible <= 2920,
-        "snd_nxt MUST NOT rewind under RFC 6675 selective retransmit (got flight={})",
-        flight_visible,
+    assert_eq!(
+        snap.snd_nxt, snd_nxt_at_loss,
+        "snd_nxt MUST NOT rewind under RFC 6675 selective retransmit",
     );
 }
 
@@ -1345,12 +1346,12 @@ fn sack_triggers_fast_retransmit_on_piggybacked_ack() {
     let _ = try_pop(&mut tcb);
 
     let snd_una_at_loss = tcb.debug_snapshot().snd_una;
-    let sack_left = snd_una_at_loss.wrapping_add(1460);
-    let sack_right = sack_left.wrapping_add(1460);
+    let sack_left = snd_una_at_loss.wrapping_add(SMSS);
+    let sack_right = tcb.debug_snapshot().snd_nxt;
 
     // Piggybacked ACK at snd_una: carries 100 bytes of peer data and a
     // SACK block. The pure-dup-ACK detector skips this (payload non-empty);
-    // SACK detector MUST fire.
+    // the SACK information alone must drive recovery.
     now += 1;
     let peer_data = vec![0xAB; 100];
     let pkt = build_in_full(
@@ -1366,16 +1367,27 @@ fn sack_triggers_fast_retransmit_on_piggybacked_ack() {
     );
     tcb.set_now(now);
     tcb.inject_packet(&pkt).expect("inject");
-    while try_pop(&mut tcb).is_some() {}
-
+    let mut retx = false;
+    for _ in 0..50 {
+        while let Some(p) = try_pop(&mut tcb) {
+            retx |= p.seq == snd_una_at_loss && !p.payload.is_empty();
+        }
+        if retx {
+            break;
+        }
+        now += 1;
+        tcb.set_now(now);
+        tcb.tick().expect("tick");
+    }
     let snap = tcb.debug_snapshot();
-    assert_eq!(
-        snap.ssthresh, 2920,
-        "SACK on piggybacked ACK must trigger PRR fast recovery",
-    );
     assert!(
-        snap.cwnd >= crate::congestion::INITIAL_WINDOW,
-        "PRR does not collapse cwnd; should still be ≥ IW",
+        retx,
+        "SACK on a piggybacked ACK must lead to retransmitting the hole"
+    );
+    assert_eq!(
+        snap.ssthresh,
+        2 * SMSS,
+        "and to a PRR fast-recovery reduction"
     );
 }
 
@@ -1398,13 +1410,13 @@ fn sack_does_not_retrigger_within_recovery_epoch() {
     let _ = pop(&mut tcb);
     tcb.set_now(now);
     tcb.tick().expect("tick");
-    let _ = try_pop(&mut tcb);
+    while try_pop(&mut tcb).is_some() {}
 
     let snd_una_at_loss = tcb.debug_snapshot().snd_una;
-    let sack_left = snd_una_at_loss.wrapping_add(1460);
-    let sack_right = sack_left.wrapping_add(1460);
+    let sack_left = snd_una_at_loss.wrapping_add(SMSS);
+    let sack_right = tcb.debug_snapshot().snd_nxt;
 
-    // First SACK ACK: triggers fast retransmit.
+    // First SACK ACK, then the reordering window: recovery starts.
     now += 1;
     let first = build_in_full(
         flags::ACK,
@@ -1419,16 +1431,14 @@ fn sack_does_not_retrigger_within_recovery_epoch() {
     );
     tcb.set_now(now);
     tcb.inject_packet(&first).expect("inject");
+    let _ = tick_until_packet(&mut tcb, &mut now, 50).expect("fast retransmit");
     while try_pop(&mut tcb).is_some() {}
     let after_first = tcb.debug_snapshot();
-    // PRR: ssthresh=2920, cwnd unchanged from pre-loss value.
-    assert_eq!(after_first.ssthresh, 2920);
-    assert!(after_first.cwnd >= crate::congestion::INITIAL_WINDOW);
+    assert_eq!(after_first.ssthresh, 2 * SMSS);
 
-    // Now send three more SACK ACKs at the same snd_una. They MUST NOT
-    // re-collapse anything: ssthresh stays at 2920, cwnd is allowed to
-    // grow as ACKs continue but isn't reset. We assert the non-regression
-    // by checking ssthresh hasn't been pulled lower.
+    // Three more identical SACK ACKs in the same epoch: no further
+    // reduction and no further retransmission of the hole.
+    let mut extra_retx = 0;
     for i in 0..3 {
         now += 1;
         let extra = build_in_full(
@@ -1444,12 +1454,21 @@ fn sack_does_not_retrigger_within_recovery_epoch() {
         );
         tcb.set_now(now);
         tcb.inject_packet(&extra).expect("inject");
-        while try_pop(&mut tcb).is_some() {}
+        while let Some(p) = try_pop(&mut tcb) {
+            if p.seq == snd_una_at_loss && !p.payload.is_empty() {
+                extra_retx += 1;
+            }
+        }
     }
     let after_more = tcb.debug_snapshot();
     assert_eq!(
-        after_more.ssthresh, 2920,
-        "additional SACK ACKs in the same recovery epoch must NOT re-trigger Tahoe loss",
+        after_more.ssthresh,
+        2 * SMSS,
+        "additional SACK ACKs in the same recovery epoch must NOT re-trigger a reduction",
+    );
+    assert_eq!(
+        extra_retx, 0,
+        "repeated SACKs must not resend the in-flight retransmission"
     );
 }
 
@@ -1515,8 +1534,8 @@ fn dsack_does_not_trigger_fast_recovery() {
         "a D-SACK must not start fast recovery",
     );
     let stats = tcb.stats();
-    assert_eq!(stats.dsacks, 1, "the D-SACK is counted");
-    assert_eq!(stats.sack_recoveries, 0);
+    assert_eq!(stats.dsacks_received, 1, "the D-SACK is counted");
+    assert_eq!(stats.fast_recoveries, 0);
 }
 
 /// After a SACK-driven fast-retransmit rewinds `snd_nxt` to `snd_una`, the
@@ -1622,11 +1641,11 @@ fn cumulative_ack_after_sack_rewind_is_accepted() {
     );
     tcb.set_now(now);
     tcb.inject_packet(&sack).expect("inject SACK");
-    // PRR fast-retransmit: rewind snd_nxt and retransmit 1 MSS.
-    let _ = pop(&mut tcb);
+    // After the RACK reordering window the hole is retransmitted.
+    let _ = tick_until_packet(&mut tcb, &mut now, 50).expect("retransmission");
 
     let snap = tcb.debug_snapshot();
-    assert!(snap.ssthresh >= 2 * 1460, "ssthresh ≥ 2*MSS per PRR");
+    assert!(snap.ssthresh >= 2 * SMSS, "ssthresh ≥ 2*SMSS per PRR");
     assert_eq!(snap.snd_una, snd_una_pre_loss, "snd_una not yet advanced");
     // Under RFC 6675 selective retransmit, snd_nxt is NOT rewound. The
     // retransmit travels at snd_una "below" snd_nxt, and snd_nxt stays
@@ -1989,13 +2008,10 @@ fn initial_window_is_rfc6928_iw10() {
     let _ = handshake_with_ts(&mut tcb, &mut now);
 
     let snap = tcb.debug_snapshot();
-    assert_eq!(
-        snap.cwnd,
-        crate::congestion::INITIAL_WINDOW,
-        "initial cwnd must equal RFC 6928 IW",
-    );
-    // For our MSS=1460, RFC 6928 formula gives exactly 10*MSS = 14_600.
-    assert_eq!(snap.cwnd, 14_600, "IW=10*1460 = 14600 bytes");
+    assert_eq!(snap.cwnd, IW, "initial cwnd must equal RFC 6928 IW",);
+    // SMSS excludes the 12-byte timestamp option (RFC 5681 §2), so with
+    // MSS 1460 the RFC 6928 formula gives 10 * 1448 = 14_480 (as Linux).
+    assert_eq!(snap.cwnd, 14_480, "IW = 10 * SMSS");
 }
 
 /// With IW=10 a single `send()` of up to 10 MSS-sized segments worth of
@@ -2036,8 +2052,8 @@ fn iw10_lets_first_burst_send_multiple_segments() {
         emitted_segments,
     );
     assert!(
-        emitted_bytes >= 14_600,
-        "should emit full 14600-byte burst before needing ACK; got {}",
+        emitted_bytes >= IW as usize,
+        "should emit the full IW burst before needing an ACK; got {}",
         emitted_bytes,
     );
 }
@@ -2114,11 +2130,16 @@ fn prr_exits_recovery_with_cwnd_equal_ssthresh() {
     );
     tcb.set_now(now);
     tcb.inject_packet(&sack).expect("inject SACK");
+    let _ = tick_until_packet(&mut tcb, &mut now, 50).expect("fast retransmit");
     while try_pop(&mut tcb).is_some() {}
 
     let pre_exit = tcb.debug_snapshot();
     let ssthresh_at_recovery = pre_exit.ssthresh;
-    assert_eq!(ssthresh_at_recovery, 2920, "ssthresh = max(2*MSS/2, 2*MSS)");
+    assert_eq!(
+        ssthresh_at_recovery,
+        2 * SMSS,
+        "ssthresh = max(FlightSize/2, 2*SMSS)"
+    );
 
     // Cumulative ACK at snd_max (the recovery_point) — must exit recovery.
     now += 1;
@@ -2165,19 +2186,28 @@ fn rto_still_collapses_cwnd_to_one_mss() {
     let _ = pop(&mut tcb);
 
     let cwnd_before = tcb.debug_snapshot().cwnd;
-    assert!(cwnd_before >= crate::congestion::INITIAL_WINDOW);
+    assert!(cwnd_before >= IW);
 
-    // Advance time past initial RTO (1000 ms) without any ACK.
+    // No ACK ever arrives. The first timeout is a tail loss probe (RFC 8985
+    // §7.2 caps the PTO at the RTO); the RTO re-armed behind it then fires.
     now += 2_000;
     tcb.set_now(now);
-    tcb.tick().expect("tick");
+    tcb.tick().expect("tick (TLP)");
+    while try_pop(&mut tcb).is_some() {}
+    assert!(
+        tcb.debug_snapshot().cwnd >= IW,
+        "a probe does not collapse cwnd"
+    );
+    now += 2_000;
+    tcb.set_now(now);
+    tcb.tick().expect("tick (RTO)");
 
     let snap = tcb.debug_snapshot();
     assert_eq!(
-        snap.cwnd, 1460,
-        "RTO must collapse cwnd to 1*MSS (RFC 5681 §3)",
+        snap.cwnd, SMSS,
+        "RTO must collapse cwnd to 1*SMSS (RFC 5681 §3)",
     );
-    assert!(snap.ssthresh >= 2 * 1460, "RTO must set ssthresh ≥ 2*MSS",);
+    assert!(snap.ssthresh >= 2 * SMSS, "RTO must set ssthresh ≥ 2*SMSS",);
 }
 
 // ---------------------------------------------------------------------------
@@ -2605,12 +2635,19 @@ fn rack_does_not_resend_segment_whose_retransmit_is_in_flight() {
         )
     };
 
-    // SACK of segments 2-3: recovery starts and segment 1 is retransmitted.
+    // SACK of segments 2-3. With fewer than DupThresh segments SACKed,
+    // RACK first waits a reordering window, then retransmits segment 1.
     now += 10;
     tcb.set_now(now);
     tcb.inject_packet(&sack_ack(now, peer_ts.wrapping_add(1), seg(3)))
         .expect("inject SACK");
     let mut copies = copies_of(&mut tcb, lost);
+    for _ in 0..5 {
+        now += 1;
+        tcb.set_now(now);
+        tcb.tick().expect("tick");
+        copies += copies_of(&mut tcb, lost);
+    }
     assert_eq!(copies, 1, "recovery retransmits the lost segment once");
 
     // Everything else arrives, which gives recovery send credit.
@@ -2620,20 +2657,22 @@ fn rack_does_not_resend_segment_whose_retransmit_is_in_flight() {
         .expect("inject SACK");
     copies += copies_of(&mut tcb, lost);
 
-    // The RACK reorder timer fires a few ms later, well within one RTT of the
-    // retransmit: it must not send segment 1 again.
-    now += 3;
-    tcb.set_now(now);
-    tcb.tick().expect("tick");
-    copies += copies_of(&mut tcb, lost);
+    // Timers run a few ms later, well within one RTT of the retransmit:
+    // segment 1 must not be sent again.
+    for _ in 0..3 {
+        now += 1;
+        tcb.set_now(now);
+        tcb.tick().expect("tick");
+        copies += copies_of(&mut tcb, lost);
+    }
     assert_eq!(
         copies, 1,
         "segment 1 re-sent while its retransmit is in flight"
     );
     let stats = tcb.stats();
-    assert_eq!(stats.sack_recoveries, 1);
+    assert_eq!(stats.fast_recoveries, 1);
     assert_eq!(
-        stats.retransmit_segments, 1,
+        stats.segs_retrans, 1,
         "only segment 1 is lost: the SACKed segments 2-8 must never be re-sent"
     );
 }
@@ -2659,27 +2698,24 @@ fn tlp_probes_before_rto_fires() {
     assert!(!original.payload.is_empty());
     let orig_seq = original.seq;
 
-    // Advance past TLP PTO (no SRTT sample yet → uses MIN_PTO=10ms).
-    // RTO is initial_rto_ms=1000. PTO should fire well before that.
-    now += 50;
-    tcb.set_now(now);
-    tcb.tick().expect("tick");
-
-    // A probe should now be staged.
-    let probe = try_pop(&mut tcb).expect("TLP probe should have fired");
+    // SRTT is ~5 ms from the handshake. With one segment in flight the PTO
+    // is 2*SRTT + 200 ms (worst-case delayed ACK), capped at the RTO expiry
+    // (RFC 8985 §7.2). Tick until something is emitted: it must be the
+    // probe, not an RTO.
+    let probe = tick_until_packet(&mut tcb, &mut now, 1_000).expect("TLP probe should have fired");
     assert!(!probe.payload.is_empty(), "probe carries payload");
     assert_eq!(
         probe.seq, orig_seq,
         "probe retransmits the last (only) in-flight segment",
     );
-
-    // We must NOT have fired RTO yet (snapshot would show cwnd=MSS).
     let snap = tcb.debug_snapshot();
     assert!(
-        snap.cwnd >= crate::congestion::INITIAL_WINDOW,
-        "RTO should NOT have fired yet (cwnd={})",
+        snap.cwnd >= IW,
+        "RTO must NOT have fired yet (cwnd={})",
         snap.cwnd,
     );
+    assert_eq!(tcb.stats().tlp_count, 1);
+    assert_eq!(tcb.stats().rto_count, 0);
 }
 
 // seq_lt helper for tests
@@ -2871,10 +2907,9 @@ fn rack_tail_loss_short_rtt_retransmits_first_unsacked() {
     tcb.set_now(now);
     tcb.inject_packet(&sack).expect("inject SACK");
 
-    // Drain the immediate emit. It should be seq #1, NOT seq #4.
-    tcb.set_now(now);
-    tcb.tick().expect("tick");
-    let retx = try_pop(&mut tcb).expect("must emit a retransmit");
+    // After the reordering window the first emission must be seq #1, NOT
+    // the SACKed seq #4.
+    let retx = tick_until_packet(&mut tcb, &mut now, 50).expect("must emit a retransmit");
     assert_eq!(
         retx.seq, s1_seq,
         "first retransmit must be seq #1 (snd_una), not the SACKed seq #4 \
@@ -3089,24 +3124,24 @@ fn reinit_yields_byte_identical_syn_to_fresh_new() {
     recycled.connect().expect("connect a");
     let mut scratch = [0u8; MAX_PACKET];
     let _ = recycled.extract_packet(&mut scratch).expect("syn a");
-    // Let the SYN's RTO fire so the loss counters are dirty too.
+    // Let the SYN time out so the counters are dirty too.
     recycled.set_now(u64::from(INIT_RTO_MS) + 1);
-    recycled.tick().expect("rto a");
-    assert_eq!(recycled.stats().rto_fires, 1);
+    recycled.tick().expect("syn rto a");
+    assert_eq!(recycled.stats().segs_out, 2, "SYN and its retransmission");
     recycled.reinit(cfg_b);
     assert_eq!(
         recycled.state(),
         State::Closed,
         "reinit must return to CLOSED"
     );
-    assert_eq!(
-        recycled.stats(),
-        Default::default(),
-        "reinit must reset the loss counters"
-    );
 
     // Fresh TCB with the same (cfg_b) config.
     let mut fresh: Tcb = Tcb::new(cfg_b).expect("tcb");
+    assert_eq!(
+        recycled.stats(),
+        fresh.stats(),
+        "reinit must reset the counters"
+    );
 
     // Drive both identically from CLOSED and compare the emitted SYN bytes.
     recycled.set_now(0);

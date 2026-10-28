@@ -198,6 +198,22 @@ impl TestPeer {
             }
         }
 
+        // ---- Probes ------------------------------------------------------
+        // RFC 9293 §3.10.7.4: an unacceptable segment (here: a zero-window or
+        // keepalive probe carrying an old sequence number) draws an ACK with
+        // the current window.
+        if seg.payload.is_empty()
+            && !seg.has(flags::FIN)
+            && !seg.has(flags::SYN)
+            && seq_gt(self.rcv_nxt, seg.seq)
+        {
+            let opts = self.data_options();
+            if let Some(p) = self.emit(flags::ACK, self.snd_nxt, self.rcv_nxt, &opts, &[]) {
+                out.push(p);
+            }
+            return out;
+        }
+
         // ---- Data --------------------------------------------------------
         if !seg.payload.is_empty() && !self.their_fin_received {
             if seg.seq == self.rcv_nxt {
@@ -729,8 +745,11 @@ fn simultaneous_close_via_closing_state() {
     assert_eq!(client.state(), State::Closed);
 }
 
-/// Peer advertises `window=0`; client should arm the persist timer, fire a
-/// 1-byte probe at the deadline, then resume sending after the window opens.
+/// Peer advertises `window=0`; the client must arm the persist timer and,
+/// at the deadline, send a zero-window probe: an ACK carrying an old
+/// sequence number (`SND.UNA - 1`) and no data, which the peer answers with
+/// its current window (as Linux does — the probe never pushes data into a
+/// closed window). Once the window opens, the queued data flows.
 #[test]
 fn zero_window_persist_probes() {
     let mut client = make_client();
@@ -745,31 +764,33 @@ fn zero_window_persist_probes() {
     let pkts = drain_client(&mut client, now);
     assert!(pkts.is_empty(), "must not send when window=0");
 
-    // Advance past the persist deadline (≈ rto_ms ≈ 1s default).
+    // Advance past the persist deadline (≈ RTO).
     now += 2_000;
     let pkts = drain_client(&mut client, now);
     assert_eq!(pkts.len(), 1, "expected zero-window probe");
     let probe = wire::parse(&pkts[0]).expect("parse probe");
-    assert_eq!(probe.payload.len(), 1, "probe should be exactly 1 byte");
+    assert!(probe.payload.is_empty(), "probe carries no data");
+    let una = client.debug_snapshot().snd_una;
+    assert_eq!(probe.seq, una.wrapping_sub(1), "probe uses SND.UNA - 1");
 
-    // Open the window: peer ACKs the probe with a non-zero window.
+    // The probe is answered; the window has opened in the meantime.
     peer.advertised_window = 4_096;
     now += 1;
     peer.now_ms = now;
     let acks = peer.handle(&pkts[0]);
-    assert_eq!(acks.len(), 1);
+    assert_eq!(acks.len(), 1, "peer must answer the probe");
     now += 1;
     client.set_now(now);
     client
         .inject_packet(&acks[0])
         .expect("inject window update");
 
-    // Remaining 3 bytes should now flow.
+    // All 4 bytes now flow.
     now += 1;
     let pkts = drain_client(&mut client, now);
-    assert_eq!(pkts.len(), 1, "remaining bytes after window opens");
+    assert_eq!(pkts.len(), 1, "data after window opens");
     let parsed = wire::parse(&pkts[0]).expect("parse data");
-    assert_eq!(parsed.payload.len(), 3);
+    assert_eq!(parsed.payload, b"data");
     now += 1;
     peer.now_ms = now;
     let _ = peer.handle(&pkts[0]);

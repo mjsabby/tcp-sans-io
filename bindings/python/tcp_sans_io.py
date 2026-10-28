@@ -147,6 +147,60 @@ _lib.tcp_inject_packet.argtypes = [c_void_p, c_void_p, c_size_t, c_uint64]
 _lib.tcp_extract_packet.restype = c_int32
 _lib.tcp_extract_packet.argtypes = [c_void_p, c_void_p, c_size_t, POINTER(c_size_t)]
 
+_lib.tcp_set_secret.restype = c_int32
+_lib.tcp_set_secret.argtypes = [c_void_p, c_void_p]
+
+_lib.tcp_set_mtu.restype = c_int32
+_lib.tcp_set_mtu.argtypes = [c_void_p, c_uint16]
+
+_lib.tcp_update_pmtu.restype = c_int32
+_lib.tcp_update_pmtu.argtypes = [c_void_p, c_uint64, c_uint16]
+
+_lib.tcp_set_fin_wait2_timeout.restype = c_int32
+_lib.tcp_set_fin_wait2_timeout.argtypes = [c_void_p, c_uint64, c_uint32]
+
+_lib.tcp_next_deadline.restype = c_uint64
+_lib.tcp_next_deadline.argtypes = [c_void_p]
+
+
+class TcpStats(ctypes.Structure):
+    """Mirror of the C ``TcpStats`` (128 bytes) returned by ``tcp_get_stats``."""
+
+    _fields_ = [
+        ("segs_out", c_uint64),
+        ("segs_in", c_uint64),
+        ("bytes_sent", c_uint64),
+        ("bytes_retrans", c_uint64),
+        ("bytes_received", c_uint64),
+        ("dup_bytes_received", c_uint64),
+        ("segs_retrans", c_uint64),
+        ("dsacks_received", c_uint64),
+        ("fast_recoveries", c_uint32),
+        ("rto_count", c_uint32),
+        ("tlp_count", c_uint32),
+        ("ooo_drops", c_uint32),
+        ("oow_suppressed", c_uint32),
+        ("srtt_ms", c_uint32),
+        ("rttvar_ms", c_uint32),
+        ("min_rtt_ms", c_uint32),
+        ("rto_ms", c_uint32),
+        ("cwnd", c_uint32),
+        ("ssthresh", c_uint32),
+        ("pipe", c_uint32),
+        ("mss", c_uint32),
+        ("snd_wnd", c_uint32),
+        ("rcv_wnd", c_uint32),
+        ("ca_state", c_uint8),
+        ("state", c_uint8),
+        ("_reserved", c_uint8 * 2),
+    ]
+
+
+assert ctypes.sizeof(TcpStats) == 128
+
+_lib.tcp_get_stats.restype = c_int32
+_lib.tcp_get_stats.argtypes = [c_void_p, POINTER(TcpStats)]
+
 # ---------------------------------------------------------------------------
 # State / error / event constants — keep in sync with the Rust enum.
 # ---------------------------------------------------------------------------
@@ -394,8 +448,45 @@ class TcpStream:
             self._handle, c_uint64(now_ms), c_uint32(user_timeout_ms),
         ))
 
+    def set_secret(self, secret: bytes) -> None:
+        """Install a 16-byte CSPRNG host secret keying the per-connection
+        timestamp offset and passive-open ISNs. Call before connect/listen;
+        recommended for anything internet-facing."""
+        if len(secret) != 16:
+            raise ValueError("secret must be exactly 16 bytes")
+        buf = (c_uint8 * 16)(*secret)
+        _check(_lib.tcp_set_secret(self._handle, ctypes.cast(buf, c_void_p)))
+
+    def set_mtu(self, mtu: int) -> None:
+        """Set the IPv4 path MTU (clamped to 576..1500) before the handshake,
+        e.g. 1420 behind a default WireGuard interface."""
+        _check(_lib.tcp_set_mtu(self._handle, c_uint16(mtu)))
+
+    def update_pmtu(self, now_ms: int, mtu: int) -> None:
+        """Report a smaller path MTU mid-connection (e.g. from ICMP)."""
+        _check(_lib.tcp_update_pmtu(self._handle, c_uint64(now_ms), c_uint16(mtu)))
+
+    def set_fin_wait2_timeout(self, now_ms: int, timeout_ms: int) -> None:
+        """FIN_WAIT_2 timeout (default 60 s; 0 disables)."""
+        _check(_lib.tcp_set_fin_wait2_timeout(
+            self._handle, c_uint64(now_ms), c_uint32(timeout_ms),
+        ))
+
     def tick(self, now_ms: int) -> None:
         _check(_lib.tcp_tick(self._handle, c_uint64(now_ms)))
+
+    def next_deadline(self) -> Optional[int]:
+        """Absolute ``now_ms`` at which ``tick`` next has timer work, or
+        ``None`` when no timer is armed. Sleep until the earlier of this and
+        the next datagram."""
+        d = int(_lib.tcp_next_deadline(self._handle))
+        return None if d == 0xFFFF_FFFF_FFFF_FFFF else d
+
+    def stats(self) -> TcpStats:
+        """Per-connection counters (comparable to Linux ``TCP_INFO``)."""
+        out = TcpStats()
+        _check(_lib.tcp_get_stats(self._handle, ctypes.byref(out)))
+        return out
 
     # ---- introspection -------------------------------------------------
 

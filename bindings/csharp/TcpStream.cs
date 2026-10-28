@@ -111,6 +111,55 @@ internal sealed class TcpStream : IDisposable
 
     public void Tick(ulong nowMs) => Check(Native.tcp_tick(_storage, nowMs));
 
+    /// <summary>
+    /// Install a 16-byte CSPRNG host secret keying the per-connection
+    /// timestamp offset and passive-open ISNs. Call before Connect/Listen;
+    /// recommended for anything internet-facing.
+    /// </summary>
+    public void SetSecret(ReadOnlySpan<byte> secret)
+    {
+        if (secret.Length != 16)
+            throw new ArgumentException("secret must be exactly 16 bytes", nameof(secret));
+        unsafe
+        {
+            fixed (byte* p = secret)
+            {
+                Check(Native.tcp_set_secret(_storage, (IntPtr)p));
+            }
+        }
+    }
+
+    /// <summary>
+    /// IPv4 path MTU (clamped to 576..1500) before the handshake, e.g. 1420
+    /// behind a default WireGuard interface.
+    /// </summary>
+    public void SetMtu(ushort mtu) => Check(Native.tcp_set_mtu(_storage, mtu));
+
+    /// <summary>Report a smaller path MTU mid-connection (e.g. from ICMP).</summary>
+    public void UpdatePmtu(ulong nowMs, ushort mtu) =>
+        Check(Native.tcp_update_pmtu(_storage, nowMs, mtu));
+
+    /// <summary>FIN_WAIT_2 timeout (default 60 s; 0 disables).</summary>
+    public void SetFinWait2Timeout(ulong nowMs, uint timeoutMs) =>
+        Check(Native.tcp_set_fin_wait2_timeout(_storage, nowMs, timeoutMs));
+
+    /// <summary>
+    /// Absolute nowMs at which Tick next has timer work, or null when no
+    /// timer is armed. Sleep until the earlier of this and the next datagram.
+    /// </summary>
+    public ulong? NextDeadline()
+    {
+        ulong d = Native.tcp_next_deadline(_storage);
+        return d == ulong.MaxValue ? null : d;
+    }
+
+    /// <summary>Per-connection counters (comparable to Linux TCP_INFO).</summary>
+    public TcpStats Stats()
+    {
+        Check(Native.tcp_get_stats(_storage, out var s));
+        return s;
+    }
+
     public TcpState State() => (TcpState)Native.tcp_state(_storage);
 
     public TcpEvents Poll() => (TcpEvents)Native.tcp_poll(_storage);
