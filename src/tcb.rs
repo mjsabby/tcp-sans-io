@@ -423,6 +423,10 @@ pub struct Tcb<const BUF: usize = BUF_CAP> {
 
     // ---- Delayed ACK -----------------------------------------------------
     pending_ack: bool,
+    /// Right edge (`ack + window`) of the last receive window put on the
+    /// wire. `recv()` compares against it to decide whether freeing ring
+    /// space warrants an explicit window update.
+    rcv_adv_edge: u32,
     delayed_ack_count: u8,
     ack_deadline: Option<u64>,
 
@@ -553,6 +557,7 @@ impl<const BUF: usize> Tcb<BUF> {
             rto_deadline: None,
             rtt_probe: None,
             pending_ack: false,
+            rcv_adv_edge: 0,
             delayed_ack_count: 0,
             ack_deadline: None,
             persist_deadline: None,
@@ -1011,6 +1016,7 @@ impl<const BUF: usize> Tcb<BUF> {
         self.rttvar_ms = 0;
         self.rtt_first_sample = false;
         self.pending_ack = false;
+        self.rcv_adv_edge = 0;
         self.delayed_ack_count = 0;
         self.ack_deadline = None;
         self.persist_deadline = None;
@@ -1067,6 +1073,7 @@ impl<const BUF: usize> Tcb<BUF> {
         if n > 0 {
             self.drain_reassembly();
             self.rcv_wnd = self.advertised_window();
+            self.maybe_send_window_update()?;
         }
         if n == 0 {
             match self.state {
@@ -2132,7 +2139,13 @@ impl<const BUF: usize> Tcb<BUF> {
             if seg.has(flags::FIN) || filled_gap {
                 self.send_pure_ack()?;
             } else {
-                self.delayed_ack_count = self.delayed_ack_count.saturating_add(1);
+                // RFC 5681 §4.2 asks for an ACK at least every second
+                // *full-sized* segment, so count a coalesced/TSO segment by
+                // how many MSS it spans — otherwise a 64 KiB super-segment
+                // would only earn one ACK per 128 KiB and stall the sender.
+                let full = seg.payload.len() / (self.local_mss.max(1) as usize);
+                let units = full.clamp(1, u8::MAX as usize) as u8;
+                self.delayed_ack_count = self.delayed_ack_count.saturating_add(units);
                 self.pending_ack = true;
                 if self.delayed_ack_count >= 2 {
                     self.send_pure_ack()?;
@@ -3182,6 +3195,34 @@ impl<const BUF: usize> Tcb<BUF> {
     // Emission helpers
     // ---------------------------------------------------------------------
 
+    /// Receiver-side window update (RFC 9293 §3.8.6.2.2, SWS-avoiding): once
+    /// the application has drained enough of the receive ring that the window
+    /// we could advertise is at least double what the peer currently sees and
+    /// grew by at least two segments, tell the peer right away. Otherwise a
+    /// sender throttled by our window idles until the delayed-ACK timer or a
+    /// persist probe, because nothing else would carry the reopened window.
+    fn maybe_send_window_update(&mut self) -> Result<(), TcpError> {
+        if !matches!(
+            self.state,
+            State::Established | State::FinWait1 | State::FinWait2
+        ) {
+            return Ok(());
+        }
+        let quantum = 1u32 << self.rcv_wscale;
+        let wire_wnd = (self.advertised_window() / quantum).min(u16::MAX as u32) * quantum;
+        let new_edge = self.rcv_nxt.wrapping_add(wire_wnd);
+        let cur = if seq_gt(self.rcv_adv_edge, self.rcv_nxt) {
+            self.rcv_adv_edge.wrapping_sub(self.rcv_nxt)
+        } else {
+            0
+        };
+        let grew = new_edge.wrapping_sub(self.rcv_nxt).saturating_sub(cur);
+        if grew >= 2 * self.local_mss as u32 && wire_wnd >= 2 * cur {
+            self.send_pure_ack()?;
+        }
+        Ok(())
+    }
+
     fn send_pure_ack(&mut self) -> Result<(), TcpError> {
         if self.tx_ring.is_full() {
             return Ok(());
@@ -3285,6 +3326,10 @@ impl<const BUF: usize> Tcb<BUF> {
         })?;
         if queued {
             self.ip_id = self.ip_id.wrapping_add(1);
+            if !is_syn && (flag_bits & flags::ACK) != 0 {
+                let shift = self.rcv_wscale;
+                self.rcv_adv_edge = ack.wrapping_add((window as u32) << shift);
+            }
         }
         Ok(queued)
     }

@@ -831,18 +831,122 @@ fn l4_csum_trusted_inject_skips_tcp_checksum_only() {
     let ihl = (pkt[0] & 0x0F) as usize * 4;
     pkt[ihl + 16] ^= 0xFF; // corrupt the TCP checksum field
 
-    assert!(tcb.inject_packet(&pkt.clone()).is_err(), "strict path rejects");
+    assert!(
+        tcb.inject_packet(&pkt.clone()).is_err(),
+        "strict path rejects"
+    );
 
     let mut bad_ip = pkt.clone();
     bad_ip[10] ^= 0xFF; // corrupt the IPv4 header checksum
-    assert!(tcb.inject_packet_l4_csum_trusted(&bad_ip).is_err(), "IP csum still verified");
+    assert!(
+        tcb.inject_packet_l4_csum_trusted(&bad_ip).is_err(),
+        "IP csum still verified"
+    );
 
     now += 1;
     tcb.set_now(now);
-    tcb.inject_packet_l4_csum_trusted(&pkt).expect("trusted inject");
+    tcb.inject_packet_l4_csum_trusted(&pkt)
+        .expect("trusted inject");
     let mut buf = vec![0u8; payload.len()];
     assert_eq!(tcb.recv(&mut buf).expect("recv"), payload.len());
     assert_eq!(buf, payload);
+}
+
+/// A segment spanning several MSS (GRO/TSO-coalesced) counts as that many
+/// full-sized segments for delayed-ACK purposes, so it is ACKed at once.
+#[test]
+fn multi_mss_segment_is_acked_immediately() {
+    let mut tcb = make_tcb();
+    let mut now = 0u64;
+    let _ = handshake_with_ts(&mut tcb, &mut now);
+
+    let seq = PSS.wrapping_add(1);
+    let big = build_in(
+        flags::ACK,
+        seq,
+        ISS.wrapping_add(1),
+        PEER_WIN,
+        None,
+        Some((60, 0)),
+        &[0x22; 4 * 1460],
+    );
+    tcb.inject_packet(&big).expect("inject");
+    let ack = try_pop(&mut tcb).expect("multi-MSS segment must be ACKed now");
+    let seq = seq.wrapping_add(4 * 1460);
+    assert_eq!(ack.ack, seq);
+
+    let small = build_in(
+        flags::ACK,
+        seq,
+        ISS.wrapping_add(1),
+        PEER_WIN,
+        None,
+        Some((61, 0)),
+        &[0x11; 100],
+    );
+    tcb.inject_packet(&small).expect("inject");
+    assert!(
+        try_pop(&mut tcb).is_none(),
+        "one small segment is still delay-ACKed"
+    );
+}
+
+/// Draining a nearly-full receive ring must reopen the window with an explicit
+/// ACK; a sender stalled on our window would otherwise sit idle until a timer.
+/// Tiny reads stay silent (receiver-side SWS avoidance).
+#[test]
+fn recv_drain_sends_window_update() {
+    let mut tcb = make_tcb();
+    let mut now = 0u64;
+    let _ = handshake_with_ts(&mut tcb, &mut now);
+
+    let left = 2_000usize;
+    let mut seq = PSS.wrapping_add(1);
+    let mut todo = crate::BUF_CAP - left;
+    let mut last = None;
+    while todo > 0 {
+        let n = todo.min(16_000);
+        let pkt = build_in(
+            flags::ACK,
+            seq,
+            ISS.wrapping_add(1),
+            PEER_WIN,
+            None,
+            Some((60, 0)),
+            &vec![0x5a; n],
+        );
+        tcb.set_now(now);
+        tcb.inject_packet(&pkt).expect("inject");
+        seq = seq.wrapping_add(n as u32);
+        todo -= n;
+        while let Some(p) = try_pop(&mut tcb) {
+            last = Some(p);
+        }
+    }
+    now += 1_000;
+    tcb.set_now(now);
+    tcb.tick().expect("tick");
+    while let Some(p) = try_pop(&mut tcb) {
+        last = Some(p);
+    }
+    let last = last.expect("data must be ACKed");
+    assert_eq!(last.ack, seq);
+    assert_eq!(last.window as usize, left);
+
+    let mut buf = vec![0u8; 16_000];
+    assert_eq!(tcb.recv(&mut buf[..1_000]).expect("recv"), 1_000);
+    assert!(
+        try_pop(&mut tcb).is_none(),
+        "small read must not trigger an update"
+    );
+
+    assert_eq!(tcb.recv(&mut buf[..10_000]).expect("recv"), 10_000);
+    let upd = try_pop(&mut tcb).expect("window update after large drain");
+    assert_eq!(upd.flags, flags::ACK);
+    assert!(upd.payload.is_empty());
+    assert_eq!(upd.ack, seq);
+    assert_eq!(upd.window as usize, left + 11_000);
+    assert!(try_pop(&mut tcb).is_none());
 }
 
 /// Peer RST while ESTABLISHED transitions us straight to CLOSED, sets the
