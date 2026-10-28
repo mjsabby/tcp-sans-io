@@ -1453,6 +1453,69 @@ fn sack_does_not_retrigger_within_recovery_epoch() {
     );
 }
 
+/// A D-SACK (RFC 2883) reports a duplicate the peer already had, e.g. from a
+/// spurious retransmit. It is not evidence of a hole: entering recovery on it
+/// cuts the window and re-sends `snd_una`, which the peer also has, so the
+/// next D-SACK repeats the cycle and the window keeps halving.
+#[test]
+fn dsack_does_not_trigger_fast_recovery() {
+    let mut tcb = make_tcb();
+    let mut now = 0u64;
+    let peer_ts = handshake_with_ts(&mut tcb, &mut now);
+
+    let payload: ::std::vec::Vec<u8> = (0..(3 * 1448)).map(|i| (i & 0xFF) as u8).collect();
+    tcb.send(&payload).expect("send");
+    tcb.set_now(now);
+    tcb.tick().expect("tick");
+    while try_pop(&mut tcb).is_some() {}
+
+    // The peer cumulatively ACKs the first segment.
+    let first = tcb.debug_snapshot().snd_una;
+    let first_end = first.wrapping_add(1448);
+    now += 5;
+    let ack = build_in(
+        flags::ACK,
+        PSS.wrapping_add(1),
+        first_end,
+        PEER_WIN,
+        None,
+        Some((peer_ts.wrapping_add(1), now as u32)),
+        &[],
+    );
+    tcb.set_now(now);
+    tcb.inject_packet(&ack).expect("inject ACK");
+    while try_pop(&mut tcb).is_some() {}
+    let before = tcb.debug_snapshot();
+
+    // A duplicate ACK whose only SACK block is a D-SACK for that segment.
+    now += 1;
+    let dsack = build_in_full(
+        flags::ACK,
+        PSS.wrapping_add(1),
+        first_end,
+        PEER_WIN,
+        None,
+        Some((peer_ts.wrapping_add(2), now as u32)),
+        false,
+        Some((first, first_end)),
+        &[],
+    );
+    tcb.set_now(now);
+    tcb.inject_packet(&dsack).expect("inject D-SACK");
+    let mut retransmits = 0;
+    while let Some(s) = try_pop(&mut tcb) {
+        if !s.payload.is_empty() && seq_lt(s.seq, before.snd_nxt) {
+            retransmits += 1;
+        }
+    }
+    assert_eq!(retransmits, 0, "a D-SACK must not cause a retransmit");
+    assert_eq!(
+        tcb.debug_snapshot().ssthresh,
+        before.ssthresh,
+        "a D-SACK must not start fast recovery",
+    );
+}
+
 /// After a SACK-driven fast-retransmit rewinds `snd_nxt` to `snd_una`, the
 /// peer's first cumulative ACK following recovery may land **above** the
 /// rewound `snd_nxt` — because the peer had buffered our pre-rewind
@@ -2495,6 +2558,74 @@ fn rack_reorder_timer_marks_old_unsacked_segments_lost() {
         rack_retx >= 1,
         "RACK should have retransmitted at least one of segs #2/#3 (got {})",
         rack_retx,
+    );
+}
+
+/// RFC 8985 §6.1 judges a segment by its latest transmission. Once a lost
+/// segment has been retransmitted, RACK must not keep finding its original
+/// transmission lost and re-send it while the retransmit is still in flight:
+/// every extra copy reaches the peer as a duplicate.
+#[test]
+fn rack_does_not_resend_segment_whose_retransmit_is_in_flight() {
+    fn copies_of(tcb: &mut Tcb, seq: u32) -> usize {
+        let mut n = 0;
+        while let Some(s) = try_pop(tcb) {
+            if s.seq == seq && !s.payload.is_empty() {
+                n += 1;
+            }
+        }
+        n
+    }
+    let mut tcb = make_tcb();
+    let mut now = 0u64;
+    let peer_ts = handshake_with_ts(&mut tcb, &mut now);
+
+    // Eight segments go out together; the first is lost.
+    let payload: ::std::vec::Vec<u8> = (0..(8 * 1448)).map(|i| (i & 0xFF) as u8).collect();
+    tcb.send(&payload).expect("send");
+    tcb.set_now(now);
+    tcb.tick().expect("tick");
+    while try_pop(&mut tcb).is_some() {}
+    let lost = tcb.debug_snapshot().snd_una;
+    let seg = |k: u32| lost.wrapping_add(k * 1448);
+    let sack_ack = |now: u64, ts: u32, hi: u32| {
+        build_in_full(
+            flags::ACK,
+            PSS.wrapping_add(1),
+            lost,
+            PEER_WIN,
+            None,
+            Some((ts, now as u32)),
+            false,
+            Some((seg(1), hi)),
+            &[],
+        )
+    };
+
+    // SACK of segments 2-3: recovery starts and segment 1 is retransmitted.
+    now += 10;
+    tcb.set_now(now);
+    tcb.inject_packet(&sack_ack(now, peer_ts.wrapping_add(1), seg(3)))
+        .expect("inject SACK");
+    let mut copies = copies_of(&mut tcb, lost);
+    assert_eq!(copies, 1, "recovery retransmits the lost segment once");
+
+    // Everything else arrives, which gives recovery send credit.
+    now += 2;
+    tcb.set_now(now);
+    tcb.inject_packet(&sack_ack(now, peer_ts.wrapping_add(2), seg(8)))
+        .expect("inject SACK");
+    copies += copies_of(&mut tcb, lost);
+
+    // The RACK reorder timer fires a few ms later, well within one RTT of the
+    // retransmit: it must not send segment 1 again.
+    now += 3;
+    tcb.set_now(now);
+    tcb.tick().expect("tick");
+    copies += copies_of(&mut tcb, lost);
+    assert_eq!(
+        copies, 1,
+        "segment 1 re-sent while its retransmit is in flight"
     );
 }
 

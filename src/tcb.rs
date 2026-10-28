@@ -2335,12 +2335,18 @@ impl<const BUF: usize> Tcb<BUF> {
             //    spurious fast-retransmit and collapse cwnd.
             //
             // 2. **RFC 2018 / RFC 6675 SACK** — any ACK (pure OR
-            //    piggybacked) that carries a SACK block is authoritative
-            //    evidence that data above `snd_una` was received, so a
-            //    hole exists. We enter recovery on the first SACK-bearing
-            //    ACK (more aggressive than RFC 6675's strict IsLost
-            //    trigger). `cc.in_recovery()` then guards against
+            //    piggybacked) whose SACK blocks cover bytes above
+            //    `snd_una` that weren't SACKed before is authoritative
+            //    evidence that a hole exists. We enter recovery on the
+            //    first such ACK (more aggressive than RFC 6675's strict
+            //    IsLost trigger). `cc.in_recovery()` then guards against
             //    re-entering until the current recovery episode exits.
+            //    A D-SACK (RFC 2883) reports only a duplicate the peer
+            //    already had, e.g. from a spurious retransmit, so an ACK
+            //    with no newly SACKed bytes neither triggers recovery nor
+            //    counts as a dup-ACK. Otherwise each spurious retransmit's
+            //    D-SACK would start another recovery that re-sends
+            //    `snd_una`, which the peer also has.
             //
             // The window-unchanged condition is implicitly enforced by
             // `update_send_window` happening after this branch returns;
@@ -2350,10 +2356,10 @@ impl<const BUF: usize> Tcb<BUF> {
                 && self.scale_peer_window(seg.window) == self.snd_wnd
                 && !self.cc.in_recovery()
             {
-                let sack_trigger = self.sack_enabled && !seg.options.sack.is_empty();
+                let has_sack = self.sack_enabled && !seg.options.sack.is_empty();
                 let pure_dup = seg.payload.is_empty() && !seg.has(flags::FIN);
-                let trigger = if sack_trigger {
-                    true
+                let trigger = if has_sack {
+                    newly_sacked > 0
                 } else if pure_dup {
                     self.cc.on_dup_ack()
                 } else {
@@ -2929,7 +2935,8 @@ impl<const BUF: usize> Tcb<BUF> {
         }
         // RACK bookkeeping: every transmission goes into the send_queue
         // so RACK can later judge "was this segment sent long ago?"
-        self.send_queue.push(seq, bytes as u32, self.now_ms, true);
+        self.send_queue
+            .push_retransmit(seq, bytes as u32, self.now_ms);
         // Piggybacked ACK clears delayed-ACK state.
         self.pending_ack = false;
         self.delayed_ack_count = 0;

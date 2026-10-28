@@ -99,6 +99,33 @@ impl SendQueue {
         });
     }
 
+    /// Record a retransmission of `[seq, seq+len)` at `send_ts_ms`. RFC 8985
+    /// §6.1 judges a segment by its latest transmission, so every older entry
+    /// overlapping the range takes the new send time. Otherwise RACK keeps
+    /// finding the original transmission lost and re-sends data whose
+    /// retransmit is still in flight. A new entry is added only when no
+    /// existing one already covers the whole range.
+    pub fn push_retransmit(&mut self, seq: u32, len: u32, send_ts_ms: u64) {
+        if len == 0 {
+            return;
+        }
+        let end = seq.wrapping_add(len);
+        let mut covered = false;
+        for read in 0..self.len {
+            let idx = (self.head + read) % SEND_QUEUE_CAP;
+            if let Some(e) = self.entries.get_mut(idx) {
+                if seq_gt(end, e.seq_start) && seq_gt(e.seq_end, seq) {
+                    e.send_ts_ms = send_ts_ms;
+                    e.is_retx = true;
+                    covered |= seq_le(e.seq_start, seq) && seq_le(end, e.seq_end);
+                }
+            }
+        }
+        if !covered {
+            self.push(seq, len, send_ts_ms, true);
+        }
+    }
+
     /// Iterate entries in insertion order (oldest first). Convenient for
     /// RACK scans.
     pub fn iter(&self) -> Iter<'_> {
