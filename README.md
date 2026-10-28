@@ -36,9 +36,9 @@ shows what that costs against Linux CUBIC on lossy long paths.
 |---|---|---|
 | State machine, active + passive open, simultaneous open | RFC 9293 | ✅ |
 | Half-open replacement (a new SYN recycles a stalled `SYN_RCVD` slot) | — (single-slot listener policy) | ✅ |
-| SYN cookies, keeping WS / SACK / ECN via timestamp bits | RFC 4987 | ✅ optional |
-| ISN selection | RFC 6528 | ✅ keyed by `tcp_set_secret` on passive opens; host-supplied `iss` on active |
-| MSS; MTU / PMTU (`tcp_set_mtu`, `tcp_update_pmtu`, black-hole clamp) | RFC 9293, RFC 1191, RFC 4821 (spirit) | ✅ |
+| SYN cookies while the half-open slot is busy (a valid cookie ACK takes the slot over); WS / SACK / ECN kept via timestamp bits; key derived from the host secret or set explicitly, surviving one rotation | RFC 4987 | ✅ |
+| ISN selection | RFC 6528 | ✅ keyed by `tcp_set_secret` on passive opens (`tcp_listen` requires a secret); host-supplied `iss` on active |
+| MSS; MTU / PMTU (`tcp_set_mtu`, `tcp_update_pmtu`, black-hole clamp, probing back up) | RFC 9293, RFC 1191, RFC 4821 (spirit) | ✅ |
 | Timestamps: RTTM, PAWS, keyed per-connection offset | RFC 7323 §3–5 | ✅ |
 | Window Scale | RFC 7323 §2 | ✅ |
 | SACK, both directions; receiver holds the whole window out of order | RFC 2018 | ✅ |
@@ -56,8 +56,8 @@ shows what that costs against Linux CUBIC on lossy long paths.
 | Zero-window persist probes | RFC 9293 §3.8.6.1 | ✅ Linux-style probe at `SND.UNA − 1` |
 | Delayed ACK (2nd full segment / 40 ms; immediate for out-of-order and duplicates) | RFC 1122 §4.2.3.2, RFC 5681 §4.2 | ✅ |
 | R2 retransmission limit, USER TIMEOUT, keepalive | RFC 9293 §3.8.3–3.8.4 | ✅ on by default |
-| FIN_WAIT_2 timeout | Linux `tcp_fin_timeout` | ✅ 60 s |
-| TIME_WAIT, re-ACK and restart on a retransmitted FIN | RFC 9293 §3.10.7.4 | ✅ 60 s |
+| FIN_WAIT_2 timeout | Linux `tcp_fin_timeout` | ✅ 60 s, restarted only by the application reading |
+| TIME_WAIT, re-ACK and restart on a retransmitted FIN | RFC 9293 §3.10.7.4 | ✅ 60 s; restarts capped at 120 s after entry |
 
 ### Deliberately deferred
 
@@ -91,15 +91,16 @@ shows what that costs against Linux CUBIC on lossy long paths.
 
 ### Memory footprint
 
-Per connection, `tcp_handle_size()` is **2,176,648 bytes (≈ 2.08 MiB)** with
-default features, or **139,272 bytes (136 KiB)** with `small-buffers`:
+Per connection, `tcp_handle_size()` is **2,176,856 bytes (≈ 2.08 MiB)** with
+default features, or **139,480 bytes (136 KiB)** with `small-buffers`:
 
 - `BUF_CAP` send ring + receive ring (2 × 1 MiB; 2 × 32 KiB with
   `small-buffers`). Out-of-order data is parked inside the receive ring at
   its final offset, so the whole advertised window can be held while a hole
   is repaired at no extra memory cost.
 - 48 KiB egress staging ring (32 × `MAX_PACKET`).
-- 24 KiB retransmission queue (1024 segment records).
+- 24 KiB retransmission queue (1024 segment records, plus a 128-byte
+  bitmap of the SACKed ones).
 - 6 KiB out-of-order range tracker (512 ranges; 384 B / 32 ranges with
   `small-buffers`).
 - Under 1 KiB of scalar state.
@@ -117,17 +118,21 @@ whole TCB by value, so pure-Rust callers should box it (or use
 ## Connection state machine
 
 The eleven TCP states and every transition the stack can take. The graph is
-**implementation-accurate** — its edges are exactly the relation enforced by
-`allowed_transition()` in the `tcb_client_session` fuzz target, which panics if
-the live TCB ever makes a move the picture doesn't show, so the two cannot
-drift apart.
+**implementation-accurate** — its edges are exactly the relation of
+`State::debug_transition_allowed()` (`src/state.rs`). Every fuzz target panics
+if the live TCB makes a move outside it, and a unit test fails if
+`docs/state-machine.dot` draws a different set of edges, so the picture and
+the code cannot drift apart.
 
 ![TCP connection state machine](docs/state-machine.svg)
 
-Bold purple is the non-textbook **SYN_RCVD → LISTEN** revert: the stateful
-passive path keeps at most one half-open slot and recycles it after a bounded
-SYN-ACK retransmit budget (the flood-resistance argument), rather than leaking
-it. Dashed grey edges are aborts (RST / `abort()` / `reset()`). See
+Bold purple is the non-textbook **SYN_RCVD → LISTEN** revert: a listener
+keeps at most one half-open slot and recycles it after a bounded SYN-ACK
+retransmit budget (or an exact RST), rather than leaking it. Green edges are
+SYN-cookie promotions: while the slot is busy, other peers get cookie
+SYN-ACKs, and a valid cookie ACK establishes directly — from SYN_RCVD by
+taking the slot over. Dashed grey edges are aborts (RST / `abort()` /
+timeouts). See
 [`docs/state-machine.md`](docs/state-machine.md) for a live-rendering Mermaid
 copy, the full transition table with code citations, and how to regenerate the
 SVG from [`docs/state-machine.dot`](docs/state-machine.dot).
@@ -153,14 +158,15 @@ mis-ordering, corruption, a panic, or an unbounded loop.
 | `INITIAL_WINDOW` | 10 × SMSS (14,480 B with timestamps) | `congestion.rs` | RFC 6928 initial cwnd. |
 | `MIN_PEER_MSS` | 64 B | `tcb/mod.rs` | Floor on a peer-requested MSS (bounds per-byte header and queue cost). |
 | `RTO_MIN` / `RTO_MAX` | 200 ms / 60 s | `tcb/mod.rs` | RTO clamp; exponential backoff is capped at `RTO_MAX`. |
-| TLP PTO floor / delayed ACK / `TIME_WAIT` | 10 ms / 40 ms / 60 s | `tcb/mod.rs` | Probe timeout floor, delayed-ACK timer, 2·MSL. |
+| TLP PTO floor / delayed ACK / `TIME_WAIT` | 10 ms / 40 ms / 60 s (≤ 120 s) | `tcb/mod.rs` | Probe timeout floor, delayed-ACK timer, 2·MSL; a retransmitted FIN restarts 2·MSL, at most 120 s after entry. |
 | `MAX_SYN_RETRIES` / `MAX_SYN_RCVD_RETRIES` | 6 / 5 | `tcb/mod.rs` | SYN retransmissions before an active open fails; SYN-ACK retransmissions before a half-open reverts to `LISTEN`. |
 | `MAX_RETRANSMITS` | 10 | `tcb/mod.rs` | RFC 9293 §3.8.3 "R2": consecutive timeouts (data, FIN or unanswered zero-window probes) with no proof of life before abort. |
-| USER TIMEOUT | 300 s | `tcb/mod.rs` | Max time with outstanding send work but less than one full segment acknowledged; defeats slow-reader and zero-window pinning. `set_user_timeout(0)` disables. |
+| USER TIMEOUT | 300 s | `tcb/mod.rs` | Max time with outstanding send work but less than one full segment acknowledged; reaps stalled, zero-window and sub-MSS-trickle peers. A reader acknowledging a full segment per period is live progress, not a stall (see *Threat model*). `set_user_timeout(0)` disables. |
 | Keepalive | 600 s idle / 60 s / 4 probes | `tcb/mod.rs` | Reaps a vanished peer on an idle connection. `set_keepalive(0, …)` disables. |
-| FIN_WAIT_2 timeout | 60 s | `tcb/mod.rs` | Time a peer may leave its half open after ACKing our FIN (refreshed by its data). |
+| FIN_WAIT_2 timeout | 60 s | `tcb/mod.rs` | Time a peer may leave its half open after ACKing our FIN; restarted only when the application reads, never by the peer's data alone. |
+| Black-hole MSS clamp / probe | 3, 5 RTOs → 1024, 536 / 10 s … 10 min | `tcb/mod.rs` | Consecutive timeouts of a large segment clamp the MSS; one probe segment at the next larger size (first after 10 s, doubling up to 10 min on failure) restores it once it arrives. |
 | Out-of-window reply rate | 1 per 500 ms | `tcb/mod.rs` | Challenge ACKs, dup ACKs for unacceptable segments and RSTs to stray segments, per connection. Exempt: one immediate ACK (D-SACK) per data / FIN segment that could be the peer's own retransmission — acceptable ACK, plus a timestamp when negotiated — since the peer's loss recovery depends on it. |
-| Cookie validity | 64–128 s | `tcb/cookie.rs` | Two 64 s buckets; 29-bit SipHash MAC (2⁻²⁹ blind forgery per attempt). |
+| Cookie validity | 64–128 s | `tcb/cookie.rs` | Two 64 s buckets, under the current and the previous key (one rotation); 29-bit SipHash MAC (2⁻²⁹ blind forgery per attempt). |
 
 ### Why the bounds are sound
 
@@ -214,8 +220,9 @@ hostile peer:
   connection; only a data or FIN segment carrying an acceptable ACK (and a
   timestamp when negotiated) is answered at once, with a single ACK.
 - **No state exhaustion inside a TCB.** One half-open per listener TCB
-  with a bounded SYN-ACK budget, or stateless SYN cookies; no allocator to
-  drain. (Bounding the *number* of TCBs is the host's job.)
+  with a bounded SYN-ACK budget, and stateless SYN cookies for every other
+  peer while it is busy; no allocator to drain. (Bounding the *number* of
+  TCBs is the host's job.)
 - **No information disclosure.** Emitted packets are built in
   zero-initialised scratch with exactly the payload bytes copied;
   `tcp_init` zeroes reused storage; timestamps are offset per connection
@@ -510,20 +517,25 @@ to put on the wire and hands you back the bytes the peer sent.
    tick / extract / send-recv) and ticks when `tcp_next_deadline()` comes
    due (or periodically) **even when idle**.
 5. **Secrets and ISNs** — a high-entropy `iss` (RFC 6528) per active open
-   from a CSPRNG, never a counter; and, for anything internet-facing, a
-   16-byte CSPRNG secret via `tcp_set_secret` (keys timestamp offsets and
-   passive-open ISNs). Listeners exposed to SYN floods also install a
-   cookie secret with `tcp_set_cookie_secret` and rotate it.
+   from a CSPRNG, never a counter; and a 16-byte CSPRNG secret via
+   `tcp_set_secret` (keys timestamp offsets, passive-open ISNs and the
+   SYN-cookie key) on every listener — `tcp_listen` fails without one — and
+   on anything internet-facing. `tcp_set_cookie_secret` optionally installs
+   an explicit, rotatable cookie key (cookies survive one rotation).
 6. **The path MTU** — `tcp_set_mtu` before the handshake when the tunnel
    MTU is below 1500 (1420 for a default WireGuard interface), and
    `tcp_update_pmtu` if you receive ICMP "fragmentation needed".
 7. **5-tuple demux** — route each inbound datagram to the TCB that owns
    its 4-tuple. The stack rejects mismatches with `NOT_FOR_US`, but you
-   shouldn't rely on that for routing N connections.
+   shouldn't rely on that for routing N connections. A listener may also
+   accept SYNs and cookie ACKs from *other* peers while its half-open slot
+   is busy, and its replies are addressed to them: route every outbound
+   packet by its own destination address, not by the TCB that emitted it.
 8. **Admission control** — a cap on concurrent TCBs (including those in
-   `TIME_WAIT`, which hold their storage for 60 s) and on half-open
-   listeners per source; the stack bounds each connection, never the
-   count.
+   `TIME_WAIT`, which hold their storage for 60–120 s) and on half-open
+   listeners per source; the stack bounds how long a stalled or vanished
+   peer holds a connection, never the count — and never a live peer you
+   keep serving (apply application deadlines for those).
 
 ### The canonical pump loop
 
@@ -602,8 +614,10 @@ free(mem);                             // you own the memory
 - Pass a **monotonic, non-decreasing `now_ms`**; use the same value for
   every call within a turn.
 - Seed `iss` from a **CSPRNG** (per connection), and install a CSPRNG
-  secret with `tcp_set_secret` on internet-facing TCBs. Servers: cookie
-  secret from a CSPRNG too, rotated periodically.
+  secret with `tcp_set_secret` on every listener (`tcp_listen` returns
+  `INVALID_STATE` without one) and on internet-facing TCBs. An explicit
+  cookie secret (`tcp_set_cookie_secret`) is optional; rotate it no more
+  often than every ~2 minutes (only the previous key is kept).
 - **Set the MTU** (`tcp_set_mtu`) to the tunnel's real MTU before the
   handshake — 1420 behind a default WireGuard interface — so no datagram
   needs fragmenting.
@@ -611,10 +625,11 @@ free(mem);                             // you own the memory
   then `tcp_destroy` + free.
 - **Bound the number of concurrent TCBs** and refuse/evict past that budget.
   Each TCB is independent and costs `tcp_handle_size()` (~2.08 MiB default,
-  136 KiB under `small-buffers`) — including for the 60 s it spends in
+  136 KiB under `small-buffers`) — including for the 60–120 s it spends in
   `TIME_WAIT`; the per-connection reapers (R2 / USER TIMEOUT / keepalive /
-  FIN_WAIT_2, all on by default) bound each connection's *lifetime*, never
-  the aggregate *count* — only the host can do that. On `PEER_CLOSED` you
+  FIN_WAIT_2, all on by default) bound how long a stalled or vanished peer
+  holds a connection, never the aggregate *count* — only the host can do
+  that — nor a live peer the application keeps serving. On `PEER_CLOSED` you
   **must** eventually `close`; keepalive does not probe `CLOSE_WAIT`.
 
 **SHOULD**
@@ -630,7 +645,9 @@ free(mem);                             // you own the memory
 **DON'T**
 - Don't touch one handle from two threads at once — the stack has **no
   internal locking** (it's single-threaded by design; shard TCBs across
-  threads, one owner each).
+  threads, one owner each). The Python and C# wrappers serialize the calls
+  on each handle with a per-handle lock; raw C ABI callers must do so
+  themselves.
 - Don't `send`/`recv`/`inject`/`tick` after `tcp_destroy`, and don't reuse
   storage without a fresh `tcp_init` (the magic guard will reject it).
 - Don't assume `OVERFLOW` (`-9`) is recoverable — it signals an internal
@@ -747,13 +764,13 @@ proof.
 | Layer | What it covers | Files |
 |---|---|---|
 | **Property tests** | Wire codec round-trips; checksum integrity; serial-arithmetic; out-of-order reassembly vs a model | `src/property_tests.rs` (proptest, 4096 cases each) |
-| **Security regressions** | One test per finding of the public-deployment review: blind injection, RFC 5961 challenge/rate limits, forged zero window, PAWS, timestamp poisoning by a rejected ACK, ACK storms, old-data reflection, listener RSTs, SYN-SENT RST, simultaneous open, half-open replacement, cookie options, keyed timestamps, FIN_WAIT_2, slow-reader / zero-window stalls, no SACKed retransmits, ECE handling, no sequence rewinds, full-window out-of-order, D-SACK, MTU / PMTU / black-hole, FFI stack use, NULL / zero-length / misaligned FFI arguments | `src/security_tests.rs` |
+| **Security regressions** | One test per finding of the public-deployment review: blind injection, RFC 5961 challenge/rate limits, forged zero window, PAWS, timestamp poisoning by a rejected ACK, ACK storms, old-data reflection, listener RSTs, SYN-SENT RST, simultaneous open, half-open replacement, cookie options, keyed timestamps, FIN_WAIT_2, slow-reader / zero-window stalls, no SACKed retransmits, ECE handling, no sequence rewinds, full-window out-of-order, D-SACK, MTU / PMTU / black-hole, FFI stack use, NULL / zero-length / misaligned FFI arguments. Second review: TS.Recent only after ACK validation, CE on a CWR segment, FIN after the peer's FIN, zero-window probe ACKs, out-of-order data beyond a FIN, FIN_WAIT_2 trickle and TIME_WAIT pinning, keyed listener ISNs, hybrid cookies (option preservation, spoofed-SYN lockout, rotation), black-hole probing | `src/security_tests.rs` |
 | **Link simulation** | Two real TCBs over a seeded discrete-event link (bottleneck queue, delay, loss, reordering, ACK loss, burst and tail loss, slow reader, chaos with sequence wrap). Asserts retransmissions equal drops, goodput vs the Mathis bound, TLP before RTO, clean closes, and that `next_deadline()` never leaves a host spinning | `src/sim_tests.rs` |
 | **TCB internals** | R2 / SYN retry limits, keepalive, USER TIMEOUT, lost FIN, TIME_WAIT restart (and no restart by a forged FIN), unread data across the final close, byte-exact data after SND.UNA laps back to ISS (4 GiB; release builds), in-place init, liveness oracles, deadline reporting | `src/tcb/tests.rs` |
 | **C ABI ownership** | `tcp_destroy` releases the `heap-buffers` rings (counting allocator, own binary): `cargo test --release --features std,heap-buffers --test ffi_heap_buffers` | `tests/ffi_heap_buffers.rs` |
 | **Conformance tests** | Exact wire bytes per spec scenario | `src/conformance_tests.rs` |
 | **Loopback tests** | End-to-end behavioral tests via in-memory peer | `src/loopback_tests.rs` |
-| **Server / adversarial** | LISTEN/SYN_RCVD hardening (cookies, SYN flood, blind RST/ACK) | `src/server_tests.rs` |
+| **Server / adversarial** | LISTEN/SYN_RCVD hardening (secret required, hybrid cookies and key rotation, SYN flood, blind and inexact RST/ACK) | `src/server_tests.rs` |
 | **gVisor interop** | Against Google's reference netstack | `bindings/gvisor/*_test.go` |
 | **smoltcp interop** | Against smoltcp (the dominant no_std Rust TCP stack, used in embedded). In-memory channel between two userspace stacks — completely independent codebases negotiating options + sequencing data. | `src/smoltcp_interop_tests.rs` |
 | **Real Linux TUN** | Against the Linux kernel TCP stack via TUN | `bindings/gvisor/tun_test.go` |
@@ -920,40 +937,58 @@ include/
 The stack assumes the host is friendly but the peer — and anyone who can
 put packets on the path — is hostile.
 
-- **Connection pinning.** Every way a peer can hold a TCB is bounded by
-  default: R2 (10 unanswered timeouts), USER TIMEOUT (300 s without a full
-  segment of progress — defeats zero-window and slow-reader "Sockstress"
-  stalls, which a proof-of-life-based timer cannot), keepalive (reaps
-  vanished idle peers), FIN_WAIT_2 (60 s), bounded SYN / SYN-ACK
-  retransmission, and half-open replacement so one spoofed SYN cannot lock
-  a stateful listener. The host must still cap the *number* of TCBs
-  (including `TIME_WAIT` ones) — see the contract above.
+- **Connection pinning.** A peer that *stops making progress* cannot hold
+  a TCB: R2 (10 unanswered timeouts), USER TIMEOUT (300 s without a full
+  segment of progress — defeats zero-window and sub-segment-trickle
+  "Sockstress" stalls, which a proof-of-life-based timer cannot), keepalive
+  (reaps vanished idle peers) and bounded SYN / SYN-ACK retransmission.
+  Once the host has closed and our FIN is acknowledged, the peer cannot
+  extend the TCB's life either: FIN_WAIT_2 lasts 60 s unless the
+  application keeps reading, and TIME_WAIT at most 120 s however often the
+  FIN is re-sent. What is *not* bounded is a live peer making slow but real
+  progress while the host keeps the connection — e.g. a reader that
+  acknowledges one segment every few minutes holds an ESTABLISHED TCB, or a
+  closed one still draining its send buffer, for as long as it keeps that
+  up; that is the application's policy to set (idle, total-time or
+  minimum-throughput deadlines). The host must also cap the *number* of
+  TCBs (including `TIME_WAIT` ones) — see the contract above.
 - **Off-path injection (RFC 5961).** Data and FINs need the ACK bit and an
   acceptable sequence; a RST is honoured only at exactly `RCV.NXT` (in
-  SYN-RECEIVED too), a SYN in a synchronized state draws a challenge ACK,
-  and segments whose ACK falls outside `[SND.UNA − MAX.SND.WND, SND.NXT]`
-  are dropped with a challenge ACK before they can update TS.Recent or
-  count as proof of life. PAWS
-  drops old-timestamp data, the window update rule ignores a forged future
-  WL1, and the passive ISN plus timestamp offset are keyed per 4-tuple
-  (`tcp_set_secret`), so neither the host clock nor sequence numbers leak.
+  SYN_RCVD too), a SYN in a synchronized state draws a challenge ACK, and
+  ACKs outside `[SND.UNA − MAX.SND.WND, SND.NXT]` are dropped with a
+  challenge ACK — and leave no trace: a segment failing that check cannot
+  move TS.Recent (which would let PAWS discard the peer's real data), echo
+  CE or count as proof of life. PAWS drops old-timestamp data, the window
+  update rule ignores a forged future WL1, and the passive ISN plus
+  timestamp offset are keyed per 4-tuple (`tcp_listen` requires
+  `tcp_set_secret`), so neither the host clock nor sequence numbers leak.
 - **Reflection and ACK storms.** Replies to unacceptable segments
   (challenge ACKs, dup ACKs for out-of-window data, RSTs to stray ACKs or
   SYN-ACKs) are limited to one per 500 ms per connection, each a single
-  header-only packet of at most 80 bytes; a bare ACK to a listener draws
-  at most one such RST, addressed to the segment's source. Only data or a
-  FIN that could be the peer's own retransmission — an acceptable ACK and,
-  when negotiated, a timestamp — is answered outside that budget (one ACK,
-  with a D-SACK, per segment), because the peer's loss recovery depends on
-  it; a forger must first guess an acceptable ACK.
-- **SYN floods.** Stateless SYN cookies (29-bit SipHash MAC, 64 s buckets)
-  that keep window scaling, SACK and ECN when the client uses timestamps.
+  header-only packet of at most 80 bytes; a SYN-ACK to a listener draws at
+  most one such RST, addressed to the segment's source, and a bare ACK that
+  is not a valid cookie draws nothing. Only data or a FIN that could be the
+  peer's own retransmission — an acceptable ACK and, when negotiated, a
+  timestamp — is answered outside that budget (one ACK, with a D-SACK, per
+  segment), because the peer's loss recovery depends on it; a forger must
+  first guess an acceptable ACK.
+- **SYN floods.** A listener holds one half-open statefully (keeping every
+  option) and answers every other SYN with a stateless SYN cookie (29-bit
+  SipHash MAC, 64 s buckets, keyed from the host secret unless set
+  explicitly) that keeps window scaling, SACK and ECN when the client uses
+  timestamps. A valid cookie ACK takes the half-open slot over, so spoofed
+  SYNs at any rate cannot lock a listener out, and a cookie survives one
+  key rotation.
 - **Malformed and adversarial segments.** Every parser path is
   bounds-checked and returns `Result`; peer MSS is floored at 64 B; option
   processing, SACK and D-SACK handling, and out-of-order insertion are
   bounded per segment; nothing SACKed is ever retransmitted and nothing
-  received is ever reneged. Fuzz targets under `fuzz/` exercise the parser
-  and full TCB sessions with invariant and liveness oracles.
+  received is ever reneged; repeated SACK blocks over an already-SACKed
+  queue cost a binary search and a bitmap skip, not a walk over every
+  segment (≈ 0.1 µs instead of 2 µs per ACK with 1024 segments in flight).
+  Fuzz targets under `fuzz/` exercise
+  the parser and full TCB sessions — including a hostile multi-peer target
+  for listeners and SYN cookies — with invariant and liveness oracles.
 - **Host safety.** The C ABI validates handles (magic guard), rejects
   NULL pointers with a length and misaligned storage, accepts NULL for
   zero-length buffers, and builds the TCB in place (no multi-MiB stack
@@ -961,10 +996,11 @@ put packets on the path — is hostile.
   traps (`ud2` / `udf`) instead of spinning or unwinding across the FFI.
 
 Residual risks the host owns: the number of concurrent TCBs and their
-memory (≈ 2.08 MiB each by default, held through `TIME_WAIT`), CPU spent
-per inbound packet (bounded per segment, but proportional to packet rate),
-and secret management (rotate the cookie secret; keep `tcp_set_secret`
-secret).
+memory (≈ 2.08 MiB each by default, held through `TIME_WAIT`), how long a
+live but slow peer may hold a connection the application keeps open, CPU
+spent per inbound packet (bounded per segment, but proportional to packet
+rate), and secret management (keep `tcp_set_secret` secret; rotate an
+explicit cookie secret no more often than every ~2 minutes).
 
 ## Licence
 

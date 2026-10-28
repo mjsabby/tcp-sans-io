@@ -1,19 +1,22 @@
 // TCP connection state machine for tcp-sans-io.
 //
 // This is the authoritative, implementation-accurate transition graph. Its
-// edges are exactly the relation enforced by `allowed_transition()` in
-// fuzz/fuzz_targets/tcb_client_session.rs (the oracle that panics on any
-// transition not drawn here), so the picture and the running check cannot
-// drift apart. Transition sites live in src/tcb.rs; State is in src/state.rs.
+// edges are exactly the relation of `State::debug_transition_allowed()` in
+// src/state.rs: every fuzz target panics on a transition it does not allow,
+// and a unit test in src/state.rs fails if this file draws a different set
+// of edges, so the picture and the code cannot drift apart. Transition sites
+// live in src/tcb/ (input.rs, ack.rs, cookie.rs, timers.rs, mod.rs).
 //
 // Regenerate the SVG after editing:
 //   dot -Tsvg docs/state-machine.dot -o docs/state-machine.svg
 //
 // Legend:
 //   solid black   normal protocol transition (trigger / action)
-//   bold purple   SYN_RCVD -> LISTEN revert: the stateful flood-resistance
-//                 path (bounded SYN-ACK retransmit budget, then recycle slot)
-//   dashed grey   abort: RST received, local abort(), or host reset() -> CLOSED
+//   bold purple   SYN_RCVD -> LISTEN revert: the half-open slot is recycled
+//                 (bounded SYN-ACK retransmit budget, or an exact RST)
+//   green         SYN-cookie promotion: a valid cookie ACK establishes the
+//                 connection with no prior state
+//   dashed grey   abort: RST received, local abort(), or a timeout -> CLOSED
 //
 digraph tcp_state_machine {
     rankdir=TB;
@@ -39,11 +42,21 @@ digraph tcp_state_machine {
     Closed   -> Listen      [label="listen()"];
     Listen   -> SynRcvd     [label="recv SYN\n/ send SYN-ACK"];
     SynSent  -> Established  [label="recv SYN-ACK\n/ send ACK"];
-    SynRcvd  -> Established  [label="recv ACK (3rd)"];
+    SynSent  -> SynRcvd     [label="recv SYN (simultaneous open)\n/ send SYN-ACK"];
+    SynRcvd  -> Established  [label="recv ACK (3rd), or another\npeer's valid cookie ACK"];
+    SynRcvd  -> CloseWait   [label="3rd ACK carries FIN\n/ send ACK"];
+    TimeWait -> Listen      [label="listen()"];
 
-    // Stateful flood resistance: at most one half-open slot, bounded
-    // SYN-ACK retransmits, then the slot is recycled back to LISTEN. A RST
-    // exactly at RCV.NXT in SYN_RCVD recycles it the same way (any other
+    // Hybrid SYN cookies: while the half-open slot is busy, other peers get
+    // stateless cookie SYN-ACKs. A valid cookie ACK establishes directly —
+    // from LISTEN, or from SYN_RCVD by taking over the pending half-open.
+    Listen   -> Established [label="recv valid cookie ACK",
+                             color="#1f7a4d", fontcolor="#1f7a4d"];
+    Listen   -> CloseWait   [label="valid cookie ACK\ncarrying FIN",
+                             color="#1f7a4d", fontcolor="#1f7a4d"];
+
+    // The half-open slot is recycled back to LISTEN after its bounded
+    // SYN-ACK retransmit budget, or by a RST exactly at RCV.NXT (any other
     // in-window RST only draws a challenge ACK, RFC 5961).
     SynRcvd  -> Listen      [label="SYN-ACK budget exhausted\nor exact RST (listener)",
                              color="#7b2fbe", fontcolor="#7b2fbe", penwidth=2.0];
@@ -63,16 +76,16 @@ digraph tcp_state_machine {
     CloseWait   -> LastAck   [label="close()\n/ send FIN"];
     LastAck     -> Closed    [label="recv ACK of FIN"];
 
-    // ---- Aborts: RST received / abort() / reset() -> CLOSED -------------
+    // ---- Aborts: RST received / abort() / timeouts -> CLOSED ------------
     edge [style=dashed, color="#999999", fontcolor="#999999"];
-    SynSent     -> Closed [label="RST / reset()"];
-    SynRcvd     -> Closed [label="RST (non-listener)\n/ reset()"];
-    Listen      -> Closed [label="close()"];
-    Established -> Closed [label="RST / abort()\n/ reset()"];
-    FinWait1    -> Closed [label="RST / reset()"];
-    FinWait2    -> Closed [label="RST / reset()"];
-    Closing     -> Closed [label="RST / reset()"];
-    CloseWait   -> Closed [label="RST / abort()\n/ reset()"];
+    SynSent     -> Closed [label="RST / SYN retries\n/ abort()"];
+    SynRcvd     -> Closed [label="RST (non-listener)\n/ abort()"];
+    Listen      -> Closed [label="close() / abort()"];
+    Established -> Closed [label="RST / abort()\n/ R2, USER TIMEOUT, keepalive"];
+    FinWait1    -> Closed [label="RST / abort()\n/ R2, USER TIMEOUT"];
+    FinWait2    -> Closed [label="RST / abort()\n/ FIN_WAIT_2 timeout"];
+    Closing     -> Closed [label="RST / abort() / R2"];
+    CloseWait   -> Closed [label="RST / abort()\n/ R2, USER TIMEOUT"];
 
     // ---- Rank hints for a clean top-to-bottom flow ----------------------
     { rank=same; SynSent; SynRcvd; }

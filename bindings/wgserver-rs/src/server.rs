@@ -69,6 +69,9 @@ struct Conn {
 
 pub struct Server {
     cfg: ServerConfig,
+    /// Host secret installed on every listener (keys ISNs, timestamp
+    /// offsets and the derived SYN-cookie key); `listen()` requires one.
+    host_secret: [u8; 16],
     sock: UdpSocket,
     conns: Vec<Conn>,
     /// Indices in `conns` that need pump attention this iteration.
@@ -104,6 +107,7 @@ impl Server {
         // of MiB on the wire.
         let _ = sock.set_nonblocking(false); // we use read_timeout for portability
 
+        let host_secret = fresh_secret();
         let mut conns: Vec<Conn> = Vec::with_capacity(cfg.num_listeners as usize);
         for i in 0..cfg.num_listeners {
             let port = cfg.base_port + i;
@@ -123,10 +127,11 @@ impl Server {
             };
             let mut tcb = Tcb::new(tcb_cfg).map_err(map_tcp_err)?;
             tcb.set_now(0);
-            tcb.listen().map_err(map_tcp_err)?;
+            tcb.set_secret(&host_secret);
             if let Some(ref secret) = cfg.cookie_secret {
                 tcb.set_cookie_secret(secret);
             }
+            tcb.listen().map_err(map_tcp_err)?;
             conns.push(Conn {
                 tcb,
                 active: false,
@@ -140,6 +145,7 @@ impl Server {
 
         Ok(Self {
             cfg,
+            host_secret,
             sock,
             conns,
             active: Vec::with_capacity(256),
@@ -461,13 +467,15 @@ impl Server {
                 initial_rto_ms: 1000,
             });
             conn.tcb.set_now(now_ms);
+            // `reinit` clears the secrets: reinstall them before LISTEN.
+            conn.tcb.set_secret(&self.host_secret);
+            if let Some(ref secret) = self.cfg.cookie_secret {
+                conn.tcb.set_cookie_secret(secret);
+            }
             if let Err(e) = conn.tcb.listen() {
                 if !self.cfg.quiet {
                     eprintln!("wgserver: re-listen idx={idx} err={e:?}");
                 }
-            }
-            if let Some(ref secret) = self.cfg.cookie_secret {
-                conn.tcb.set_cookie_secret(secret);
             }
             return Ok(false);
         }
@@ -556,6 +564,18 @@ fn parse_dest_index(
 /// yields an off-path-unpredictable value with no extra dependency. (The
 /// Go driver learns the server ISS from the SYN-ACK, so nothing relies on
 /// predictability.)
+/// 16 bytes from std's randomly seeded (OS RNG) hasher keys.
+fn fresh_secret() -> [u8; 16] {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    let a = RandomState::new().build_hasher().finish();
+    let b = RandomState::new().build_hasher().finish();
+    let mut s = [0u8; 16];
+    s[..8].copy_from_slice(&a.to_le_bytes());
+    s[8..].copy_from_slice(&b.to_le_bytes());
+    s
+}
+
 fn fresh_iss() -> u32 {
     use std::collections::hash_map::RandomState;
     use std::hash::{BuildHasher, Hasher};

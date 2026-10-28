@@ -6,6 +6,10 @@
 // for storage: we query tcp_handle_size / tcp_handle_align, allocate that
 // block via Marshal.AllocHGlobal (which on .NET satisfies any reasonable
 // alignment requirement up to pointer size), and free it after destroy.
+//
+// Thread safety: the native stack has no internal locking, so every native
+// call (and Dispose, which frees the block) runs under a per-instance lock.
+// Methods may be called from several threads; they execute one at a time.
 
 using System.Runtime.InteropServices;
 
@@ -17,6 +21,7 @@ internal sealed class TcpStream : IDisposable
     // MSS/options change would turn every extract into BufferTooSmall).
     private static readonly int MaxPacket = (int)(nuint)Native.tcp_max_packet();
 
+    private readonly object _sync = new();
     private IntPtr _storage;
     private bool _destroyed;
 
@@ -64,13 +69,26 @@ internal sealed class TcpStream : IDisposable
         }
     }
 
-    public void Connect(ulong nowMs) => Check(Native.tcp_connect(_storage, nowMs));
-
-    public void Listen(ulong nowMs) => Check(Native.tcp_listen(_storage, nowMs));
+    public void Connect(ulong nowMs)
+    {
+        lock (_sync) Check(Native.tcp_connect(_storage, nowMs));
+    }
 
     /// <summary>
-    /// Install a 16-byte secret enabling stateless SYN cookies (RFC 4987).
-    /// Once set, an inbound SYN in LISTEN is answered statelessly.
+    /// CLOSED → LISTEN. Requires <see cref="SetSecret"/> (or
+    /// <see cref="SetCookieSecret"/>) first; InvalidState otherwise.
+    /// </summary>
+    public void Listen(ulong nowMs)
+    {
+        lock (_sync) Check(Native.tcp_listen(_storage, nowMs));
+    }
+
+    /// <summary>
+    /// Install (or rotate to) an explicit 16-byte CSPRNG SYN-cookie key
+    /// (RFC 4987). A listener holds one half-open handshake statefully and
+    /// answers SYNs with cookies while that slot is busy. Cookies issued under
+    /// the previous key stay valid, so rotate at most every ~2 minutes.
+    /// Without this call the key is derived from <see cref="SetSecret"/>.
     /// </summary>
     public void SetCookieSecret(ReadOnlySpan<byte> secret)
     {
@@ -80,40 +98,54 @@ internal sealed class TcpStream : IDisposable
         {
             fixed (byte* p = secret)
             {
-                Check(Native.tcp_set_cookie_secret(_storage, (IntPtr)p));
+                lock (_sync) Check(Native.tcp_set_cookie_secret(_storage, (IntPtr)p));
             }
         }
     }
 
-    public void Close(ulong nowMs) => Check(Native.tcp_close(_storage, nowMs));
+    public void Close(ulong nowMs)
+    {
+        lock (_sync) Check(Native.tcp_close(_storage, nowMs));
+    }
 
     /// <summary>
     /// Immediate teardown: queues a RST+ACK in the egress ring, drops all
     /// buffered data, transitions to CLOSED. Drain <see cref="ExtractPacket"/>
     /// once afterwards so the RST reaches the wire, then Dispose.
     /// </summary>
-    public void Abort(ulong nowMs) => Check(Native.tcp_abort(_storage, nowMs));
+    public void Abort(ulong nowMs)
+    {
+        lock (_sync) Check(Native.tcp_abort(_storage, nowMs));
+    }
 
     /// <summary>
     /// Reconfigure / disable TCP keepalive (RFC 9293 §3.8.4). On by default
     /// (10 min idle / 60 s interval / 4 probes); idleMs == 0 disables.
     /// </summary>
-    public void SetKeepalive(ulong nowMs, uint idleMs, uint intvlMs, byte count) =>
-        Check(Native.tcp_set_keepalive(_storage, nowMs, idleMs, intvlMs, count));
+    public void SetKeepalive(ulong nowMs, uint idleMs, uint intvlMs, byte count)
+    {
+        lock (_sync) Check(Native.tcp_set_keepalive(_storage, nowMs, idleMs, intvlMs, count));
+    }
 
     /// <summary>
     /// RFC 9293 §3.8.3 USER TIMEOUT: max time without forward progress while
     /// send data is outstanding before the connection aborts. On by default
     /// (5 min); 0 disables.
     /// </summary>
-    public void SetUserTimeout(ulong nowMs, uint userTimeoutMs) =>
-        Check(Native.tcp_set_user_timeout(_storage, nowMs, userTimeoutMs));
+    public void SetUserTimeout(ulong nowMs, uint userTimeoutMs)
+    {
+        lock (_sync) Check(Native.tcp_set_user_timeout(_storage, nowMs, userTimeoutMs));
+    }
 
-    public void Tick(ulong nowMs) => Check(Native.tcp_tick(_storage, nowMs));
+    public void Tick(ulong nowMs)
+    {
+        lock (_sync) Check(Native.tcp_tick(_storage, nowMs));
+    }
 
     /// <summary>
     /// Install a 16-byte CSPRNG host secret keying the per-connection
-    /// timestamp offset and passive-open ISNs. Call before Connect/Listen;
+    /// timestamp offset, passive-open ISNs and (unless set explicitly) the
+    /// SYN-cookie key. Call before Connect/Listen; required for Listen and
     /// recommended for anything internet-facing.
     /// </summary>
     public void SetSecret(ReadOnlySpan<byte> secret)
@@ -124,7 +156,7 @@ internal sealed class TcpStream : IDisposable
         {
             fixed (byte* p = secret)
             {
-                Check(Native.tcp_set_secret(_storage, (IntPtr)p));
+                lock (_sync) Check(Native.tcp_set_secret(_storage, (IntPtr)p));
             }
         }
     }
@@ -133,15 +165,25 @@ internal sealed class TcpStream : IDisposable
     /// IPv4 path MTU (clamped to 576..1500) before the handshake, e.g. 1420
     /// behind a default WireGuard interface.
     /// </summary>
-    public void SetMtu(ushort mtu) => Check(Native.tcp_set_mtu(_storage, mtu));
+    public void SetMtu(ushort mtu)
+    {
+        lock (_sync) Check(Native.tcp_set_mtu(_storage, mtu));
+    }
 
     /// <summary>Report a smaller path MTU mid-connection (e.g. from ICMP).</summary>
-    public void UpdatePmtu(ulong nowMs, ushort mtu) =>
-        Check(Native.tcp_update_pmtu(_storage, nowMs, mtu));
+    public void UpdatePmtu(ulong nowMs, ushort mtu)
+    {
+        lock (_sync) Check(Native.tcp_update_pmtu(_storage, nowMs, mtu));
+    }
 
-    /// <summary>FIN_WAIT_2 timeout (default 60 s; 0 disables).</summary>
-    public void SetFinWait2Timeout(ulong nowMs, uint timeoutMs) =>
-        Check(Native.tcp_set_fin_wait2_timeout(_storage, nowMs, timeoutMs));
+    /// <summary>
+    /// FIN_WAIT_2 timeout (default 60 s; 0 disables). Restarted only when the
+    /// application reads received data.
+    /// </summary>
+    public void SetFinWait2Timeout(ulong nowMs, uint timeoutMs)
+    {
+        lock (_sync) Check(Native.tcp_set_fin_wait2_timeout(_storage, nowMs, timeoutMs));
+    }
 
     /// <summary>
     /// Absolute nowMs at which Tick next has timer work, or null when no
@@ -149,20 +191,28 @@ internal sealed class TcpStream : IDisposable
     /// </summary>
     public ulong? NextDeadline()
     {
-        ulong d = Native.tcp_next_deadline(_storage);
+        ulong d;
+        lock (_sync) d = Native.tcp_next_deadline(_storage);
         return d == ulong.MaxValue ? null : d;
     }
 
     /// <summary>Per-connection counters (comparable to Linux TCP_INFO).</summary>
     public TcpStats Stats()
     {
-        Check(Native.tcp_get_stats(_storage, out var s));
+        TcpStats s;
+        lock (_sync) Check(Native.tcp_get_stats(_storage, out s));
         return s;
     }
 
-    public TcpState State() => (TcpState)Native.tcp_state(_storage);
+    public TcpState State()
+    {
+        lock (_sync) return (TcpState)Native.tcp_state(_storage);
+    }
 
-    public TcpEvents Poll() => (TcpEvents)Native.tcp_poll(_storage);
+    public TcpEvents Poll()
+    {
+        lock (_sync) return (TcpEvents)Native.tcp_poll(_storage);
+    }
 
     /// <summary>
     /// Buffer bytes into the send ring (the next Tick / inject flushes them).
@@ -178,7 +228,8 @@ internal sealed class TcpStream : IDisposable
             fixed (byte* p = data)
             {
                 UIntPtr written;
-                int rc = Native.tcp_send(_storage, (IntPtr)p, (UIntPtr)data.Length, out written);
+                int rc;
+                lock (_sync) rc = Native.tcp_send(_storage, (IntPtr)p, (UIntPtr)data.Length, out written);
                 if (rc == (int)TcpErrorCode.WouldBlock) return 0; // backpressure, not an error
                 if (rc != 0) throw new TcpException(rc);
                 return (int)(nuint)written;
@@ -201,7 +252,8 @@ internal sealed class TcpStream : IDisposable
             fixed (byte* p = buf)
             {
                 UIntPtr read;
-                int rc = Native.tcp_recv(_storage, (IntPtr)p, (UIntPtr)max, out read);
+                int rc;
+                lock (_sync) rc = Native.tcp_recv(_storage, (IntPtr)p, (UIntPtr)max, out read);
                 if (rc == (int)TcpErrorCode.ConnectionClosed) return Array.Empty<byte>(); // EOF
                 if (rc != 0) throw new TcpException(rc);
                 int n = (int)(nuint)read;
@@ -226,7 +278,8 @@ internal sealed class TcpStream : IDisposable
         {
             fixed (byte* p = packet)
             {
-                int rc = Native.tcp_inject_packet(
+                int rc;
+                lock (_sync) rc = Native.tcp_inject_packet(
                     _storage, (IntPtr)p, (UIntPtr)packet.Length, nowMs);
                 if (rc == (int)TcpErrorCode.NotForUs
                     || rc == (int)TcpErrorCode.MalformedPacket
@@ -251,7 +304,8 @@ internal sealed class TcpStream : IDisposable
             fixed (byte* p = buf)
             {
                 UIntPtr written;
-                int rc = Native.tcp_extract_packet(
+                int rc;
+                lock (_sync) rc = Native.tcp_extract_packet(
                     _storage, (IntPtr)p, (UIntPtr)MaxPacket, out written);
                 if (rc != 0) throw new TcpException(rc);
                 int n = (int)(nuint)written;
@@ -265,13 +319,16 @@ internal sealed class TcpStream : IDisposable
 
     public void Dispose()
     {
-        if (_destroyed) return;
-        _destroyed = true;
-        if (_storage != IntPtr.Zero)
+        lock (_sync)
         {
-            Native.tcp_destroy(_storage);
-            Marshal.FreeHGlobal(_storage);
-            _storage = IntPtr.Zero;
+            if (_destroyed) return;
+            _destroyed = true;
+            if (_storage != IntPtr.Zero)
+            {
+                Native.tcp_destroy(_storage);
+                Marshal.FreeHGlobal(_storage);
+                _storage = IntPtr.Zero;
+            }
         }
     }
 

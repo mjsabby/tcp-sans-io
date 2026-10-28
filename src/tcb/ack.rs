@@ -135,6 +135,7 @@ impl<const BUF: usize> Tcb<BUF> {
             }
             self.note_progress(data_acked.saturating_add(u32::from(fin_acked)));
         }
+        self.pmtu_probe_on_ack();
 
         // ---- Send window (RFC 9293 §3.10.7.4, hardened) -----------------
         let wnd_before = self.snd_wnd;
@@ -221,6 +222,31 @@ impl<const BUF: usize> Tcb<BUF> {
             }
         }
         Ok(())
+    }
+
+    /// A path-MTU probe that arrived (cumulatively ACKed, or SACKed, without
+    /// ever being retransmitted) proves the larger size: raise the cap one
+    /// step, and keep probing until the pre-clamp size is restored.
+    fn pmtu_probe_on_ack(&mut self) {
+        if !self.pmtu_probe_inflight {
+            return;
+        }
+        let delivered = seq_ge(self.snd_una, self.pmtu_probe_end)
+            || self
+                .rtx
+                .find(self.pmtu_probe_start)
+                .and_then(|i| self.rtx.get(i))
+                .is_some_and(|s| s.has(seg_flags::SACKED));
+        if !delivered {
+            return;
+        }
+        self.pmtu_probe_inflight = false;
+        self.pmtu_mss = self.pmtu_mss.max(self.pmtu_probe_mss);
+        if self.pmtu_mss >= self.pmtu_restore_mss {
+            self.pmtu_restore_mss = 0;
+        } else {
+            self.pmtu_probe_at = self.now_ms;
+        }
     }
 
     /// Window update. RFC 9293's SND.WL1/WL2 test keeps reordered stale

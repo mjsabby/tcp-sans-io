@@ -181,6 +181,24 @@ impl OooList {
         Insert::Stored { dup }
     }
 
+    /// Forget everything held at or beyond `limit` (> `rcv_nxt`), trimming a
+    /// range that straddles it. Used once the peer's FIN position is known.
+    pub fn truncate_from(&mut self, limit: u32, rcv_nxt: u32) {
+        let lim = off(limit, rcv_nxt);
+        // Ranges before `k` end at or below the limit and are kept whole.
+        let k = self.slice().partition_point(|r| off(r.end, rcv_nxt) <= lim);
+        let mut keep = k;
+        if k < self.len {
+            if let Some(r) = self.ranges.get_mut(k) {
+                if off(r.start, rcv_nxt) < lim {
+                    r.end = limit;
+                    keep = k + 1;
+                }
+            }
+        }
+        self.len = self.len.min(keep);
+    }
+
     /// `RCV.NXT` has advanced to `rcv_nxt`. Drop ranges now at or below it
     /// and, if a held range starts at or before `rcv_nxt`, consume it.
     /// Returns the new `RCV.NXT` (the end of the consumed contiguous run).
@@ -367,6 +385,26 @@ mod tests {
         assert_eq!(l.len(), 1);
         assert_eq!(l.containing(600), Some((300, 950)));
         assert!(l.debug_valid(100));
+    }
+
+    #[test]
+    fn truncate_from_trims_straddling_range_and_drops_later_ones() {
+        let mut l = OooList::new();
+        l.insert(200, 300, 100);
+        l.insert(400, 500, 100);
+        l.insert(600, 700, 100);
+        l.truncate_from(450, 100);
+        assert_eq!(l.len(), 2);
+        assert_eq!(l.last_end(), Some(450));
+        assert!(l.debug_valid(100));
+        l.truncate_from(400, 100);
+        assert_eq!(
+            (l.len(), l.last_end()),
+            (1, Some(300)),
+            "range ending at the limit kept"
+        );
+        l.truncate_from(150, 100);
+        assert!(l.is_empty());
     }
 
     #[test]

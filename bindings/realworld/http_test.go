@@ -361,6 +361,9 @@ func setupTUNAndServer(t *testing.T) (*httpServer, func()) {
 		tryRun("ip", "link", "del", name)
 		t.Fatalf("NewTcpHandle: %v", err)
 	}
+	if err := srv.SetSecret(NewSecret()); err != nil {
+		t.Fatalf("SetSecret: %v", err)
+	}
 	if err := srv.Listen(); err != nil {
 		srv.Free()
 		_ = tun.Close()

@@ -189,7 +189,9 @@ pub unsafe extern "C" fn tcp_connect(handle: *mut TcpStreamHandle, now_ms: u64) 
 }
 
 /// Passive open (`CLOSED` → `LISTEN`); the remote is wildcarded until a SYN
-/// arrives. For hostile networks install a cookie secret first.
+/// arrives. Requires [`tcp_set_secret`] (or [`tcp_set_cookie_secret`]) first;
+/// `InvalidState` otherwise. While the single half-open slot is busy, SYNs
+/// from other peers are answered with SYN cookies.
 ///
 /// # Safety
 /// `handle` must be NULL or a live handle from [`tcp_init`].
@@ -204,7 +206,9 @@ pub unsafe extern "C" fn tcp_listen(handle: *mut TcpStreamHandle, now_ms: u64) -
     }
 }
 
-/// Install a 128-bit secret enabling stateless SYN cookies (RFC 4987).
+/// Install (or rotate to) an explicit 128-bit SYN-cookie key (RFC 4987);
+/// without it the key is derived from [`tcp_set_secret`]. Cookies issued
+/// under the previous key stay valid.
 ///
 /// # Safety
 /// `handle` as above; `secret` must point to 16 readable bytes.
@@ -227,9 +231,10 @@ pub unsafe extern "C" fn tcp_set_cookie_secret(
 }
 
 /// Install a 128-bit host secret (CSPRNG output). Keys the per-connection
-/// TCP timestamp offset (so timestamps do not reveal the host clock) and
-/// per-SYN ISNs on stateful listeners. Call before `tcp_connect` /
-/// `tcp_listen`. Strongly recommended for internet-facing use.
+/// TCP timestamp offset (so timestamps do not reveal the host clock),
+/// passive-open ISNs and, unless one was installed explicitly, the SYN-cookie
+/// key. Call before `tcp_connect` / `tcp_listen`; required by `tcp_listen`,
+/// strongly recommended for internet-facing use.
 ///
 /// # Safety
 /// `handle` as above; `secret` must point to 16 readable bytes.
@@ -343,8 +348,8 @@ pub unsafe extern "C" fn tcp_set_user_timeout(
 }
 
 /// Set the FIN_WAIT_2 timeout (`0` disables; default 60 s): once our FIN is
-/// ACKed, the peer must FIN within this long (refreshed by its data) or the
-/// connection is reset.
+/// ACKed, the peer must FIN within this long or the connection is reset. Only
+/// the application reading data (`tcp_recv`) restarts it.
 ///
 /// # Safety
 /// `handle` must be NULL or a live handle from [`tcp_init`].

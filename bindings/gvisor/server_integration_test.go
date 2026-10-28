@@ -284,6 +284,9 @@ func TestServerAgainstGvisorNetstack(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer srv.Free()
+	if err := srv.SetSecret(NewSecret()); err != nil {
+		t.Fatalf("set secret: %v", err)
+	}
 	if err := srv.Listen(); err != nil {
 		t.Fatalf("listen: %v", err)
 	}

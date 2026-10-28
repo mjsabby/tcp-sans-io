@@ -37,7 +37,8 @@ go test -v -timeout 120s ./...
 # 10000-connection scale test.
 STRESS=1 go test -v -timeout 300s -run TestWGServer_10000_Connections ./...
 
-# Slow no-cookies bounded-half-open test (~65 s).
+# Flood test without an explicit cookie secret (cookie key derived from
+# the host secret).
 STRESS=1 go test -v -timeout 180s -run TestWGServer_SynFlood_NoCookies ./...
 
 # All STRESS tests.
@@ -65,8 +66,8 @@ scale: 10000/10000 ok (100.00%) in 2.55s; p50=63ms p95=68ms p99=79ms
 
 | Test                                       | Default? | What it asserts                                                       |
 | ------------------------------------------ | -------- | --------------------------------------------------------------------- |
-| `TestWGServer_SynFlood_NoCookies`          | `STRESS=1` | Half-open lifetime is **bounded**: after ~63 s the listener re-arms. |
-| `TestWGServer_SynFlood_Cookies`            | ✅       | 20 K forged SYNs + cookies on → server holds no state; legit succeeds. |
+| `TestWGServer_SynFlood_NoCookies`          | `STRESS=1` | Without `--cookies`, a forged SYN holds the half-open slot, yet a legit client still gets through at once (cookie key derived from the host secret). |
+| `TestWGServer_SynFlood_Cookies`            | ✅       | 20 K forged SYNs + cookies on → one half-open, the rest answered statelessly; legit succeeds. |
 | `TestWGServer_BareAck_NoReflection`        | ✅       | Bare ACK in LISTEN emits zero packets (no reflection).                |
 | `TestWGServer_Listen_DropsFinSilently`     | ✅       | Bare FIN in LISTEN emits zero packets.                                |
 | `TestWGServer_Listen_DropsRstSilently`     | ✅       | Bare RST in LISTEN emits zero packets.                                |
@@ -88,12 +89,12 @@ scale: 10000/10000 ok (100.00%) in 2.55s; p50=63ms p95=68ms p99=79ms
   byte stream and assert it. The behaviorally critical property is
   that the server stays in LISTEN and emits exactly one packet.
 * **`SynFlood_NoCookies`** — single-Tcb-per-port means the FIRST
-  forged SYN locks the listener into SYN_RCVD; subsequent SYNs
-  (legitimate or otherwise) are rejected until the
-  `MAX_SYN_RCVD_RETRIES` (= 5) retransmit budget expires with
-  Karn-doubling RTO capped at 60 s — roughly 63 s of unavailability.
-  The production defense for fast availability under flood is SYN
-  cookies (`--cookies <hex32>`); cookies hold no per-half-open state.
+  forged SYN takes the listener's only half-open slot (SYN_RCVD).
+  Every listener has a host secret (`listen()` requires one), from
+  which a SYN-cookie key is derived, so later SYNs — legitimate or not
+  — are answered with cookies, and a legitimate client's valid cookie
+  ACK takes the slot over. `--cookies <hex32>` installs an explicit
+  (rotatable) cookie key instead.
 
 ## OS knobs
 

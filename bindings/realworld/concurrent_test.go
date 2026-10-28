@@ -109,6 +109,9 @@ func newConcurrentServer(t *testing.T, n int) (*concurrentServer, func()) {
 			tryRun("ip", "link", "del", name)
 			t.Fatalf("NewTcpHandle[%d]: %v", i, err)
 		}
+		if err := tcb.SetSecret(NewSecret()); err != nil {
+			t.Fatalf("SetSecret: %v", err)
+		}
 		if err := tcb.Listen(); err != nil {
 			tcb.Free()
 			_ = tun.Close()

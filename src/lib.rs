@@ -6,8 +6,8 @@
 //!
 //! Both **active** opens (`connect`) and **passive** opens (`listen`) are
 //! supported. The passive path implements the canonical RFC 793 server
-//! states (LISTEN and SYN_RECEIVED) plus optional RFC 4987 SYN cookies
-//! for stateless flood resistance.
+//! states (LISTEN and SYN_RECEIVED) plus RFC 4987 SYN cookies, used while
+//! the listener's single half-open slot is busy, for flood resistance.
 //!
 //! Design constraints:
 //! * `#![no_std]`, no heap allocation, no panics, no threads, no syscalls.
@@ -40,24 +40,30 @@
 //!
 //! 3. **Bound the number of connections.** Only the host can: each TCB is
 //!    independent and unaware of the others, and costs ≈ 2.08 MiB by default
-//!    (136 KiB under the `small-buffers` feature) — including the 60 s it spends
-//!    in `TIME_WAIT`. The per-connection timers bound each connection's
-//!    *lifetime*, never the aggregate *count*. Cap concurrent TCBs and
-//!    refuse/evict past the budget, or an attacker who merely opens many
-//!    connections exhausts memory regardless of any per-connection defense.
+//!    (136 KiB under the `small-buffers` feature) — including the 60–120 s it
+//!    spends in `TIME_WAIT`. The per-connection timers bound how long a
+//!    *stalled or vanished* peer, or one the host has closed on, holds a
+//!    connection — never the aggregate *count*, and never a live peer the host
+//!    keeps serving (see 7). Cap concurrent TCBs and refuse/evict past the
+//!    budget, or an attacker who merely opens many connections exhausts memory
+//!    regardless of any per-connection defense.
 //!
-//! 4. **Install secrets.** On internet-facing TCBs call [`Tcb::set_secret`]
-//!    with 16 CSPRNG bytes (keys timestamp offsets and passive-open ISNs), and
-//!    set the path MTU with [`Tcb::set_mtu`] (1420 behind a default WireGuard
-//!    interface).
+//! 4. **Install secrets.** Call [`Tcb::set_secret`] with 16 CSPRNG bytes
+//!    (keys timestamp offsets, passive-open ISNs and the SYN-cookie key) on
+//!    every listener — [`Tcb::listen`] refuses to run without a secret — and on
+//!    internet-facing active opens, and set the path MTU with [`Tcb::set_mtu`]
+//!    (1420 behind a default WireGuard interface).
 //!
-//! 5. **Use SYN cookies on untrusted listeners.** Before exposing a listener to
-//!    hostile traffic, call [`Tcb::set_cookie_secret`] with 16 bytes from a
-//!    CSPRNG and rotate it periodically (old cookies stay valid ~64–128 s after
-//!    rotation). Without cookies the stateful path is still flood-bounded (one
-//!    half-open per TCB, capped SYN-ACK retransmits); cookies let one listener
-//!    absorb a SYN flood holding *zero* per-connection state until the third
-//!    ACK validates. A predictable or leaked secret defeats the protection.
+//! 5. **Understand the listener's SYN cookies.** A listener holds one
+//!    half-open handshake statefully (keeping every option the client offers)
+//!    and answers SYNs with RFC 4987 cookies while that slot is busy; a valid
+//!    cookie ACK takes the slot over, so spoofed SYNs cannot lock it. The
+//!    cookie key derives from the host secret; [`Tcb::set_cookie_secret`]
+//!    installs an explicit one instead. Rotating it keeps the previous key
+//!    valid, so cookies survive one rotation (rotate no more often than every
+//!    ~2 minutes). A predictable or leaked secret defeats the protection.
+//!    Busy-listener replies go to *other* peers than the half-open's: route
+//!    every outbound packet by its own destination address, never by the TCB.
 //!
 //! 6. **Act on lifecycle signals and release the TCB.** Read [`Tcb::poll`] and
 //!    react: on `PEER_CLOSED` (peer FIN → `CLOSE_WAIT`) the host **must**
@@ -69,11 +75,19 @@
 //!    releases it. After a clean close, first `recv` any bytes the peer sent
 //!    before its FIN (`READABLE` stays set until they are drained).
 //!
-//! 7. **Don't disable the idle/stall reapers without a replacement.** Keepalive
-//!    and the USER TIMEOUT are **on by default** and are what bound an idle or
-//!    stalling peer's hold on a TCB. A host that turns either off
-//!    ([`Tcb::set_keepalive`]`(0, …)` / [`Tcb::set_user_timeout`]`(0)`) must
-//!    provide its own idle/stall reaping or it reopens the memory-pinning DoS.
+//! 7. **Don't disable the idle/stall reapers without a replacement, and
+//!    bound live connections yourself.** Keepalive and the USER TIMEOUT are
+//!    **on by default** and are what bound a vanished or *stalled* peer's hold
+//!    on a TCB. A host that turns either off ([`Tcb::set_keepalive`]`(0, …)` /
+//!    [`Tcb::set_user_timeout`]`(0)`) must provide its own reaping or it
+//!    reopens the memory-pinning DoS. Neither bounds a *live* peer that keeps
+//!    making slow progress — e.g. a reader acknowledging one segment every few
+//!    minutes holds the connection as long as the host keeps it open — so apply
+//!    application-level deadlines (idle or total time, minimum throughput)
+//!    where that matters. After `close()`, data still queued drains under the
+//!    same USER TIMEOUT rule; once our FIN is acknowledged, `FIN_WAIT_2` lasts
+//!    60 s unless the application keeps reading, and `TIME_WAIT` at most 120 s
+//!    however often the peer re-sends its FIN.
 //!
 //! Under `cfg(test)` we let `std` link so we can run a loopback harness that
 //! simulates two TCBs talking through an in-memory wire.

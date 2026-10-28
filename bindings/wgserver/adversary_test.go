@@ -81,16 +81,14 @@ func runOne(t *testing.T, drv *Transport, port uint16, srcPort uint16, msg strin
 }
 
 // TestWGServer_SynFlood_NoCookies fires a SYN flood with forged
-// random sources. The single-TCB-per-port listener holds the first SYN
-// in SYN_RCVD and rejects other 4-tuples meanwhile, but once that
-// half-open has retransmitted its SYN-ACK unanswered, a SYN from a new
-// 4-tuple replaces it — so a legitimate client gets through after about
-// one SYN-ACK timeout (~1 s) instead of waiting out the whole SYN-ACK
-// budget (~63 s).
+// random sources at a listener without an explicit cookie secret. The
+// single-TCB-per-port listener holds the first SYN in SYN_RCVD; later
+// SYNs are answered with SYN cookies keyed from the host secret, and the
+// legitimate client's valid cookie ACK takes the slot over — so it gets
+// through at once instead of waiting for the forged half-open to expire.
 //
 // This asserts the server is not held hostage by a flood. Gated by
-// STRESS=1; the production defense for floods is SYN cookies (covered in
-// TestWGServer_SynFlood_Cookies).
+// STRESS=1.
 func TestWGServer_SynFlood_NoCookies(t *testing.T) {
 	if os.Getenv("STRESS") == "" {
 		t.Skip("set STRESS=1 to run the no-cookies flood test")
@@ -147,9 +145,9 @@ func TestWGServer_SynFlood_NoCookies(t *testing.T) {
 		rx, tx, dropped, mismatch, res.Latency)
 }
 
-// TestWGServer_SynFlood_Cookies enables SYN cookies and verifies a
-// legitimate client still succeeds after a flood. With cookies on,
-// the server holds *no* state for the forged SYNs.
+// TestWGServer_SynFlood_Cookies enables an explicit SYN-cookie secret and
+// verifies a legitimate client still succeeds after a flood. The server
+// holds one half-open; every other forged SYN is answered statelessly.
 func TestWGServer_SynFlood_Cookies(t *testing.T) {
 	// 16 bytes of zeros is a valid secret — content doesn't matter
 	// for the harness, only the protocol behavior.
@@ -186,9 +184,9 @@ func TestWGServer_SynFlood_Cookies(t *testing.T) {
 	runOne(t, drv, 31100, 50100, "cookies-post-flood", OptsNone)
 }
 
-// TestWGServer_BareAck_NoReflection sends a bare ACK to LISTEN with
-// no cookie secret installed. The server must emit ZERO packets —
-// otherwise it'd be a reflection / amplification gadget.
+// TestWGServer_BareAck_NoReflection sends a bare ACK (not a valid
+// cookie) to LISTEN. The server must emit ZERO packets — otherwise it'd
+// be a reflection / amplification gadget.
 func TestWGServer_BareAck_NoReflection(t *testing.T) {
 	drv, h, cleanup := adversarySetup(t, "none", 1, 31200)
 	defer cleanup()

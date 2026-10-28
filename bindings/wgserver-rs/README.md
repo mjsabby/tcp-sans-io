@@ -40,9 +40,11 @@ wgserver [options]
   --base-port  <p>           first listening TCP port (default 30000)
   --num-listeners <N>        listener count (default 16, max 65535)
   --cookies <hex32|random|none>
-                             enable SYN cookies with a 16-byte secret
-                             (32 hex chars), generate a random secret,
-                             or leave them off (default)
+                             install an explicit SYN-cookie secret
+                             (32 hex chars) or a random one; default:
+                             none (the cookie key a busy listener
+                             answers with is derived from the per-run
+                             host secret)
   --memory-cap-mib <N>       refuse to run if total estimated RSS would
                              exceed this (default 4096)
   --quiet                    suppress per-iteration stats output

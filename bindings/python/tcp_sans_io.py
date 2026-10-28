@@ -9,7 +9,10 @@ The ``TcpStream`` class wraps every FFI entry point in a Pythonic API that:
 * allocates the connection's storage block as an aligned ``c_uint64`` array
   (caller-owned, exactly as the FFI contract requires),
 * surfaces negative status codes as :class:`TcpError` exceptions,
-* never holds a Python-side reference longer than the underlying handle.
+* never holds a Python-side reference longer than the underlying handle,
+* serializes calls on one handle with a per-handle lock: ctypes releases the
+  GIL during foreign calls, and the native stack has no internal locking, so
+  two threads entering the same handle at once would race inside it.
 
 This module is stdlib-only — no NumPy, no cffi, no pip install.
 """
@@ -19,6 +22,7 @@ from __future__ import annotations
 import ctypes
 import os
 import sys
+import threading
 from ctypes import (
     POINTER,
     c_int32,
@@ -329,9 +333,12 @@ class TcpStream:
       :meth:`state` is ``State.CLOSED``; for an immediate one call
       :meth:`abort` and drain the RST. Destroying mid-connection silently
       abandons the peer.
+    * Thread-safe per handle: every method holds the handle's lock for the
+      duration of its native call, so methods may be called from several
+      threads (they run one at a time). Different handles never contend.
     """
 
-    __slots__ = ("_storage", "_handle", "_destroyed")
+    __slots__ = ("_storage", "_handle", "_destroyed", "_lock")
 
     def __init__(
         self,
@@ -366,6 +373,8 @@ class TcpStream:
         self._storage = (c_uint64 * n_words)()
         self._handle = ctypes.cast(self._storage, c_void_p)
         self._destroyed = False
+        # Re-entrant so a GC-triggered __del__ can never self-deadlock.
+        self._lock = threading.RLock()
 
         local_ip_buf = (c_uint8 * 4)(*local_ip)
         remote_ip_buf = (c_uint8 * 4)(*remote_ip)
@@ -384,9 +393,10 @@ class TcpStream:
     # ---- lifecycle -----------------------------------------------------
 
     def destroy(self) -> None:
-        if not self._destroyed:
-            _lib.tcp_destroy(self._handle)
-            self._destroyed = True
+        with self._lock:
+            if not self._destroyed:
+                _lib.tcp_destroy(self._handle)
+                self._destroyed = True
 
     def __enter__(self) -> "TcpStream":
         return self
@@ -396,29 +406,39 @@ class TcpStream:
 
     def __del__(self) -> None:  # pragma: no cover
         try:
-            self.destroy()
+            if hasattr(self, "_lock"):
+                self.destroy()
         except Exception:
             pass
 
     # ---- connection control -------------------------------------------
 
     def connect(self, now_ms: int) -> None:
-        _check(_lib.tcp_connect(self._handle, c_uint64(now_ms)))
+        with self._lock:
+            _check(_lib.tcp_connect(self._handle, c_uint64(now_ms)))
 
     def listen(self, now_ms: int) -> None:
-        """Transition CLOSED → LISTEN. Wildcard remote until SYN arrives."""
-        _check(_lib.tcp_listen(self._handle, c_uint64(now_ms)))
+        """Transition CLOSED → LISTEN. Wildcard remote until SYN arrives.
+        Requires :meth:`set_secret` (or :meth:`set_cookie_secret`) first;
+        raises ``InvalidState`` otherwise."""
+        with self._lock:
+            _check(_lib.tcp_listen(self._handle, c_uint64(now_ms)))
 
     def set_cookie_secret(self, secret: bytes) -> None:
-        """Enable RFC 4987 SYN cookies. ``secret`` must be exactly 16 bytes
-        from a CSPRNG. Once set, the listener answers SYNs statelessly."""
+        """Install (or rotate to) an explicit 16-byte CSPRNG SYN-cookie key
+        (RFC 4987). The listener holds one half-open handshake statefully and
+        answers SYNs with cookies while that slot is busy. Cookies issued
+        under the previous key stay valid, so rotate at most every ~2 min.
+        Without this call the key is derived from :meth:`set_secret`."""
         if len(secret) != 16:
             raise ValueError("cookie secret must be exactly 16 bytes")
         buf = (c_uint8 * 16)(*secret)
-        _check(_lib.tcp_set_cookie_secret(self._handle, ctypes.cast(buf, c_void_p)))
+        with self._lock:
+            _check(_lib.tcp_set_cookie_secret(self._handle, ctypes.cast(buf, c_void_p)))
 
     def close(self, now_ms: int) -> None:
-        _check(_lib.tcp_close(self._handle, c_uint64(now_ms)))
+        with self._lock:
+            _check(_lib.tcp_close(self._handle, c_uint64(now_ms)))
 
     def abort(self, now_ms: int) -> None:
         """Immediate teardown: queue a RST+ACK in the egress ring, drop all
@@ -426,7 +446,8 @@ class TcpStream:
         once afterwards so the RST actually reaches the wire, then
         ``destroy()``. Idempotent on CLOSED; no wire effect in LISTEN /
         SYN_SENT."""
-        _check(_lib.tcp_abort(self._handle, c_uint64(now_ms)))
+        with self._lock:
+            _check(_lib.tcp_abort(self._handle, c_uint64(now_ms)))
 
     def set_keepalive(self, now_ms: int, idle_ms: int, intvl_ms: int, count: int) -> None:
         """Reconfigure/disable TCP keepalive (RFC 9293 3.8.4). After ``idle_ms``
@@ -434,67 +455,80 @@ class TcpStream:
         probes are sent ``intvl_ms`` apart; an unanswered run aborts the
         connection as a vanished peer. On by default (10 min / 60 s / 4 probes);
         pass ``idle_ms == 0`` to disable."""
-        _check(_lib.tcp_set_keepalive(
-            self._handle, c_uint64(now_ms),
-            c_uint32(idle_ms), c_uint32(intvl_ms), c_uint8(count),
-        ))
+        with self._lock:
+            _check(_lib.tcp_set_keepalive(
+                self._handle, c_uint64(now_ms),
+                c_uint32(idle_ms), c_uint32(intvl_ms), c_uint8(count),
+            ))
 
     def set_user_timeout(self, now_ms: int, user_timeout_ms: int) -> None:
         """Set the RFC 9293 3.8.3 USER TIMEOUT: max time without forward
         progress (snd_una advancing) while send data is outstanding, before the
         connection aborts. On by default (5 min); bounds the zero-window /
         dribbled-ACK DoS. ``user_timeout_ms == 0`` disables it."""
-        _check(_lib.tcp_set_user_timeout(
-            self._handle, c_uint64(now_ms), c_uint32(user_timeout_ms),
-        ))
+        with self._lock:
+            _check(_lib.tcp_set_user_timeout(
+                self._handle, c_uint64(now_ms), c_uint32(user_timeout_ms),
+            ))
 
     def set_secret(self, secret: bytes) -> None:
         """Install a 16-byte CSPRNG host secret keying the per-connection
-        timestamp offset and passive-open ISNs. Call before connect/listen;
+        timestamp offset, passive-open ISNs and (unless set explicitly) the
+        SYN-cookie key. Call before connect/listen; required for listen and
         recommended for anything internet-facing."""
         if len(secret) != 16:
             raise ValueError("secret must be exactly 16 bytes")
         buf = (c_uint8 * 16)(*secret)
-        _check(_lib.tcp_set_secret(self._handle, ctypes.cast(buf, c_void_p)))
+        with self._lock:
+            _check(_lib.tcp_set_secret(self._handle, ctypes.cast(buf, c_void_p)))
 
     def set_mtu(self, mtu: int) -> None:
         """Set the IPv4 path MTU (clamped to 576..1500) before the handshake,
         e.g. 1420 behind a default WireGuard interface."""
-        _check(_lib.tcp_set_mtu(self._handle, c_uint16(mtu)))
+        with self._lock:
+            _check(_lib.tcp_set_mtu(self._handle, c_uint16(mtu)))
 
     def update_pmtu(self, now_ms: int, mtu: int) -> None:
         """Report a smaller path MTU mid-connection (e.g. from ICMP)."""
-        _check(_lib.tcp_update_pmtu(self._handle, c_uint64(now_ms), c_uint16(mtu)))
+        with self._lock:
+            _check(_lib.tcp_update_pmtu(self._handle, c_uint64(now_ms), c_uint16(mtu)))
 
     def set_fin_wait2_timeout(self, now_ms: int, timeout_ms: int) -> None:
-        """FIN_WAIT_2 timeout (default 60 s; 0 disables)."""
-        _check(_lib.tcp_set_fin_wait2_timeout(
-            self._handle, c_uint64(now_ms), c_uint32(timeout_ms),
-        ))
+        """FIN_WAIT_2 timeout (default 60 s; 0 disables). Restarted only when
+        the application reads received data."""
+        with self._lock:
+            _check(_lib.tcp_set_fin_wait2_timeout(
+                self._handle, c_uint64(now_ms), c_uint32(timeout_ms),
+            ))
 
     def tick(self, now_ms: int) -> None:
-        _check(_lib.tcp_tick(self._handle, c_uint64(now_ms)))
+        with self._lock:
+            _check(_lib.tcp_tick(self._handle, c_uint64(now_ms)))
 
     def next_deadline(self) -> Optional[int]:
         """Absolute ``now_ms`` at which ``tick`` next has timer work, or
         ``None`` when no timer is armed. Sleep until the earlier of this and
         the next datagram."""
-        d = int(_lib.tcp_next_deadline(self._handle))
+        with self._lock:
+            d = int(_lib.tcp_next_deadline(self._handle))
         return None if d == 0xFFFF_FFFF_FFFF_FFFF else d
 
     def stats(self) -> TcpStats:
         """Per-connection counters (comparable to Linux ``TCP_INFO``)."""
         out = TcpStats()
-        _check(_lib.tcp_get_stats(self._handle, ctypes.byref(out)))
+        with self._lock:
+            _check(_lib.tcp_get_stats(self._handle, ctypes.byref(out)))
         return out
 
     # ---- introspection -------------------------------------------------
 
     def state(self) -> int:
-        return int(_lib.tcp_state(self._handle))
+        with self._lock:
+            return int(_lib.tcp_state(self._handle))
 
     def poll(self) -> int:
-        return int(_lib.tcp_poll(self._handle))
+        with self._lock:
+            return int(_lib.tcp_poll(self._handle))
 
     # ---- buffers -------------------------------------------------------
 
@@ -512,12 +546,13 @@ class TcpStream:
             return 0
         buf = (c_uint8 * len(data)).from_buffer_copy(data)
         written = c_size_t(0)
-        rc = _lib.tcp_send(
-            self._handle,
-            ctypes.cast(buf, c_void_p),
-            c_size_t(len(data)),
-            ctypes.byref(written),
-        )
+        with self._lock:
+            rc = _lib.tcp_send(
+                self._handle,
+                ctypes.cast(buf, c_void_p),
+                c_size_t(len(data)),
+                ctypes.byref(written),
+            )
         if rc == -6:  # WouldBlock: ring full — pure backpressure, retry later.
             return 0
         _check(rc)
@@ -534,12 +569,13 @@ class TcpStream:
         reset (or the stack aborted) the connection."""
         buf = (c_uint8 * max_bytes)()
         read = c_size_t(0)
-        rc = _lib.tcp_recv(
-            self._handle,
-            ctypes.cast(buf, c_void_p),
-            c_size_t(max_bytes),
-            ctypes.byref(read),
-        )
+        with self._lock:
+            rc = _lib.tcp_recv(
+                self._handle,
+                ctypes.cast(buf, c_void_p),
+                c_size_t(max_bytes),
+                ctypes.byref(read),
+            )
         if rc == -8:  # ConnectionClosed: clean EOF.
             return b""
         _check(rc)
@@ -558,12 +594,13 @@ class TcpStream:
         if not packet:
             return False
         buf = (c_uint8 * len(packet)).from_buffer_copy(packet)
-        rc = _lib.tcp_inject_packet(
-            self._handle,
-            ctypes.cast(buf, c_void_p),
-            c_size_t(len(packet)),
-            c_uint64(now_ms),
-        )
+        with self._lock:
+            rc = _lib.tcp_inject_packet(
+                self._handle,
+                ctypes.cast(buf, c_void_p),
+                c_size_t(len(packet)),
+                c_uint64(now_ms),
+            )
         if rc in (-3, -4, -5):  # InvalidState / MalformedPacket / NotForUs
             return False
         _check(rc)
@@ -572,12 +609,13 @@ class TcpStream:
     def extract_packet(self) -> Optional[bytes]:
         buf = (c_uint8 * MAX_PACKET)()
         written = c_size_t(0)
-        rc = _lib.tcp_extract_packet(
-            self._handle,
-            ctypes.cast(buf, c_void_p),
-            c_size_t(MAX_PACKET),
-            ctypes.byref(written),
-        )
+        with self._lock:
+            rc = _lib.tcp_extract_packet(
+                self._handle,
+                ctypes.cast(buf, c_void_p),
+                c_size_t(MAX_PACKET),
+                ctypes.byref(written),
+            )
         _check(rc)
         n = int(written.value)
         if n == 0:

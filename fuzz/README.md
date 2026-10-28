@@ -11,12 +11,13 @@ so those are the natural targets.
 |---|---|
 | `wire_parse` | `wire::parse` never panics on any byte sequence. |
 | `wire_parse_emit_roundtrip` | For any successfully parsed segment, re-emitting and re-parsing produces the same observable fields (seq, ack, flags, window, MSS / WS / TS / SACK options, payload). |
-| `tcb_inject_sequence` | A fresh `Tcb` in `Listen` survives any sequence of arbitrary `inject_packet` calls + clock ticks without panicking, blowing through bounded buffers, or leaving the state machine in an unreachable state. |
+| `tcb_inject_sequence` | A fresh `Tcb` (in `Listen`, or `SynSent`) survives any sequence of fuzzer-built segments + clock ticks without panicking, blowing through bounded buffers, or leaving the state machine in an unreachable state. Each segment is wrapped in a datagram with **valid IP and TCP checksums** (random bytes almost never pass the checksum gate — the original byte-chunking harness stalled in the parser at ~170 edges); SEQ/ACK are raw or rebased onto the live connection, TCP options raw bytes or a structured set, from three peers. |
+| `tcb_hostile_peer` | Structured hostile peers (three of them, valid segments with SEQ/ACK relative to the live state) against a listener or an active open, interleaved with `send` / `recv` / `close` / `abort` / `listen` / `connect`, PMTU reports and secret rotations. Reaches LISTEN / SYN_RCVD, hybrid SYN cookies (busy-slot cookie SYN-ACKs, cookie ACKs taking the slot over, key rotation), simultaneous open and every closing state. Extra oracles: at most one reply to a non-SYN segment in LISTEN and to any segment while a half-open persists. It found the FIN-before-out-of-order-data invariant break. |
 | `tcb_client_session` | Drives the **active-open send/retransmit** path (`connect` → scripted SACK-enabled handshake → `send` → fuzzer-chosen cumulative-ACK offsets, SACK blocks, and clock jumps that fire TLP/RTO). Asserts the internal `TcpError::Overflow` invariant code never escapes the API. This is the path the `tcp_tick: -9` TLP partial-ACK bug lived in. |
 | `tcb_loopback` | Drives **two real stacks** (client + server) against each other through a fuzzer-controlled chaos channel with a *finite drop budget* (so the channel is eventually reliable). Oracle: the bidirectional transfer **must always converge** — a stack that deadlocks (e.g. the PRR ACK-clock stall: recovery with `snd_credit == 0` and an empty pipe) never does, and trips the iteration budget. A per-step **liveness** oracle (below) trips the same black-hole the *instant* it forms, and the harness fast-forwards its clock to the next armed timer at quiescence so a missing timer surfaces in a fraction of the runtime. This is the deadlock / sender-stall catcher that the single-peer targets cannot be (their synthetic peer may legitimately stall the connection). |
 | `tcb_loopback_small` | Same engine and oracles as `tcb_loopback` but with **8 KiB rings** (vs. the megabyte default). Tiny windows keep the connection in perpetual slow-start + loss-recovery, driving the credit / flight / reassembly-hole edge states — where deadlocks hide — at many times the exec/s. The large-ring variant additionally covers ring wrap-around; run both. |
 
-Both `tcb_*` targets treat a returned `TcpError::Overflow` as a hard
+All `tcb_*` targets treat a returned `TcpError::Overflow` as a hard
 failure: it is an *internal* "a sequence-derived buffer offset/length
 went out of range" code that must be unreachable from any inbound packet
 or timer tick. Swallowing it (as the original `tcb_inject_sequence` did)
@@ -36,8 +37,9 @@ invariants after every operation (`send` / `inject_packet` / `tick` /
 | **Livelock / quiescence** | At a *fixed* clock with nothing injected, the stack must stop emitting within a bounded number of `tick`+drain cycles. A stack that emits forever at one instant is livelocked. |
 | **Liveness / no black-hole** (`Tcb::debug_check_liveness()`) | The *deadlock* counterpart to `debug_validate_invariants` (which only checks "a timer implies outstanding data"). Checks the direction deadlocks live in: sent-but-unacked data must always have a retransmit timer (RTO/TLP/RACK) behind it, and data queued under a zero window must have a persist timer. Catches the PRR `snd_credit == 0` stall **and** a lost sole-outstanding FIN at the first quiescent step, not after the whole budget burns down. |
 | **Bounded output** | A single drain may not exceed a hard packet cap (no ACK/output storm). |
+| **No stale deadline** | At rest, `next_deadline()` lies strictly in the future (an event-driven host would otherwise spin). |
 | **Monotonic progress** | `snd_una` and `rcv_nxt` (cumulative cursors) may only advance in serial-number space. |
-| Legal state transitions | Only RFC 793 edges (`Established → FinWait1`, …); rejects impossible jumps like `Closed → Established`. |
+| Legal state transitions | Only the edges `State::debug_transition_allowed` lists — exactly those `docs/state-machine.dot` draws (a unit test compares them); rejects impossible jumps like `Closed → Established`. |
 | Bogus-ACK non-mutation | An ACK above `snd_max` must not advance/consume sender state. |
 | Duplicate-ACK idempotence | A lone duplicate pure ACK must not move sequence state or drain the send ring. |
 | No-loss convergence | A scripted lossless sub-session, after data + FIN are ACKed, must end with an empty send ring, `snd_una == snd_nxt`, and reach `FinWait2`. |
@@ -71,7 +73,7 @@ cargo +nightly fuzz run wire_parse -- -max_total_time=300 -timeout=10
 
 # All stateful targets, 1 min each (heap-backed buffers keep ASAN's stack
 # shallow — see the heap-buffers note below).
-for t in tcb_inject_sequence tcb_client_session; do
+for t in tcb_inject_sequence tcb_hostile_peer tcb_client_session; do
     cargo +nightly fuzz run "$t" -- -max_total_time=60 -timeout=10 -rss_limit_mb=4096
 done
 

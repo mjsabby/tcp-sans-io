@@ -2,7 +2,7 @@
 
 use super::{
     Deadline, Tcb, BLACKHOLE_MSS1, BLACKHOLE_MSS2, BLACKHOLE_RTO_STEP1, BLACKHOLE_RTO_STEP2,
-    MAX_RETRANSMITS, MAX_SYN_RCVD_RETRIES, MAX_SYN_RETRIES, RTO_MAX_MS,
+    MAX_RETRANSMITS, MAX_SYN_RCVD_RETRIES, MAX_SYN_RETRIES, PMTU_PROBE_MIN_MS, RTO_MAX_MS,
 };
 use crate::error::TcpError;
 use crate::rtx_queue::seg_flags;
@@ -144,7 +144,9 @@ impl<const BUF: usize> Tcb<BUF> {
     }
 
     /// Path-MTU black-hole fallback: repeated timeouts of a segment larger
-    /// than a conservative size clamp the MSS (1024, then 536).
+    /// than a conservative size clamp the MSS (1024, then 536). A plain
+    /// outage looks the same, so the clamp is provisional: probe segments at
+    /// the next larger size later restore it if the path carries them.
     fn blackhole_check(&mut self) {
         let target = if self.rtx_count >= BLACKHOLE_RTO_STEP2 {
             BLACKHOLE_MSS2
@@ -155,7 +157,15 @@ impl<const BUF: usize> Tcb<BUF> {
         };
         let head = self.rtx.get(0).map_or(0, |s| s.payload_len());
         if self.pmtu_mss > target && head > u32::from(target).saturating_sub(12) {
+            if self.pmtu_restore_mss == 0 {
+                self.pmtu_restore_mss = self.pmtu_mss;
+                self.pmtu_probe_backoff_ms = PMTU_PROBE_MIN_MS;
+            }
             self.pmtu_mss = target;
+            self.pmtu_probe_inflight = false;
+            self.pmtu_probe_at = self
+                .now_ms
+                .saturating_add(u64::from(self.pmtu_probe_backoff_ms));
         }
     }
 

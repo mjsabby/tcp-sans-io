@@ -83,3 +83,98 @@ impl State {
         )
     }
 }
+
+#[cfg(any(test, feature = "std"))]
+impl State {
+    /// Every state change one API call (`inject_packet`, `tick`, `connect`,
+    /// `listen`, `close`, `abort`, …) can make. The fuzz targets panic on any
+    /// other move, and `docs/state-machine.dot` must draw exactly these edges
+    /// (checked by a unit test), so the diagram cannot drift from the code.
+    pub fn debug_transition_allowed(self, next: State) -> bool {
+        use State::*;
+        self == next
+            || matches!(
+                (self, next),
+                (Closed, SynSent | Listen)
+                    // SYN; a valid cookie ACK (possibly carrying a FIN);
+                    // close() / abort().
+                    | (Listen, SynRcvd | Established | CloseWait | Closed)
+                    // SYN-ACK; simultaneous open; RST / timeout / abort().
+                    | (SynSent, Established | SynRcvd | Closed)
+                    // Third ACK (or a cookie ACK taking over the slot),
+                    // possibly with a FIN; close(); recycle; abort.
+                    | (SynRcvd, Established | CloseWait | FinWait1 | Listen | Closed)
+                    | (Established, FinWait1 | CloseWait | Closed)
+                    | (FinWait1, FinWait2 | Closing | TimeWait | Closed)
+                    | (FinWait2, TimeWait | Closed)
+                    | (Closing, TimeWait | Closed)
+                    | (TimeWait, Closed | Listen)
+                    | (CloseWait, LastAck | Closed)
+                    | (LastAck, Closed)
+            )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::panic)]
+    extern crate std;
+    use super::State;
+    use std::collections::BTreeSet;
+
+    const ALL: [State; 11] = [
+        State::Closed,
+        State::SynSent,
+        State::Established,
+        State::FinWait1,
+        State::FinWait2,
+        State::Closing,
+        State::TimeWait,
+        State::CloseWait,
+        State::LastAck,
+        State::Listen,
+        State::SynRcvd,
+    ];
+
+    fn by_name(name: &str) -> State {
+        *ALL.iter()
+            .find(|s| std::format!("{s:?}") == name)
+            .unwrap_or_else(|| panic!("unknown state {name} in state-machine.dot"))
+    }
+
+    /// The committed diagram draws exactly the transitions the code allows.
+    #[test]
+    fn state_machine_diagram_matches_the_transition_relation() {
+        let dot = include_str!("../docs/state-machine.dot");
+        let mut drawn = BTreeSet::new();
+        for line in dot.lines() {
+            let line = line.trim();
+            if line.starts_with("//") {
+                continue;
+            }
+            let Some((from, rest)) = line.split_once("->") else {
+                continue;
+            };
+            let to: std::string::String = rest
+                .trim_start()
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric())
+                .collect();
+            drawn.insert((by_name(from.trim()) as u8, by_name(&to) as u8));
+        }
+        let mut allowed = BTreeSet::new();
+        for a in ALL {
+            for b in ALL {
+                if a != b && a.debug_transition_allowed(b) {
+                    allowed.insert((a as u8, b as u8));
+                }
+            }
+        }
+        let missing: std::vec::Vec<_> = allowed.difference(&drawn).collect();
+        let extra: std::vec::Vec<_> = drawn.difference(&allowed).collect();
+        assert!(
+            missing.is_empty() && extra.is_empty(),
+            "diagram drift: not drawn {missing:?}, drawn but not allowed {extra:?}"
+        );
+    }
+}

@@ -18,7 +18,7 @@ use std::alloc::{alloc, dealloc, Layout};
 use tcp_sans_io::ffi::{
     tcp_abi_version, tcp_close, tcp_connect, tcp_destroy, tcp_extract_packet, tcp_handle_align,
     tcp_handle_size, tcp_init, tcp_inject_packet, tcp_listen, tcp_max_packet, tcp_recv, tcp_selftest,
-    tcp_send, tcp_state, tcp_tick, TcpStreamHandle,
+    tcp_send, tcp_set_secret, tcp_state, tcp_tick, TcpStreamHandle,
 };
 
 const ST_ESTABLISHED: u8 = 2;
@@ -68,6 +68,11 @@ impl Handle {
     }
 
     fn listen(&self, now: u64) {
+        // A listener requires a secret; this in-process harness needs no
+        // unpredictability, so a fixed one is fine.
+        let secret = [0x5au8; 16];
+        // SAFETY: live handle owned by this wrapper; `secret` is 16 bytes.
+        assert_eq!(unsafe { tcp_set_secret(self.ptr, secret.as_ptr()) }, 0);
         // SAFETY: live handle owned by this wrapper.
         assert_eq!(unsafe { tcp_listen(self.ptr, now) }, 0);
     }

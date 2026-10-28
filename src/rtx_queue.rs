@@ -17,9 +17,20 @@
 //! Capacity is bounded by [`RTX_QUEUE_CAP`]; the sender never transmits new
 //! data while the queue is full, so the bound is a cap on segments in flight
 //! (≈1.4 MiB at a 1448-byte MSS — above the default 1 MiB window).
+//!
+//! A per-slot bitmap mirrors the `SACKED` flag so SACK processing and the
+//! RACK scan step over SACKed runs a 64-slot word at a time: an ACK whose
+//! blocks span an already SACKed queue (every duplicate ACK of a recovery
+//! episode — or a hostile peer repeating one) costs a binary search and at
+//! most 16 bitmap words per block, not a walk over every segment.
 
 /// Maximum number of segments in flight.
 pub const RTX_QUEUE_CAP: usize = 1024;
+
+/// Words in the per-slot SACKed bitmap (the capacity is a multiple of 64,
+/// so a word never spans the ring's wrap point).
+const SACK_WORDS: usize = RTX_QUEUE_CAP / 64;
+const _: () = assert!(RTX_QUEUE_CAP.is_multiple_of(64));
 
 /// Per-segment state bits.
 pub mod seg_flags {
@@ -79,6 +90,8 @@ fn seq_le(a: u32, b: u32) -> bool {
 /// Bounded FIFO of [`Seg`]s.
 pub struct RtxQueue {
     segs: [Seg; RTX_QUEUE_CAP],
+    /// Bit `p` is set iff the segment in physical slot `p` is SACKed.
+    sacked_map: [u64; SACK_WORDS],
     head: usize,
     len: usize,
     sacked: u32,
@@ -106,6 +119,7 @@ impl RtxQueue {
                 xmit_seq: 0,
                 flags: 0,
             }; RTX_QUEUE_CAP],
+            sacked_map: [0; SACK_WORDS],
             head: 0,
             len: 0,
             sacked: 0,
@@ -123,6 +137,7 @@ impl RtxQueue {
         self.lost = 0;
         self.retrans = 0;
         self.lost_hint = 0;
+        self.sacked_map = [0; SACK_WORDS];
     }
 
     #[inline]
@@ -165,6 +180,75 @@ impl RtxQueue {
     }
 
     #[inline]
+    fn sacked_bit(&self, p: usize) -> bool {
+        self.sacked_map
+            .get(p / 64)
+            .is_some_and(|w| w & (1u64 << (p % 64)) != 0)
+    }
+
+    #[inline]
+    fn set_sacked_bit(&mut self, p: usize, on: bool) {
+        if let Some(w) = self.sacked_map.get_mut(p / 64) {
+            let m = 1u64 << (p % 64);
+            if on {
+                *w |= m;
+            } else {
+                *w &= !m;
+            }
+        }
+    }
+
+    /// Move the SACKed bits of the `count` slots from physical slot `from`
+    /// (circularly) up one slot, as `split` moves the entries: word at a
+    /// time, highest bits first, so no source bit is overwritten unread.
+    fn shift_sacked_bits_up(&mut self, from: usize, count: usize) {
+        let low_mask = |n: usize| if n >= 64 { !0u64 } else { (1u64 << n) - 1 };
+        let mut left = count;
+        while left > 0 {
+            // The highest remaining source bit and the run below it in its word.
+            let hi = (from + left - 1) % RTX_QUEUE_CAP;
+            let (w, top) = (hi / 64, hi % 64);
+            let n = left.min(top + 1);
+            let lo = top + 1 - n;
+            let src = (self.sacked_map.get(w).copied().unwrap_or(0) >> lo) & low_mask(n);
+            // Bit 63 carries into bit 0 of the next word (wrapping the ring).
+            let stay = if top == 63 {
+                if let Some(next) = self.sacked_map.get_mut((w + 1) % SACK_WORDS) {
+                    *next = (*next & !1) | (src >> (n - 1));
+                }
+                n - 1
+            } else {
+                n
+            };
+            if let Some(word) = self.sacked_map.get_mut(w).filter(|_| stay > 0) {
+                let mask = low_mask(stay) << (lo + 1);
+                *word = (*word & !mask) | ((src & low_mask(stay)) << (lo + 1) & mask);
+            }
+            left -= n;
+        }
+    }
+
+    /// Logical index of the first segment at or after `from` that is not
+    /// SACKed. Visits at most one bitmap word per 64 slots.
+    pub fn next_unsacked(&self, from: usize) -> Option<usize> {
+        let mut i = from;
+        while i < self.len {
+            let p = self.phys(i);
+            let bit = p % 64;
+            let word = self.sacked_map.get(p / 64).copied().unwrap_or(0);
+            // Bit k of `clear` set ⇔ slot p + k is not SACKed.
+            let clear = !word >> bit;
+            let span = (64 - bit).min(self.len - i);
+            let k = clear.trailing_zeros() as usize;
+            if k < span {
+                return Some(i + k);
+            }
+            i += span;
+        }
+        None
+    }
+
+    #[inline]
     pub fn get(&self, i: usize) -> Option<&Seg> {
         if i >= self.len {
             return None;
@@ -197,6 +281,7 @@ impl RtxQueue {
             *slot = Seg { xmit_seq, ..seg };
             self.next_xmit = xmit_seq.wrapping_add(1);
             self.len += 1;
+            self.set_sacked_bit(p, seg.has(SACKED));
             true
         } else {
             false
@@ -234,6 +319,8 @@ impl RtxQueue {
         if let Some(s) = self.get_mut(i) {
             s.flags = flags;
         }
+        let p = self.phys(i);
+        self.set_sacked_bit(p, flags & SACKED != 0);
         if flags & LOST != 0 && flags & RETRANS == 0 && i < self.lost_hint {
             self.lost_hint = i;
         }
@@ -267,7 +354,7 @@ impl RtxQueue {
         if !(seq_lt(s.start, at) && seq_lt(at, s.end)) || self.is_full() {
             return false;
         }
-        // Shift entries i+1.. up by one.
+        // Shift entries i+1.. up by one (and their SACKed bits with them).
         let mut j = self.len;
         while j > i + 1 {
             let src = self.segs.get(self.phys(j - 1)).copied();
@@ -277,6 +364,7 @@ impl RtxQueue {
             }
             j -= 1;
         }
+        self.shift_sacked_bits_up(self.phys(i + 1), self.len - (i + 1));
         self.len += 1;
         let lower = Seg {
             end: at,
@@ -290,6 +378,8 @@ impl RtxQueue {
         if let Some(d) = self.get_mut(i + 1) {
             *d = upper;
         }
+        let p = self.phys(i + 1);
+        self.set_sacked_bit(p, s.has(SACKED));
         if i + 1 < self.lost_hint {
             self.lost_hint += 1;
         }
@@ -364,14 +454,24 @@ impl RtxQueue {
             if !seq_lt(s.start, r) {
                 break;
             }
+            if s.has(SACKED) {
+                // Step over the whole SACKed run at once.
+                match self.next_unsacked(i + 1) {
+                    Some(j) => {
+                        i = j;
+                        continue;
+                    }
+                    None => break,
+                }
+            }
             if seq_lt(r, s.end) {
                 // Block ends inside this segment: split, then SACK the lower part.
-                if s.has(SACKED) || !self.split(i, r) {
+                if !self.split(i, r) {
                     break;
                 }
                 continue;
             }
-            if !s.has(SACKED) && seq_le(l, s.start) {
+            if seq_le(l, s.start) {
                 let nf = (s.flags | SACKED) & !(LOST | RETRANS);
                 self.set_flags(i, nf);
                 newly = newly.saturating_add(s.seq_len());
@@ -468,6 +568,9 @@ impl RtxQueue {
             }
             if s.has(SACKED) && s.has(LOST | RETRANS) {
                 return Err("rtx: SACKED segment also LOST/RETRANS");
+            }
+            if self.sacked_bit(self.phys(i)) != s.has(SACKED) {
+                return Err("rtx: SACKed bitmap out of sync");
             }
             if s.has(RETRANS) && !s.has(EVER_RETRANS) {
                 return Err("rtx: RETRANS without EVER_RETRANS");
@@ -598,5 +701,75 @@ mod tests {
             200
         );
         q.debug_valid(base, base.wrapping_add(400)).unwrap();
+    }
+
+    #[test]
+    fn sacked_bitmap_shift_matches_a_bit_by_bit_move() {
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rnd = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for _ in 0..2_000 {
+            let mut q = RtxQueue::new();
+            for w in q.sacked_map.iter_mut() {
+                *w = rnd();
+            }
+            let from = (rnd() % RTX_QUEUE_CAP as u64) as usize;
+            let count = (rnd() % RTX_QUEUE_CAP as u64) as usize;
+            let mut want = q.sacked_map;
+            let bit = |m: &[u64; SACK_WORDS], p: usize| m[p / 64] >> (p % 64) & 1;
+            for k in (0..count).rev() {
+                let (s, d) = ((from + k) % RTX_QUEUE_CAP, (from + k + 1) % RTX_QUEUE_CAP);
+                let b = bit(&want, s);
+                want[d / 64] = (want[d / 64] & !(1 << (d % 64))) | (b << (d % 64));
+            }
+            q.shift_sacked_bits_up(from, count);
+            assert_eq!(q.sacked_map, want, "from {from} count {count}");
+        }
+    }
+
+    #[test]
+    fn next_unsacked_skips_runs_across_words_and_the_ring_wrap() {
+        let mut q = q_with(1000, 10);
+        // Move the head so the live range wraps the ring's end.
+        q.ack_to(1000 + 900 * 10, |_, _| ());
+        for k in 1000..1900u32 {
+            assert!(q.push(Seg {
+                start: 1000 + k * 10,
+                end: 1000 + (k + 1) * 10,
+                ..Seg::default()
+            }));
+        }
+        let first = q.get(0).unwrap().start;
+        assert_eq!(q.len(), 1000);
+        // SACK everything except logical 0, 130 and 999.
+        q.sack(first + 10, first + 1300, |_| ());
+        q.sack(first + 1310, first + 9990, |_| ());
+        q.debug_valid(first, first + 10_000).unwrap();
+        assert_eq!(q.next_unsacked(0), Some(0));
+        assert_eq!(q.next_unsacked(1), Some(130));
+        assert_eq!(q.next_unsacked(131), Some(999));
+        assert_eq!(q.next_unsacked(1000), None);
+        // A repeated block over the SACKed runs only adds the hole at 130.
+        assert_eq!(q.sack(first + 10, first + 9990, |_| ()), 10);
+        assert_eq!(q.sack(first + 10, first + 9990, |_| ()), 0);
+        // Splitting keeps the bitmap aligned with the shifted entries.
+        assert!(q.split(0, first + 5));
+        q.debug_valid(first, first + 10_000).unwrap();
+        assert_eq!(q.next_unsacked(2), Some(999 + 1));
+        // Cumulative ACK past the run; reused (formerly SACKed) slots start
+        // un-SACKed.
+        q.ack_to(first + 9990, |_, _| ());
+        assert!(q.push(Seg {
+            start: first + 10_000,
+            end: first + 10_010,
+            ..Seg::default()
+        }));
+        assert_eq!(q.next_unsacked(0), Some(0));
+        assert_eq!(q.next_unsacked(1), Some(1));
+        q.debug_valid(first + 9990, first + 10_010).unwrap();
     }
 }

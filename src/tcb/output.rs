@@ -6,7 +6,7 @@
 //! (RFC 9293 §3.8.6.2.1). Sequence numbers are never rewound; a
 //! retransmission re-sends a queued segment in place.
 
-use super::{seq_gt, Deadline, Tcb};
+use super::{seq_gt, seq_lt, Deadline, Tcb, BLACKHOLE_MSS1, PMTU_PROBE_MAX_MS, PMTU_PROBE_MIN_MS};
 use crate::congestion;
 use crate::error::TcpError;
 use crate::rtx_queue::{seg_flags, Seg};
@@ -90,9 +90,12 @@ impl<const BUF: usize> Tcb<BUF> {
         }
         let mss = self.mss_payload();
         let avail = self.usable_window().min(unsent);
+        let probe = self.pmtu_probe_len().filter(|&(len, _)| avail >= len);
         // Sender SWS avoidance: a full segment, everything that is queued,
         // or at least half the largest window the peer ever offered.
-        let len = if avail >= mss {
+        let len = if let Some((plen, _)) = probe {
+            plen
+        } else if avail >= mss {
             mss
         } else if avail > 0 && (avail == unsent || avail >= self.max_snd_wnd / 2) {
             avail
@@ -106,7 +109,52 @@ impl<const BUF: usize> Tcb<BUF> {
             self.cc.on_idle_restart(congestion::initial_window(mss));
         }
         let fin = self.fin_owed() && len == unsent;
-        self.emit_new(len, fin)
+        let seq = self.snd_nxt;
+        let sent = self.emit_new(len, fin)?;
+        if let (true, Some((plen, cap))) = (sent, probe) {
+            self.pmtu_probe_inflight = true;
+            self.pmtu_probe_mss = cap;
+            self.pmtu_probe_start = seq;
+            self.pmtu_probe_end = seq.wrapping_add(plen);
+        }
+        Ok(sent)
+    }
+
+    /// After a black-hole clamp, the next new segment may be a path-MTU
+    /// probe: `(payload, MSS cap)` one size step up, sent only from a calm
+    /// state (no recovery, no unanswered timeout). Normal segments stay at
+    /// the clamped size until a probe gets through.
+    fn pmtu_probe_len(&self) -> Option<(u32, u16)> {
+        if self.pmtu_restore_mss == 0
+            || self.pmtu_probe_inflight
+            || self.now_ms < self.pmtu_probe_at
+            || self.rtx_count != 0
+            || self.cc.state() != congestion::CaState::Open
+        {
+            return None;
+        }
+        let next = if self.pmtu_mss < BLACKHOLE_MSS1 && self.pmtu_restore_mss > BLACKHOLE_MSS1 {
+            BLACKHOLE_MSS1
+        } else {
+            self.pmtu_restore_mss
+        };
+        let cap = self.local_mss.min(self.peer_mss).min(next);
+        let ts = if self.ts_enabled { 12 } else { 0 };
+        let len = u32::from(cap).saturating_sub(ts);
+        (len > self.mss_payload()).then_some((len, next))
+    }
+
+    /// The probe had to be retransmitted: the larger size is (still) not
+    /// getting through, or the path was lossy. Back off and retry later.
+    fn pmtu_probe_failed(&mut self) {
+        self.pmtu_probe_inflight = false;
+        self.pmtu_probe_backoff_ms = self
+            .pmtu_probe_backoff_ms
+            .saturating_mul(2)
+            .clamp(PMTU_PROBE_MIN_MS, PMTU_PROBE_MAX_MS);
+        self.pmtu_probe_at = self
+            .now_ms
+            .saturating_add(u64::from(self.pmtu_probe_backoff_ms));
     }
 
     /// Transmit `len` new bytes at `SND.NXT` (plus a FIN if `fin`).
@@ -159,6 +207,12 @@ impl<const BUF: usize> Tcb<BUF> {
         let Some(mut s) = self.rtx.get(i).copied() else {
             return Ok(false);
         };
+        if self.pmtu_probe_inflight
+            && seq_lt(s.start, self.pmtu_probe_end)
+            && seq_gt(s.end, self.pmtu_probe_start)
+        {
+            self.pmtu_probe_failed();
+        }
         if s.payload_len() > mss && self.rtx.split(i, s.start.wrapping_add(mss)) {
             if let Some(n) = self.rtx.get(i).copied() {
                 s = n;
@@ -456,8 +510,13 @@ impl<const BUF: usize> Tcb<BUF> {
     }
 
     /// Wire window field and the byte window it represents. SYN windows are
-    /// unscaled (RFC 7323 §2.3). Rounding to the scale granularity never
-    /// shrinks the previously advertised right edge.
+    /// unscaled (RFC 7323 §2.3). Rounding to the scale granularity does not
+    /// shrink the previously advertised right edge, but is capped at the free
+    /// space rounded up to one scale unit: rounding up against the advertised
+    /// edge on every ACK otherwise let that edge creep forward by up to
+    /// `2^shift - 1` bytes per ACK, so a full buffer never advertised a zero
+    /// window. Past the cap it rounds down — a sub-unit retraction that window
+    /// scaling makes unavoidable (RFC 7323 §2.4).
     fn outbound_window(&self, is_syn: bool) -> (u16, u32) {
         let adv = self.advertised_window();
         if is_syn {
@@ -473,6 +532,10 @@ impl<const BUF: usize> Tcb<BUF> {
         let mut units = adv >> shift;
         if (units << shift) < cur {
             units = cur.div_ceil(1u32 << shift);
+            let cap = (self.recv_ring.free() as u32).div_ceil(1u32 << shift);
+            if units > cap {
+                units = cur >> shift;
+            }
         }
         let units = units.min(u32::from(u16::MAX));
         (units as u16, units << shift)

@@ -65,24 +65,8 @@ fn check(tcb: &Tcb) {
 }
 
 fn allowed_transition(prev: State, next: State) -> bool {
-    use State::*;
-    if prev == next {
-        return true;
-    }
-    matches!(
-        (prev, next),
-        (Closed, SynSent | Listen)
-            | (Listen, SynRcvd | Closed)
-            | (SynRcvd, Established | Listen | FinWait1 | Closed)
-            | (SynSent, Established | Closed)
-            | (Established, FinWait1 | CloseWait | Closed)
-            | (FinWait1, FinWait2 | Closing | TimeWait | Closed)
-            | (FinWait2, TimeWait | Closed)
-            | (Closing, TimeWait | Closed)
-            | (TimeWait, Closed)
-            | (CloseWait, LastAck | Closed)
-            | (LastAck, Closed)
-    )
+    // The one relation `docs/state-machine.dot` draws (checked by a unit test).
+    prev.debug_transition_allowed(next)
 }
 
 #[track_caller]

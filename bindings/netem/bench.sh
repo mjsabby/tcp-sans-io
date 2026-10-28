@@ -3,7 +3,7 @@
 #
 # Topology, rebuilt from scratch for every run (no cached TCP metrics):
 #
-#   tsb-tx                          tsb-mid (router)             tsb-rx
+#   $NS-tx                          $NS-mid (router)             $NS-rx
 #   tcp-sans-io ⇄ TUN tsb0 ─┐                                    kernel_peer.py
 #     (tsbench, 10.203.1.2) ├─ tx0 ══ mid0 ─[netem]─ mid1 ══ rx0  sink / source
 #   Linux TCP (10.203.0.1) ─┘        ─[netem]─                   (10.203.2.2)
@@ -28,7 +28,11 @@
 #
 # TSB_PCAP=DIR captures packet headers at the receiver's interface for every
 # run into DIR/<profile>-<dir>-<stack>-<run>.pcap. TSB_CPU=N picks the CPU a
-# sending tcp-sans-io endpoint is pinned to (default 2).
+# sending tcp-sans-io endpoint is pinned to (default 2). TSB_NS=PREFIX names
+# the run's network namespaces (default tsb<pid>, so concurrent runs from
+# different checkouts never tear down each other's path); runs on one host
+# are serialized by /run/lock/tcp-sans-io-bench.lock so they do not compete
+# for the link or the pinned CPU.
 set -euo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -76,12 +80,30 @@ if [[ $EUID -ne 0 ]]; then
     fi
     args=(--profiles "$profiles" --runs "$runs" --dir "$dir" --stacks "$stacks" --out "$out")
     [[ -n "$baseline_lib" ]] && args+=(--baseline-lib "$baseline_lib")
-    exec sudo env TSB_PCAP="${TSB_PCAP:-}" TSB_CPU="${TSB_CPU:-2}" "$0" "${args[@]}"
+    exec sudo env TSB_PCAP="${TSB_PCAP:-}" TSB_CPU="${TSB_CPU:-2}" TSB_NS="${TSB_NS:-}" \
+        "$0" "${args[@]}"
 fi
 [[ -n "$baseline_lib" ]] && stacks="$stacks tcp-sans-io@base"
 [[ -x "$HERE/tsbench" ]] || { echo "build $HERE/tsbench first" >&2; exit 1; }
 
-TX=tsb-tx MID=tsb-mid RX=tsb-rx
+# One benchmark at a time per host: concurrent runs would share the CPU and
+# skew each other's numbers.
+exec 9>/run/lock/tcp-sans-io-bench.lock
+if ! flock -n 9; then
+    echo "bench.sh: waiting for another run to finish (/run/lock/tcp-sans-io-bench.lock)" >&2
+    flock 9
+fi
+# Per-run namespace names: fixed ones let one run's teardown destroy
+# another's network path mid-transfer.
+NS=${TSB_NS:-tsb$$}
+TX=$NS-tx MID=$NS-mid RX=$NS-rx
+# Namespaces of earlier runs that died without tearing down (named
+# tsb<pid>-*, pid gone). Safe under the lock.
+for ns in $(ip netns list | awk '{print $1}' | grep -E '^tsb[0-9]+-(tx|mid|rx)$' || true); do
+    pid=${ns#tsb}
+    pid=${pid%%-*}
+    kill -0 "$pid" 2>/dev/null || ip netns del "$ns" 2>/dev/null || true
+done
 TX_IP=10.203.0.1 RX_IP=10.203.2.2 OUR_IP=10.203.1.2
 PORT=18181
 TMP=$(mktemp -d /tmp/tsb.XXXXXX)

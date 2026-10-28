@@ -83,6 +83,12 @@ int32_t tcp_destroy(TcpStreamHandle* handle);
 
 /* ---- Connection control ----------------------------------------------- */
 int32_t tcp_connect(TcpStreamHandle* handle, uint64_t now_ms);
+/* Passive open (CLOSED / TIME_WAIT -> LISTEN). Requires tcp_set_secret (or
+ * tcp_set_cookie_secret) first: TCP_ERR_INVALID_STATE otherwise. The listener
+ * holds one half-open handshake statefully and answers SYNs from other peers
+ * with SYN cookies while that slot is busy; a valid cookie ACK takes the slot
+ * over. Those replies go to other peers than the half-open's: route outbound
+ * packets by their destination address, not by handle. */
 int32_t tcp_listen (TcpStreamHandle* handle, uint64_t now_ms);
 int32_t tcp_close  (TcpStreamHandle* handle, uint64_t now_ms);
 /* Abort the connection: queues a TCP RST+ACK in the TX ring, transitions
@@ -94,8 +100,10 @@ int32_t tcp_close  (TcpStreamHandle* handle, uint64_t now_ms);
 int32_t tcp_abort  (TcpStreamHandle* handle, uint64_t now_ms);
 int32_t tcp_tick   (TcpStreamHandle* handle, uint64_t now_ms);
 
-/* Install a 16-byte secret enabling stateless SYN cookies (RFC 4987).
- * `secret` must point to exactly 16 readable bytes from a CSPRNG. */
+/* Install (or rotate to) an explicit 16-byte SYN-cookie key (RFC 4987) from a
+ * CSPRNG; without it the key is derived from tcp_set_secret. Cookies issued
+ * under the previous key stay valid, so rotate at most every ~2 minutes.
+ * `secret` must point to exactly 16 readable bytes. */
 int32_t tcp_set_cookie_secret(TcpStreamHandle* handle, const uint8_t* secret);
 
 /* Reconfigure/disable TCP keepalive (RFC 9293 3.8.4). After `idle_ms` of
@@ -121,8 +129,10 @@ int32_t tcp_set_user_timeout(TcpStreamHandle* handle, uint64_t now_ms,
 
 /* Install a 16-byte host secret from a CSPRNG. Keys the per-connection TCP
  * timestamp offset (so TSval reveals neither the host clock nor a
- * cross-connection correlator) and per-SYN ISNs on stateful listeners.
- * Call before tcp_connect / tcp_listen. Recommended for internet-facing use. */
+ * cross-connection correlator), passive-open ISNs and, unless
+ * tcp_set_cookie_secret installed one, the SYN-cookie key. Call before
+ * tcp_connect / tcp_listen; required by tcp_listen, recommended for any
+ * internet-facing connection. */
 int32_t tcp_set_secret(TcpStreamHandle* handle, const uint8_t* secret);
 
 /* Set the IPv4 path MTU (clamped to 576..1500) BEFORE the handshake: the MSS
@@ -135,12 +145,14 @@ int32_t tcp_set_mtu(TcpStreamHandle* handle, uint16_t mtu);
  * needed" the host received). Shrinks the segment size for the rest of the
  * connection and retransmits in-flight segments that no longer fit. Without
  * ICMP the stack still clamps the MSS after repeated timeouts of large
- * segments (path-MTU black-hole fallback). */
+ * segments (path-MTU black-hole fallback), then probes the larger size again
+ * (after 10 s, backing off to 10 min) and restores it once a probe arrives. */
 int32_t tcp_update_pmtu(TcpStreamHandle* handle, uint64_t now_ms, uint16_t mtu);
 
 /* FIN_WAIT_2 timeout (0 disables; default 60 s): after our FIN is ACKed the
- * peer must send its FIN within this long (refreshed whenever it sends data),
- * otherwise the connection is reset. Bounds peers that half-close forever. */
+ * peer must send its FIN within this long, otherwise the connection is reset.
+ * Only the application reading received data (tcp_recv) restarts it, so a
+ * peer trickling bytes nobody reads cannot hold a closed connection. */
 int32_t tcp_set_fin_wait2_timeout(TcpStreamHandle* handle, uint64_t now_ms,
                                   uint32_t timeout_ms);
 

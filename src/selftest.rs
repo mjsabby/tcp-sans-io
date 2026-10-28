@@ -118,6 +118,9 @@ fn run(cli: &mut Tcb<SELFTEST_BUF>, srv: &mut Tcb<SELFTEST_BUF>) -> i32 {
     let mut now: u64 = 0;
     cli.set_now(now);
     srv.set_now(now);
+    // A listener requires a secret; this in-process loopback needs no
+    // unpredictability, so a fixed one is fine.
+    srv.set_secret(&[0x5e; 16]);
     if srv.listen().is_err() || cli.connect().is_err() {
         return result::SETUP_FAILED;
     }

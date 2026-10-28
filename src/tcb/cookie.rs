@@ -5,6 +5,12 @@
 //! timestamps, the SYN-ACK's TSval additionally encodes the peer's window
 //! scale, SACK-permitted and ECN in its low 6 bits (as Linux does), so a
 //! cookie-promoted connection keeps window scaling and SACK.
+//!
+//! Listeners are hybrid: the single half-open slot is used statefully
+//! (keeping every option), and cookies answer SYNs only while that slot is
+//! busy. A cookie validates against the current key and, after a rotation,
+//! the previous one while cookies issued under it can still be valid. The
+//! key is either installed explicitly or derived from the host secret.
 
 use super::{seq_gt, Endpoint, Tcb, DEFAULT_PEER_MSS, MIN_PEER_MSS};
 use crate::error::TcpError;
@@ -32,6 +38,8 @@ pub(super) struct CookieOpts {
     pub wscale: Option<u8>,
     pub sack: bool,
     pub ecn: bool,
+    /// Validated with the key in force before the last rotation.
+    pub prev_key: bool,
 }
 
 impl<const BUF: usize> Tcb<BUF> {
@@ -80,9 +88,13 @@ impl<const BUF: usize> Tcb<BUF> {
     /// untrusted peers should call [`Tcb::set_secret`].
     pub(super) fn ts_offset_for(&self, remote: Endpoint) -> u32 {
         match self.host_key() {
-            Some(k) => Self::tuple_hash(k, self.local, remote, b'T', 0) as u32,
+            Some(k) => self.ts_offset_with(k, remote),
             None => 0,
         }
+    }
+
+    fn ts_offset_with(&self, key: &[u8; 16], remote: Endpoint) -> u32 {
+        Self::tuple_hash(key, self.local, remote, b'T', 0) as u32
     }
 
     /// RFC 6528 ISN for a passive open when a host secret is installed:
@@ -100,7 +112,14 @@ impl<const BUF: usize> Tcb<BUF> {
     }
 
     /// 32-bit cookie: top 3 bits = MSS index, low 29 bits = MAC.
-    fn compute_cookie(&self, bucket: u64, remote: Endpoint, mss_idx: u8, peer_seq: u32) -> u32 {
+    fn compute_cookie(
+        &self,
+        key: &[u8; 16],
+        bucket: u64,
+        remote: Endpoint,
+        mss_idx: u8,
+        peer_seq: u32,
+    ) -> u32 {
         let mut buf = [0u8; 25];
         let fields: [&[u8]; 7] = [
             &bucket.to_be_bytes(),
@@ -118,12 +137,13 @@ impl<const BUF: usize> Tcb<BUF> {
             }
             at += f.len();
         }
-        let mac = siphash24(&self.cookie_secret, &buf);
+        let mac = siphash24(key, &buf);
         let macbits = (mac as u32) & 0x1FFF_FFFF;
         ((u32::from(mss_idx) & 0x7) << 29) | macbits
     }
 
-    /// Answer a SYN in `LISTEN` statelessly with a cookie SYN-ACK.
+    /// Answer a SYN statelessly with a cookie SYN-ACK (the listener's
+    /// half-open slot is busy).
     pub(super) fn emit_cookie_synack(&mut self, seg: &Segment<'_>) -> Result<(), TcpError> {
         if self.tx_ring.is_full() {
             return Ok(()); // host has not drained; the peer will retry
@@ -139,7 +159,7 @@ impl<const BUF: usize> Tcb<BUF> {
             .max(MIN_PEER_MSS);
         let mss_idx = cookie_mss_index(peer_mss);
         let bucket = self.now_ms / COOKIE_TIME_BUCKET_MS;
-        let cookie = self.compute_cookie(bucket, remote, mss_idx, seg.seq);
+        let cookie = self.compute_cookie(&self.cookie_secret, bucket, remote, mss_idx, seg.seq);
 
         // Options can only be preserved through the cookie via TSval bits.
         let ts_off = self.ts_offset_for(remote);
@@ -202,14 +222,18 @@ impl<const BUF: usize> Tcb<BUF> {
         if queued {
             self.ip_id = self.ip_id.wrapping_add(1);
             self.stats.segs_out = self.stats.segs_out.saturating_add(1);
+            self.cookie_secret_used = true;
         }
         Ok(())
     }
 
-    /// Validate a bare ACK in `LISTEN` as the third leg of a cookie
-    /// handshake. On success recover the connection state, enter
-    /// `ESTABLISHED`, and process the segment normally.
-    pub(super) fn try_promote_via_cookie(&mut self, seg: &Segment<'_>) -> Result<bool, TcpError> {
+    /// Validate a bare ACK as the third leg of a cookie handshake. Never
+    /// mutates state, so a busy listener can check before giving up its
+    /// half-open.
+    pub(super) fn validate_cookie(&self, seg: &Segment<'_>) -> Option<CookieOpts> {
+        if !self.cookie_secret_set {
+            return None;
+        }
         let remote = Endpoint {
             ip: seg.src_ip,
             port: seg.src_port,
@@ -218,23 +242,61 @@ impl<const BUF: usize> Tcb<BUF> {
         let mss_idx = ((cookie >> 29) & 0x7) as u8;
         let peer_seq = seg.seq.wrapping_sub(1);
         let now_bucket = self.now_ms / COOKIE_TIME_BUCKET_MS;
-        let valid = [now_bucket, now_bucket.wrapping_sub(1)]
-            .iter()
-            .any(|&b| self.compute_cookie(b, remote, mss_idx, peer_seq) == cookie);
-        if !valid {
-            return Ok(false);
-        }
-        let opts = match decode_ts_opts(seg.options.ts) {
-            Some(o) => CookieOpts {
-                mss: cookie_mss_from_index(mss_idx),
-                ..o
-            },
-            None => return Ok(false), // malformed option bits
+        let issued_with = |key: &[u8; 16]| {
+            [now_bucket, now_bucket.wrapping_sub(1)]
+                .iter()
+                .any(|&b| self.compute_cookie(key, b, remote, mss_idx, peer_seq) == cookie)
         };
+        let prev_valid = self.prev_cookie_secret_set && self.now_ms < self.prev_cookie_until_ms;
+        let prev_key = if issued_with(&self.cookie_secret) {
+            false
+        } else if prev_valid && issued_with(&self.prev_cookie_secret) {
+            true
+        } else {
+            return None;
+        };
+        // Malformed option bits in the echoed TSval: not a cookie we issued.
+        let opts = decode_ts_opts(seg.options.ts)?;
+        Some(CookieOpts {
+            mss: cookie_mss_from_index(mss_idx),
+            prev_key,
+            ..opts
+        })
+    }
+
+    /// Validate a bare ACK in `LISTEN` as a cookie handshake's third leg and,
+    /// on success, promote (see [`Self::promote_via_cookie`]).
+    pub(super) fn try_promote_via_cookie(&mut self, seg: &Segment<'_>) -> Result<bool, TcpError> {
+        match self.validate_cookie(seg) {
+            Some(opts) => self.promote_via_cookie(seg, opts).map(|()| true),
+            None => Ok(false),
+        }
+    }
+
+    /// Recover the connection state a validated cookie encodes, enter
+    /// `ESTABLISHED`, and process the segment normally.
+    pub(super) fn promote_via_cookie(
+        &mut self,
+        seg: &Segment<'_>,
+        opts: CookieOpts,
+    ) -> Result<(), TcpError> {
+        let remote = Endpoint {
+            ip: seg.src_ip,
+            port: seg.src_port,
+        };
+        let cookie = seg.ack.wrapping_sub(1);
+        let peer_seq = seg.seq.wrapping_sub(1);
 
         self.reset_connection_state();
         self.remote = remote;
-        self.ts_offset = self.ts_offset_for(remote);
+        // Without a host secret the cookie key also keys the timestamp
+        // offset: use the key the SYN-ACK was built with, or our TSvals
+        // would jump and the peer's PAWS would discard them.
+        self.ts_offset = if opts.prev_key && !self.secret_set {
+            self.ts_offset_with(&self.prev_cookie_secret, remote)
+        } else {
+            self.ts_offset_for(remote)
+        };
         self.iss = cookie;
         self.irs = peer_seq;
         self.rcv_nxt = peer_seq.wrapping_add(1);
@@ -263,9 +325,21 @@ impl<const BUF: usize> Tcb<BUF> {
             crate::congestion::Reno::new(crate::congestion::initial_window(self.mss_payload()));
         self.state = State::Established;
         self.on_established();
-        self.on_synchronized(seg)?;
-        Ok(true)
+        self.on_synchronized(seg)
     }
+}
+
+/// SYN-cookie key derived from the host secret (domain-separated from the
+/// timestamp-offset and ISN hashes), so a listener with only a host secret
+/// still answers SYNs statelessly while its half-open slot is busy.
+pub(super) fn derive_cookie_key(secret: &[u8; 16]) -> [u8; 16] {
+    let lo = siphash24(secret, b"tcp-sans-io syn-cookie key 0").to_le_bytes();
+    let hi = siphash24(secret, b"tcp-sans-io syn-cookie key 1").to_le_bytes();
+    let mut key = [0u8; 16];
+    for (d, s) in key.iter_mut().zip(lo.iter().chain(hi.iter())) {
+        *d = *s;
+    }
+    key
 }
 
 /// Decode the option bits a cookie SYN-ACK hid in its TSval, from the third
@@ -276,6 +350,7 @@ fn decode_ts_opts(ts: Option<(u32, u32)>) -> Option<CookieOpts> {
         wscale: None,
         sack: false,
         ecn: false,
+        prev_key: false,
     };
     // No timestamps, or a zero TSecr (nothing echoed): no preserved options.
     let Some((_, tsecr)) = ts.filter(|&(_, e)| e != 0) else {
@@ -389,6 +464,7 @@ mod tests {
             wscale: None,
             sack: false,
             ecn: false,
+            prev_key: false,
         });
         assert_eq!((o.wscale, o.sack, o.ecn), (Some(7), true, false));
         let none = decode_ts_opts(Some((1, TS_OPT_WS_MASK)));
