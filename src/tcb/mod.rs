@@ -328,6 +328,9 @@ pub struct Tcb<const BUF: usize = BUF_CAP> {
     /// segment (RFC 6937 §3 / Linux "reno SACK"): bytes counted that way,
     /// subtracted from `pipe` until the cumulative ACK covers them.
     reno_sacked: u32,
+    /// Segments reported duplicate by the D-SACKs believed so far (cf. Linux
+    /// `dsack_dups`); never more than `stats.segs_retrans`.
+    dsack_segs: u64,
     cc: Reno,
     /// Sender was cwnd-limited in the current round (gates cwnd growth).
     cwnd_limited: bool,
@@ -343,14 +346,20 @@ pub struct Tcb<const BUF: usize = BUF_CAP> {
     /// acknowledged. Tracked explicitly: `SND.UNA == ISS` alone cannot tell,
     /// because SND.UNA returns to ISS after every 2^32 bytes sent.
     syn_unacked: bool,
+    /// Sequence space acknowledged since ISS (SYN, data and FIN), like
+    /// Linux's `bytes_acked`: an acceptable ACK never reaches below it.
+    snd_acked: u64,
 
     // ---- Buffers.
     send_ring: Ring<BUF>,
     recv_ring: Ring<BUF>,
     /// Out-of-order ranges parked in `recv_ring`'s free space.
     ooo: OooList,
-    /// A FIN seen beyond `RCV.NXT` (processed when the gap closes).
-    ooo_fin: Option<u32>,
+    /// The peer's FIN while it lies beyond `RCV.NXT`. RFC 9293 processes
+    /// segments in SEG.SEQ order, so it takes effect only once `RCV.NXT`
+    /// reaches it, and data processed ahead of it that covers its sequence
+    /// number overrides it (see `input.rs`).
+    ooo_fin: Option<HeldFin>,
     /// D-SACK block to report on the next ACK (RFC 2883).
     dsack: Option<(u32, u32)>,
 
@@ -451,6 +460,15 @@ pub(crate) fn seq_lt(a: u32, b: u32) -> bool {
 #[inline]
 pub(crate) fn seq_in_range(x: u32, lo: u32, hi_exclusive: u32) -> bool {
     x.wrapping_sub(lo) < hi_exclusive.wrapping_sub(lo)
+}
+
+/// A FIN that arrived beyond `RCV.NXT`, with the first sequence number of
+/// the segment that carried it (the FIN itself for a bare FIN), which is
+/// its place in SEG.SEQ processing order.
+#[derive(Clone, Copy, Debug)]
+struct HeldFin {
+    start: u32,
+    seq: u32,
 }
 
 impl<const BUF: usize> Tcb<BUF> {
@@ -593,6 +611,7 @@ impl<const BUF: usize> Tcb<BUF> {
         self.tlp_is_retrans = false;
         self.dup_acks = 0;
         self.reno_sacked = 0;
+        self.dsack_segs = 0;
         self.cc = Reno::new(congestion::initial_window(u32::from(self.local_mss)));
         self.cwnd_limited = false;
         self.cwnd_limited_seq = self.iss;
@@ -601,6 +620,7 @@ impl<const BUF: usize> Tcb<BUF> {
         self.syn_xmit_ms = 0;
         self.syn_retransmitted = false;
         self.syn_unacked = false;
+        self.snd_acked = 0;
         self.send_ring.clear();
         self.recv_ring.clear();
         self.ooo.clear();
@@ -757,12 +777,12 @@ impl<const BUF: usize> Tcb<BUF> {
                 return Err("out-of-order data beyond the receive buffer");
             }
         }
-        if let Some(f) = self.ooo_fin {
-            if !self.state.can_recv() || !seq_gt(f, self.rcv_nxt) {
+        if let Some(h) = self.ooo_fin {
+            if !self.state.can_recv() || !seq_gt(h.seq, self.rcv_nxt) {
                 return Err("stale out-of-order FIN");
             }
-            if self.ooo_last_end().is_some_and(|e| seq_gt(e, f)) {
-                return Err("out-of-order data beyond the peer's FIN");
+            if seq_gt(h.start, h.seq) {
+                return Err("out-of-order FIN precedes its own segment");
             }
         }
         if let Some(n) = self.tx_ring.peek_head_len() {
@@ -1190,6 +1210,12 @@ impl<const BUF: usize> Tcb<BUF> {
         self.snd_nxt = self.snd_una;
         self.syn_unacked = false;
         self.fin_sent = false;
+        self.disarm_timers();
+    }
+
+    /// Disarm every timer: a `CLOSED` TCB has no further work, so
+    /// `next_deadline()` must not wake the host for it.
+    pub(super) fn disarm_timers(&mut self) {
         self.rto_deadline = Deadline::OFF;
         self.time_wait_deadline = Deadline::OFF;
         self.fin_wait2_deadline = Deadline::OFF;

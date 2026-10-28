@@ -4,13 +4,14 @@
 //! acceptability (+ PAWS), RST (RFC 5961 §3), SYN (RFC 5961 §4), the ACK
 //! bit (segments without ACK are dropped), ACK acceptability (RFC 5961 §5 —
 //! checked before the segment may update any state), ACK processing (see
-//! [`super::ack`]), segment text, FIN. Responses to unacceptable or
-//! suspicious segments are rate limited per connection, except an immediate
-//! ACK to data or a FIN that could be the peer's own retransmission (see
-//! `may_answer_at_once`).
+//! [`super::ack`]), segment text, FIN. As in Linux, a segment with none of
+//! ACK, SYN and RST is dropped before all of that. Responses to
+//! unacceptable or suspicious segments are rate limited per connection,
+//! except an immediate ACK to data or a FIN that could be the peer's own
+//! retransmission (see `may_answer_at_once`).
 
 use super::{
-    seq_ge, seq_gt, seq_in_range, seq_le, seq_lt, Deadline, Endpoint, Tcb, DELAYED_ACK_MS,
+    seq_ge, seq_gt, seq_in_range, seq_le, seq_lt, Deadline, Endpoint, HeldFin, Tcb, DELAYED_ACK_MS,
     MIN_PEER_MSS, PAWS_IDLE_MS, TIME_WAIT_MAX_MS, TIME_WAIT_MS,
 };
 use crate::congestion::{self, Reno};
@@ -126,6 +127,7 @@ impl<const BUF: usize> Tcb<BUF> {
         };
         self.iss = self.passive_iss(self.remote, seg.seq);
         self.snd_una = self.iss;
+        self.snd_acked = 0;
         self.snd_nxt = self.iss;
         self.ts_offset = self.ts_offset_for(self.remote);
         self.absorb_syn_options(seg);
@@ -209,6 +211,7 @@ impl<const BUF: usize> Tcb<BUF> {
         // RFC 3168 §6.1.1: ECN is on iff the SYN-ACK has ECE without CWR.
         self.ecn_enabled = seg.has(flags::ECE) && !seg.has(flags::CWR);
         self.snd_una = seg.ack;
+        self.snd_acked = u64::from(seg.ack.wrapping_sub(self.iss));
         self.syn_unacked = false;
         self.rtx_count = 0;
         self.handshake_rtt_sample(seg);
@@ -233,15 +236,23 @@ impl<const BUF: usize> Tcb<BUF> {
         Ok(())
     }
 
+    /// Handshake RTT sample from the SYN's (or SYN-ACK's) own send time.
+    /// Only after a retransmission does TSecr decide which one arrived, and
+    /// only if it echoes a time between our first SYN and now (Linux checks
+    /// the same in SYN-SENT): the peer controls TSecr.
     fn handshake_rtt_sample(&mut self, seg: &Segment<'_>) {
-        let sample = match (self.ts_enabled, seg.options.ts) {
-            (true, Some((_, tsecr))) if tsecr != 0 => {
-                Some((self.now_ms as u32).wrapping_sub(self.tsecr_to_ms(tsecr)))
+        let sample = if !self.syn_retransmitted {
+            u32::try_from(self.now_ms.saturating_sub(self.syn_xmit_ms)).ok()
+        } else {
+            match (self.ts_enabled, seg.options.ts) {
+                (true, Some((_, tsecr))) if tsecr != 0 => {
+                    let t = self.tsecr_to_ms(tsecr);
+                    let now = self.now_ms as u32;
+                    (seq_ge(t, self.syn_xmit_ms as u32) && seq_le(t, now))
+                        .then_some(now.wrapping_sub(t))
+                }
+                _ => None,
             }
-            _ if !self.syn_retransmitted => {
-                u32::try_from(self.now_ms.saturating_sub(self.syn_xmit_ms)).ok()
-            }
-            _ => None,
         };
         if let Some(r) = sample {
             if r < 60_000 {
@@ -312,6 +323,7 @@ impl<const BUF: usize> Tcb<BUF> {
     fn complete_passive_open(&mut self, seg: &Segment<'_>) -> Result<(), TcpError> {
         let is_syn = seg.has(flags::SYN);
         self.snd_una = seg.ack;
+        self.snd_acked = u64::from(seg.ack.wrapping_sub(self.iss));
         self.syn_unacked = false;
         self.snd_wnd = if is_syn {
             u32::from(seg.window)
@@ -382,6 +394,12 @@ impl<const BUF: usize> Tcb<BUF> {
     }
 
     pub(super) fn on_synchronized(&mut self, seg: &Segment<'_>) -> Result<(), TcpError> {
+        // A segment with none of ACK, SYN and RST can change nothing here
+        // (step 5 drops it); Linux and BSD discard it before step 1, so it
+        // cannot draw a reply either.
+        if !seg.has(flags::ACK) && !seg.has(flags::SYN) && !seg.has(flags::RST) {
+            return Ok(());
+        }
         let payload_len = seg.payload.len() as u32;
         let fin = seg.has(flags::FIN);
         let seg_len = payload_len + u32::from(fin) + u32::from(seg.has(flags::SYN));
@@ -455,31 +473,49 @@ impl<const BUF: usize> Tcb<BUF> {
 
         let prev_rcv_nxt = self.rcv_nxt;
         let mut ack_now = false;
-        if payload_len > 0 && self.state.can_recv() {
-            ack_now |= self.receive_payload(seg);
+        // Text and FIN are taken only until the peer's FIN (RFC 9293
+        // §3.10.7.4 steps 7-8); after it they can only be bogus, and a second
+        // FIN must not advance RCV.NXT.
+        if self.state.can_recv() {
+            // Out-of-order data already parked at this FIN's sequence number,
+            // in a block that starts no later than this segment, comes first
+            // in SEG.SEQ order: the FIN is not the end of the stream.
+            let seg_fin = fin
+                .then(|| seg.seq.wrapping_add(payload_len))
+                .filter(|&f| !self.parked_ahead_of(seg.seq, f));
+            if payload_len > 0 {
+                ack_now |= self.receive_payload(seg, seg_fin);
+            }
+            if let Some(f) = seg_fin {
+                ack_now |= self.receive_fin(seg.seq, f);
+            } else if fin {
+                ack_now = true; // an overridden FIN is a duplicate: ACK at once
+            }
+            ack_now |= self.maybe_consume_ooo_fin();
         }
-        // A FIN after the peer's FIN (CLOSE-WAIT and later) is not part of
-        // the stream: it must not advance RCV.NXT.
-        if fin && self.state.can_recv() {
-            ack_now |= self.receive_fin(seg.seq.wrapping_add(payload_len));
-        }
-        self.maybe_consume_ooo_fin();
         let advanced = self.rcv_nxt != prev_rcv_nxt;
 
-        if ack_now || (fin && advanced) {
+        if ack_now {
             self.send_pure_ack()?;
         } else if advanced {
             self.schedule_delayed_ack(payload_len);
         } else if payload_len > 0 || fin {
-            // Consumed sequence space but nothing was accepted.
-            self.send_pure_ack()?;
+            // Text or a FIN after the peer's FIN: nothing was taken.
+            self.send_oow_ack()?;
         }
         self.maybe_send_data()
     }
 
-    /// Step 1 failed: reply per RFC 9293 (ACK) unless it is a RST. Only a
-    /// segment that [`Self::may_answer_at_once`] gets an immediate reply;
-    /// every other reply comes out of the rate-limited budget.
+    /// Step 1 failed. RFC 9293 answers with an ACK; RFC 5961 §5.2's ACK
+    /// window decides how. A segment whose ACK field is acceptable (which an
+    /// off-path sender would have to guess) may be the peer's: as in Linux
+    /// and BSD, its ACK field is still processed if the segment ends at or
+    /// after `Last.ACK.sent` (e.g. a retransmitted FIN that also acknowledges
+    /// ours), and if it could be the peer's own retransmission
+    /// ([`Self::may_answer_at_once`]) it is answered at once: duplicate data
+    /// with a D-SACK (RFC 2883) so the sender learns its retransmission was
+    /// spurious, a zero-window probe with our window. Every other reply comes
+    /// out of the rate-limited budget.
     fn on_unacceptable(
         &mut self,
         seg: &Segment<'_>,
@@ -489,11 +525,24 @@ impl<const BUF: usize> Tcb<BUF> {
         if seg.has(flags::RST) {
             return Ok(());
         }
-        if !self.may_answer_at_once(seg) {
+        if seg.has(flags::SYN) || !seg.has(flags::ACK) || !self.ack_acceptable(seg.ack) {
             return self.send_oow_ack();
         }
         let end = seg.seq.wrapping_add(payload_len);
-        if self.state == State::TimeWait && fin && end.wrapping_add(1) == self.rcv_nxt {
+        let right_edge = self.rcv_nxt.wrapping_add(self.recv_ring.free() as u32);
+        let ack_live = seq_ge(end.wrapping_add(u32::from(fin)), self.last_ack_sent)
+            && seq_le(seg.seq, right_edge)
+            && !self.paws_reject(seg);
+        if ack_live {
+            self.update_ts_recent(seg);
+            self.on_peer_alive();
+            self.process_ack(seg)?;
+            if self.state == State::Closed {
+                return Ok(()); // our FIN was ACKed in LAST-ACK
+            }
+        }
+        let at_once = self.may_answer_at_once(seg);
+        if at_once && self.state == State::TimeWait && fin && end.wrapping_add(1) == self.rcv_nxt {
             // RFC 9293 §3.10.7.4: a retransmitted FIN means our last ACK was
             // lost; re-ACK it and restart 2·MSL — but never beyond
             // TIME_WAIT_MAX_MS after entry, so FINs cannot pin the TCB.
@@ -502,23 +551,25 @@ impl<const BUF: usize> Tcb<BUF> {
             self.time_wait_deadline = Deadline::at(restart.min(cap));
             return self.send_pure_ack();
         }
-        // Duplicate data: answer at once, with a D-SACK (RFC 2883) so the
-        // sender learns the retransmission was spurious.
-        if payload_len > 0 && seq_le(end, self.rcv_nxt) {
+        if at_once && payload_len > 0 && seq_le(end, self.rcv_nxt) {
+            // Duplicate data: answer at once, with a D-SACK (RFC 2883) so the
+            // sender learns the retransmission was spurious.
             self.stats.dup_bytes_received = self
                 .stats
                 .dup_bytes_received
                 .saturating_add(u64::from(payload_len));
-            if self.sack_enabled {
-                self.dsack = Some((seg.seq, end));
-            }
-            return self.send_pure_ack();
+            self.note_dsack(seg.seq, end);
+            self.send_pure_ack()?;
+        } else if at_once && seq_ge(seg.seq, self.rcv_nxt) && self.recv_ring.free() == 0 {
+            // Beyond the window: the peer probing our zero window.
+            self.send_pure_ack()?;
+        } else {
+            self.send_oow_ack()?;
         }
-        // Beyond the window: the peer probing our zero window.
-        if seq_ge(seg.seq, self.rcv_nxt) && self.recv_ring.free() == 0 {
-            return self.send_pure_ack();
+        if ack_live {
+            self.maybe_send_data()?;
         }
-        self.send_oow_ack()
+        Ok(())
     }
 
     /// Whether an unacceptable data or FIN segment could be the peer's own
@@ -589,9 +640,11 @@ impl<const BUF: usize> Tcb<BUF> {
     /// Accept payload into the receive ring. In-order bytes are appended;
     /// out-of-order bytes are parked at their final offset in the ring's
     /// free space (the whole receive window can be held across a hole).
+    /// `seg_fin` is this segment's FIN, if it is to be processed: parked
+    /// bytes absorbed after in-order ones stop there.
     /// Returns `true` when an immediate ACK is due (out-of-order arrival,
     /// a filled hole, or duplicate data).
-    fn receive_payload(&mut self, seg: &Segment<'_>) -> bool {
+    fn receive_payload(&mut self, seg: &Segment<'_>, seg_fin: Option<u32>) -> bool {
         let mut seq = seg.seq;
         let mut data = seg.payload;
         let mut ack_now = false;
@@ -602,20 +655,10 @@ impl<const BUF: usize> Tcb<BUF> {
             };
             self.stats.dup_bytes_received =
                 self.stats.dup_bytes_received.saturating_add(lead as u64);
-            if self.sack_enabled {
-                self.dsack = Some((seq, self.rcv_nxt));
-            }
+            self.note_dsack(seq, self.rcv_nxt);
             data = rest;
             seq = self.rcv_nxt;
             ack_now = true;
-        }
-        // Nothing at or beyond a FIN already received can be stream data.
-        if let Some(fin_seq) = self.ooo_fin {
-            if !seq_lt(seq, fin_seq) {
-                return true;
-            }
-            let room = fin_seq.wrapping_sub(seq) as usize;
-            data = data.get(..data.len().min(room)).unwrap_or(&[]);
         }
         let free = self.recv_ring.free();
         let off = seq.wrapping_sub(self.rcv_nxt) as usize;
@@ -630,7 +673,13 @@ impl<const BUF: usize> Tcb<BUF> {
             let n = self.recv_ring.write(data);
             self.rcv_nxt = self.rcv_nxt.wrapping_add(n as u32);
             self.stats.bytes_received = self.stats.bytes_received.saturating_add(n as u64);
-            return self.absorb_ooo() || ack_now;
+            // In-order text is processed ahead of a FIN held out of order; if
+            // it covers the FIN's sequence number, that FIN was not the end
+            // of the stream (Linux drops such a FIN as fully covered).
+            if self.ooo_fin.is_some_and(|h| seq_gt(self.rcv_nxt, h.seq)) {
+                self.ooo_fin = None;
+            }
+            return self.absorb_ooo(seg_fin) || ack_now;
         }
         let end = seq.wrapping_add(take as u32);
         match self.ooo.insert(seq, end, self.rcv_nxt) {
@@ -639,9 +688,15 @@ impl<const BUF: usize> Tcb<BUF> {
                 if dup {
                     self.stats.dup_bytes_received =
                         self.stats.dup_bytes_received.saturating_add(take as u64);
-                    if self.sack_enabled {
-                        self.dsack = Some((seq, end));
-                    }
+                    self.note_dsack(seq, end);
+                }
+                // So does parked text from a segment that starts no later
+                // than the held FIN's: it comes first in SEG.SEQ order.
+                if self
+                    .ooo_fin
+                    .is_some_and(|h| seq_le(seq, h.start) && seq_gt(end, h.seq))
+                {
+                    self.ooo_fin = None;
                 }
             }
             Insert::Full => {
@@ -651,9 +706,38 @@ impl<const BUF: usize> Tcb<BUF> {
         true
     }
 
-    /// Make parked out-of-order bytes that now abut `RCV.NXT` readable.
-    fn absorb_ooo(&mut self) -> bool {
-        let new = self.ooo.advance(self.rcv_nxt);
+    /// Queue a D-SACK (RFC 2883) for duplicate bytes `[l, r)`, trimmed to
+    /// sequence space this connection can have received: nothing before the
+    /// peer's first byte, nor more than `BUF` below `RCV.NXT` (a conforming
+    /// sender never has more than our window unacknowledged, so it cannot
+    /// legitimately repeat anything older).
+    fn note_dsack(&mut self, l: u32, r: u32) {
+        if !self.sack_enabled {
+            return;
+        }
+        let span = if self.stats.bytes_received >= BUF as u64 {
+            BUF as u32
+        } else {
+            self.rcv_nxt.wrapping_sub(self.irs.wrapping_add(1))
+        };
+        let floor = self.rcv_nxt.wrapping_sub(span);
+        let l = if seq_lt(l, floor) { floor } else { l };
+        if seq_lt(l, r) {
+            self.dsack = Some((l, r));
+        }
+    }
+
+    /// Make parked out-of-order bytes that now abut `RCV.NXT` readable, but
+    /// never past a FIN that is processed before them (`seg_fin`, or one
+    /// held out of order and not overridden): nothing after it belongs to
+    /// the stream, and consuming the FIN purges the rest.
+    fn absorb_ooo(&mut self, seg_fin: Option<u32>) -> bool {
+        let mut new = self.ooo.advance(self.rcv_nxt);
+        for f in [seg_fin, self.ooo_fin.map(|h| h.seq)].into_iter().flatten() {
+            if seq_ge(f, self.rcv_nxt) && seq_gt(new, f) {
+                new = f;
+            }
+        }
         let n = new.wrapping_sub(self.rcv_nxt);
         if n == 0 {
             return false;
@@ -664,35 +748,48 @@ impl<const BUF: usize> Tcb<BUF> {
         true
     }
 
-    /// Handle a FIN occupying sequence number `fin_seq`.
-    fn receive_fin(&mut self, fin_seq: u32) -> bool {
-        if fin_seq == self.rcv_nxt {
+    /// Handle the FIN at sequence number `fin` of a segment starting at
+    /// `start`. At `RCV.NXT` it is consumed now; beyond it, it is held until
+    /// `RCV.NXT` gets there (the lowest wins, as it is reached first; a
+    /// repeat keeps the earliest start). A FIN is always ACKed at once.
+    fn receive_fin(&mut self, start: u32, fin: u32) -> bool {
+        if fin == self.rcv_nxt {
             self.consume_fin();
-        } else if seq_gt(fin_seq, self.rcv_nxt)
-            && (fin_seq.wrapping_sub(self.rcv_nxt) as usize) <= self.recv_ring.free()
+        } else if seq_gt(fin, self.rcv_nxt)
+            && (fin.wrapping_sub(self.rcv_nxt) as usize) <= self.recv_ring.free()
         {
-            // Out of order: remember it until the gap closes. The stream ends
-            // at the lowest FIN seen, so parked data beyond it is dropped.
-            let fin_seq = match self.ooo_fin {
-                Some(f) if seq_lt(f, fin_seq) => f,
-                _ => fin_seq,
-            };
-            self.ooo_fin = Some(fin_seq);
-            self.ooo.truncate_from(fin_seq, self.rcv_nxt);
+            match self.ooo_fin {
+                Some(h) if seq_lt(h.seq, fin) => {}
+                Some(h) if h.seq == fin && seq_le(h.start, start) => {}
+                _ => self.ooo_fin = Some(HeldFin { start, seq: fin }),
+            }
         }
         true
     }
 
-    fn maybe_consume_ooo_fin(&mut self) {
-        if self.ooo_fin == Some(self.rcv_nxt) && self.state.can_recv() {
+    /// Whether out-of-order data parked at `fin` comes before a FIN segment
+    /// starting at `start` in SEG.SEQ order: its block starts no later.
+    /// (Adjacent parked data forms one block, as Linux coalesces it.)
+    fn parked_ahead_of(&self, start: u32, fin: u32) -> bool {
+        self.ooo
+            .containing(fin)
+            .is_some_and(|(block, _)| seq_le(block, start))
+    }
+
+    /// Consume a FIN held out of order once `RCV.NXT` reaches it. Returns
+    /// whether it did: the caller then sends the one ACK the FIN is owed
+    /// (an extra immediate or delayed ACK would be redundant).
+    fn maybe_consume_ooo_fin(&mut self) -> bool {
+        if self.ooo_fin.is_some_and(|h| h.seq == self.rcv_nxt) && self.state.can_recv() {
             self.consume_fin();
-            let _ = self.send_pure_ack();
+            return true;
         }
+        false
     }
 
     /// The peer's FIN sits at `RCV.NXT`: consume it. Nothing follows a FIN,
-    /// so out-of-order data parked beyond it is forgotten (never delivered
-    /// or SACKed), as Linux `tcp_fin` purges its out-of-order queue.
+    /// so out-of-order data parked beyond it is forgotten (never delivered,
+    /// no longer SACKed), as Linux `tcp_fin` purges its out-of-order queue.
     fn consume_fin(&mut self) {
         self.rcv_nxt = self.rcv_nxt.wrapping_add(1);
         self.ooo.clear();

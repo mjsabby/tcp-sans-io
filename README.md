@@ -91,8 +91,8 @@ shows what that costs against Linux CUBIC on lossy long paths.
 
 ### Memory footprint
 
-Per connection, `tcp_handle_size()` is **2,176,856 bytes (≈ 2.08 MiB)** with
-default features, or **139,480 bytes (136 KiB)** with `small-buffers`:
+Per connection, `tcp_handle_size()` is **2,176,864 bytes (≈ 2.08 MiB)** with
+default features, or **139,488 bytes (136 KiB)** with `small-buffers`:
 
 - `BUF_CAP` send ring + receive ring (2 × 1 MiB; 2 × 32 KiB with
   `small-buffers`). Out-of-order data is parked inside the receive ring at
@@ -764,9 +764,9 @@ proof.
 | Layer | What it covers | Files |
 |---|---|---|
 | **Property tests** | Wire codec round-trips; checksum integrity; serial-arithmetic; out-of-order reassembly vs a model | `src/property_tests.rs` (proptest, 4096 cases each) |
-| **Security regressions** | One test per finding of the public-deployment review: blind injection, RFC 5961 challenge/rate limits, forged zero window, PAWS, timestamp poisoning by a rejected ACK, ACK storms, old-data reflection, listener RSTs, SYN-SENT RST, simultaneous open, half-open replacement, cookie options, keyed timestamps, FIN_WAIT_2, slow-reader / zero-window stalls, no SACKed retransmits, ECE handling, no sequence rewinds, full-window out-of-order, D-SACK, MTU / PMTU / black-hole, FFI stack use, NULL / zero-length / misaligned FFI arguments. Second review: TS.Recent only after ACK validation, CE on a CWR segment, FIN after the peer's FIN, zero-window probe ACKs, out-of-order data beyond a FIN, FIN_WAIT_2 trickle and TIME_WAIT pinning, keyed listener ISNs, hybrid cookies (option preservation, spoofed-SYN lockout, rotation), black-hole probing | `src/security_tests.rs` |
+| **Security regressions** | One test per finding of the public-deployment review: blind injection, RFC 5961 challenge/rate limits, forged zero window, PAWS, timestamp poisoning by a rejected ACK, ACK storms, old-data reflection, listener RSTs, SYN-SENT RST, simultaneous open, half-open replacement, cookie options, keyed timestamps, FIN_WAIT_2, slow-reader / zero-window stalls, no SACKed retransmits, ECE handling, no sequence rewinds, full-window out-of-order, D-SACK (reported and believed), forged TSecr, reply gating for unacceptable segments, MTU / PMTU / black-hole, FFI stack use, NULL / zero-length / misaligned FFI arguments. Second review: TS.Recent only after ACK validation, CE on a CWR segment, FIN after the peer's FIN, zero-window probe ACKs, out-of-order data beyond a FIN, FIN_WAIT_2 trickle and TIME_WAIT pinning, keyed listener ISNs, hybrid cookies (option preservation, spoofed-SYN lockout, rotation), black-hole probing | `src/security_tests.rs` |
 | **Link simulation** | Two real TCBs over a seeded discrete-event link (bottleneck queue, delay, loss, reordering, ACK loss, burst and tail loss, slow reader, chaos with sequence wrap). Asserts retransmissions equal drops, goodput vs the Mathis bound, TLP before RTO, clean closes, and that `next_deadline()` never leaves a host spinning | `src/sim_tests.rs` |
-| **TCB internals** | R2 / SYN retry limits, keepalive, USER TIMEOUT, lost FIN, TIME_WAIT restart (and no restart by a forged FIN), unread data across the final close, byte-exact data after SND.UNA laps back to ISS (4 GiB; release builds), in-place init, liveness oracles, deadline reporting | `src/tcb/tests.rs` |
+| **TCB internals** | R2 / SYN retry limits, keepalive, USER TIMEOUT, lost FIN, TIME_WAIT restart (and no restart by a forged FIN), FIN edge cases (FIN after FIN, out-of-order FIN consumed with one ACK and processed in SEG.SEQ order, ACK carried by a retransmitted FIN), unread data across the final close, byte-exact data after SND.UNA laps back to ISS (4 GiB; release builds), in-place init, liveness oracles, deadline reporting | `src/tcb/tests.rs` |
 | **C ABI ownership** | `tcp_destroy` releases the `heap-buffers` rings (counting allocator, own binary): `cargo test --release --features std,heap-buffers --test ffi_heap_buffers` | `tests/ffi_heap_buffers.rs` |
 | **Conformance tests** | Exact wire bytes per spec scenario | `src/conformance_tests.rs` |
 | **Loopback tests** | End-to-end behavioral tests via in-memory peer | `src/loopback_tests.rs` |
@@ -955,23 +955,30 @@ put packets on the path — is hostile.
 - **Off-path injection (RFC 5961).** Data and FINs need the ACK bit and an
   acceptable sequence; a RST is honoured only at exactly `RCV.NXT` (in
   SYN_RCVD too), a SYN in a synchronized state draws a challenge ACK, and
-  ACKs outside `[SND.UNA − MAX.SND.WND, SND.NXT]` are dropped with a
-  challenge ACK — and leave no trace: a segment failing that check cannot
+  ACKs outside `[SND.UNA − MAX.SND.WND, SND.NXT]`, or below what has
+  actually been acknowledged (an ACK of bytes never sent, as in Linux), are
+  dropped with a challenge ACK — and leave no trace: a segment failing that check cannot
   move TS.Recent (which would let PAWS discard the peer's real data), echo
   CE or count as proof of life. PAWS drops old-timestamp data, the window
   update rule ignores a forged future WL1, and the passive ISN plus
   timestamp offset are keyed per 4-tuple (`tcp_listen` requires
   `tcp_set_secret`), so neither the host clock nor sequence numbers leak.
-- **Reflection and ACK storms.** Replies to unacceptable segments
-  (challenge ACKs, dup ACKs for out-of-window data, RSTs to stray ACKs or
-  SYN-ACKs) are limited to one per 500 ms per connection, each a single
-  header-only packet of at most 80 bytes; a SYN-ACK to a listener draws at
-  most one such RST, addressed to the segment's source, and a bare ACK that
-  is not a valid cookie draws nothing. Only data or a FIN that could be the
-  peer's own retransmission — an acceptable ACK and, when negotiated, a
-  timestamp — is answered outside that budget (one ACK, with a D-SACK, per
-  segment), because the peer's loss recovery depends on it; a forger must
-  first guess an acceptable ACK.
+- **Reflection and ACK storms.** Segments with none of ACK, SYN and RST
+  are dropped unanswered. Replies to unacceptable segments (challenge ACKs,
+  dup ACKs for out-of-window data, RSTs to stray ACKs or SYN-ACKs) are
+  limited to one per 500 ms per connection, each a single header-only packet
+  of at most 80 bytes; a SYN-ACK to a listener draws at most one such RST,
+  addressed to the segment's source, and a bare ACK that is not a valid
+  cookie draws nothing. Only data or a FIN that could be the peer's own
+  retransmission — an acceptable ACK and, when negotiated, a timestamp — is
+  answered outside that budget (one ACK per segment, with a D-SACK that never
+  names sequence space the connection cannot have received), because the
+  peer's loss recovery depends on it; a forger must first guess an
+  acceptable ACK. On the sending side a D-SACK is believed only for data
+  that was actually retransmitted, and RTT samples come from our own send
+  times (TSecr only after a retransmission, and never later than it), so
+  neither a forged D-SACK nor a forged TSecr can skew loss detection or the
+  RTO.
 - **SYN floods.** A listener holds one half-open statefully (keeping every
   option) and answers every other SYN with a stateless SYN cookie (29-bit
   SipHash MAC, 64 s buckets, keyed from the host secret unless set

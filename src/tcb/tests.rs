@@ -374,6 +374,234 @@ fn data_is_byte_exact_after_snd_una_laps_back_to_iss() {
     t.debug_validate_invariants().unwrap();
 }
 
+fn peer_seg(t: &mut Tcb, seq: u32, ack: u32, fl: u8, payload: &[u8]) {
+    t.inject_packet(&peer_pkt(
+        seq,
+        ack,
+        flags::ACK | fl,
+        65535,
+        &TcpOptions::NONE,
+        payload,
+    ))
+    .unwrap();
+}
+
+/// RFC 9293 §3.10.7.4 steps 7–8: nothing at or after the peer's FIN is part
+/// of its stream. A second FIN used to advance RCV.NXT again, so our ACKs
+/// and FIN acknowledged a byte the peer never sent, and in TIME-WAIT its
+/// genuine FIN retransmission drew that bogus ACK.
+#[test]
+fn fin_after_the_peers_fin_is_ignored() {
+    let fin = PEER_ISS + 1;
+    let mut t = established();
+    t.set_now(100);
+    peer_seg(&mut t, fin, 1001, flags::FIN, &[]);
+    assert_eq!(t.state(), State::CloseWait);
+    peer_seg(&mut t, fin + 1, 1001, flags::FIN, &[]);
+    assert_eq!(t.rcv_nxt, fin + 1);
+    drain(&mut t);
+    t.close().unwrap();
+    let out = drain(&mut t);
+    assert!(out.iter().all(|p| p.1 == fin + 1), "{out:?}");
+
+    let mut t = established();
+    t.close().unwrap();
+    drain(&mut t);
+    t.set_now(100);
+    peer_seg(&mut t, fin, 1002, flags::FIN, &[]);
+    assert_eq!(t.state(), State::TimeWait);
+    peer_seg(&mut t, fin + 1, 1002, flags::FIN, &[]);
+    drain(&mut t);
+    t.set_now(5_000);
+    peer_seg(&mut t, fin, 1002, flags::FIN, &[]); // genuine retransmission
+    let re = drain(&mut t);
+    assert_eq!(re.len(), 1);
+    assert_eq!(re[0].1, fin + 1);
+}
+
+/// A retransmitted FIN lies wholly below RCV.NXT, so step 1 rejects it,
+/// yet it may carry the only ACK of our FIN. Linux and BSD still process
+/// the ACK field of a segment ending at or after the ACK we last sent, so
+/// CLOSING and LAST-ACK finish without waiting for our FIN's RTO.
+#[test]
+fn ack_on_a_retransmitted_fin_is_processed() {
+    let fin = PEER_ISS + 1;
+    let mut t = established();
+    t.close().unwrap();
+    drain(&mut t);
+    t.set_now(100);
+    peer_seg(&mut t, fin, 1001, flags::FIN, &[]); // the FINs cross
+    assert_eq!(t.state(), State::Closing);
+    drain(&mut t);
+    t.set_now(150);
+    peer_seg(&mut t, fin, 1002, flags::FIN, &[]);
+    assert_eq!(t.state(), State::TimeWait);
+    let re = drain(&mut t);
+    assert_eq!(re.len(), 1, "the retransmitted FIN is re-ACKed");
+    assert_eq!(re[0].1, fin + 1);
+
+    let mut t = established();
+    t.set_now(100);
+    peer_seg(&mut t, fin, 1001, flags::FIN, &[]);
+    t.close().unwrap();
+    assert_eq!(t.state(), State::LastAck);
+    drain(&mut t);
+    t.set_now(150);
+    peer_seg(&mut t, fin, 1002, flags::FIN, &[]);
+    assert_eq!(t.state(), State::Closed);
+}
+
+/// Segments the peer sends in TIME-WAIT are proof of life, so they re-arm
+/// the keepalive clock: a FIN it re-sends because our ACK was lost (its ACK
+/// field is processed) or a pure ACK. When 2·MSL expires the CLOSED TCB
+/// must still report no deadline, or an event-driven host keeps waking for
+/// a dead connection.
+#[test]
+fn time_wait_expiry_leaves_no_timer_after_peer_segments() {
+    let fin = PEER_ISS + 1;
+    for (seq, fl) in [(fin, flags::FIN), (fin + 1, 0)] {
+        let mut t = established();
+        t.close().unwrap();
+        drain(&mut t);
+        t.set_now(100);
+        peer_seg(&mut t, fin, 1002, flags::FIN, &[]);
+        assert_eq!(t.state(), State::TimeWait);
+        drain(&mut t);
+        t.set_now(1_000);
+        peer_seg(&mut t, seq, 1002, fl, &[]);
+        let expiry = t.next_deadline().expect("2*MSL armed");
+        t.set_now(expiry);
+        t.tick().unwrap();
+        assert_eq!(t.state(), State::Closed);
+        assert_eq!(t.next_deadline(), None, "flags {fl:#x}");
+    }
+}
+
+/// RFC 9293 processes segments in SEG.SEQ order, so a FIN held beyond
+/// RCV.NXT takes effect only when RCV.NXT reaches it. Data processed ahead
+/// of it that covers its sequence number shows it was not the end of the
+/// stream (a forged FIN, say), and the FIN is dropped, as Linux drops a
+/// fully covered FIN: in-order data, or out-of-order data from a segment
+/// that starts no later than the FIN's, whichever arrives first.
+#[test]
+fn held_fin_is_overridden_by_data_processed_ahead_of_it() {
+    let d = PEER_ISS + 1;
+    let mut buf = [0u8; 512];
+
+    let mut t = established();
+    peer_seg(&mut t, d + 50, 1001, flags::FIN, &[]);
+    peer_seg(&mut t, d, 1001, 0, &[1; 100]);
+    assert_eq!((t.state(), t.rcv_nxt), (State::Established, d + 100));
+    assert_eq!(t.recv(&mut buf), Ok(100));
+    t.debug_validate_invariants().unwrap();
+    peer_seg(&mut t, d + 100, 1001, flags::FIN, &[]);
+    assert_eq!(t.state(), State::CloseWait, "the real FIN still closes");
+
+    // A bare FIN at d+150 and a FIN after text from d+120, against data
+    // [d+100, d+200) arriving before or after the FIN.
+    for (fin_start, data_first) in [(150, false), (150, true), (120, false), (120, true)] {
+        let mut t = established();
+        let fin_text = std::vec![3u8; 150 - fin_start as usize];
+        if data_first {
+            peer_seg(&mut t, d + 100, 1001, 0, &[2; 100]);
+        }
+        peer_seg(&mut t, d + fin_start, 1001, flags::FIN, &fin_text);
+        if !data_first {
+            peer_seg(&mut t, d + 100, 1001, 0, &[2; 100]);
+        }
+        t.debug_validate_invariants().unwrap();
+        peer_seg(&mut t, d, 1001, 0, &[1; 100]);
+        assert_eq!(
+            (t.state(), t.rcv_nxt),
+            (State::Established, d + 200),
+            "FIN segment from d+{fin_start}, data first: {data_first}"
+        );
+        t.debug_validate_invariants().unwrap();
+    }
+}
+
+/// The other half of SEG.SEQ order: data from a segment that starts after
+/// the FIN's segment is processed after the FIN, so the FIN ends the stream
+/// and the data past it is purged, in either arrival order. That includes
+/// an in-order FIN segment and data parked beyond its FIN, where the FIN
+/// used to be lost.
+#[test]
+fn fin_segment_wins_over_data_that_starts_after_it() {
+    let d = PEER_ISS + 1;
+    let mut buf = [0u8; 512];
+    for data_first in [false, true] {
+        let mut t = established();
+        if data_first {
+            peer_seg(&mut t, d + 130, 1001, 0, &[9; 100]);
+        }
+        peer_seg(&mut t, d + 100, 1001, flags::FIN, &[2; 50]);
+        if !data_first {
+            peer_seg(&mut t, d + 130, 1001, 0, &[9; 100]);
+        }
+        peer_seg(&mut t, d, 1001, 0, &[1; 100]);
+        assert_eq!(
+            (t.state(), t.rcv_nxt),
+            (State::CloseWait, d + 151),
+            "data first: {data_first}"
+        );
+        assert_eq!(t.recv(&mut buf), Ok(150));
+        t.debug_validate_invariants().unwrap();
+    }
+
+    let mut t = established();
+    peer_seg(&mut t, d + 50, 1001, 0, &[9; 100]);
+    peer_seg(&mut t, d, 1001, flags::FIN, &[1; 100]);
+    assert_eq!((t.state(), t.rcv_nxt), (State::CloseWait, d + 101));
+    assert_eq!(t.recv(&mut buf), Ok(100));
+    assert_eq!(&buf[..100], &[1u8; 100][..]);
+    t.debug_validate_invariants().unwrap();
+}
+
+/// An out-of-order FIN is consumed once, when the gap closes: with a
+/// single ACK (it used to be two, or one plus a redundant delayed ACK for a
+/// bare FIN), never skipped by bytes queued past it (they were delivered
+/// and the FIN lost), and never displaced by a later, higher FIN.
+#[test]
+fn out_of_order_fin_is_consumed_once_and_never_skipped() {
+    let d = PEER_ISS + 1;
+    let mut t = established();
+    peer_seg(&mut t, d + 100, 1001, flags::FIN, &[2; 100]);
+    drain(&mut t);
+    peer_seg(&mut t, d, 1001, 0, &[1; 100]);
+    let out = drain(&mut t);
+    assert_eq!(out.len(), 1, "{out:?}");
+    assert_eq!((out[0].1, t.state()), (d + 201, State::CloseWait));
+
+    let mut t = established();
+    peer_seg(&mut t, d + 100, 1001, flags::FIN, &[]);
+    drain(&mut t);
+    peer_seg(&mut t, d, 1001, 0, &[1; 100]);
+    assert_eq!(drain(&mut t).len(), 1);
+    t.set_now(t.now_ms + 500);
+    t.tick().unwrap();
+    assert!(drain(&mut t).is_empty(), "redundant delayed ACK");
+
+    let mut buf = [0u8; 512];
+    let mut t = established();
+    peer_seg(&mut t, d + 100, 1001, flags::FIN, &[2; 100]);
+    peer_seg(&mut t, d + 200, 1001, 0, &[3; 100]);
+    peer_seg(&mut t, d, 1001, 0, &[1; 100]);
+    assert_eq!(t.state(), State::CloseWait);
+    assert_eq!(
+        t.recv(&mut buf).unwrap(),
+        200,
+        "bytes past the FIN delivered"
+    );
+    t.debug_validate_invariants().unwrap();
+
+    let mut t = established();
+    peer_seg(&mut t, d + 100, 1001, flags::FIN, &[]);
+    peer_seg(&mut t, d + 300, 1001, flags::FIN, &[]);
+    peer_seg(&mut t, d, 1001, 0, &[1; 100]);
+    assert_eq!(t.state(), State::CloseWait);
+    assert_eq!(t.rcv_nxt, d + 101);
+}
+
 #[test]
 fn keepalive_reaps_vanished_idle_peer_and_spares_live_one() {
     let mut t = established();
