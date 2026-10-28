@@ -72,6 +72,10 @@ pub mod events {
 
 /// 2*MSL — RFC 793 specifies 2 minutes; 60 s as Linux (`TCP_TIMEWAIT_LEN`).
 const TIME_WAIT_MS: u64 = 60_000;
+/// Longest a TCB may stay in `TIME_WAIT`. A retransmitted FIN restarts the
+/// 2·MSL timer (RFC 9293 §3.10.7.4), but never past this cap after entry, so
+/// a peer re-sending its FIN cannot hold the (≈2 MiB) TCB indefinitely.
+const TIME_WAIT_MAX_MS: u64 = 2 * TIME_WAIT_MS;
 const RTO_MAX_MS: u32 = 60_000;
 const RTO_MIN_MS: u32 = 200;
 /// Delayed-ACK quantum (Linux default is 40 ms; RFC 5681 caps at 500 ms).
@@ -110,8 +114,10 @@ const DEFAULT_KEEPALIVE_IDLE_MS: u32 = 600_000;
 const DEFAULT_KEEPALIVE_INTVL_MS: u32 = 60_000;
 const DEFAULT_KEEPALIVE_COUNT: u8 = 4;
 /// Default FIN_WAIT_2 timeout (Linux `tcp_fin_timeout`): after our FIN is
-/// acknowledged, the peer has this long (refreshed by any data it sends) to
-/// send its own FIN before the connection is reset.
+/// acknowledged, the peer has this long to send its own FIN before the
+/// connection is reset. Only the application reading received data restarts
+/// it; the peer's data alone does not, so a trickling peer cannot pin a TCB
+/// the host has already closed.
 const DEFAULT_FIN_WAIT2_TIMEOUT_MS: u32 = 60_000;
 /// Minimum spacing of responses to unacceptable / suspicious segments
 /// (RFC 5961 §7 challenge ACKs, out-of-window dup ACKs, RSTs to stray
@@ -126,6 +132,12 @@ const BLACKHOLE_RTO_STEP1: u8 = 3;
 const BLACKHOLE_RTO_STEP2: u8 = 5;
 const BLACKHOLE_MSS1: u16 = 1024;
 const BLACKHOLE_MSS2: u16 = DEFAULT_PEER_MSS;
+/// After a black-hole clamp, one segment at the next larger size probes the
+/// path (RFC 4821 spirit): the first probe goes this long after the clamp, a
+/// failed probe doubles the interval up to `PMTU_PROBE_MAX_MS`. A clamp
+/// caused by a plain outage is therefore undone within seconds.
+const PMTU_PROBE_MIN_MS: u32 = 10_000;
+const PMTU_PROBE_MAX_MS: u32 = 600_000;
 
 /// Window Scale shift count (RFC 7323 §2) we advertise, derived from the
 /// receive-ring capacity: the minimal scale that lets us advertise the
@@ -275,6 +287,18 @@ pub struct Tcb<const BUF: usize = BUF_CAP> {
     peer_mss: u16,
     /// Path-MTU cap on the MSS (lowered by `update_pmtu` / black-hole).
     pmtu_mss: u16,
+    /// MSS cap in force before a black-hole clamp (0: no clamp to undo).
+    pmtu_restore_mss: u16,
+    /// MSS cap the in-flight probe segment was sized for.
+    pmtu_probe_mss: u16,
+    /// A probe segment `[pmtu_probe_start, pmtu_probe_end)` is in flight.
+    pmtu_probe_inflight: bool,
+    pmtu_probe_start: u32,
+    pmtu_probe_end: u32,
+    /// Earliest time (ms) the next probe may be sent.
+    pmtu_probe_at: u64,
+    /// Current probe interval (ms).
+    pmtu_probe_backoff_ms: u32,
     ts_enabled: bool,
     ts_recent: u32,
     ts_recent_stamp: u64,
@@ -354,6 +378,8 @@ pub struct Tcb<const BUF: usize = BUF_CAP> {
     fin_sent: bool,
     fin_seq: u32,
     time_wait_deadline: Deadline,
+    /// When `TIME_WAIT` was entered (bounds its restarts).
+    time_wait_since_ms: u64,
     fin_wait2_timeout_ms: u32,
     fin_wait2_deadline: Deadline,
     error: Option<TcpError>,
@@ -386,8 +412,19 @@ pub struct Tcb<const BUF: usize = BUF_CAP> {
     last_oow_ms: Deadline,
 
     // ---- Secrets.
+    /// Current SYN-cookie key: installed by `set_cookie_secret`, or derived
+    /// from the host secret. `cookie_secret_set` = a cookie key is available.
     cookie_secret: [u8; 16],
     cookie_secret_set: bool,
+    /// The cookie key came from `set_cookie_secret` (not derived).
+    cookie_secret_explicit: bool,
+    /// A cookie SYN-ACK was sent under the current key.
+    cookie_secret_used: bool,
+    /// The key before the last rotation, kept while cookies issued under it
+    /// can still be valid (until `prev_cookie_until_ms`).
+    prev_cookie_secret: [u8; 16],
+    prev_cookie_secret_set: bool,
+    prev_cookie_until_ms: u64,
     secret: [u8; 16],
     secret_set: bool,
 
@@ -486,6 +523,11 @@ impl<const BUF: usize> Tcb<BUF> {
         self.is_listener = false;
         self.cookie_secret = [0; 16];
         self.cookie_secret_set = false;
+        self.cookie_secret_explicit = false;
+        self.cookie_secret_used = false;
+        self.prev_cookie_secret = [0; 16];
+        self.prev_cookie_secret_set = false;
+        self.prev_cookie_until_ms = 0;
         self.secret = [0; 16];
         self.secret_set = false;
         self.now_ms = 0;
@@ -525,6 +567,13 @@ impl<const BUF: usize> Tcb<BUF> {
         self.local_mss = self.mtu.saturating_sub(HDR_LEN);
         self.peer_mss = DEFAULT_PEER_MSS;
         self.pmtu_mss = self.local_mss;
+        self.pmtu_restore_mss = 0;
+        self.pmtu_probe_mss = 0;
+        self.pmtu_probe_inflight = false;
+        self.pmtu_probe_start = 0;
+        self.pmtu_probe_end = 0;
+        self.pmtu_probe_at = 0;
+        self.pmtu_probe_backoff_ms = 0;
         self.ts_enabled = false;
         self.ts_recent = 0;
         self.ts_recent_stamp = 0;
@@ -571,6 +620,7 @@ impl<const BUF: usize> Tcb<BUF> {
         self.fin_sent = false;
         self.fin_seq = 0;
         self.time_wait_deadline = Deadline::OFF;
+        self.time_wait_since_ms = 0;
         self.fin_wait2_deadline = Deadline::OFF;
         self.error = None;
         self.tx_ring.clear();
@@ -705,6 +755,14 @@ impl<const BUF: usize> Tcb<BUF> {
         if let Some(e) = self.ooo_last_end() {
             if e.wrapping_sub(self.rcv_nxt) as usize > self.recv_ring.free() {
                 return Err("out-of-order data beyond the receive buffer");
+            }
+        }
+        if let Some(f) = self.ooo_fin {
+            if !self.state.can_recv() || !seq_gt(f, self.rcv_nxt) {
+                return Err("stale out-of-order FIN");
+            }
+            if self.ooo_last_end().is_some_and(|e| seq_gt(e, f)) {
+                return Err("out-of-order data beyond the peer's FIN");
             }
         }
         if let Some(n) = self.tx_ring.peek_head_len() {
@@ -858,8 +916,9 @@ impl<const BUF: usize> Tcb<BUF> {
     }
 
     /// Set the FIN_WAIT_2 timeout (`0` disables). Once our FIN is ACKed, the
-    /// peer must send its FIN within this long (refreshed whenever it sends
-    /// data); otherwise the connection is reset.
+    /// peer must send its FIN within this long; otherwise the connection is
+    /// reset. The application reading received data restarts the timeout
+    /// (the host still wants the peer's half); the peer's data alone does not.
     pub fn set_fin_wait2_timeout(&mut self, ms: u32) {
         self.fin_wait2_timeout_ms = ms;
         self.fin_wait2_deadline = if ms != 0 && self.state == State::FinWait2 {
@@ -890,6 +949,12 @@ impl<const BUF: usize> Tcb<BUF> {
     /// segments that no longer fit (they were most likely dropped).
     pub fn update_pmtu(&mut self, mtu: u16) {
         let mss = mtu.clamp(MIN_MTU, MAX_MTU) - HDR_LEN;
+        // A reported MTU also bounds black-hole recovery: never probe above it.
+        self.pmtu_restore_mss = self.pmtu_restore_mss.min(mss);
+        if self.pmtu_restore_mss <= self.pmtu_mss.min(mss) {
+            self.pmtu_restore_mss = 0;
+            self.pmtu_probe_inflight = false;
+        }
         if mss >= self.pmtu_mss {
             return;
         }
@@ -909,17 +974,47 @@ impl<const BUF: usize> Tcb<BUF> {
 
     /// Install a 128-bit host secret (from a CSPRNG). Keys the per-connection
     /// timestamp offset (so TSval does not reveal the host clock, RFC 7323
-    /// §5.4) and, on listeners without cookies, per-SYN ISNs (RFC 6528).
+    /// §5.4) and per-SYN ISNs on listeners (RFC 6528). Unless
+    /// [`Tcb::set_cookie_secret`] installed an explicit cookie key, it also
+    /// derives the SYN-cookie key a listener falls back to while its
+    /// half-open slot is busy. [`Tcb::listen`] requires this (or a cookie
+    /// secret).
     pub fn set_secret(&mut self, secret: &[u8; 16]) {
         self.secret = *secret;
         self.secret_set = true;
+        if !self.cookie_secret_explicit {
+            self.install_cookie_key(cookie::derive_cookie_key(secret));
+        }
     }
 
-    /// Configure a 128-bit secret that switches a listener into stateless
-    /// SYN-cookie mode (RFC 4987). Also used as the host secret if
+    /// Install (or rotate to) an explicit 128-bit SYN-cookie key (RFC 4987),
+    /// from a CSPRNG. A listener holds one half-open handshake statefully and
+    /// answers further SYNs with cookies while that slot is busy. Cookies
+    /// issued under the previous key stay valid for their normal 64–128 s
+    /// lifetime, so rotating no more often than every ~2 minutes never breaks
+    /// a handshake in progress. Also used as the host secret if
     /// [`Tcb::set_secret`] was not called.
     pub fn set_cookie_secret(&mut self, secret: &[u8; 16]) {
-        self.cookie_secret = *secret;
+        self.install_cookie_key(*secret);
+        self.cookie_secret_explicit = true;
+    }
+
+    /// Make `key` the current cookie key. The old one keeps validating for
+    /// the lifetime of the cookies issued under it (two time buckets from
+    /// now) — and only if any were: otherwise every forged cookie ACK would
+    /// pay for a second key for nothing.
+    fn install_cookie_key(&mut self, key: [u8; 16]) {
+        if self.cookie_secret_set && self.cookie_secret != key && self.cookie_secret_used {
+            self.prev_cookie_secret = self.cookie_secret;
+            self.prev_cookie_secret_set = true;
+            self.prev_cookie_until_ms = self
+                .now_ms
+                .saturating_add(2 * cookie::COOKIE_TIME_BUCKET_MS);
+        }
+        if self.cookie_secret != key {
+            self.cookie_secret_used = false;
+        }
+        self.cookie_secret = key;
         self.cookie_secret_set = true;
     }
 
@@ -949,15 +1044,24 @@ impl<const BUF: usize> Tcb<BUF> {
     /// Passive open: `CLOSED` → `LISTEN` (also allowed from `LISTEN` and
     /// `TIME_WAIT`). The remote endpoint is wildcarded until a SYN arrives.
     ///
-    /// Without a cookie secret the listener holds one half-open connection
-    /// at a time; a half-open whose SYN-ACK has already needed a retransmit
-    /// is replaced by a SYN from a new peer, so a spoofed SYN cannot lock
-    /// the listener. With [`Tcb::set_cookie_secret`] the listener answers
-    /// SYNs statelessly and keeps no state until the handshake completes.
+    /// Requires a secret ([`Tcb::set_secret`] or [`Tcb::set_cookie_secret`]);
+    /// returns `InvalidState` otherwise. Without one, every connection the
+    /// listener accepts would get the same ISN and a TSval equal to the host
+    /// clock.
+    ///
+    /// The listener holds one half-open connection at a time, statefully, so
+    /// it keeps every option the client offers. While that slot is busy, SYNs
+    /// from other peers are answered with SYN cookies (no state); a valid
+    /// cookie ACK replaces the pending half-open, so spoofed SYNs cannot lock
+    /// the listener. A half-open whose SYN-ACK already needed a retransmit
+    /// also yields its slot to a SYN from a new peer.
     pub fn listen(&mut self) -> Result<(), TcpError> {
         match self.state {
             State::Closed | State::Listen | State::TimeWait => {}
             _ => return Err(TcpError::InvalidState),
+        }
+        if !self.secret_set && !self.cookie_secret_set {
+            return Err(TcpError::InvalidState);
         }
         self.remote = Endpoint {
             ip: [0u8; 4],
@@ -985,13 +1089,19 @@ impl<const BUF: usize> Tcb<BUF> {
 
     /// Copy received in-order data out. Returns `ConnectionClosed` once the
     /// ring is empty and the peer has FINned, `ConnectionReset` after an
-    /// abort.
+    /// abort. In `FIN_WAIT_2`, consuming data restarts the FIN_WAIT_2 timeout.
     pub fn recv(&mut self, dst: &mut [u8]) -> Result<usize, TcpError> {
         if let Some(e) = self.error {
             return Err(e);
         }
         let n = self.recv_ring.read(dst);
         if n > 0 {
+            if self.state == State::FinWait2 && self.fin_wait2_timeout_ms != 0 {
+                self.fin_wait2_deadline = Deadline::at(
+                    self.now_ms
+                        .saturating_add(u64::from(self.fin_wait2_timeout_ms)),
+                );
+            }
             self.maybe_send_window_update()?;
         }
         if n == 0 {

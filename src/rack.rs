@@ -258,9 +258,21 @@ pub fn detect_loss(rack: &Rack, q: &mut RtxQueue, now: u64, reo_wnd: u32) -> (bo
     let mut timeout = 0u64;
     let mut marked = false;
     let thresh = u64::from(rack.rtt).saturating_add(u64::from(reo_wnd));
-    for i in 0..q.len() {
-        let Some(s) = q.get(i).copied() else { break };
-        if s.has(seg_flags::SACKED) || (s.has(seg_flags::LOST) && !s.has(seg_flags::RETRANS)) {
+    let mut i = 0;
+    while let Some(s) = q.get(i).copied() {
+        if s.has(seg_flags::SACKED) {
+            // Never a candidate: step over the whole SACKed run at once.
+            match q.next_unsacked(i + 1) {
+                Some(j) => {
+                    i = j;
+                    continue;
+                }
+                None => break,
+            }
+        }
+        let idx = i;
+        i += 1;
+        if s.has(seg_flags::LOST) && !s.has(seg_flags::RETRANS) {
             continue;
         }
         if !sent_after(rack.xmit_seq, rack.end_seq, s.xmit_seq, s.end) {
@@ -273,7 +285,7 @@ pub fn detect_loss(rack: &Rack, q: &mut RtxQueue, now: u64, reo_wnd: u32) -> (bo
         }
         let deadline = s.xmit_ts.saturating_add(thresh);
         if now >= deadline {
-            q.mark_lost(i);
+            q.mark_lost(idx);
             marked = true;
         } else {
             timeout = timeout.max(deadline - now);

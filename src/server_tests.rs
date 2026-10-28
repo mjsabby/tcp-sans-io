@@ -42,7 +42,11 @@ const SERVER_ISS: u32 = 0x9000_0000;
 const CLIENT_ISS: u32 = 0x1000_0000;
 const PEER_WIN: u16 = 65_535;
 const INIT_RTO_MS: u32 = 1000;
+const HOST_SECRET: [u8; 16] = [0x5a; 16];
 
+/// A listener (not yet listening) with a host secret installed, as
+/// `listen()` requires. Its passive ISNs are keyed, so tests read the
+/// server's ISS from the SYN-ACK.
 fn make_listener() -> Tcb {
     // The remote in TcbConfig is wildcarded by `listen()` immediately, so
     // the value here doesn't matter — we pass real-looking values for
@@ -59,7 +63,9 @@ fn make_listener() -> Tcb {
         iss: SERVER_ISS,
         initial_rto_ms: INIT_RTO_MS,
     };
-    Tcb::new(cfg).expect("tcb")
+    let mut t = Tcb::new(cfg).expect("tcb");
+    t.set_secret(&HOST_SECRET);
+    t
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -215,7 +221,10 @@ fn passive_handshake_completes_and_emits_correct_synack() {
     assert_eq!(synack.src_ip, SERVER_IP);
     assert_eq!(synack.dst_ip, CLIENT_IP);
     assert_eq!(synack.flags, flags::SYN | flags::ACK);
-    assert_eq!(synack.seq, SERVER_ISS);
+    assert_ne!(
+        synack.seq, SERVER_ISS,
+        "passive ISN is keyed by the host secret (RFC 6528), not the configured ISS"
+    );
     assert_eq!(synack.ack, CLIENT_ISS.wrapping_add(1));
     assert_eq!(synack.mss, Some(1460), "SYN-ACK must offer MSS");
     let (_, tsecr) = synack.ts.expect("SYN-ACK must echo TS");
@@ -226,7 +235,7 @@ fn passive_handshake_completes_and_emits_correct_synack() {
     let ack = build_in(
         flags::ACK,
         CLIENT_ISS.wrapping_add(1),
-        SERVER_ISS.wrapping_add(1),
+        synack.seq.wrapping_add(1),
         PEER_WIN,
         None,
         Some((43, 0)),
@@ -259,13 +268,13 @@ fn passive_handshake_with_piggybacked_data_in_third_ack() {
     );
     s.set_now(1);
     s.inject_packet(&syn).expect("inject SYN");
-    let _synack = pop(&mut s);
+    let synack = pop(&mut s);
 
     let payload = b"GET / HTTP/1.0\r\n\r\n";
     let ack = build_in(
         flags::ACK | flags::PSH,
         CLIENT_ISS.wrapping_add(1),
-        SERVER_ISS.wrapping_add(1),
+        synack.seq.wrapping_add(1),
         PEER_WIN,
         None,
         Some((101, 0)),
@@ -305,7 +314,7 @@ fn syn_rcvd_retransmits_synack_on_rto_then_reverts_to_listen() {
     s.set_now(0);
     s.inject_packet(&syn).expect("inject SYN");
     assert_eq!(s.state(), State::SynRcvd);
-    let _synack0 = pop(&mut s);
+    let synack0 = pop(&mut s);
 
     // Drive RTOs without ever sending the third ACK. After enough
     // retransmits we should drop back to LISTEN, not stay wedged.
@@ -318,7 +327,7 @@ fn syn_rcvd_retransmits_synack_on_rto_then_reverts_to_listen() {
         s.tick().expect("tick");
         if let Some(p) = try_pop(&mut s) {
             assert_eq!(p.flags, flags::SYN | flags::ACK);
-            assert_eq!(p.seq, SERVER_ISS);
+            assert_eq!(p.seq, synack0.seq);
             retries += 1;
         }
         rto = (rto * 2).min(60_000);
@@ -377,14 +386,44 @@ fn syn_retransmit_in_syn_rcvd_is_idempotent() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn listen_drops_bare_ack_silently_when_no_cookie_secret() {
+fn listen_requires_a_secret() {
+    let cfg = TcbConfig {
+        local: Endpoint {
+            ip: SERVER_IP,
+            port: SERVER_PORT,
+        },
+        remote: Endpoint {
+            ip: [0; 4],
+            port: 0,
+        },
+        iss: SERVER_ISS,
+        initial_rto_ms: INIT_RTO_MS,
+    };
+    let mut s: Tcb = Tcb::new(cfg).expect("tcb");
+    assert_eq!(s.listen(), Err(crate::TcpError::InvalidState));
+    assert_eq!(s.state(), State::Closed);
+    s.set_cookie_secret(&[1; 16]);
+    s.listen().expect("a cookie secret is enough");
+    let mut t: Tcb = Tcb::new(cfg).expect("tcb");
+    t.set_secret(&[2; 16]);
+    t.listen().expect("a host secret is enough");
+    t.reinit(cfg);
+    assert_eq!(
+        t.listen(),
+        Err(crate::TcpError::InvalidState),
+        "reinit clears the secrets"
+    );
+}
+
+#[test]
+fn listen_drops_stray_bare_ack_silently() {
     let mut s = make_listener();
     s.set_now(0);
     s.listen().expect("listen");
 
-    // Forged third-ACK without a prior SYN. With cookies disabled, this
-    // must be silently dropped — never promote to ESTABLISHED — and must
-    // *not* reflect a RST (avoid amplification).
+    // Forged third-ACK without a prior SYN (not a valid cookie). It must be
+    // silently dropped — never promote to ESTABLISHED — and must *not*
+    // reflect a RST (avoid amplification).
     let bogus = build_in(
         flags::ACK,
         CLIENT_ISS.wrapping_add(1),
@@ -487,7 +526,7 @@ fn listen_rejects_packet_with_wrong_local_ip() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn syn_rcvd_rejects_off_path_syn_from_different_remote() {
+fn syn_rcvd_answers_other_peers_statelessly() {
     let mut s = make_listener();
     s.set_now(0);
     s.listen().expect("listen");
@@ -504,10 +543,11 @@ fn syn_rcvd_rejects_off_path_syn_from_different_remote() {
         &[],
     );
     s.inject_packet(&syn).expect("inject SYN");
-    let _ = pop(&mut s);
+    let synack = pop(&mut s);
     assert_eq!(s.state(), State::SynRcvd);
 
-    // Attacker on a different IP tries to inject a SYN.
+    // Another peer's SYN while the slot is busy: answered with a cookie
+    // SYN-ACK, holding no state; the half-open stays pinned to its peer.
     let attacker_syn = build_in_from(
         ATTACKER_IP,
         ATTACKER_PORT,
@@ -520,10 +560,48 @@ fn syn_rcvd_rejects_off_path_syn_from_different_remote() {
         false,
         &[],
     );
-    let err = s.inject_packet(&attacker_syn).expect_err("must reject");
-    assert!(matches!(err, crate::TcpError::NotForUs));
+    s.inject_packet(&attacker_syn)
+        .expect("busy listener answers");
+    let cookie_synack = pop(&mut s);
+    assert_eq!(cookie_synack.dst_ip, ATTACKER_IP);
+    assert_eq!(cookie_synack.flags, flags::SYN | flags::ACK);
+    assert_eq!(cookie_synack.ack, 0xdead_beef_u32.wrapping_add(1));
+    assert_ne!(cookie_synack.seq, synack.seq);
+    assert!(try_pop(&mut s).is_none());
     assert_eq!(s.state(), State::SynRcvd, "stay locked to original peer");
-    assert!(try_pop(&mut s).is_none(), "no reply to off-path SYN");
+
+    // Other segments from a stranger are still not ours.
+    let stray = build_in_from(
+        ATTACKER_IP,
+        ATTACKER_PORT,
+        flags::ACK,
+        0xdead_bef0,
+        synack.seq.wrapping_add(1),
+        PEER_WIN,
+        None,
+        None,
+        false,
+        &[],
+    );
+    assert_eq!(
+        s.inject_packet(&stray),
+        Err(crate::TcpError::NotForUs),
+        "an ACK that is not a valid cookie is not ours"
+    );
+
+    // The original handshake completes undisturbed.
+    let ack = build_in(
+        flags::ACK,
+        CLIENT_ISS.wrapping_add(1),
+        synack.seq.wrapping_add(1),
+        PEER_WIN,
+        None,
+        None,
+        false,
+        &[],
+    );
+    s.inject_packet(&ack).expect("third ACK");
+    assert_eq!(s.state(), State::Established);
 }
 
 #[test]
@@ -543,7 +621,7 @@ fn syn_rcvd_blind_ack_with_wrong_ack_value_does_not_promote() {
         &[],
     );
     s.inject_packet(&syn).expect("inject SYN");
-    let _ = pop(&mut s);
+    let synack = pop(&mut s);
 
     // Attacker (same 5-tuple — assume on-path discoverer of the SYN, but
     // can't read our SYN-ACK) tries to forge a third ACK. They guess the
@@ -551,7 +629,7 @@ fn syn_rcvd_blind_ack_with_wrong_ack_value_does_not_promote() {
     let bogus = build_in(
         flags::ACK,
         CLIENT_ISS.wrapping_add(1),
-        SERVER_ISS.wrapping_add(0xdead),
+        synack.seq.wrapping_add(0xdead),
         PEER_WIN,
         None,
         None,
@@ -625,7 +703,7 @@ fn syn_rcvd_exact_rst_reverts_to_listen() {
     let rst = build_in(
         flags::RST,
         CLIENT_ISS.wrapping_add(1),
-        SERVER_ISS.wrapping_add(1),
+        0,
         PEER_WIN,
         None,
         None,
@@ -696,13 +774,82 @@ fn syn_rcvd_non_exact_in_window_rst_is_challenged() {
     assert_eq!(s.state(), State::Established);
 }
 
+/// RFC 5961 §3.2 holds in SYN-RECEIVED too: an in-window RST that does not
+/// exactly match RCV.NXT draws a challenge ACK instead of tearing the
+/// half-open down (it used to accept any RST within the 1 MiB window).
+#[test]
+fn syn_rcvd_in_window_rst_must_match_exactly() {
+    let mut s = make_listener();
+    s.set_now(0);
+    s.listen().expect("listen");
+    let syn = build_in(
+        flags::SYN,
+        CLIENT_ISS,
+        0,
+        PEER_WIN,
+        Some(1460),
+        None,
+        false,
+        &[],
+    );
+    s.inject_packet(&syn).expect("inject SYN");
+    let synack = pop(&mut s);
+    let mut challenges = 0;
+    for k in 0..20u32 {
+        s.set_now(u64::from(k));
+        let rst = build_in(
+            flags::RST,
+            CLIENT_ISS.wrapping_add(2 + k * 4096),
+            0,
+            0,
+            None,
+            None,
+            false,
+            &[],
+        );
+        s.inject_packet(&rst).expect("inject RST");
+        while let Some(p) = try_pop(&mut s) {
+            assert_eq!(p.flags, flags::ACK, "challenge ACK");
+            assert_eq!(p.ack, CLIENT_ISS.wrapping_add(1));
+            assert_eq!(p.seq, synack.seq.wrapping_add(1));
+            challenges += 1;
+        }
+        assert_eq!(s.state(), State::SynRcvd, "non-exact RST {k} accepted");
+    }
+    assert_eq!(challenges, 1, "challenge ACKs are rate limited");
+}
+
 // ---------------------------------------------------------------------------
 // SYN-cookie (stateless) flows
 // ---------------------------------------------------------------------------
+//
+// The listener's single half-open slot is used statefully; cookies answer
+// SYNs only while it is busy. Each test first occupies the slot with a SYN
+// from a peer that never completes (a spoofed source).
 
 const COOKIE_SECRET: [u8; 16] = [
     0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe, 0xef, 0xcd, 0xab, 0x89, 0x67, 0x45, 0x23, 0x01,
 ];
+
+/// Fill the listener's half-open slot with a SYN that is never completed.
+fn occupy_slot(s: &mut Tcb) {
+    let syn = build_in_from(
+        ATTACKER_IP,
+        ATTACKER_PORT,
+        flags::SYN,
+        0x7777_0000,
+        0,
+        PEER_WIN,
+        Some(1460),
+        None,
+        false,
+        &[],
+    );
+    s.inject_packet(&syn).expect("occupying SYN");
+    let synack = pop(s);
+    assert_eq!(synack.dst_ip, ATTACKER_IP);
+    assert_eq!(s.state(), State::SynRcvd);
+}
 
 #[test]
 fn cookie_handshake_round_trip() {
@@ -710,6 +857,7 @@ fn cookie_handshake_round_trip() {
     s.set_cookie_secret(&COOKIE_SECRET);
     s.set_now(0);
     s.listen().expect("listen");
+    occupy_slot(&mut s);
 
     // SYN from client.
     let syn = build_in(
@@ -725,12 +873,13 @@ fn cookie_handshake_round_trip() {
     s.set_now(1);
     s.inject_packet(&syn).expect("inject SYN");
 
-    // Cookie SYN-ACK should appear, but state must remain LISTEN.
+    // Cookie SYN-ACK should appear; the half-open slot is untouched.
     let synack = pop(&mut s);
     assert_eq!(synack.flags, flags::SYN | flags::ACK);
+    assert_eq!(synack.dst_ip, CLIENT_IP);
     assert_eq!(synack.ack, CLIENT_ISS.wrapping_add(1));
     let cookie = synack.seq;
-    assert_eq!(s.state(), State::Listen, "stateless cookies stay in LISTEN");
+    assert_eq!(s.state(), State::SynRcvd, "cookies hold no state");
     // SACK-permitted survives the stateless handshake: it is encoded in the
     // low bits of our TSval (the peer offered timestamps).
     assert!(
@@ -776,8 +925,9 @@ fn cookie_promoted_idle_connection_is_reaped_by_default_keepalive() {
     s.set_cookie_secret(&COOKIE_SECRET);
     s.set_now(0);
     s.listen().expect("listen");
+    occupy_slot(&mut s);
 
-    // SYN → cookie SYN-ACK (stays LISTEN, holds no state).
+    // SYN → cookie SYN-ACK (holds no state for this peer).
     let syn = build_in(
         flags::SYN,
         CLIENT_ISS,
@@ -864,6 +1014,12 @@ fn cookie_rejects_forged_third_ack() {
     s.inject_packet(&forged).expect("inject forged ACK");
     assert_eq!(s.state(), State::Listen, "forged cookie must not promote");
     assert!(try_pop(&mut s).is_none(), "no reflection for failed cookie");
+
+    // Nor can a forged cookie take over a busy slot.
+    occupy_slot(&mut s);
+    assert_eq!(s.inject_packet(&forged), Err(crate::TcpError::NotForUs));
+    assert_eq!(s.state(), State::SynRcvd);
+    assert!(try_pop(&mut s).is_none());
 }
 
 #[test]
@@ -872,6 +1028,7 @@ fn cookie_handshake_survives_one_time_bucket_rollover() {
     s.set_cookie_secret(&COOKIE_SECRET);
     s.set_now(0);
     s.listen().expect("listen");
+    occupy_slot(&mut s);
 
     // SYN at t = 0.
     let syn = build_in(
@@ -905,13 +1062,15 @@ fn cookie_handshake_survives_one_time_bucket_rollover() {
     assert_eq!(s.state(), State::Established);
 }
 
-#[test]
-fn cookie_rejects_third_ack_after_secret_rotation() {
+/// Issue a cookie SYN-ACK to the client from a busy listener, rotate the
+/// cookie secret `rotations` times (each intermediate key issuing a cookie of
+/// its own), then deliver the client's third ACK.
+fn cookie_ack_after_rotations(rotations: u8) -> State {
     let mut s = make_listener();
     s.set_cookie_secret(&COOKIE_SECRET);
     s.set_now(0);
     s.listen().expect("listen");
-
+    occupy_slot(&mut s);
     let syn = build_in(
         flags::SYN,
         CLIENT_ISS,
@@ -923,13 +1082,24 @@ fn cookie_rejects_third_ack_after_secret_rotation() {
         &[],
     );
     s.inject_packet(&syn).expect("inject SYN");
-    let synack = pop(&mut s);
-    let cookie = synack.seq;
-
-    // Operator rotates the secret — outstanding cookies become invalid.
-    let new_secret = [0xAAu8; 16];
-    s.set_cookie_secret(&new_secret);
-
+    let cookie = pop(&mut s).seq;
+    for k in 0..rotations {
+        s.set_cookie_secret(&[0xA0 | k; 16]);
+        let other = build_in_from(
+            [10, 0, 0, 50 + k],
+            40_000,
+            flags::SYN,
+            0x2000_0000,
+            0,
+            PEER_WIN,
+            Some(1460),
+            None,
+            false,
+            &[],
+        );
+        s.inject_packet(&other).expect("another peer's SYN");
+        assert_eq!(pop(&mut s).dst_ip, [10, 0, 0, 50 + k]);
+    }
     let ack = build_in(
         flags::ACK,
         CLIENT_ISS.wrapping_add(1),
@@ -941,11 +1111,24 @@ fn cookie_rejects_third_ack_after_secret_rotation() {
         &[],
     );
     s.set_now(1);
-    s.inject_packet(&ack).expect("inject ACK");
+    let _ = s.inject_packet(&ack);
+    s.state()
+}
+
+/// Rotating the cookie secret keeps the previous key for validation, so a
+/// handshake in flight across a rotation still completes (it used to be
+/// silently dropped, leaving the client to hang).
+#[test]
+fn cookie_survives_one_secret_rotation() {
+    assert_eq!(cookie_ack_after_rotations(1), State::Established);
+}
+
+#[test]
+fn cookie_rejected_after_two_secret_rotations() {
     assert_eq!(
-        s.state(),
-        State::Listen,
-        "rotated secret invalidates old cookies"
+        cookie_ack_after_rotations(2),
+        State::SynRcvd,
+        "only the previous key is kept"
     );
 }
 
@@ -954,15 +1137,16 @@ fn cookie_rejects_third_ack_after_secret_rotation() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn syn_flood_under_cookies_holds_no_state() {
+fn syn_flood_under_cookies_holds_one_half_open() {
     let mut s = make_listener();
     s.set_cookie_secret(&COOKIE_SECRET);
     s.set_now(0);
     s.listen().expect("listen");
 
-    // Simulate a flood of 1000 SYNs from spoofed sources. With cookies
-    // enabled, the listener must remain in LISTEN throughout, never
-    // entering SYN_RCVD nor pinning a remote.
+    // Simulate a flood of 1000 SYNs from spoofed sources. The first takes
+    // the half-open slot; every later one is answered with a cookie and
+    // holds no state (the slot stays with the first source).
+    let mut synacks = 0;
     for i in 0..1000u32 {
         let src_ip = [10, 0, 1, (i & 0xff) as u8];
         let src_port = 30000 + ((i >> 8) & 0xffff) as u16;
@@ -979,28 +1163,25 @@ fn syn_flood_under_cookies_holds_no_state() {
             false,
             &[],
         );
-        s.set_now(i as u64);
-        // Drain any pending SYN-ACK from the previous iteration first;
-        // the FFI contract requires a drained tx_buf before inject.
-        let _ = try_pop(&mut s);
+        s.set_now(i as u64 / 4);
         s.inject_packet(&syn).expect("inject flood SYN");
-        assert_eq!(
-            s.state(),
-            State::Listen,
-            "SYN-flood iter {i} promoted state"
-        );
-        // Drain *this* iteration's cookie SYN-ACK so the next inject
-        // can run.
-        let _ = try_pop(&mut s);
+        assert_eq!(s.state(), State::SynRcvd, "SYN-flood iter {i}");
+        // Drain this iteration's SYN-ACK so the next inject can run (the
+        // FFI contract requires a drained egress ring before inject).
+        while let Some(p) = try_pop(&mut s) {
+            assert_eq!(p.dst_ip, src_ip);
+            assert_eq!(p.ack, seq.wrapping_add(1));
+            synacks += 1;
+        }
     }
+    assert_eq!(synacks, 1000, "every SYN answered");
 }
 
 #[test]
-fn syn_flood_without_cookies_caps_half_open_lifetime() {
-    // No cookie secret installed: the stateful path must still be safe,
-    // just bounded. The single-TCB design means at most one half-open at
-    // a time; an off-path attacker who knows the 5-tuple can hold the
-    // slot for at most MAX_SYN_RCVD_RETRIES retransmits before we revert.
+fn half_open_lifetime_is_capped() {
+    // The single-TCB design means at most one half-open at a time; an
+    // off-path attacker who knows the 5-tuple can hold the slot for at most
+    // MAX_SYN_RCVD_RETRIES retransmits before we revert.
     let mut s = make_listener();
     s.set_now(0);
     s.listen().expect("listen");
@@ -1070,11 +1251,11 @@ fn listen_recycles_after_clean_close() {
         &[],
     );
     s.inject_packet(&syn).expect("inject SYN");
-    let _ = pop(&mut s);
+    let synack = pop(&mut s);
     let ack = build_in(
         flags::ACK,
         CLIENT_ISS.wrapping_add(1),
-        SERVER_ISS.wrapping_add(1),
+        synack.seq.wrapping_add(1),
         PEER_WIN,
         None,
         None,
@@ -1087,7 +1268,7 @@ fn listen_recycles_after_clean_close() {
     let rst = build_in(
         flags::RST,
         CLIENT_ISS.wrapping_add(1),
-        SERVER_ISS.wrapping_add(1),
+        synack.seq.wrapping_add(1),
         PEER_WIN,
         None,
         None,
@@ -1197,7 +1378,7 @@ fn passive_handshake_negotiates_window_scale() {
     let ack = build_in_ws(
         flags::ACK,
         CLIENT_ISS.wrapping_add(1),
-        SERVER_ISS.wrapping_add(1),
+        synack.seq.wrapping_add(1),
         third_ack_win,
         None,
         None,
@@ -1249,7 +1430,7 @@ fn passive_handshake_without_ws_disables_scaling() {
     let ack = build_in(
         flags::ACK,
         CLIENT_ISS.wrapping_add(1),
-        SERVER_ISS.wrapping_add(1),
+        synack.seq.wrapping_add(1),
         1000,
         None,
         Some((43, 0)),

@@ -79,6 +79,9 @@ func setupGitListener(t *testing.T) (*cdylibListener, func()) {
 		tryRun("ip", "link", "del", name)
 		t.Fatalf("NewTcpHandle: %v", err)
 	}
+	if err := handle.SetSecret(NewSecret()); err != nil {
+		t.Fatalf("SetSecret: %v", err)
+	}
 	if err := handle.Listen(); err != nil {
 		handle.Free()
 		_ = tun.Close()

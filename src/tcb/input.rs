@@ -11,7 +11,7 @@
 
 use super::{
     seq_ge, seq_gt, seq_in_range, seq_le, seq_lt, Deadline, Endpoint, Tcb, DELAYED_ACK_MS,
-    MIN_PEER_MSS, PAWS_IDLE_MS, TIME_WAIT_MS,
+    MIN_PEER_MSS, PAWS_IDLE_MS, TIME_WAIT_MAX_MS, TIME_WAIT_MS,
 };
 use crate::congestion::{self, Reno};
 use crate::error::TcpError;
@@ -29,7 +29,7 @@ impl<const BUF: usize> Tcb<BUF> {
             if self.may_replace_half_open(seg) {
                 self.reset_to_listen_or_closed();
             } else {
-                return Err(TcpError::NotForUs);
+                return self.on_busy_listener(seg);
             }
         }
         self.stats.segs_in = self.stats.segs_in.saturating_add(1);
@@ -63,6 +63,29 @@ impl<const BUF: usize> Tcb<BUF> {
             && self.syn_rcvd_retries >= 1
     }
 
+    /// Segment from a peer other than the half-open's, while a listener's
+    /// only slot is busy (hybrid SYN cookies). SYNs are answered with a
+    /// cookie SYN-ACK, holding no state; a valid cookie ACK proves the peer
+    /// receives our packets — which a pending half-open has not yet shown —
+    /// so it takes over the slot. Spoofed SYNs therefore cannot lock a
+    /// listener out, however fast they arrive.
+    fn on_busy_listener(&mut self, seg: &Segment<'_>) -> Result<(), TcpError> {
+        if self.state != State::SynRcvd || !self.is_listener || !self.cookie_secret_set {
+            return Err(TcpError::NotForUs);
+        }
+        let ctl = seg.has(flags::RST) || seg.has(flags::FIN);
+        if seg.has(flags::SYN) && !seg.has(flags::ACK) && !ctl {
+            return self.emit_cookie_synack(seg);
+        }
+        if seg.has(flags::ACK) && !seg.has(flags::SYN) && !seg.has(flags::RST) {
+            if let Some(opts) = self.validate_cookie(seg) {
+                self.reset_to_listen_or_closed();
+                return self.promote_via_cookie(seg, opts);
+            }
+        }
+        Err(TcpError::NotForUs)
+    }
+
     // ---------------------------------------------------------------------
     // LISTEN
     // ---------------------------------------------------------------------
@@ -89,11 +112,10 @@ impl<const BUF: usize> Tcb<BUF> {
         if !seg.has(flags::SYN) || seg.has(flags::FIN) {
             return Ok(());
         }
-        if self.cookie_secret_set {
-            self.emit_cookie_synack(seg)
-        } else {
-            self.accept_syn_stateful(seg)
-        }
+        // The half-open slot is free: hold this handshake statefully, which
+        // keeps every option the client offers (cookies cannot carry window
+        // scaling or SACK without timestamps).
+        self.accept_syn_stateful(seg)
     }
 
     fn accept_syn_stateful(&mut self, seg: &Segment<'_>) -> Result<(), TcpError> {
@@ -242,6 +264,8 @@ impl<const BUF: usize> Tcb<BUF> {
             if !self.acceptable(seg.seq, 0) {
                 return Ok(()); // blind RST outside the window
             }
+            // RFC 5961 §3.2 applies here too: only an exact match resets;
+            // any other in-window RST draws a (rate-limited) challenge ACK.
             if seg.seq != self.rcv_nxt {
                 return self.send_oow_ack();
             }
@@ -364,7 +388,14 @@ impl<const BUF: usize> Tcb<BUF> {
         // A bare FIN at RCV.NXT needs no buffer space: accept it even into a
         // zero window (Linux does the same).
         let bare_fin = fin && payload_len == 0 && seg.seq == self.rcv_nxt;
-        if !(self.acceptable(seg.seq, seg_len) || bare_fin) {
+        let acceptable = self.acceptable(seg.seq, seg_len) || bare_fin;
+        // RFC 9293 §3.10.7.4: a zero window accepts no text, but "special
+        // allowance should be made to accept valid ACKs ... and RSTs". A
+        // segment at RCV.NXT (a window probe) has its control fields
+        // processed and only its text dropped, as Linux does.
+        let zero_window_probe =
+            !acceptable && seg.seq == self.rcv_nxt && self.recv_ring.free() == 0;
+        if !acceptable && !zero_window_probe {
             return self.on_unacceptable(seg, payload_len, fin);
         }
         if self.paws_reject(seg) {
@@ -402,11 +433,13 @@ impl<const BUF: usize> Tcb<BUF> {
         }
         self.update_ts_recent(seg);
         if self.ecn_enabled {
-            if seg.ecn == ecn::CE {
-                self.ce_observed = true;
-            }
+            // RFC 3168 §6.1.3: CWR ends the echo of earlier CE marks, but a
+            // CE mark on the CWR-carrying packet itself must still be echoed.
             if seg.has(flags::CWR) {
                 self.ce_observed = false;
+            }
+            if seg.ecn == ecn::CE {
+                self.ce_observed = true;
             }
         }
         self.on_peer_alive();
@@ -415,24 +448,23 @@ impl<const BUF: usize> Tcb<BUF> {
         if self.state == State::Closed {
             return Ok(()); // our FIN was ACKed in LAST-ACK
         }
+        if zero_window_probe {
+            self.send_pure_ack()?;
+            return self.maybe_send_data();
+        }
 
         let prev_rcv_nxt = self.rcv_nxt;
         let mut ack_now = false;
         if payload_len > 0 && self.state.can_recv() {
             ack_now |= self.receive_payload(seg);
         }
-        if fin {
+        // A FIN after the peer's FIN (CLOSE-WAIT and later) is not part of
+        // the stream: it must not advance RCV.NXT.
+        if fin && self.state.can_recv() {
             ack_now |= self.receive_fin(seg.seq.wrapping_add(payload_len));
         }
         self.maybe_consume_ooo_fin();
         let advanced = self.rcv_nxt != prev_rcv_nxt;
-        if advanced && self.state == State::FinWait2 && self.fin_wait2_timeout_ms != 0 {
-            // The peer is still sending on its half: keep waiting for its FIN.
-            self.fin_wait2_deadline = Deadline::at(
-                self.now_ms
-                    .saturating_add(u64::from(self.fin_wait2_timeout_ms)),
-            );
-        }
 
         if ack_now || (fin && advanced) {
             self.send_pure_ack()?;
@@ -463,8 +495,11 @@ impl<const BUF: usize> Tcb<BUF> {
         let end = seg.seq.wrapping_add(payload_len);
         if self.state == State::TimeWait && fin && end.wrapping_add(1) == self.rcv_nxt {
             // RFC 9293 §3.10.7.4: a retransmitted FIN means our last ACK was
-            // lost; re-ACK it and restart 2·MSL.
-            self.time_wait_deadline = Deadline::at(self.now_ms.saturating_add(TIME_WAIT_MS));
+            // lost; re-ACK it and restart 2·MSL — but never beyond
+            // TIME_WAIT_MAX_MS after entry, so FINs cannot pin the TCB.
+            let restart = self.now_ms.saturating_add(TIME_WAIT_MS);
+            let cap = self.time_wait_since_ms.saturating_add(TIME_WAIT_MAX_MS);
+            self.time_wait_deadline = Deadline::at(restart.min(cap));
             return self.send_pure_ack();
         }
         // Duplicate data: answer at once, with a D-SACK (RFC 2883) so the
@@ -574,6 +609,14 @@ impl<const BUF: usize> Tcb<BUF> {
             seq = self.rcv_nxt;
             ack_now = true;
         }
+        // Nothing at or beyond a FIN already received can be stream data.
+        if let Some(fin_seq) = self.ooo_fin {
+            if !seq_lt(seq, fin_seq) {
+                return true;
+            }
+            let room = fin_seq.wrapping_sub(seq) as usize;
+            data = data.get(..data.len().min(room)).unwrap_or(&[]);
+        }
         let free = self.recv_ring.free();
         let off = seq.wrapping_sub(self.rcv_nxt) as usize;
         if off >= free {
@@ -624,24 +667,37 @@ impl<const BUF: usize> Tcb<BUF> {
     /// Handle a FIN occupying sequence number `fin_seq`.
     fn receive_fin(&mut self, fin_seq: u32) -> bool {
         if fin_seq == self.rcv_nxt {
-            self.rcv_nxt = self.rcv_nxt.wrapping_add(1);
-            self.advance_state_on_remote_fin();
+            self.consume_fin();
         } else if seq_gt(fin_seq, self.rcv_nxt)
             && (fin_seq.wrapping_sub(self.rcv_nxt) as usize) <= self.recv_ring.free()
         {
-            // Out of order: remember it until the gap closes.
+            // Out of order: remember it until the gap closes. The stream ends
+            // at the lowest FIN seen, so parked data beyond it is dropped.
+            let fin_seq = match self.ooo_fin {
+                Some(f) if seq_lt(f, fin_seq) => f,
+                _ => fin_seq,
+            };
             self.ooo_fin = Some(fin_seq);
+            self.ooo.truncate_from(fin_seq, self.rcv_nxt);
         }
         true
     }
 
     fn maybe_consume_ooo_fin(&mut self) {
         if self.ooo_fin == Some(self.rcv_nxt) && self.state.can_recv() {
-            self.ooo_fin = None;
-            self.rcv_nxt = self.rcv_nxt.wrapping_add(1);
-            self.advance_state_on_remote_fin();
+            self.consume_fin();
             let _ = self.send_pure_ack();
         }
+    }
+
+    /// The peer's FIN sits at `RCV.NXT`: consume it. Nothing follows a FIN,
+    /// so out-of-order data parked beyond it is forgotten (never delivered
+    /// or SACKed), as Linux `tcp_fin` purges its out-of-order queue.
+    fn consume_fin(&mut self) {
+        self.rcv_nxt = self.rcv_nxt.wrapping_add(1);
+        self.ooo.clear();
+        self.ooo_fin = None;
+        self.advance_state_on_remote_fin();
     }
 
     fn advance_state_on_remote_fin(&mut self) {
@@ -665,6 +721,7 @@ impl<const BUF: usize> Tcb<BUF> {
 
     pub(super) fn enter_time_wait(&mut self) {
         self.time_wait_deadline = Deadline::at(self.now_ms.saturating_add(TIME_WAIT_MS));
+        self.time_wait_since_ms = self.now_ms;
         self.fin_wait2_deadline = Deadline::OFF;
         self.keepalive_deadline = Deadline::OFF;
         self.user_timeout_deadline = Deadline::OFF;

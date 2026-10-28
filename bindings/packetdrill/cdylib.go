@@ -158,6 +158,19 @@ func (h *Handle) Listen(nowMs uint64) error {
 	return nil
 }
 
+// SetSecret installs the 16-byte host secret (CSPRNG output) that keys
+// timestamp offsets, passive-open ISNs and the derived SYN-cookie key.
+// Listen requires it (or a cookie secret).
+func (h *Handle) SetSecret(secret []byte) error {
+	if len(secret) != 16 {
+		return errors.New("secret must be exactly 16 bytes")
+	}
+	if rc := C.tcp_set_secret(h.handle, (*C.uint8_t)(unsafe.Pointer(&secret[0]))); rc != 0 {
+		return fmt.Errorf("tcp_set_secret: %d", int(rc))
+	}
+	return nil
+}
+
 func (h *Handle) Close(nowMs uint64) error {
 	rc := C.tcp_close(h.handle, C.uint64_t(nowMs))
 	if rc != 0 {

@@ -386,6 +386,9 @@ class IntegrationTests(unittest.TestCase):
             )
 
         try:
+            with self.assertRaises(tcp_sans_io.TcpError):
+                server.listen(now)  # a listener requires a secret
+            server.set_secret(os.urandom(16))
             server.listen(now)
             self.assertEqual(server.state(), tcp_sans_io.State.LISTEN)
             self.assertTrue(server.poll() & tcp_sans_io.Events.LISTENING)
@@ -400,14 +403,14 @@ class IntegrationTests(unittest.TestCase):
             synack = wire.parse(pkts[0])
             self.assertTrue(synack.has(wire.SYN) and synack.has(wire.ACK))
             self.assertEqual(synack.ack, (cli_iss + 1) & 0xFFFF_FFFF)
-            self.assertEqual(synack.seq, SERVER_ISS)
+            srv_iss = synack.seq  # keyed by the secret (RFC 6528)
             self.assertEqual(server.state(), tcp_sans_io.State.SYN_RCVD)
             self.assertTrue(server.poll() & tcp_sans_io.Events.HALF_OPEN)
 
             # Third ACK → ESTABLISHED.
             now += 5
             third_ack = cli_emit(
-                wire.ACK, (cli_iss + 1) & 0xFFFF_FFFF, (SERVER_ISS + 1) & 0xFFFF_FFFF
+                wire.ACK, (cli_iss + 1) & 0xFFFF_FFFF, (srv_iss + 1) & 0xFFFF_FFFF
             )
             self.assertTrue(server.inject_packet(third_ack, now))
             drain(server, now)
@@ -418,7 +421,7 @@ class IntegrationTests(unittest.TestCase):
             ping = cli_emit(
                 wire.ACK | wire.PSH,
                 (cli_iss + 1) & 0xFFFF_FFFF,
-                (SERVER_ISS + 1) & 0xFFFF_FFFF,
+                (srv_iss + 1) & 0xFFFF_FFFF,
                 b"ping",
             )
             self.assertTrue(server.inject_packet(ping, now))
@@ -432,7 +435,7 @@ class IntegrationTests(unittest.TestCase):
             self.assertTrue(pkts, "server must emit its data")
             reply = wire.parse(pkts[-1])
             self.assertEqual(reply.payload, b"pong")
-            self.assertEqual(reply.seq, (SERVER_ISS + 1) & 0xFFFF_FFFF)
+            self.assertEqual(reply.seq, (srv_iss + 1) & 0xFFFF_FFFF)
         finally:
             server.destroy()
 

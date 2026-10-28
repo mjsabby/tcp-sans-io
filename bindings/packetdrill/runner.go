@@ -11,6 +11,7 @@
 package packetdrill
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"strconv"
@@ -57,6 +58,7 @@ type runner struct {
 	localPort, peerPort uint16
 	established         bool // any handshake happened
 	isListener          bool
+	ourISSLearned       bool
 
 	// Pending bytes to be received from the cdylib (synthetic data
 	// generator). Each --send pushes; --recv pops + verifies.
@@ -144,6 +146,10 @@ func (r *runner) runDirective(d DirectiveStep) error {
 		}
 		r.handle = h
 		r.isListener = true
+		// A listener requires a secret; a fixed one keeps runs reproducible.
+		if err := h.SetSecret(bytes.Repeat([]byte{0x5a}, 16)); err != nil {
+			return err
+		}
 		return h.Listen(r.nowMs)
 
 	case "send":
@@ -271,6 +277,15 @@ func (r *runner) runExpect(st ExpectStep) error {
 	// peer, so the dst is the peer — we pin remoteIP/peerPort from the
 	// first injected packet, not from outbound. So this is already
 	// handled.
+
+	// A listener's ISN is keyed by its secret (RFC 6528), so — like real
+	// packetdrill — learn it from our first SYN-ACK instead of assuming
+	// the configured ISS.
+	if r.isListener && !r.ourISSLearned && observed.Flags&flagSYN != 0 &&
+		st.Pkt.Seq.Mode == SeqLiteral {
+		r.sym.OurISS = observed.Seq - uint32(int32(st.Pkt.Seq.Value))
+		r.ourISSLearned = true
+	}
 
 	if err := MatchPacket(observed, st.Pkt, r.sym, SideOur); err != nil {
 		return fmt.Errorf("match: %v\n  observed: %s\n  expected: %s",

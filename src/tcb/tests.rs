@@ -449,6 +449,7 @@ fn user_timeout_rearmed_by_full_segment_progress() {
 fn close_from_syn_rcvd_keeps_invariants() {
     let mut t = Box::new(Tcb::new(cfg(5000)).unwrap());
     t.set_now(0);
+    t.set_secret(&[3; 16]);
     t.listen().unwrap();
     let o = TcpOptions {
         mss: Some(1460),

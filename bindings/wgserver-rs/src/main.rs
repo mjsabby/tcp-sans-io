@@ -121,8 +121,8 @@ options:
   --server-ip  <a.b.c.d>       virtual TCP server IP (default {DEFAULT_SERVER_IP})
   --base-port  <p>             first listening TCP port (default {DEFAULT_BASE_PORT})
   --num-listeners <N>          listener count (default {DEFAULT_NUM_LISTENERS}, max 65535)
-  --cookies <hex32|none>       enable SYN cookies with the given 16-byte secret (32 hex chars)
-                               or generate a random one if `random` is passed; default off
+  --cookies <hex32|none>       explicit SYN-cookie secret (32 hex chars), or `random`; default none
+                               (a busy listener's cookies are then keyed from the host secret)
   --memory-cap-mib <N>         refuse to run if total TCB RSS would exceed this (default {DEFAULT_MEMORY_CAP_MIB})
   --quiet                      suppress per-packet trace output
   -h, --help                   show this help

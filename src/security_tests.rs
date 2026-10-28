@@ -469,6 +469,7 @@ fn injected_segment_cannot_start_an_ack_storm() {
     let mut now = 1u64;
     a.set_now(now);
     b.set_now(now);
+    b.set_secret(&[3u8; 16]);
     b.listen().unwrap();
     a.connect().unwrap();
     let mut buf = [0u8; MAX_PACKET];
@@ -586,6 +587,7 @@ fn forged_old_data_cannot_bypass_the_reply_rate_limit() {
 #[test]
 fn listener_rst_goes_to_sender_and_is_rate_limited() {
     let mut s = new_tcb(SRV, ([0; 4], 0), 4242);
+    s.set_secret(&[3u8; 16]);
     s.set_now(0);
     s.listen().unwrap();
     let mut rsts = Vec::new();
@@ -692,13 +694,15 @@ fn simultaneous_open_completes() {
     assert_eq!(b.state(), State::Established);
 }
 
-/// A non-cookie listener holds one half-open. A spoofed SYN (whose source
-/// never completes the handshake) used to lock it for ~63 s; once the
+/// A listener holds one half-open. A spoofed SYN (whose source never
+/// completes the handshake) used to lock it for ~63 s. While the slot is
+/// busy, other peers' SYNs are answered with cookies (no state); once the
 /// half-open has needed a SYN-ACK retransmission, a SYN from a new peer
-/// replaces it.
+/// takes over the slot statefully.
 #[test]
 fn spoofed_syn_cannot_lock_stateful_listener() {
     let mut s = new_tcb(SRV, ([0; 4], 0), 4242);
+    s.set_secret(&[3u8; 16]);
     s.set_now(0);
     s.listen().unwrap();
     let syn = TcpOptions {
@@ -707,14 +711,20 @@ fn spoofed_syn_cannot_lock_stateful_listener() {
     };
     s.inject_packet(&pkt(ATTACKER, SRV, 1, 0, flags::SYN, 65535, &syn, &[]))
         .unwrap();
-    drain(&mut s);
-    // A fresh half-open is protected: a concurrent SYN is turned away...
+    let held = drain(&mut s)[0].seq;
+    // A fresh half-open keeps its slot; a concurrent SYN gets a cookie...
     s.set_now(100);
-    assert_eq!(
-        s.inject_packet(&pkt(CLI, SRV, 77, 0, flags::SYN, 65535, &syn, &[])),
-        Err(TcpError::NotForUs)
+    s.inject_packet(&pkt(CLI, SRV, 77, 0, flags::SYN, 65535, &syn, &[]))
+        .unwrap();
+    let out = drain(&mut s);
+    assert_eq!(out.len(), 1);
+    assert_eq!((out[0].dst, out[0].flags), (CLI, flags::SYN | flags::ACK));
+    assert_ne!(
+        out[0].seq, held,
+        "stateless cookie, not the half-open's ISS"
     );
-    // ...but after the first SYN-ACK retransmission (1 s RTO) it yields.
+    assert_eq!(s.state(), State::SynRcvd);
+    // ...and after the first SYN-ACK retransmission (1 s RTO) it yields.
     let mut now = 100;
     while now < 1_200 {
         now += 100;
@@ -729,6 +739,20 @@ fn spoofed_syn_cannot_lock_stateful_listener() {
     assert!(out
         .iter()
         .any(|o| o.dst == CLI && o.flags == flags::SYN | flags::ACK));
+    // The slot now belongs to CLI: its third ACK completes statefully.
+    let isn = out[0].seq;
+    s.inject_packet(&pkt(
+        CLI,
+        SRV,
+        78,
+        isn + 1,
+        flags::ACK,
+        65535,
+        &TcpOptions::NONE,
+        &[],
+    ))
+    .unwrap();
+    assert_eq!(s.state(), State::Established);
 }
 
 /// SYN cookies used to drop window scaling and SACK (64 KiB window cap, no
@@ -737,8 +761,16 @@ fn spoofed_syn_cannot_lock_stateful_listener() {
 fn cookie_connections_keep_window_scaling_and_sack() {
     let mut s = new_tcb(SRV, ([0; 4], 0), 4242);
     s.set_now(10_000);
-    s.listen().unwrap();
     s.set_cookie_secret(&[7u8; 16]);
+    s.listen().unwrap();
+    // Occupy the half-open slot so the client is answered with a cookie.
+    let mss = TcpOptions {
+        mss: Some(1460),
+        ..TcpOptions::NONE
+    };
+    s.inject_packet(&pkt(ATTACKER, SRV, 9, 0, flags::SYN, 65535, &mss, &[]))
+        .unwrap();
+    drain(&mut s);
     let o = TcpOptions {
         mss: Some(1460),
         wscale: Some(7),
@@ -750,6 +782,8 @@ fn cookie_connections_keep_window_scaling_and_sack() {
         .unwrap();
     let sa = drain(&mut s);
     let synack = &sa[0];
+    assert_eq!(synack.dst, CLI);
+    assert_eq!(s.state(), State::SynRcvd, "the client holds no state yet");
     assert!(
         synack.opts.wscale.is_some(),
         "WS offered in the cookie SYN-ACK"
@@ -856,9 +890,10 @@ fn fin_wait_2_is_bounded() {
     );
 }
 
-/// FIN_WAIT_2 is refreshed while the peer keeps sending on its half.
+/// FIN_WAIT_2 is restarted while the application keeps reading the peer's
+/// half (it still wants the data).
 #[test]
-fn fin_wait_2_survives_while_peer_sends() {
+fn fin_wait_2_survives_while_the_application_reads() {
     let (mut c, sseq, iss) = established(1000, true, false);
     c.set_now(1010);
     c.close().unwrap();
@@ -876,6 +911,7 @@ fn fin_wait_2_survives_while_peer_sends() {
     .unwrap();
     assert_eq!(c.state(), State::FinWait2);
     let mut seq = sseq;
+    let mut buf = [0u8; 64];
     for k in 1..=5u64 {
         c.set_now(1010 + k * 50_000);
         c.tick().unwrap();
@@ -892,12 +928,60 @@ fn fin_wait_2_survives_while_peer_sends() {
         .unwrap();
         seq += 4;
         drain(&mut c);
+        assert_eq!(c.recv(&mut buf).unwrap(), 4);
         assert_eq!(
             c.state(),
             State::FinWait2,
             "half-closed peer still sending at +{k}x50s"
         );
     }
+}
+
+/// After the host closed, a peer trickling bytes nobody reads used to hold
+/// FIN_WAIT_2 (and its ≈2 MiB TCB) indefinitely: each byte restarted the
+/// timeout. Only the application reading restarts it now.
+#[test]
+fn fin_wait_2_trickle_cannot_pin_a_closed_connection() {
+    let (mut c, sseq, iss) = established(1000, true, false);
+    c.set_now(1020);
+    c.close().unwrap();
+    drain(&mut c);
+    c.set_now(1030);
+    c.inject_packet(&pkt(
+        SRV,
+        CLI,
+        sseq,
+        iss + 2,
+        flags::ACK,
+        8192,
+        &ts(5, 0),
+        &[],
+    ))
+    .unwrap();
+    assert_eq!(c.state(), State::FinWait2);
+    let mut now = 1030u64;
+    for k in 0..100u32 {
+        now += 10_000;
+        c.set_now(now);
+        c.tick().unwrap();
+        if c.state() != State::FinWait2 {
+            break;
+        }
+        c.inject_packet(&pkt(
+            SRV,
+            CLI,
+            sseq + k,
+            iss + 2,
+            flags::ACK,
+            8192,
+            &ts(10 + k, 0),
+            b"x",
+        ))
+        .unwrap();
+        drain(&mut c);
+    }
+    assert_eq!(c.state(), State::Closed, "trickle kept FIN_WAIT_2 alive");
+    assert!(now <= 1030 + 70_000, "reset only after {} ms", now - 1030);
 }
 
 /// A "slow reader" that keeps the window tiny and acknowledges a few bytes
@@ -1347,4 +1431,722 @@ fn tcp_init_rejects_misaligned_storage() {
     assert_eq!(rc, TcpError::InvalidState.as_code());
     // SAFETY: matching dealloc.
     unsafe { std::alloc::dealloc(base, layout) };
+}
+
+// ---------------------------------------------------------------------------
+// Second review: protocol and hardening findings
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::too_many_arguments)]
+fn pkt_ecn(
+    src: ([u8; 4], u16),
+    dst: ([u8; 4], u16),
+    seq: u32,
+    ack: u32,
+    fl: u8,
+    win: u16,
+    opts: &TcpOptions,
+    payload: &[u8],
+    ecn: u8,
+) -> Vec<u8> {
+    let mut b = vec![0u8; 20 + 60 + payload.len()];
+    let n = wire::emit(
+        &mut b, src.0, dst.0, src.1, dst.1, seq, ack, fl, win, opts, payload, 7, ecn,
+    )
+    .unwrap();
+    b.truncate(n);
+    b
+}
+
+fn recv_all(c: &mut Tcb) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut buf = vec![0u8; 65536];
+    while let Ok(n) = c.recv(&mut buf) {
+        if n == 0 {
+            break;
+        }
+        out.extend_from_slice(&buf[..n]);
+    }
+    out
+}
+
+/// A blind segment with a guessable in-window SEQ but a bogus ACK fails the
+/// RFC 5961 §5 check — and must leave no trace. Its far-future TSval used
+/// to be copied into TS.Recent first, after which PAWS discarded every
+/// genuine data segment (the receive direction was dead for ~24 days).
+#[test]
+fn segment_failing_the_ack_check_cannot_poison_ts_recent() {
+    for pure_ack in [false, true] {
+        let (mut c, sseq, iss) = established(1000, true, false);
+        c.set_now(1020);
+        let poison = ts(0x7000_0000, 0);
+        let bogus_ack = (iss + 1).wrapping_add(0x8000_0000);
+        let forged = if pure_ack {
+            pkt(SRV, CLI, sseq, bogus_ack, flags::ACK, 8192, &poison, &[])
+        } else {
+            pkt(
+                SRV,
+                CLI,
+                sseq.wrapping_sub(1000),
+                bogus_ack,
+                flags::ACK,
+                8192,
+                &poison,
+                &[0x41; 1400],
+            )
+        };
+        c.inject_packet(&forged).unwrap();
+        drain(&mut c);
+        assert!(recv_all(&mut c).is_empty(), "forged data delivered");
+        c.set_now(1040);
+        c.inject_packet(&pkt(
+            SRV,
+            CLI,
+            sseq,
+            iss + 1,
+            flags::ACK | flags::PSH,
+            8192,
+            &ts(50, 0),
+            b"data",
+        ))
+        .unwrap();
+        assert_eq!(
+            recv_all(&mut c),
+            b"data",
+            "genuine data PAWS-rejected (pure ACK variant: {pure_ack})"
+        );
+        c.set_now(1100);
+        c.tick().unwrap(); // delayed ACK
+        let out = drain(&mut c);
+        assert_eq!(
+            out.last().unwrap().opts.ts.unwrap().1,
+            50,
+            "TSecr not poisoned"
+        );
+    }
+}
+
+/// RFC 3168 §6.1.3: CWR stops the echo of *earlier* CE marks, but a CE
+/// mark on the CWR-carrying packet itself is new congestion and must be
+/// echoed (it used to be cleared by the CWR in the same segment).
+#[test]
+fn ce_on_a_cwr_segment_is_echoed() {
+    let (mut c, sseq, iss) = established(1000, true, true);
+    c.set_now(1020);
+    c.inject_packet(&pkt_ecn(
+        SRV,
+        CLI,
+        sseq,
+        iss + 1,
+        flags::ACK | flags::PSH | flags::CWR,
+        8192,
+        &ts(5, 0),
+        &[1u8; 100],
+        wire::ecn::CE,
+    ))
+    .unwrap();
+    c.set_now(1100);
+    c.tick().unwrap();
+    let out = drain(&mut c);
+    let ack = out
+        .iter()
+        .rev()
+        .find(|o| o.flags & flags::ACK != 0)
+        .unwrap();
+    assert_ne!(ack.flags & flags::ECE, 0, "CE signal lost");
+    // A later CWR without CE does end the echo.
+    c.inject_packet(&pkt_ecn(
+        SRV,
+        CLI,
+        sseq + 100,
+        iss + 1,
+        flags::ACK | flags::PSH | flags::CWR,
+        8192,
+        &ts(6, 0),
+        &[1u8; 100],
+        wire::ecn::ECT_0,
+    ))
+    .unwrap();
+    c.set_now(1200);
+    c.tick().unwrap();
+    let out = drain(&mut c);
+    let ack = out
+        .iter()
+        .rev()
+        .find(|o| o.flags & flags::ACK != 0)
+        .unwrap();
+    assert_eq!(ack.flags & flags::ECE, 0);
+}
+
+/// After the peer's FIN, nothing it sends can occupy sequence space: a
+/// second FIN at RCV.NXT used to advance RCV.NXT, so we acknowledged a
+/// sequence number the peer never sent.
+#[test]
+fn fin_after_the_peers_fin_does_not_advance_rcv_nxt() {
+    let (mut c, sseq, iss) = established(1000, true, false);
+    c.set_now(1020);
+    c.inject_packet(&pkt(
+        SRV,
+        CLI,
+        sseq,
+        iss + 1,
+        flags::ACK | flags::FIN,
+        8192,
+        &ts(5, 0),
+        &[],
+    ))
+    .unwrap();
+    assert_eq!(c.state(), State::CloseWait);
+    drain(&mut c);
+    // A bare FIN at RCV.NXT, then one carrying data.
+    for (k, payload) in [&b""[..], b"late"].into_iter().enumerate() {
+        c.set_now(1030 + k as u64);
+        c.inject_packet(&pkt(
+            SRV,
+            CLI,
+            sseq + 1,
+            iss + 1,
+            flags::ACK | flags::FIN,
+            8192,
+            &ts(6 + k as u32, 0),
+            payload,
+        ))
+        .unwrap();
+        let out = drain(&mut c);
+        assert!(out.iter().all(|o| o.ack == sseq + 1), "{out:?}");
+        assert_eq!(c.debug_snapshot().rcv_nxt, sseq + 1);
+        assert_eq!(c.state(), State::CloseWait);
+        c.debug_validate_invariants().unwrap();
+    }
+}
+
+/// RFC 9293 §3.10.7.4: with a zero receive window, valid ACKs must still be
+/// accepted. The ACK carried by a peer's one-byte window probe at RCV.NXT
+/// used to be ignored along with the probe's data.
+#[test]
+fn zero_window_probe_acknowledgment_is_processed() {
+    let (mut c, sseq, iss) = established(1000, true, false);
+    // Our window-scale shift: the smallest that fits the ring in 16 bits.
+    let shift = (0..15).find(|&s| (crate::BUF_CAP >> s) <= 0xffff).unwrap();
+    let chunk = [7u8; 1448];
+    let (mut seq, mut t, mut tsv) = (sseq, 1020u64, 10u32);
+    // The peer fills our receive buffer; the application never reads.
+    loop {
+        t += 1;
+        tsv += 1;
+        c.set_now(t);
+        c.inject_packet(&pkt(
+            SRV,
+            CLI,
+            seq,
+            iss + 1,
+            flags::ACK,
+            65535,
+            &ts(tsv, 0),
+            &chunk,
+        ))
+        .unwrap();
+        for o in drain(&mut c) {
+            // Window scaling may round the advertised edge up by less than
+            // one unit, never further: it used to creep ~16 bytes per ACK at
+            // 1 MiB (shift 5), so a full buffer never advertised zero.
+            let edge = o.ack + (u32::from(o.win) << shift);
+            assert!(
+                edge < sseq + crate::BUF_CAP as u32 + (1 << shift),
+                "edge {edge} past the buffer"
+            );
+        }
+        let after = c.debug_snapshot().rcv_nxt;
+        if after == seq {
+            break;
+        }
+        seq = after;
+    }
+    assert_eq!(c.debug_snapshot().recv_ring_len as usize, crate::BUF_CAP);
+    c.send(&[1u8; 1000]).unwrap();
+    c.tick().unwrap();
+    let d = drain(&mut c);
+    assert!(d.iter().any(|o| o.len == 1000 && o.win == 0));
+    t += 5;
+    tsv += 1;
+    c.set_now(t);
+    c.inject_packet(&pkt(
+        SRV,
+        CLI,
+        seq,
+        iss + 1 + 1000,
+        flags::ACK,
+        65535,
+        &ts(tsv, 0),
+        b"p",
+    ))
+    .unwrap();
+    let out = drain(&mut c);
+    assert_eq!(
+        c.debug_snapshot().snd_una,
+        iss + 1 + 1000,
+        "probe's ACK ignored"
+    );
+    assert_eq!(out.len(), 1, "the probe is answered");
+    assert_eq!(
+        (out[0].ack, out[0].win),
+        (seq, 0),
+        "probe data not accepted"
+    );
+}
+
+/// Found by fuzzing: a FIN accepted at P while out-of-order data was parked
+/// at P+1 left a range starting at RCV.NXT (breaking the stack's own
+/// invariant), and the stack then SACKed data beyond the peer's FIN.
+#[test]
+fn fin_before_parked_out_of_order_data_purges_it() {
+    let (mut c, sseq, iss) = established(1000, true, false);
+    c.set_now(1020);
+    c.inject_packet(&pkt(
+        SRV,
+        CLI,
+        sseq + 11,
+        iss + 1,
+        flags::ACK,
+        8192,
+        &ts(5, 0),
+        &[1u8; 100],
+    ))
+    .unwrap();
+    drain(&mut c);
+    c.set_now(1021);
+    c.inject_packet(&pkt(
+        SRV,
+        CLI,
+        sseq,
+        iss + 1,
+        flags::ACK | flags::FIN,
+        8192,
+        &ts(6, 0),
+        &[2u8; 10],
+    ))
+    .unwrap();
+    let out = drain(&mut c);
+    c.debug_validate_invariants().unwrap();
+    assert_eq!(c.state(), State::CloseWait);
+    let last = out.last().unwrap();
+    assert_eq!(last.ack, sseq + 11);
+    assert!(last.opts.sack.is_empty(), "SACKed data beyond the FIN");
+    assert_eq!(recv_all(&mut c), [2u8; 10]);
+}
+
+/// Out-of-order data beyond a FIN that is itself still out of order cannot
+/// belong to the stream either: it is never stored, so filling the hole
+/// delivers exactly the data before the FIN, then the FIN.
+#[test]
+fn data_beyond_an_out_of_order_fin_is_never_delivered() {
+    let (mut c, sseq, iss) = established(1000, true, false);
+    c.set_now(1020);
+    // FIN at sseq+20 (after 10 bytes at sseq+10), then junk beyond it:
+    // one segment straddling the FIN (matching bytes before it), one past it.
+    c.inject_packet(&pkt(
+        SRV,
+        CLI,
+        sseq + 10,
+        iss + 1,
+        flags::ACK | flags::FIN,
+        8192,
+        &ts(5, 0),
+        &[2u8; 10],
+    ))
+    .unwrap();
+    let mut straddle = vec![2u8; 2];
+    straddle.extend_from_slice(&[9u8; 98]);
+    c.inject_packet(&pkt(
+        SRV,
+        CLI,
+        sseq + 18,
+        iss + 1,
+        flags::ACK,
+        8192,
+        &ts(5, 0),
+        &straddle,
+    ))
+    .unwrap();
+    c.inject_packet(&pkt(
+        SRV,
+        CLI,
+        sseq + 30,
+        iss + 1,
+        flags::ACK,
+        8192,
+        &ts(5, 0),
+        &[9u8; 50],
+    ))
+    .unwrap();
+    drain(&mut c);
+    c.debug_validate_invariants().unwrap();
+    c.inject_packet(&pkt(
+        SRV,
+        CLI,
+        sseq,
+        iss + 1,
+        flags::ACK,
+        8192,
+        &ts(6, 0),
+        &[1u8; 10],
+    ))
+    .unwrap();
+    let out = drain(&mut c);
+    c.debug_validate_invariants().unwrap();
+    assert_eq!(c.state(), State::CloseWait);
+    assert_eq!(out.last().unwrap().ack, sseq + 21);
+    let mut want = vec![1u8; 10];
+    want.extend_from_slice(&[2u8; 10]);
+    assert_eq!(recv_all(&mut c), want);
+}
+
+/// A peer re-sending its FIN every 59 s used to keep a TIME_WAIT TCB (and
+/// its storage) alive indefinitely. Restarts are capped at 120 s after
+/// entering TIME_WAIT.
+#[test]
+fn time_wait_cannot_be_pinned_by_fin_retransmissions() {
+    let (mut c, sseq, iss) = established(1000, true, false);
+    c.set_now(1020);
+    c.close().unwrap();
+    drain(&mut c);
+    c.set_now(1030);
+    c.inject_packet(&pkt(
+        SRV,
+        CLI,
+        sseq,
+        iss + 2,
+        flags::ACK | flags::FIN,
+        8192,
+        &ts(5, 0),
+        &[],
+    ))
+    .unwrap();
+    drain(&mut c);
+    assert_eq!(c.state(), State::TimeWait);
+    let mut now = 1030u64;
+    let mut reacks = 0;
+    for k in 0..10u32 {
+        now += 59_000;
+        c.set_now(now);
+        c.tick().unwrap();
+        if c.state() != State::TimeWait {
+            break;
+        }
+        let _ = c.inject_packet(&pkt(
+            SRV,
+            CLI,
+            sseq,
+            iss + 2,
+            flags::ACK | flags::FIN,
+            8192,
+            &ts(6 + k, 0),
+            &[],
+        ));
+        reacks += drain(&mut c).len();
+    }
+    assert_eq!(c.state(), State::Closed);
+    assert!(reacks >= 1, "retransmitted FINs are still re-ACKed");
+    assert!(now - 1030 <= 2 * 60_000 + 59_000, "held {} ms", now - 1030);
+}
+
+/// Without a secret, every connection a reused listener accepted got the
+/// same ISN and a TSval equal to the host clock; `listen()` now requires a
+/// secret, which keys both.
+#[test]
+fn listener_isns_and_timestamps_are_keyed() {
+    let mut s = new_tcb(SRV, ([0; 4], 0), 0xDEAD_BEEF);
+    assert_eq!(s.listen(), Err(TcpError::InvalidState));
+    s.set_secret(&[0x33; 16]);
+    let o = TcpOptions {
+        mss: Some(1460),
+        ts: Some((1, 0)),
+        ..TcpOptions::NONE
+    };
+    let mut isns = Vec::new();
+    for (i, cli) in [([1, 1, 1, 1], 1111u16), ([2, 2, 2, 2], 2222u16)]
+        .into_iter()
+        .enumerate()
+    {
+        let now = 5_000_000 + i as u64 * 777;
+        s.set_now(now);
+        s.listen().unwrap();
+        s.inject_packet(&pkt(cli, SRV, 42, 0, flags::SYN, 65535, &o, &[]))
+            .unwrap();
+        let sa = drain(&mut s).remove(0);
+        assert_ne!(
+            u64::from(sa.opts.ts.unwrap().0),
+            now,
+            "TSval is the host clock"
+        );
+        assert_ne!(sa.seq, 0xDEAD_BEEF);
+        isns.push(sa.seq);
+        s.abort().unwrap();
+        drain(&mut s);
+    }
+    assert_ne!(isns[0], isns[1], "same ISN for two clients");
+}
+
+/// A client without timestamps (Windows' default) used to lose window
+/// scaling and SACK on any cookie listener. The free half-open slot is now
+/// used statefully, which keeps every option.
+#[test]
+fn idle_cookie_listener_keeps_ws_and_sack_without_timestamps() {
+    let mut s = new_tcb(SRV, ([0; 4], 0), 1);
+    s.set_secret(&[1; 16]);
+    s.set_cookie_secret(&[2; 16]);
+    s.set_now(10_000);
+    s.listen().unwrap();
+    let o = TcpOptions {
+        mss: Some(1460),
+        wscale: Some(8),
+        sack_permitted: true,
+        ..TcpOptions::NONE
+    };
+    s.inject_packet(&pkt(CLI, SRV, 5000, 0, flags::SYN, 65535, &o, &[]))
+        .unwrap();
+    let synack = drain(&mut s).remove(0);
+    assert!(synack.opts.wscale.is_some() && synack.opts.sack_permitted);
+    assert_eq!(s.state(), State::SynRcvd);
+}
+
+/// 200 spoofed SYNs per second used to lock a listener out: every time the
+/// half-open became replaceable, the attacker's next SYN took it. A busy
+/// listener now answers the legitimate client with a cookie, whose valid
+/// ACK takes over the slot.
+#[test]
+fn spoofed_syn_flood_cannot_lock_out_a_listener() {
+    let mut s = new_tcb(SRV, ([0; 4], 0), 1);
+    s.set_secret(&[3; 16]);
+    s.set_now(0);
+    s.listen().unwrap();
+    let legit: ([u8; 4], u16) = ([192, 168, 1, 1], 5555);
+    let mss = TcpOptions {
+        mss: Some(1460),
+        ..TcpOptions::NONE
+    };
+    let mut legit_synack = None;
+    for t in 0..=3_000u64 {
+        s.set_now(t);
+        s.tick().unwrap();
+        if t % 5 == 0 {
+            let src = (
+                [100, (t >> 16) as u8, (t >> 8) as u8, t as u8],
+                1024 + t as u16,
+            );
+            let _ = s.inject_packet(&pkt(src, SRV, t as u32, 0, flags::SYN, 65535, &mss, &[]));
+        }
+        if t == 1003 {
+            s.inject_packet(&pkt(legit, SRV, 777, 0, flags::SYN, 65535, &mss, &[]))
+                .unwrap();
+        }
+        for o in drain(&mut s) {
+            if o.dst == legit && o.flags == flags::SYN | flags::ACK {
+                legit_synack = Some(o.seq);
+            }
+        }
+        if t == 1050 {
+            let isn = legit_synack.expect("the legitimate client was answered");
+            s.inject_packet(&pkt(
+                legit,
+                SRV,
+                778,
+                isn + 1,
+                flags::ACK,
+                65535,
+                &TcpOptions::NONE,
+                b"hi",
+            ))
+            .unwrap();
+            assert_eq!(s.state(), State::Established);
+            break;
+        }
+    }
+    assert_eq!(
+        s.state(),
+        State::Established,
+        "legitimate client locked out"
+    );
+    assert_eq!(recv_all(&mut s), b"hi");
+}
+
+/// With only a cookie secret (no host secret) the cookie key also keys the
+/// timestamp offset. A handshake validated with the pre-rotation key must
+/// keep that offset, or our TSval would jump and the peer's PAWS would drop
+/// our segments.
+#[test]
+fn cookie_promotion_after_rotation_keeps_the_timestamp_offset() {
+    let mut s = new_tcb(SRV, ([0; 4], 0), 1);
+    s.set_cookie_secret(&[1; 16]);
+    s.set_now(10_000);
+    s.listen().unwrap();
+    let mss = TcpOptions {
+        mss: Some(1460),
+        ..TcpOptions::NONE
+    };
+    s.inject_packet(&pkt(ATTACKER, SRV, 9, 0, flags::SYN, 65535, &mss, &[]))
+        .unwrap();
+    drain(&mut s);
+    let o = TcpOptions {
+        mss: Some(1460),
+        ts: Some((100, 0)),
+        ..TcpOptions::NONE
+    };
+    s.inject_packet(&pkt(CLI, SRV, 500, 0, flags::SYN, 65535, &o, &[]))
+        .unwrap();
+    let synack = drain(&mut s).remove(0);
+    let synack_tsval = synack.opts.ts.unwrap().0;
+    s.set_cookie_secret(&[2; 16]);
+    s.set_now(10_050);
+    s.inject_packet(&pkt(
+        CLI,
+        SRV,
+        501,
+        synack.seq + 1,
+        flags::ACK | flags::PSH,
+        65535,
+        &ts(101, synack_tsval),
+        b"GET /",
+    ))
+    .unwrap();
+    assert_eq!(
+        s.state(),
+        State::Established,
+        "pre-rotation cookie accepted"
+    );
+    s.set_now(10_100);
+    s.tick().unwrap(); // delayed ACK of the request
+    let ack = drain(&mut s);
+    let ack = ack.last().expect("data is acknowledged");
+    let tsval = ack.opts.ts.unwrap().0;
+    let advance = tsval.wrapping_sub(synack_tsval);
+    assert!(
+        advance <= 100 + 64,
+        "TSval jumped by {advance} across promotion"
+    );
+}
+
+/// The path-MTU black-hole fallback fires after any ~1.4 s outage (three
+/// RTOs of a full-sized segment) and used to clamp the MSS for good. Probes
+/// at the larger size now restore it once the path is back.
+#[test]
+fn short_outage_clamp_is_undone_by_probing() {
+    let (mut c, sseq, iss) = established(1000, true, false);
+    assert_eq!(c.stats().mss, 1448);
+    c.send(&vec![0u8; 200_000]).unwrap();
+    let mut now = 1020u64;
+    while now < 1020 + 1_500 {
+        now += 10;
+        c.set_now(now);
+        c.tick().unwrap();
+        drain(&mut c); // path down: everything is lost
+    }
+    assert!(c.stats().mss < 1448, "outage triggered the clamp");
+    let mut acked = iss + 1;
+    let mut tsv = 50u32;
+    for _ in 0..3_000 {
+        now += 10;
+        c.set_now(now);
+        c.tick().unwrap();
+        for o in drain(&mut c) {
+            if o.len > 0 && o.seq == acked {
+                acked += o.len as u32;
+            }
+        }
+        tsv += 1;
+        let _ = c.inject_packet(&pkt(
+            SRV,
+            CLI,
+            sseq,
+            acked,
+            flags::ACK,
+            65535,
+            &ts(tsv, 0),
+            &[],
+        ));
+        let _ = c.send(&vec![0u8; 65536]);
+        if c.stats().mss == 1448 {
+            break;
+        }
+    }
+    assert_eq!(c.stats().mss, 1448, "MSS restored after the outage");
+    assert!(
+        now - 1020 <= 1_500 + 15_000,
+        "restored only after {} ms",
+        now - 1020
+    );
+}
+
+/// On a real black hole (full-sized segments never arrive), the probe is
+/// lost: the clamp stays and the probes back off.
+#[test]
+fn black_hole_clamp_survives_failed_probes() {
+    let after = |a: u32, b: u32| (a.wrapping_sub(b) as i32) > 0;
+    let (mut c, sseq, iss) = established(1000, true, false);
+    c.send(&vec![0u8; 400_000]).unwrap();
+    let mut now = 1020u64;
+    let mut acked = iss + 1;
+    let mut tsv = 50u32;
+    let mut probes = 0;
+    let mut clamped = false;
+    // The receiver holds one SACK block above `acked` (one probe is missing
+    // at a time) and, like any receiver, only ACKs what reaches it.
+    let mut sacked: Option<(u32, u32)> = None;
+    for _ in 0..12_000 {
+        now += 10;
+        c.set_now(now);
+        c.tick().unwrap();
+        let mut delivered = false;
+        for o in drain(&mut c) {
+            if o.len > 1012 {
+                if clamped {
+                    probes += 1;
+                }
+                continue; // the black hole eats every large segment
+            }
+            if o.len == 0 {
+                continue;
+            }
+            delivered = true;
+            let end = o.seq + o.len as u32;
+            if !after(o.seq, acked) {
+                if after(end, acked) {
+                    acked = end;
+                }
+            } else {
+                sacked = Some(match sacked {
+                    Some((l, r)) if !after(o.seq, r) => (l, if after(end, r) { end } else { r }),
+                    Some(b) => b,
+                    None => (o.seq, end),
+                });
+            }
+            if let Some((l, r)) = sacked {
+                if !after(l, acked) {
+                    if after(r, acked) {
+                        acked = r;
+                    }
+                    sacked = None;
+                }
+            }
+        }
+        if delivered {
+            tsv += 1;
+            let mut opts = ts(tsv, 0);
+            if let Some((l, r)) = sacked {
+                opts.sack = SackBlocks::from_slice(&[(l, r)]);
+            }
+            let _ = c.inject_packet(&pkt(SRV, CLI, sseq, acked, flags::ACK, 65535, &opts, &[]));
+        }
+        clamped |= c.stats().mss < 1448;
+        let _ = c.send(&vec![0u8; 65536]);
+    }
+    assert!(clamped, "the black hole was detected");
+    assert!(c.stats().mss <= 1012, "clamp undone on a real black hole");
+    assert!(probes >= 2, "probes were sent ({probes})");
+    assert!(probes <= 4, "probes back off ({probes} in 2 min)");
+    assert_eq!(c.state(), State::Established);
+    assert!(
+        after(acked, iss + 100_000),
+        "data keeps flowing at the clamped size"
+    );
 }

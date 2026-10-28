@@ -55,10 +55,12 @@ calling thread's stack for <1 ms.)
    peer.
 4. **A driver loop** (Step 2) that ticks when `tcp_next_deadline()` comes
    due — even when idle.
-5. **Secrets**: a CSPRNG `iss` per connection (RFC 6528); for anything
-   internet-facing a 16-byte CSPRNG secret via `tcp_set_secret`; servers
-   also pass one to `tcp_set_cookie_secret` for stateless SYN-cookie flood
-   resistance.
+5. **Secrets**: a CSPRNG `iss` per connection (RFC 6528), and a 16-byte
+   CSPRNG secret via `tcp_set_secret` on every listener (`tcp_listen`
+   returns `INVALID_STATE` without one) and anything internet-facing. It
+   also keys the SYN cookies a listener answers with while its half-open
+   slot is busy; `tcp_set_cookie_secret` optionally installs an explicit,
+   rotatable cookie key instead.
 6. **The path MTU** via `tcp_set_mtu` before the handshake if the tunnel is
    below 1500 (1420 for a default WireGuard interface).
 
@@ -80,7 +82,11 @@ pump loop*. The non-obvious rules that bindings get wrong:
   as EOF.
 - After `close`, keep pumping until `tcp_state` is `CLOSED`, `recv` any bytes
   still `READABLE` (the peer's data before its FIN), then `destroy`.
-- One handle is single-threaded — the stack has no internal locking.
+- Route each outbound packet by its own destination address: a listener
+  answers *other* peers (SYN cookies) while its half-open slot is busy.
+- One handle is single-threaded — the stack has no internal locking. If
+  your language can call into one handle from several threads (e.g. ctypes
+  releases the GIL), serialize the calls per handle in the wrapper.
 
 ## Step 3 — Tier-1 certification: self-loopback hash test (REQUIRED)
 
@@ -100,7 +106,8 @@ cd bindings/conformance && cargo run --release
 
 Port its ~200 lines into your language's test suite, using *your* wrapper:
 
-1. Create two handles: client (`tcp_connect`) and server (`tcp_listen`).
+1. Create two handles: client (`tcp_connect`) and server (`tcp_set_secret`,
+   then `tcp_listen`).
 2. Each turn: `tick` both with a virtual clock; ferry each side's extracted
    packets through a chaos channel (drop ~1%, dup ~1%, reorder ~1%) into the
    other's `inject_packet`; both `send` a deterministic per-offset byte

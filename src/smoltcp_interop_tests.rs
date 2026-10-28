@@ -147,6 +147,7 @@ impl InteropHarness {
             initial_rto_ms: 1000,
         })
         .expect("Tcb::new");
+        our.set_secret(&[0x42; 16]);
         our.listen().expect("listen");
 
         // smoltcp interface — IP medium (we ferry raw IPv4 packets).

@@ -290,6 +290,15 @@ internal static class Program
             ServerIp, ServerPort, new byte[4], 0, ServerIss, 1000);
         ulong now = 1000;
 
+        try
+        {
+            server.Listen(now);
+            throw new Exception("Listen without a secret must fail");
+        }
+        catch (TcpException e) when (e.Code == TcpErrorCode.InvalidState)
+        {
+        }
+        server.SetSecret(System.Security.Cryptography.RandomNumberGenerator.GetBytes(16));
         server.Listen(now);
         AssertEqual(TcpState.Listen, server.State(), "LISTEN");
         Assert((server.Poll() & TcpEvents.Listening) != 0, "LISTENING event");
@@ -303,13 +312,13 @@ internal static class Program
         var synack = Wire.Parse(pkts[0]);
         Assert(synack.Has(Flags.SYN) && synack.Has(Flags.ACK), "SYN-ACK flags");
         AssertEqual(ClientIss + 1, synack.Ack, "SYN-ACK acks client ISS+1");
-        AssertEqual(ServerIss, synack.Seq, "SYN-ACK at server ISS");
+        uint srvIss = synack.Seq; // keyed by the secret (RFC 6528)
         AssertEqual(TcpState.SynRcvd, server.State(), "SYN_RCVD");
         Assert((server.Poll() & TcpEvents.HalfOpen) != 0, "HALF_OPEN event");
 
         // Third ACK → ESTABLISHED.
         now += 5;
-        var third = EmitFromClient(Flags.ACK, ClientIss + 1, ServerIss + 1);
+        var third = EmitFromClient(Flags.ACK, ClientIss + 1, srvIss + 1);
         Assert(server.InjectPacket(third, now), "third ACK accepted");
         Drain(server, now);
         AssertEqual(TcpState.Established, server.State(), "ESTABLISHED");
@@ -317,7 +326,7 @@ internal static class Program
         // Client data → server application.
         now += 5;
         var ping = EmitFromClient(
-            (byte)(Flags.ACK | Flags.PSH), ClientIss + 1, ServerIss + 1,
+            (byte)(Flags.ACK | Flags.PSH), ClientIss + 1, srvIss + 1,
             payload: Encoding.ASCII.GetBytes("ping"));
         Assert(server.InjectPacket(ping, now), "data accepted");
         Drain(server, now);
@@ -330,7 +339,7 @@ internal static class Program
         Assert(pkts.Count >= 1, "server must emit its data");
         var reply = Wire.Parse(pkts[^1]);
         AssertEqual("pong", Encoding.ASCII.GetString(reply.Payload), "server payload");
-        AssertEqual(ServerIss + 1, reply.Seq, "server data at ISS+1");
+        AssertEqual(srvIss + 1, reply.Seq, "server data at ISS+1");
     }
 
     /// <summary>Hand-craft a CLIENT → SERVER packet for the passive tests.</summary>

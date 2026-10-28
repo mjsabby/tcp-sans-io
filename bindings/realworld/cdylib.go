@@ -16,6 +16,7 @@ package realworld
 import "C"
 
 import (
+	crand "crypto/rand"
 	"errors"
 	"fmt"
 	"time"
@@ -154,6 +155,19 @@ func (h *TcpHandle) Listen() error {
 	return nil
 }
 
+// SetSecret installs the 16-byte host secret (CSPRNG output) that keys
+// timestamp offsets, passive-open ISNs and the derived SYN-cookie key.
+// Listen requires it (or a cookie secret).
+func (h *TcpHandle) SetSecret(secret []byte) error {
+	if len(secret) != 16 {
+		return errors.New("secret must be exactly 16 bytes")
+	}
+	if rc := C.tcp_set_secret(h.handle, (*C.uint8_t)(unsafe.Pointer(&secret[0]))); rc != 0 {
+		return fmt.Errorf("tcp_set_secret: %d", int(rc))
+	}
+	return nil
+}
+
 func (h *TcpHandle) Close() error {
 	rc := C.tcp_close(h.handle, h.now())
 	if rc != 0 {
@@ -238,4 +252,13 @@ func (h *TcpHandle) InjectPacket(pkt []byte) error {
 	default:
 		return fmt.Errorf("tcp_inject_packet: %d", rc)
 	}
+}
+
+// NewSecret returns 16 CSPRNG bytes for SetSecret.
+func NewSecret() []byte {
+	b := make([]byte, 16)
+	if _, err := crand.Read(b); err != nil {
+		panic(err)
+	}
+	return b
 }

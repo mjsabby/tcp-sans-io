@@ -328,6 +328,7 @@ impl Sim {
             initial_rto_ms: 1000,
         });
         b.set_now(0);
+        b.set_secret(&[0x42; 16]);
         b.listen().unwrap();
         let mut s = Self {
             now_us: 0,

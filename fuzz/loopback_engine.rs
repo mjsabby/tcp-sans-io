@@ -146,6 +146,7 @@ pub fn run<const BUF: usize>(data: &[u8], xfer: u32, send_cap: usize) {
     srv.set_user_timeout(0);
     cli.set_keepalive(0, 0, 0);
     srv.set_keepalive(0, 0, 0);
+    srv.set_secret(&[0x5e; 16]);
     if srv.listen().is_err() || cli.connect().is_err() {
         return;
     }
