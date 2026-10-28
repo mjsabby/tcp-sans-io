@@ -266,6 +266,36 @@ pub struct DebugSnapshot {
     pub state: u8,
 }
 
+/// Cumulative loss-recovery counters for one connection, for diagnostics.
+/// Rust-only (not part of the C ABI). Every counter is bumped on a path that
+/// only runs when something already went wrong, so keeping them costs
+/// nothing in steady state. Reset by [`Tcb::reinit`].
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct TcbStats {
+    /// Retransmission timeouts; each collapses `cwnd` and resends from
+    /// `snd_una`.
+    pub rto_fires: u32,
+    /// Tail loss probes sent (RFC 8985 §7).
+    pub tlp_probes: u32,
+    /// Fast-recovery episodes started by newly SACKed data.
+    pub sack_recoveries: u32,
+    /// Fast-recovery episodes started by three duplicate ACKs.
+    pub dupack_recoveries: u32,
+    /// Fast-recovery episodes started by RACK loss detection.
+    pub rack_recoveries: u32,
+    /// Fast-recovery episodes started by an ECN echo (RFC 3168).
+    pub ecn_recoveries: u32,
+    /// ACKs carrying a D-SACK (RFC 2883): the peer received a duplicate, so
+    /// one of our retransmits was spurious.
+    pub dsacks: u32,
+    /// Zero-window probes sent.
+    pub zero_window_probes: u32,
+    /// Data segments sent again below `snd_max`.
+    pub retransmit_segments: u32,
+    /// Payload bytes in those segments.
+    pub retransmit_bytes: u64,
+}
+
 #[derive(Copy, Clone, Debug)]
 struct RttProbe {
     /// Smallest seq value the ACK must reach for the probe to count
@@ -434,6 +464,9 @@ pub struct Tcb<const BUF: usize = BUF_CAP> {
     persist_deadline: Option<u64>,
     persist_backoff_ms: u32,
 
+    // ---- Diagnostics -----------------------------------------------------
+    stats: TcbStats,
+
     // ---- Connection lifecycle flags --------------------------------------
     fin_sent: bool,
     fin_seq: u32,
@@ -562,6 +595,7 @@ impl<const BUF: usize> Tcb<BUF> {
             ack_deadline: None,
             persist_deadline: None,
             persist_backoff_ms: 0,
+            stats: TcbStats::default(),
             fin_sent: false,
             fin_seq: 0,
             time_wait_deadline: None,
@@ -613,6 +647,12 @@ impl<const BUF: usize> Tcb<BUF> {
     #[inline]
     pub fn state(&self) -> State {
         self.state
+    }
+
+    /// Loss-recovery counters for the current connection.
+    #[inline]
+    pub fn stats(&self) -> TcbStats {
+        self.stats
     }
 
     /// Compact debug snapshot. Strictly diagnostic; not part of the
@@ -1027,6 +1067,7 @@ impl<const BUF: usize> Tcb<BUF> {
         self.error = None;
         self.tx_ring.clear();
         self.syn_rcvd_retries = 0;
+        self.stats = TcbStats::default();
     }
 
     /// Revert from a half-open passive state back to `LISTEN` (or
@@ -1339,6 +1380,7 @@ impl<const BUF: usize> Tcb<BUF> {
                 }
                 let flight = self.snd_nxt.wrapping_sub(self.snd_una);
                 self.cc.on_rto_loss(flight);
+                self.stats.rto_fires = self.stats.rto_fires.saturating_add(1);
                 self.snd_nxt = self.snd_una;
                 // RTO means we've lost confidence about what's in flight;
                 // SACK information is stale. Clear scoreboard + rxt state
@@ -2278,6 +2320,7 @@ impl<const BUF: usize> Tcb<BUF> {
             let flight = self.snd_nxt.wrapping_sub(self.snd_una);
             self.cc.enter_recovery(flight, self.snd_max);
             self.send_cwr_pending = true;
+            self.stats.ecn_recoveries = self.stats.ecn_recoveries.saturating_add(1);
         }
 
         // ---- Absorb inbound SACK blocks (regardless of dup/advancing) ----
@@ -2292,6 +2335,17 @@ impl<const BUF: usize> Tcb<BUF> {
         let mut latest_sack_send_ts: u64 = 0;
         let mut latest_sack_end_seq: u32 = 0;
         if self.sack_enabled {
+            let blocks = seg.options.sack.as_slice();
+            if let Some(&(l, r)) = blocks.first() {
+                let dsack = seq_le(r, ack)
+                    || blocks
+                        .iter()
+                        .skip(1)
+                        .any(|&(l2, r2)| seq_le(l2, l) && seq_le(r, r2));
+                if dsack {
+                    self.stats.dsacks = self.stats.dsacks.saturating_add(1);
+                }
+            }
             for (l, r) in seg.options.sack.as_slice().iter().copied() {
                 let new_bytes =
                     self.sack_scoreboard
@@ -2366,6 +2420,12 @@ impl<const BUF: usize> Tcb<BUF> {
                     false
                 };
                 if trigger {
+                    if has_sack {
+                        self.stats.sack_recoveries = self.stats.sack_recoveries.saturating_add(1);
+                    } else {
+                        self.stats.dupack_recoveries =
+                            self.stats.dupack_recoveries.saturating_add(1);
+                    }
                     // RFC 6937 PRR + RFC 6675 selective retransmit:
                     // * enter_recovery captures FULL flight (snd_max -
                     //   snd_una) so ssthresh halves the real in-flight.
@@ -2394,6 +2454,10 @@ impl<const BUF: usize> Tcb<BUF> {
                     .saturating_sub(sacked)
                     .saturating_add(self.rxt_unacked);
                 self.cc.on_ack_in_recovery(newly_sacked, pipe);
+                // Drop now-SACKed transmissions so RACK never judges
+                // delivered segments "lost" (the advancing-ACK path prunes
+                // the same way).
+                self.send_queue.prune(self.snd_una, &self.sack_scoreboard);
             }
             self.run_rack_scan();
             // Even duplicate ACKs may carry a window update.
@@ -2658,29 +2722,31 @@ impl<const BUF: usize> Tcb<BUF> {
                     end
                 };
                 if seq_lt(lo, hi) {
-                    // Find the first un-SACKed sub-range within [lo, hi).
-                    let (sub_lo, sub_hi) = self
-                        .sack_scoreboard
-                        .first_unsacked_subrange(lo, hi)
-                        .unwrap_or((lo, hi));
-                    let len = sub_hi.wrapping_sub(sub_lo);
-                    let bytes = core::cmp::min(len, core::cmp::min(credit, mss_payload)) as usize;
-                    if bytes > 0 {
-                        let queued = self.emit_data_at(sub_lo, bytes)?;
-                        if !queued {
-                            // Egress ring full: put the range back rather
-                            // than dropping it, so the retransmit isn't
-                            // deferred to a later RACK re-scan or, worst
-                            // case, the RTO.
-                            self.rack_lost_queue.insert_sorted(sub_lo, hi, self.snd_una);
+                    // Resend only the first un-SACKed sub-range of [lo, hi); a
+                    // range the peer has SACKed in full is simply dropped.
+                    if let Some((sub_lo, sub_hi)) =
+                        self.sack_scoreboard.first_unsacked_subrange(lo, hi)
+                    {
+                        let len = sub_hi.wrapping_sub(sub_lo);
+                        let bytes =
+                            core::cmp::min(len, core::cmp::min(credit, mss_payload)) as usize;
+                        if bytes > 0 {
+                            let queued = self.emit_data_at(sub_lo, bytes)?;
+                            if !queued {
+                                // Egress ring full: put the range back rather
+                                // than dropping it, so the retransmit isn't
+                                // deferred to a later RACK re-scan or, worst
+                                // case, the RTO.
+                                self.rack_lost_queue.insert_sorted(sub_lo, hi, self.snd_una);
+                            }
+                            return Ok(queued);
                         }
-                        return Ok(queued);
+                        // PRR credit exhausted: re-queue the loss marker for
+                        // the next credit-replenishing ACK instead of
+                        // discarding it, then fall through (the credit-exempt
+                        // FIN below may still be emittable).
+                        self.rack_lost_queue.insert_sorted(sub_lo, hi, self.snd_una);
                     }
-                    // PRR credit exhausted: re-queue the loss marker for the
-                    // next credit-replenishing ACK instead of discarding it,
-                    // then fall through (the credit-exempt FIN below may
-                    // still be emittable).
-                    self.rack_lost_queue.insert_sorted(sub_lo, hi, self.snd_una);
                 }
             }
         }
@@ -2796,6 +2862,9 @@ impl<const BUF: usize> Tcb<BUF> {
             if !queued {
                 return Ok(false);
             }
+            if !first_tx {
+                self.count_retransmit(payload_bytes as u32);
+            }
             self.snd_nxt = self.snd_nxt.wrapping_add(payload_bytes as u32);
             self.bump_snd_max();
             // Account for PRR send credit consumption (no-op outside recovery).
@@ -2886,6 +2955,11 @@ impl<const BUF: usize> Tcb<BUF> {
     /// Returns `Ok(true)` if the segment was queued, `Ok(false)` if the
     /// egress ring is full (caller must back off; bookkeeping is not
     /// advanced in that case).
+    fn count_retransmit(&mut self, bytes: u32) {
+        self.stats.retransmit_segments = self.stats.retransmit_segments.saturating_add(1);
+        self.stats.retransmit_bytes = self.stats.retransmit_bytes.saturating_add(u64::from(bytes));
+    }
+
     fn emit_data_at(&mut self, seq: u32, bytes: usize) -> Result<bool, TcpError> {
         let offset = seq.wrapping_sub(self.snd_una) as usize;
         // Never read past the buffered data. Retransmit byte counts are
@@ -2924,6 +2998,7 @@ impl<const BUF: usize> Tcb<BUF> {
             return Ok(false);
         }
         // Account: PRR snd_credit, rxt_unacked, and the rxt cursor.
+        self.count_retransmit(bytes as u32);
         self.cc.on_send(bytes as u32);
         self.rxt_unacked = self.rxt_unacked.saturating_add(bytes as u32);
         // Only advance rxt_seq when the retransmit is at or above the
@@ -2992,6 +3067,7 @@ impl<const BUF: usize> Tcb<BUF> {
         if !scan.lost.is_empty() && !self.cc.in_recovery() && seq_gt(self.snd_max, self.snd_una) {
             let flight = self.snd_max.wrapping_sub(self.snd_una);
             self.cc.enter_recovery(flight, self.snd_max);
+            self.stats.rack_recoveries = self.stats.rack_recoveries.saturating_add(1);
             self.rxt_seq = self.snd_una;
             self.rxt_unacked = 0;
             if let Some(p) = self.rtt_probe.as_mut() {
@@ -3077,6 +3153,7 @@ impl<const BUF: usize> Tcb<BUF> {
         // next tick should retry.
         if self.emit_data_at(start, bytes)? {
             self.tlp_fired = true;
+            self.stats.tlp_probes = self.stats.tlp_probes.saturating_add(1);
         }
         // RTO must remain armed (TLP is a probe, not a replacement for
         // RTO). emit_data_at already calls arm_rto_for if needed.
@@ -3106,6 +3183,7 @@ impl<const BUF: usize> Tcb<BUF> {
             let queued =
                 self.emit_segment(flags::ACK | flags::PSH, seq, self.rcv_nxt, &opts, &byte)?;
             if queued {
+                self.stats.zero_window_probes = self.stats.zero_window_probes.saturating_add(1);
                 self.snd_nxt = self.snd_nxt.wrapping_add(1);
                 self.bump_snd_max();
                 if self.rto_deadline.is_none() {

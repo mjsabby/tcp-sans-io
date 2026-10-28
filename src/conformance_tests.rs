@@ -1514,6 +1514,9 @@ fn dsack_does_not_trigger_fast_recovery() {
         before.ssthresh,
         "a D-SACK must not start fast recovery",
     );
+    let stats = tcb.stats();
+    assert_eq!(stats.dsacks, 1, "the D-SACK is counted");
+    assert_eq!(stats.sack_recoveries, 0);
 }
 
 /// After a SACK-driven fast-retransmit rewinds `snd_nxt` to `snd_una`, the
@@ -2627,6 +2630,12 @@ fn rack_does_not_resend_segment_whose_retransmit_is_in_flight() {
         copies, 1,
         "segment 1 re-sent while its retransmit is in flight"
     );
+    let stats = tcb.stats();
+    assert_eq!(stats.sack_recoveries, 1);
+    assert_eq!(
+        stats.retransmit_segments, 1,
+        "only segment 1 is lost: the SACKed segments 2-8 must never be re-sent"
+    );
 }
 
 /// TLP fires PTO before RTO when there's un-ACKed data and no ACK
@@ -3080,11 +3089,20 @@ fn reinit_yields_byte_identical_syn_to_fresh_new() {
     recycled.connect().expect("connect a");
     let mut scratch = [0u8; MAX_PACKET];
     let _ = recycled.extract_packet(&mut scratch).expect("syn a");
+    // Let the SYN's RTO fire so the loss counters are dirty too.
+    recycled.set_now(u64::from(INIT_RTO_MS) + 1);
+    recycled.tick().expect("rto a");
+    assert_eq!(recycled.stats().rto_fires, 1);
     recycled.reinit(cfg_b);
     assert_eq!(
         recycled.state(),
         State::Closed,
         "reinit must return to CLOSED"
+    );
+    assert_eq!(
+        recycled.stats(),
+        Default::default(),
+        "reinit must reset the loss counters"
     );
 
     // Fresh TCB with the same (cfg_b) config.

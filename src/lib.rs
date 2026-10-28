@@ -125,7 +125,7 @@ pub mod wire;
 
 pub use error::TcpError;
 pub use state::State;
-pub use tcb::{Endpoint, Tcb, TcbConfig};
+pub use tcb::{Endpoint, Tcb, TcbConfig, TcbStats};
 
 /// Standard maximum segment size for an Ethernet-class path.
 pub const MSS: u16 = 1460;
