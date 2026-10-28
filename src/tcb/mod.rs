@@ -356,6 +356,8 @@ pub struct Tcb<const BUF: usize = BUF_CAP> {
 
     // ---- Egress staging.
     tx_ring: TxRing,
+    /// Host back-pressure (see [`Tcb::set_egress_paused`]).
+    egress_paused: bool,
     ip_id: u16,
 
     // ---- Passive open.
@@ -479,6 +481,7 @@ impl<const BUF: usize> Tcb<BUF> {
         self.secret = [0; 16];
         self.secret_set = false;
         self.now_ms = 0;
+        self.egress_paused = false;
         self.ip_id = (cfg.iss >> 16) as u16 ^ cfg.iss as u16;
         self.keepalive_idle_ms = DEFAULT_KEEPALIVE_IDLE_MS;
         self.keepalive_intvl_ms = DEFAULT_KEEPALIVE_INTVL_MS;
@@ -731,13 +734,19 @@ impl<const BUF: usize> Tcb<BUF> {
     /// at `now` the result is always later than `now` (no busy-looping).
     ///
     /// Not timer-driven (call `tick()` yourself): transmitting data queued
-    /// by [`Self::send`], and resuming output after a full egress ring was
-    /// drained.
+    /// by [`Self::send`], resuming output after a full egress ring was
+    /// drained, and resuming after [`Self::set_egress_paused`] (output owed
+    /// while paused — an ACK, a keepalive probe — is not reported here).
     pub fn next_deadline(&self) -> Option<u64> {
-        let ack = if self.pending_ack {
+        let ack = if self.pending_ack && !self.egress_paused {
             self.ack_deadline
         } else {
             Deadline::OFF
+        };
+        let keepalive = if self.egress_paused {
+            Deadline::OFF
+        } else {
+            self.keepalive_deadline
         };
         let fin2 = if self.state == State::FinWait2 {
             self.fin_wait2_deadline
@@ -752,7 +761,7 @@ impl<const BUF: usize> Tcb<BUF> {
             self.rack_deadline,
             self.persist_deadline,
             ack,
-            self.keepalive_deadline,
+            keepalive,
             self.user_timeout_deadline,
         ]
         .into_iter()
@@ -785,6 +794,27 @@ impl<const BUF: usize> Tcb<BUF> {
     #[inline]
     pub fn set_now(&mut self, now_ms: u64) {
         self.now_ms = now_ms;
+    }
+
+    /// Host back-pressure on the egress path (like Linux TCP Small Queues):
+    /// while paused the TCB stages no data, FIN, retransmission, pure ACK or
+    /// probe, so each segment — and its ACK, window, timestamp, RTT sample
+    /// and loss timers — is built when the host can actually send it rather
+    /// than aging in the egress ring. SYN, SYN-ACK and RST are exempt.
+    ///
+    /// Packets staged before the pause stay extractable: drain them first.
+    /// Timers keep running — RTO (and R2), USER TIMEOUT, FIN_WAIT_2 and
+    /// TIME_WAIT still expire — but output they owe waits: an ACK or
+    /// keepalive probe goes out on the first `tick()` after resuming, the
+    /// persist timer retries one RTO later, and a tail-loss probe waits
+    /// until one PTO after the resume (the peer only then starts draining
+    /// what queued up). Resume after [`Self::set_now`], then `tick()`.
+    #[inline]
+    pub fn set_egress_paused(&mut self, paused: bool) {
+        if self.egress_paused && !paused && self.tlp_deadline.is_armed() {
+            self.maybe_arm_tlp();
+        }
+        self.egress_paused = paused;
     }
 
     /// Reconfigure (or disable, `idle_ms == 0`) keepalive (RFC 9293 §3.8.4)
@@ -1128,6 +1158,12 @@ impl<const BUF: usize> Tcb<BUF> {
             .wrapping_sub(self.data_una())
             .saturating_sub(u32::from(self.fin_sent));
         (self.send_ring.len() as u32).saturating_sub(sent_data)
+    }
+
+    /// Nothing more may be staged: the ring is full or the host paused us.
+    #[inline]
+    fn egress_full(&self) -> bool {
+        self.egress_paused || self.tx_ring.is_full()
     }
 
     /// Unacknowledged sequence space plus unsent data.

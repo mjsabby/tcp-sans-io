@@ -252,8 +252,9 @@ absolute `now_ms` at which `tick()` next has timer work, or `UINT64_MAX`
 when nothing is armed. An event-driven host sleeps until the earlier of
 that deadline and the next datagram, then ticks — idle connections cost
 nothing, and after a tick the deadline is always in the future (no
-spinning). Also tick right after `send`, and after draining a full egress
-ring. Hosts that cannot track deadlines tick every ~10 ms instead.
+spinning). Also tick right after `send`, after draining a full egress
+ring, and after resuming paused egress (`Tcb::set_egress_paused`). Hosts
+that cannot track deadlines tick every ~10 ms instead.
 
 **How fast does the clock need to drive?** The timer floors are:
 
@@ -688,6 +689,15 @@ A `Tcb` is ~2.08 MiB, so build it in place in heap storage
 (`Tcb::init_in_place`, as `tcp_init` does) or box it, rather than holding it
 as a stack local (or use `small-buffers` for many idle TCBs) — see *Memory
 footprint*. Event-driven Rust hosts sleep until `tcb.next_deadline()`.
+
+**Egress back-pressure.** When the host's queue toward the peer is full,
+stop pulling instead of leaving segments staged: drain `extract_packet` to
+0, then `tcb.set_egress_paused(true)`. While paused the TCB stages nothing
+but SYN / RST, so no segment ages in the ring with a stale ACK, window or
+timestamp, and the hold is not mistaken for loss (a tail-loss probe waits
+until one PTO after the resume instead of being queued behind the data it
+probes for). Resume with `set_now`, `set_egress_paused(false)` and a
+`tick()`. (Rust API only.)
 
 ### How do you know you got it right? (canonical conformance)
 

@@ -31,7 +31,7 @@ impl<const BUF: usize> Tcb<BUF> {
             return Ok(());
         }
         let mut guard = 0u32;
-        while !self.tx_ring.is_full() {
+        while !self.egress_full() {
             if crate::loop_budget_exhausted(&mut guard, TX_RING_CAP as u32 + 2, "maybe_send_data") {
                 break;
             }
@@ -273,7 +273,11 @@ impl<const BUF: usize> Tcb<BUF> {
     }
 
     pub(super) fn send_pure_ack(&mut self) -> Result<(), TcpError> {
-        if self.tx_ring.is_full() {
+        if self.egress_full() {
+            // Owed now, not at a later delayed-ACK deadline: the first tick
+            // after the host drains or resumes egress sends it.
+            self.pending_ack = true;
+            self.ack_deadline = Deadline::at(self.now_ms);
             return Ok(());
         }
         let opts = self.segment_options(0);
@@ -385,7 +389,11 @@ impl<const BUF: usize> Tcb<BUF> {
         payload: &[u8],
         ect: bool,
     ) -> Result<bool, TcpError> {
-        if self.tx_ring.is_full() {
+        // Handshake and reset segments are exempt from host back-pressure:
+        // deferring them would cost a handshake RTO or lose the reset.
+        if self.tx_ring.is_full()
+            || (self.egress_paused && flag_bits & (flags::SYN | flags::RST) == 0)
+        {
             return Ok(false);
         }
         let is_syn = flag_bits & flags::SYN != 0;

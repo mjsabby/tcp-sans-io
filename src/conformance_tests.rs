@@ -2910,6 +2910,197 @@ fn rack_tail_loss_short_rtt_retransmits_first_unsacked() {
 }
 
 // ---------------------------------------------------------------------------
+// Host egress back-pressure (`set_egress_paused`) and owed ACKs.
+// ---------------------------------------------------------------------------
+
+/// Drain the egress ring; returns the data-bearing segments.
+fn drain_data(tcb: &mut Tcb) -> Vec<ParsedOut> {
+    let mut v = Vec::new();
+    while let Some(p) = try_pop(tcb) {
+        if !p.payload.is_empty() {
+            v.push(p);
+        }
+    }
+    v
+}
+
+/// Data offered while the host holds egress is built when it resumes, so the
+/// hold costs no probe, no timeout and no inflated RTT sample. (A host that
+/// instead holds already-staged segments sees a TLP after one PTO, an RTO
+/// that collapses cwnd after 200 ms, and the hold folded into SRTT.)
+#[test]
+fn egress_pause_builds_segments_when_resumed() {
+    let mut tcb = make_tcb();
+    let mut now = 0u64;
+    let peer_ts = handshake_with_ts(&mut tcb, &mut now);
+    let before = tcb.stats();
+
+    tcb.set_egress_paused(true);
+    tcb.send(&vec![0x44; 4 * SMSS as usize]).expect("send");
+    for _ in 0..25 {
+        now += 10;
+        tcb.set_now(now);
+        tcb.tick().expect("tick");
+        assert!(
+            try_pop(&mut tcb).is_none(),
+            "nothing is staged while paused"
+        );
+        assert!(tcb.next_deadline().is_none_or(|d| d > now), "no busy loop");
+    }
+
+    tcb.set_egress_paused(false);
+    tcb.tick().expect("tick");
+    let data = drain_data(&mut tcb);
+    assert_eq!(data.len(), 4);
+    let last = data.last().expect("data");
+    let (tsval, _) = last.ts.expect("timestamps");
+    now += 1;
+    let ack = build_in(
+        flags::ACK,
+        PSS.wrapping_add(1),
+        last.seq.wrapping_add(SMSS),
+        PEER_WIN,
+        None,
+        Some((peer_ts.wrapping_add(1), tsval)),
+        &[],
+    );
+    tcb.set_now(now);
+    tcb.inject_packet(&ack).expect("inject");
+    let s = tcb.stats();
+    assert_eq!((s.tlp_count, s.rto_count, s.segs_retrans), (0, 0, 0));
+    assert!(
+        s.srtt_ms <= before.srtt_ms,
+        "the 1 ms RTT sample excludes the hold"
+    );
+    assert!(s.cwnd >= before.cwnd, "no window collapse");
+}
+
+/// A tail-loss probe that falls due while the host holds egress is not sent
+/// into the host's queue, nor dropped in favour of a window-collapsing RTO:
+/// it waits until one PTO after the resume, when the peer has had a chance
+/// to drain the queue and ACK.
+#[test]
+fn egress_pause_defers_tail_loss_probe_past_resume() {
+    let mut tcb = make_tcb();
+    let mut now = 0u64;
+    let _ = handshake_with_ts(&mut tcb, &mut now);
+    tcb.send(&vec![0x55; 4 * SMSS as usize]).expect("send");
+    tcb.tick().expect("tick");
+    let data = drain_data(&mut tcb);
+    assert_eq!(data.len(), 4);
+
+    // The host's queue toward the peer is full for ~40 ms (PTO = 10 ms).
+    tcb.set_egress_paused(true);
+    for _ in 0..3 {
+        now += 10;
+        tcb.set_now(now);
+        tcb.tick().expect("tick");
+        assert!(try_pop(&mut tcb).is_none(), "no probe while paused");
+    }
+    assert_eq!(tcb.stats().tlp_count, 0);
+
+    // Resume just before the probe postponed during the pause would fire.
+    now += 9;
+    let resumed = now;
+    tcb.set_now(now);
+    tcb.set_egress_paused(false);
+    tcb.tick().expect("tick");
+    let probe = tick_until_packet(&mut tcb, &mut now, 1_000).expect("probe");
+    assert!(
+        now >= resumed + 10,
+        "probed {} ms after the resume",
+        now - resumed
+    );
+    assert_eq!(probe.seq, data[3].seq, "TLP re-sends the last segment");
+    let s = tcb.stats();
+    assert_eq!((s.tlp_count, s.rto_count), (1, 0));
+}
+
+/// RFC 5681 §4.2: the ACK owed for a second full-sized segment that arrives
+/// while egress is paused goes out on the first tick after the resume, not
+/// when the 40 ms delayed-ACK timer would have fired.
+#[test]
+fn ack_owed_while_egress_paused_is_sent_on_resume() {
+    let mut tcb = make_tcb();
+    let mut now = 0u64;
+    let _ = handshake_with_ts(&mut tcb, &mut now);
+    let base = PSS.wrapping_add(1);
+
+    tcb.set_egress_paused(true);
+    for i in 0..2u32 {
+        let seg = build_in(
+            flags::ACK,
+            base.wrapping_add(i * 1460),
+            ISS.wrapping_add(1),
+            PEER_WIN,
+            None,
+            Some((60, 0)),
+            &[0x66; 1460],
+        );
+        tcb.inject_packet(&seg).expect("inject");
+    }
+    assert!(try_pop(&mut tcb).is_none());
+    assert!(tcb.next_deadline().is_none_or(|d| d > now), "no busy loop");
+
+    now += 1;
+    tcb.set_now(now);
+    tcb.set_egress_paused(false);
+    tcb.tick().expect("tick");
+    let ack = try_pop(&mut tcb).expect("owed ACK goes out on resume");
+    assert_eq!(ack.ack, base.wrapping_add(2 * 1460));
+}
+
+/// The same owed ACK must not be stranded behind the delayed-ACK timer when
+/// the egress ring is full as it falls due: it goes out on the first tick
+/// after the host drains the ring.
+#[test]
+fn ack_owed_while_egress_ring_full_is_sent_after_drain() {
+    let mut tcb = make_tcb();
+    let mut now = 0u64;
+    let _ = handshake_with_ts(&mut tcb, &mut now);
+    let base = PSS.wrapping_add(1);
+    let seg = |seq: u32| {
+        build_in(
+            flags::ACK,
+            seq,
+            ISS.wrapping_add(1),
+            PEER_WIN,
+            None,
+            Some((60, 0)),
+            &[0x77; 1460],
+        )
+    };
+
+    // A segment, then duplicates of it until their D-SACK ACKs fill the ring.
+    for _ in 0..=crate::tx_ring::TX_RING_CAP {
+        tcb.inject_packet(&seg(base)).expect("inject");
+    }
+    tcb.inject_packet(&seg(base.wrapping_add(1460)))
+        .expect("inject");
+    tcb.inject_packet(&seg(base.wrapping_add(2 * 1460)))
+        .expect("inject");
+    while try_pop(&mut tcb).is_some() {}
+
+    now += 1;
+    tcb.set_now(now);
+    tcb.tick().expect("tick");
+    let ack = try_pop(&mut tcb).expect("owed ACK goes out after the drain");
+    assert_eq!(ack.ack, base.wrapping_add(3 * 1460));
+}
+
+/// Back-pressure never swallows a reset.
+#[test]
+fn egress_pause_still_sends_rst_on_abort() {
+    let mut tcb = make_tcb();
+    let mut now = 0u64;
+    let _ = handshake_with_ts(&mut tcb, &mut now);
+    tcb.set_egress_paused(true);
+    tcb.abort().expect("abort");
+    let (_, rst) = pop(&mut tcb);
+    assert_ne!(rst.flags & flags::RST, 0);
+}
+
+// ---------------------------------------------------------------------------
 // Sequence-number wraparound soak.
 //
 // TCP sequence numbers are u32 (4 GiB). On a fast link that's only ~30s
