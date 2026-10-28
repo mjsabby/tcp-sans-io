@@ -451,6 +451,32 @@ fn ack_on_a_retransmitted_fin_is_processed() {
     assert_eq!(t.state(), State::Closed);
 }
 
+/// Segments the peer sends in TIME-WAIT are proof of life, so they re-arm
+/// the keepalive clock: a FIN it re-sends because our ACK was lost (its ACK
+/// field is processed) or a pure ACK. When 2·MSL expires the CLOSED TCB
+/// must still report no deadline, or an event-driven host keeps waking for
+/// a dead connection.
+#[test]
+fn time_wait_expiry_leaves_no_timer_after_peer_segments() {
+    let fin = PEER_ISS + 1;
+    for (seq, fl) in [(fin, flags::FIN), (fin + 1, 0)] {
+        let mut t = established();
+        t.close().unwrap();
+        drain(&mut t);
+        t.set_now(100);
+        peer_seg(&mut t, fin, 1002, flags::FIN, &[]);
+        assert_eq!(t.state(), State::TimeWait);
+        drain(&mut t);
+        t.set_now(1_000);
+        peer_seg(&mut t, seq, 1002, fl, &[]);
+        let expiry = t.next_deadline().expect("2*MSL armed");
+        t.set_now(expiry);
+        t.tick().unwrap();
+        assert_eq!(t.state(), State::Closed);
+        assert_eq!(t.next_deadline(), None, "flags {fl:#x}");
+    }
+}
+
 /// An out-of-order FIN is consumed once, when the gap closes: with a
 /// single ACK (it used to be two, or one plus a redundant delayed ACK for a
 /// bare FIN), never skipped by bytes queued past it (they were delivered

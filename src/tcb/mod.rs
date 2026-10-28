@@ -1194,6 +1194,12 @@ impl<const BUF: usize> Tcb<BUF> {
         self.snd_nxt = self.snd_una;
         self.syn_unacked = false;
         self.fin_sent = false;
+        self.disarm_timers();
+    }
+
+    /// Disarm every timer: a `CLOSED` TCB has no further work, so
+    /// `next_deadline()` must not wake the host for it.
+    pub(super) fn disarm_timers(&mut self) {
         self.rto_deadline = Deadline::OFF;
         self.time_wait_deadline = Deadline::OFF;
         self.fin_wait2_deadline = Deadline::OFF;

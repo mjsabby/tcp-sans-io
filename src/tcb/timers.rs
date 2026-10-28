@@ -13,9 +13,11 @@ impl<const BUF: usize> Tcb<BUF> {
     pub(super) fn run_timers(&mut self) -> Result<(), TcpError> {
         let now = self.now_ms;
         if self.time_wait_deadline.due(now) {
-            // 2·MSL over. Unread received data stays readable.
+            // 2·MSL over. Unread received data stays readable. Segments the
+            // peer sent during TIME_WAIT may have re-armed keepalive, so
+            // disarm every timer, not just this one.
             self.state = State::Closed;
-            self.time_wait_deadline = Deadline::OFF;
+            self.disarm_timers();
             return Ok(());
         }
         if self.state == State::FinWait2 && self.fin_wait2_deadline.due(now) {
