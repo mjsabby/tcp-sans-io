@@ -1794,6 +1794,78 @@ fn ce_on_a_cwr_segment_is_echoed() {
     assert_eq!(ack.flags & flags::ECE, 0);
 }
 
+/// RFC 3168 §6.1.2: CE is a property of data segments; pure ACKs are sent
+/// Not-ECT, so a CE mark on one is forged (or a middlebox artefact). It
+/// used to set the echo state, so an in-window pure ACK with CE made every
+/// following ACK of ours carry ECE and the peer halve its window; Linux
+/// only looks at CE on the data it queues.
+#[test]
+fn ce_on_a_pure_ack_is_not_echoed() {
+    let (mut c, sseq, iss) = established(1000, true, true);
+    c.set_now(1020);
+    c.inject_packet(&pkt_ecn(
+        SRV,
+        CLI,
+        sseq,
+        iss + 1,
+        flags::ACK,
+        8192,
+        &ts(5, 0),
+        &[],
+        wire::ecn::CE,
+    ))
+    .unwrap();
+    drain(&mut c);
+    for k in 0..2u32 {
+        c.inject_packet(&pkt(
+            SRV,
+            CLI,
+            sseq + k * 100,
+            iss + 1,
+            flags::ACK | flags::PSH,
+            8192,
+            &ts(6 + k, 0),
+            &[1u8; 100],
+        ))
+        .unwrap();
+    }
+    let out = drain(&mut c);
+    assert!(!out.is_empty());
+    assert!(
+        out.iter().all(|o| o.flags & flags::ECE == 0),
+        "CE on a pure ACK was echoed"
+    );
+    // CE on data is still echoed.
+    c.inject_packet(&pkt_ecn(
+        SRV,
+        CLI,
+        sseq + 200,
+        iss + 1,
+        flags::ACK | flags::PSH,
+        8192,
+        &ts(8, 0),
+        &[1u8; 100],
+        wire::ecn::CE,
+    ))
+    .unwrap();
+    c.inject_packet(&pkt(
+        SRV,
+        CLI,
+        sseq + 300,
+        iss + 1,
+        flags::ACK | flags::PSH,
+        8192,
+        &ts(9, 0),
+        &[1u8; 100],
+    ))
+    .unwrap();
+    let out = drain(&mut c);
+    assert!(
+        out.iter().any(|o| o.flags & flags::ECE != 0),
+        "CE on data must be echoed"
+    );
+}
+
 /// After the peer's FIN, nothing it sends can occupy sequence space: a
 /// second FIN at RCV.NXT used to advance RCV.NXT, so we acknowledged a
 /// sequence number the peer never sent.

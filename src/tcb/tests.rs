@@ -624,6 +624,66 @@ fn keepalive_reaps_vanished_idle_peer_and_spares_live_one() {
     assert_eq!(t.state(), State::Established);
 }
 
+/// As in Linux, keepalive probes an idle connection in any synchronized
+/// state but TIME_WAIT, so a peer that vanishes after a half close is reaped
+/// too. In CLOSE_WAIT the peer's stream is complete and nothing of ours is in
+/// flight, so the connection closes without an error and unread bytes stay
+/// readable until EOF; in FIN_WAIT_2 it aborts. A live peer that answers
+/// keeps the connection, and a listener gets no keepalive wakeups.
+#[test]
+fn keepalive_probes_idle_half_closed_connections() {
+    let d = PEER_ISS + 1;
+    let mut buf = [0u8; 64];
+
+    let mut t = established();
+    t.set_keepalive(1_000, 100, 3);
+    peer_seg(&mut t, d, 1001, flags::FIN, b"response");
+    assert_eq!(t.state(), State::CloseWait);
+    drain(&mut t);
+    run_timers(&mut t, 20, |t| t.state() == State::Closed);
+    assert_eq!(t.state(), State::Closed, "vanished half-closed peer reaped");
+    assert_eq!(t.poll() & events::ERROR, 0);
+    assert_eq!(t.recv(&mut buf), Ok(8));
+    assert_eq!(&buf[..8], b"response");
+    assert_eq!(t.recv(&mut buf), Err(TcpError::ConnectionClosed));
+
+    let mut t = established();
+    t.set_keepalive(1_000, 100, 3);
+    peer_seg(&mut t, d, 1001, flags::FIN, &[]);
+    drain(&mut t);
+    let mut probes = 0;
+    for _ in 0..20 {
+        let due = t.debug_next_deadline().unwrap();
+        t.set_now(due + 1);
+        t.tick().unwrap();
+        for (seq, _, _, len) in drain(&mut t) {
+            assert_eq!((seq, len), (1000, 0), "keepalive probe");
+            probes += 1;
+            peer_seg(&mut t, d + 1, 1001, 0, &[]); // live peer answers
+        }
+    }
+    assert!(probes > 0, "an idle CLOSE_WAIT is probed");
+    assert_eq!(t.state(), State::CloseWait, "a live peer keeps it open");
+
+    let mut t = established();
+    t.set_keepalive(1_000, 100, 3);
+    t.set_fin_wait2_timeout(0);
+    t.close().unwrap();
+    drain(&mut t);
+    peer_seg(&mut t, d, 1002, 0, &[]);
+    assert_eq!(t.state(), State::FinWait2);
+    run_timers(&mut t, 20, |t| t.state() == State::Closed);
+    assert_eq!(t.state(), State::Closed);
+    assert_ne!(t.poll() & events::ERROR, 0, "FIN_WAIT_2 reap is an abort");
+
+    let mut t: Box<Tcb> = Box::new(Tcb::new(cfg(5000)).unwrap());
+    t.set_now(0);
+    t.set_secret(&[3; 16]);
+    t.listen().unwrap();
+    t.set_keepalive(1_000, 100, 3);
+    assert_eq!(t.next_deadline(), None, "no keepalive wakeups in LISTEN");
+}
+
 #[test]
 fn keepalive_can_be_disabled() {
     let mut t = established();

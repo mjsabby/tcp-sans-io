@@ -49,7 +49,7 @@ shows what that costs against Linux CUBIC on lossy long paths.
 | Initial window of 10 segments | RFC 6928 | ✅ |
 | RACK-TLP: time-based loss detection, tail loss probe | RFC 8985 | ✅ primary loss detection |
 | Duplicate-ACK fast retransmit (peers without SACK) | RFC 5681 §3.2 | ✅ fallback |
-| ECN (ECT(0) on new data; ECE → one CWR reduction per window) | RFC 3168 | ✅ |
+| ECN (ECT(0) on new data; CE echoed only from data segments; ECE → one CWR reduction per window) | RFC 3168 | ✅ |
 | Blind-attack hardening: RST, SYN and ACK checks, rate-limited challenge ACKs | RFC 5961 §3–5, §7 | ✅ |
 | Silly-window avoidance, sender and receiver | RFC 9293 §3.8.6.2 | ✅ |
 | Window-update rule (SND.WL1 / WL2) | RFC 9293 §3.10.7.4 | ✅ a forged future WL1 cannot freeze it |
@@ -162,7 +162,7 @@ mis-ordering, corruption, a panic, or an unbounded loop.
 | `MAX_SYN_RETRIES` / `MAX_SYN_RCVD_RETRIES` | 6 / 5 | `tcb/mod.rs` | SYN retransmissions before an active open fails; SYN-ACK retransmissions before a half-open reverts to `LISTEN`. |
 | `MAX_RETRANSMITS` | 10 | `tcb/mod.rs` | RFC 9293 §3.8.3 "R2": consecutive timeouts (data, FIN or unanswered zero-window probes) with no proof of life before abort. |
 | USER TIMEOUT | 300 s | `tcb/mod.rs` | Max time with outstanding send work but less than one full segment acknowledged; reaps stalled, zero-window and sub-MSS-trickle peers. A reader acknowledging a full segment per period is live progress, not a stall (see *Threat model*). `set_user_timeout(0)` disables. |
-| Keepalive | 600 s idle / 60 s / 4 probes | `tcb/mod.rs` | Reaps a vanished peer on an idle connection. `set_keepalive(0, …)` disables. |
+| Keepalive | 600 s idle / 60 s / 4 probes | `tcb/mod.rs` | Reaps a vanished peer on an idle connection: `ESTABLISHED`, or half-closed (`CLOSE_WAIT`, `FIN_WAIT_2`), as in Linux. `set_keepalive(0, …)` disables. |
 | FIN_WAIT_2 timeout | 60 s | `tcb/mod.rs` | Time a peer may leave its half open after ACKing our FIN; restarted only when the application reads, never by the peer's data alone. |
 | Black-hole MSS clamp / probe | 3, 5 RTOs → 1024, 536 / 10 s … 10 min | `tcb/mod.rs` | Consecutive timeouts of a large segment clamp the MSS; one probe segment at the next larger size (first after 10 s, doubling up to 10 min on failure) restores it once it arrives. |
 | Out-of-window reply rate | 1 per 500 ms | `tcb/mod.rs` | Challenge ACKs, dup ACKs for unacceptable segments and RSTs to stray segments, per connection. Exempt: one immediate ACK (D-SACK) per data / FIN segment that could be the peer's own retransmission — acceptable ACK, plus a timestamp when negotiated — since the peer's loss recovery depends on it. |
@@ -463,7 +463,7 @@ tables. `TSB_PCAP=dir` captures each run's packet headers at the receiver;
 
 ```sh
 cargo build --release --lib       # cdylib + staticlib + rlib
-cargo test  --release --lib       # 207 tests: unit, conformance, loopback, property, server, security regressions, link simulation, smoltcp interop
+cargo test  --release --lib       # 253 tests: unit, conformance, loopback, property, server, security regressions, link simulation, smoltcp interop
 cargo clippy --release --lib --no-deps -- -D warnings
 ```
 
@@ -630,7 +630,8 @@ free(mem);                             // you own the memory
   FIN_WAIT_2, all on by default) bound how long a stalled or vanished peer
   holds a connection, never the aggregate *count* — only the host can do
   that — nor a live peer the application keeps serving. On `PEER_CLOSED` you
-  **must** eventually `close`; keepalive does not probe `CLOSE_WAIT`.
+  **must** eventually `close`: keepalive reaps an idle `CLOSE_WAIT` only if
+  the peer has since vanished, and a live peer keeps it open.
 
 **SHOULD**
 - Treat `inject_packet` errors (`NOT_FOR_US`, `MALFORMED_PACKET`,

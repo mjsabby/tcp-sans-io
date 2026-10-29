@@ -73,3 +73,10 @@ path = "fuzz_targets/tcb_loopback_small.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "tcb_adversary"
+path = "fuzz_targets/tcb_adversary.rs"
+test = false
+doc = false
+bench = false

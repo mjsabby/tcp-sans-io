@@ -67,9 +67,10 @@
 //!
 //! 6. **Act on lifecycle signals and release the TCB.** Read [`Tcb::poll`] and
 //!    react: on `PEER_CLOSED` (peer FIN → `CLOSE_WAIT`) the host **must**
-//!    eventually call [`Tcb::close`] — keepalive does *not* probe `CLOSE_WAIT`
-//!    (the peer didn't vanish, it closed its half), so an un-closed connection
-//!    is pinned until the host acts. On `ERROR` / `CLOSED` (including the
+//!    eventually call [`Tcb::close`]. Keepalive reaps an idle `CLOSE_WAIT` only
+//!    if the peer has since vanished (the connection then closes, unread bytes
+//!    still readable); a live peer keeps answering, so an un-closed connection
+//!    stays pinned until the host acts. On `ERROR` / `CLOSED` (including the
 //!    RST-less local aborts from R2 / USER TIMEOUT / keepalive) drop the TCB or
 //!    [`Tcb::reinit`] it for reuse; the slot is reclaimed only when the host
 //!    releases it. After a clean close, first `recv` any bytes the peer sent

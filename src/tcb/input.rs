@@ -362,10 +362,11 @@ impl<const BUF: usize> Tcb<BUF> {
         self.on_peer_alive();
     }
 
-    /// An acceptable segment arrived: the peer is alive.
+    /// An acceptable segment arrived: the peer is alive, so the keepalive
+    /// idle clock restarts (in the states keepalive runs in).
     fn on_peer_alive(&mut self) {
         self.keepalive_probes = 0;
-        if self.keepalive_idle_ms != 0 {
+        if self.keepalive_idle_ms != 0 && self.keepalive_applies() {
             self.keepalive_deadline = Deadline::at(
                 self.now_ms
                     .saturating_add(u64::from(self.keepalive_idle_ms)),
@@ -450,9 +451,13 @@ impl<const BUF: usize> Tcb<BUF> {
             return self.send_oow_ack();
         }
         self.update_ts_recent(seg);
-        if self.ecn_enabled {
-            // RFC 3168 §6.1.3: CWR ends the echo of earlier CE marks, but a
-            // CE mark on the CWR-carrying packet itself must still be echoed.
+        // RFC 3168 §6.1.2–6.1.3: CE and CWR are properties of data segments
+        // (pure ACKs are sent Not-ECT, so a CE mark on one is forged or a
+        // middlebox artefact); as in Linux only data segments move the echo
+        // state.
+        if self.ecn_enabled && payload_len > 0 {
+            // CWR ends the echo of earlier CE marks, but a CE mark on the
+            // CWR-carrying packet itself must still be echoed.
             if seg.has(flags::CWR) {
                 self.ce_observed = false;
             }
