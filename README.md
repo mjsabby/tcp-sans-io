@@ -91,8 +91,8 @@ shows what that costs against Linux CUBIC on lossy long paths.
 
 ### Memory footprint
 
-Per connection, `tcp_handle_size()` is **2,176,864 bytes (≈ 2.08 MiB)** with
-default features, or **139,488 bytes (136 KiB)** with `small-buffers`:
+Per connection, `tcp_handle_size()` is **2,176,896 bytes (≈ 2.08 MiB)** with
+default features, or **139,520 bytes (136 KiB)** with `small-buffers`:
 
 - `BUF_CAP` send ring + receive ring (2 × 1 MiB; 2 × 32 KiB with
   `small-buffers`). Out-of-order data is parked inside the receive ring at
@@ -662,7 +662,7 @@ inspecting state directly:
 | Flag | Meaning / action |
 |---|---|
 | `READABLE` | `recv` will return bytes. |
-| `WRITABLE` | `send` will accept bytes (Established/CloseWait + ring has room). |
+| `WRITABLE` | `send` will accept bytes (Established/CloseWait + ring has room, none of it lent out by the Rust `send_reserve`). |
 | `ESTABLISHED` | Handshake complete; bulk data may flow. |
 | `PEER_CLOSED` | Peer sent FIN — keep draining `recv`, then `close` your side. |
 | `CLOSED` | Fully torn down; safe to `destroy`. After a clean close, bytes the peer sent before its FIN stay readable (`READABLE`) until `recv` drains them and reports EOF. |
@@ -727,6 +727,17 @@ Segments then carry only the pseudo-header sum in the TCP checksum field
 complete. `tcb.extract_packet_with(|dgram| ...)` lends the staged datagram to
 the closure instead of copying it into your buffer. The inbound counterpart is
 `inject_packet_l4_csum_trusted`. (Rust API only.)
+
+**Filling the send ring in place.** Instead of receiving into your own buffer
+and copying it in with `send`, a host can have its data land in the send
+ring: `tcb.send_reserve(max)` lends the ring's free space as two slices (the
+second is non-empty only when the space wraps the end of the ring), and
+`tcb.send_commit(n)` appends the first `n` bytes to the stream. An
+asynchronous host can hand the slices to the OS as the buffers of a socket
+receive and commit when it completes: until the commit the TCB never touches
+the lent bytes, even if the connection resets meanwhile (the commit then
+drops them), and `send` returns `WouldBlock`. Commit, with 0 if need be,
+before `reinit` or dropping the TCB. (Rust API only.)
 
 ### How do you know you got it right? (canonical conformance)
 

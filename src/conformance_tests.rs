@@ -3151,6 +3151,85 @@ fn extract_packet_with_lends_the_staged_datagram() {
     assert_eq!(tcb.extract_packet_with(|_| ()), None);
 }
 
+/// Bytes the host writes into the space `send_reserve` lends join the stream
+/// at the commit, in order with what `send` queued around them; while the
+/// loan is out, `send` and `poll` keep off the space.
+#[test]
+fn send_reserve_fills_the_stream_in_place() {
+    use crate::TcpError;
+    let mut tcb = make_tcb();
+    let mut now = 0u64;
+    let _ = handshake_with_ts(&mut tcb, &mut now);
+    tcb.send(b"head:").expect("send");
+    let (a, b) = tcb.send_reserve(3000).expect("reserve");
+    assert_eq!((a.len(), b.len()), (3000, 0));
+    for (i, x) in a.iter_mut().enumerate() {
+        *x = i as u8;
+    }
+    assert_eq!(tcb.send(b"x"), Err(TcpError::WouldBlock));
+    assert_eq!(tcb.poll() & events::WRITABLE, 0);
+    assert_eq!(tcb.send_reserve(1).err(), Some(TcpError::InvalidState));
+    tcb.tick().expect("tick");
+    let head: Vec<u8> = drain_data(&mut tcb)
+        .into_iter()
+        .flat_map(|p| p.payload)
+        .collect();
+    assert_eq!(head, b"head:", "uncommitted bytes are not sent");
+
+    assert_eq!(tcb.send_commit(2000), Ok(2000));
+    assert_eq!(
+        tcb.send_commit(0),
+        Err(TcpError::InvalidState),
+        "the loan ended"
+    );
+    assert_ne!(tcb.poll() & events::WRITABLE, 0);
+    tcb.send(b":tail").expect("send");
+    tcb.tick().expect("tick");
+    let rest: Vec<u8> = drain_data(&mut tcb)
+        .into_iter()
+        .flat_map(|p| p.payload)
+        .collect();
+    let want: Vec<u8> = (0..2000).map(|i| i as u8).chain(*b":tail").collect();
+    assert_eq!(rest, want);
+}
+
+/// A loan outlives the connection it was made for: after the peer resets
+/// and the TCB connects again, the loan still keeps `send` off the lent
+/// space, and its commit drops the bytes instead of sending them on the new
+/// connection.
+#[test]
+fn send_commit_after_reset_drops_the_bytes() {
+    use crate::TcpError;
+    let mut tcb = make_tcb();
+    let mut now = 0u64;
+    let _ = handshake_with_ts(&mut tcb, &mut now);
+    let (a, _) = tcb.send_reserve(100).expect("reserve");
+    a.fill(0xee);
+    now += 1;
+    let rst = build_in(
+        flags::RST | flags::ACK,
+        PSS.wrapping_add(1),
+        ISS.wrapping_add(1),
+        PEER_WIN,
+        None,
+        Some((70, 0)),
+        &[],
+    );
+    tcb.set_now(now);
+    tcb.inject_packet(&rst).expect("inject RST");
+    assert_eq!(tcb.state(), State::Closed);
+
+    now += 10;
+    let _ = handshake_with_ts(&mut tcb, &mut now);
+    assert_eq!(tcb.send(b"fresh"), Err(TcpError::WouldBlock), "still lent");
+    assert_eq!(tcb.send_commit(100), Err(TcpError::InvalidState));
+    tcb.send(b"fresh").expect("send");
+    tcb.tick().expect("tick");
+    let data = drain_data(&mut tcb);
+    assert_eq!(data.len(), 1);
+    assert_eq!(data[0].payload, b"fresh");
+}
+
 // ---------------------------------------------------------------------------
 // Sequence-number wraparound soak.
 //

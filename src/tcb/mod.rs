@@ -352,6 +352,12 @@ pub struct Tcb<const BUF: usize = BUF_CAP> {
 
     // ---- Buffers.
     send_ring: Ring<BUF>,
+    /// Bytes of `send_ring`'s free space lent out by `send_reserve` (0: no
+    /// loan), and the connection (`conn_gen`) they were lent for.
+    send_lent: usize,
+    send_lent_conn: u32,
+    /// Bumped for every new connection (`reset_connection_state`).
+    conn_gen: u32,
     recv_ring: Ring<BUF>,
     /// Out-of-order ranges parked in `recv_ring`'s free space.
     ooo: OooList,
@@ -553,6 +559,9 @@ impl<const BUF: usize> Tcb<BUF> {
         self.now_ms = 0;
         self.egress_paused = false;
         self.tx_csum_offload = false;
+        self.send_lent = 0;
+        self.send_lent_conn = 0;
+        self.conn_gen = 0;
         self.ip_id = (cfg.iss >> 16) as u16 ^ cfg.iss as u16;
         self.keepalive_idle_ms = DEFAULT_KEEPALIVE_IDLE_MS;
         self.keepalive_intvl_ms = DEFAULT_KEEPALIVE_INTVL_MS;
@@ -573,6 +582,7 @@ impl<const BUF: usize> Tcb<BUF> {
     /// Reset all per-connection state, keeping the endpoints, knobs and
     /// secrets. Used by `connect`, `listen` and the passive-open paths.
     fn reset_connection_state(&mut self) {
+        self.conn_gen = self.conn_gen.wrapping_add(1);
         self.iss = self.cfg_iss;
         self.snd_una = self.iss;
         self.snd_nxt = self.iss;
@@ -1112,17 +1122,62 @@ impl<const BUF: usize> Tcb<BUF> {
     }
 
     /// Queue application data. Returns bytes accepted (`WouldBlock` if the
-    /// send ring is full). Bytes are transmitted on the next `tick` /
-    /// inbound ACK.
+    /// send ring is full, or lent out by [`Self::send_reserve`]). Bytes are
+    /// transmitted on the next `tick` / inbound ACK.
     pub fn send(&mut self, data: &[u8]) -> Result<usize, TcpError> {
         if !self.state.can_send() {
             return Err(TcpError::InvalidState);
+        }
+        if self.send_lent != 0 {
+            return Err(TcpError::WouldBlock);
         }
         let written = self.send_ring.write(data);
         if written == 0 && !data.is_empty() {
             return Err(TcpError::WouldBlock);
         }
         Ok(written)
+    }
+
+    /// Lend the send ring's free space to the host to fill in place, for
+    /// example as the buffers of an asynchronous socket receive, instead of
+    /// copying the data in through [`Self::send`]. Returns up to `max` bytes
+    /// as two slices; the second is empty unless the space wraps the end of
+    /// the ring. Fill a prefix (the first slice first), then call
+    /// [`Self::send_commit`].
+    ///
+    /// The lent bytes stay the host's until that commit, whatever happens to
+    /// the connection meanwhile: the TCB neither reads nor writes them, and
+    /// `send` returns `WouldBlock` (`poll` drops `WRITABLE`). An asynchronous
+    /// host may therefore hold raw pointers to them across other calls, but
+    /// must commit before it calls `reinit` or drops the TCB. One loan at a
+    /// time: `InvalidState` while one is out or when the connection cannot
+    /// send, `WouldBlock` when the ring is full or `max` is 0. (Rust API
+    /// only.)
+    pub fn send_reserve(&mut self, max: usize) -> Result<(&mut [u8], &mut [u8]), TcpError> {
+        if self.send_lent != 0 || !self.state.can_send() {
+            return Err(TcpError::InvalidState);
+        }
+        let (a, b) = self.send_ring.free_regions(max);
+        let n = a.len() + b.len();
+        if n == 0 {
+            return Err(TcpError::WouldBlock);
+        }
+        self.send_lent = n;
+        self.send_lent_conn = self.conn_gen;
+        Ok((a, b))
+    }
+
+    /// End the loan from [`Self::send_reserve`], appending its first `n`
+    /// bytes (clipped to the loan) to the stream as `send` would. Returns
+    /// the bytes appended; `n == 0` just ends the loan. `InvalidState` if no
+    /// loan is out, or if the connection it was lent for has since closed,
+    /// reset or been replaced: its bytes are then dropped.
+    pub fn send_commit(&mut self, n: usize) -> Result<usize, TcpError> {
+        let lent = core::mem::take(&mut self.send_lent);
+        if lent == 0 || self.send_lent_conn != self.conn_gen || !self.state.can_send() {
+            return Err(TcpError::InvalidState);
+        }
+        Ok(self.send_ring.commit(n.min(lent)))
     }
 
     /// Copy received in-order data out. Returns `ConnectionClosed` once the
@@ -1254,7 +1309,7 @@ impl<const BUF: usize> Tcb<BUF> {
         if !self.recv_ring.is_empty() {
             ev |= events::READABLE;
         }
-        if self.state.can_send() && self.send_ring.free() > 0 {
+        if self.state.can_send() && self.send_ring.free() > 0 && self.send_lent == 0 {
             ev |= events::WRITABLE;
         }
         if matches!(self.state, State::Established) {

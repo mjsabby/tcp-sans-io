@@ -188,13 +188,31 @@ impl<const N: usize> Ring<N> {
     }
 
     /// Make `n` bytes past the write cursor readable. They must already hold
-    /// valid data (written by [`Self::write_at`]). Clipped to free space;
-    /// returns the number of bytes committed.
+    /// valid data (written by [`Self::write_at`] or through
+    /// [`Self::free_regions`]). Clipped to free space; returns the number of
+    /// bytes committed.
     pub fn commit(&mut self, n: usize) -> usize {
         let n = core::cmp::min(n, self.free());
         self.tail = self.tail.wrapping_add(n);
         self.len += n;
         n
+    }
+
+    /// The free space past the write cursor, up to `max` bytes, as at most
+    /// two slices: the second is empty unless the space wraps the end of the
+    /// storage. Bytes written there become readable through [`Self::commit`].
+    pub fn free_regions(&mut self, max: usize) -> (&mut [u8], &mut [u8]) {
+        let n = core::cmp::min(max, self.free());
+        let start = self.tail & (N - 1);
+        let first = core::cmp::min(n, N - start);
+        let wrapped = n - first;
+        match self.buf.split_at_mut_checked(start) {
+            Some((before, after)) => (
+                after.get_mut(..first).unwrap_or_default(),
+                before.get_mut(..wrapped).unwrap_or_default(),
+            ),
+            None => (&mut [], &mut []),
+        }
     }
 
     /// Drop `n` bytes from the head. Saturates at `len`.
@@ -254,5 +272,27 @@ mod tests {
         );
         assert_eq!(r.commit(100), 5, "commit is clipped to free space");
         assert_eq!(r.free(), 0);
+    }
+
+    #[test]
+    fn free_regions_split_where_the_free_space_wraps() {
+        let mut r: Ring<16> = Ring::new().unwrap();
+        assert_eq!(r.write(&[0xaa; 12]), 12);
+        let mut sink = [0u8; 10];
+        assert_eq!(r.read(&mut sink), 10);
+        let (a, b) = r.free_regions(100);
+        assert_eq!(
+            (a.len(), b.len()),
+            (4, 10),
+            "all 14 free bytes, split at the end"
+        );
+        a.copy_from_slice(&[1, 2, 3, 4]);
+        b[..3].copy_from_slice(&[5, 6, 7]);
+        assert_eq!(r.commit(7), 7);
+        let mut out = [0u8; 9];
+        assert_eq!(r.read(&mut out), 9);
+        assert_eq!(out, [0xaa, 0xaa, 1, 2, 3, 4, 5, 6, 7]);
+        let (a, b) = r.free_regions(3);
+        assert_eq!((a.len(), b.len()), (3, 0), "clipped to max");
     }
 }
