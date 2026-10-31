@@ -76,6 +76,16 @@ int32_t tcp_init(TcpStreamHandle* storage,
                  const uint8_t* local_ip,  uint16_t local_port,
                  const uint8_t* remote_ip, uint16_t remote_port,
                  uint32_t iss, uint32_t initial_rto_ms);
+/* tcp_init for storage that is already all zero bytes (calloc, or a fresh
+ * anonymous mmap), which it then does not zero again: ring storage a
+ * connection never uses is never touched, so with autotuned buffers
+ * (tcp_set_buffer_limits) a handle's memory follows its ring capacities
+ * rather than tcp_handle_size(). Undefined behaviour if the storage is not
+ * all zero. */
+int32_t tcp_init_zeroed(TcpStreamHandle* storage,
+                        const uint8_t* local_ip,  uint16_t local_port,
+                        const uint8_t* remote_ip, uint16_t remote_port,
+                        uint32_t iss, uint32_t initial_rto_ms);
 /* Invalidate a handle and release anything the TCB itself owns (its rings,
  * in heap-buffers builds); the host frees the storage block afterwards.
  * NULL is a no-op; a second destroy returns TCP_ERR_INVALID_STATE. */
@@ -158,6 +168,39 @@ int32_t tcp_update_pmtu(TcpStreamHandle* handle, uint64_t now_ms, uint16_t mtu);
  * peer trickling bytes nobody reads cannot hold a closed connection. */
 int32_t tcp_set_fin_wait2_timeout(TcpStreamHandle* handle, uint64_t now_ms,
                                   uint32_t timeout_ms);
+
+/* ---- Buffer sizing and memory ----------------------------------------- */
+/* Bound the send and receive ring capacities (bytes; each clamped to
+ * 4096..BUF_CAP and rounded down to a power of two). Equal bounds pin a
+ * ring's capacity; distinct ones autotune it between them (growing with the
+ * bandwidth-delay product, shrinking once less is needed), starting each
+ * connection at 64 KiB (clamped). Default: both pinned at BUF_CAP (1 MiB),
+ * i.e. fixed buffers. A raised minimum applies at once; under a lowered
+ * maximum no new window or send space is offered beyond it and the ring
+ * shrinks once its contents and the window already advertised fit. Call
+ * before tcp_connect / tcp_listen to open at the initial capacity.
+ * TCP_ERR_INVALID_STATE if a minimum exceeds its maximum. */
+int32_t tcp_set_buffer_limits(TcpStreamHandle* handle,
+                              size_t snd_min, size_t snd_max,
+                              size_t rcv_min, size_t rcv_max);
+/* Current send / receive ring capacities in bytes (either out may be NULL). */
+int32_t tcp_get_buffer_sizes(const TcpStreamHandle* handle,
+                             size_t* out_snd, size_t* out_rcv);
+
+typedef struct TcpSpan {
+    uint8_t* ptr;
+    size_t   len;
+} TcpSpan;
+/* Write up to `cap` non-empty spans of the handle's storage that the stack
+ * will not read before writing them again (at most 3: ring space past each
+ * ring's capacity or a whole empty ring, and the egress slots when nothing
+ * is staged); returns how many were written, or a negative error. A host
+ * that backs handles with lazily allocated memory (tcp_init_zeroed over
+ * calloc / mmap) may release the whole pages inside them — e.g.
+ * madvise(MADV_DONTNEED) once a connection has been idle a while — or
+ * overwrite them; they fault back in when used. Valid until the next call
+ * on the handle. */
+int32_t tcp_reclaimable(TcpStreamHandle* handle, TcpSpan* out, size_t cap);
 
 /* ---- State / polling --------------------------------------------------- */
 uint8_t  tcp_state(const TcpStreamHandle* handle);

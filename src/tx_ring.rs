@@ -21,13 +21,16 @@
 //! relative to the BDP cap `BUF_CAP / MSS ≈ 720` segments: the host
 //! is expected to drain the ring at every wakeup, so we only need
 //! enough buffering to amortize syscall overhead within a single
-//! tick / inject cycle.
+//! tick / inject cycle. Once drained the ring starts over at the first
+//! slot, so a connection whose bursts are short only ever touches the
+//! slots its largest burst needed, and an empty ring's slot storage can
+//! be handed back to the host ([`TxRing::spare_mut`]).
 //!
 //! ## Invariants
 //!
 //! * `head + len` (mod `TX_RING_CAP`) == `tail` (computed; not
 //!   stored).
-//! * `len <= TX_RING_CAP`.
+//! * `len <= TX_RING_CAP`; `head == 0` whenever `len == 0`.
 //! * Slots in `[head .. head + len)` hold valid packet bytes;
 //!   slots outside are uninitialized as far as the consumer is
 //!   concerned.
@@ -41,26 +44,11 @@ use crate::MAX_PACKET;
 /// comfortable safety margin.
 pub const TX_RING_CAP: usize = 32;
 
-/// A single packet slot. `len` is the number of valid bytes in `buf`
-/// (always `<= MAX_PACKET`).
-#[derive(Copy, Clone)]
-struct Slot {
-    buf: [u8; MAX_PACKET],
-    len: u16,
-}
-
-impl Slot {
-    const fn new() -> Self {
-        Self {
-            buf: [0u8; MAX_PACKET],
-            len: 0,
-        }
-    }
-}
-
-/// Bounded FIFO ring of outbound packet slots.
+/// Bounded FIFO ring of outbound packet slots: slot `i` is `bufs[i]`, of
+/// which the first `lens[i]` bytes (always `<= MAX_PACKET`) are valid.
 pub struct TxRing {
-    slots: [Slot; TX_RING_CAP],
+    bufs: [[u8; MAX_PACKET]; TX_RING_CAP],
+    lens: [u16; TX_RING_CAP],
     head: usize,
     len: usize,
 }
@@ -68,7 +56,8 @@ pub struct TxRing {
 impl TxRing {
     pub const fn new() -> Self {
         Self {
-            slots: [Slot::new(); TX_RING_CAP],
+            bufs: [[0u8; MAX_PACKET]; TX_RING_CAP],
+            lens: [0; TX_RING_CAP],
             head: 0,
             len: 0,
         }
@@ -103,7 +92,7 @@ impl TxRing {
         if self.len == 0 {
             return None;
         }
-        self.slots.get(self.head).map(|s| s.len as usize)
+        self.lens.get(self.head).map(|&l| usize::from(l))
     }
 
     /// Stage a new packet by invoking `f` to write into the tail
@@ -127,12 +116,14 @@ impl TxRing {
             return Ok(false);
         }
         let tail = (self.head + self.len) % TX_RING_CAP;
-        let slot = self.slots.get_mut(tail).ok_or(TcpError::Overflow)?;
-        let n = f(&mut slot.buf)?;
+        let (Some(buf), Some(len)) = (self.bufs.get_mut(tail), self.lens.get_mut(tail)) else {
+            return Err(TcpError::Overflow);
+        };
+        let n = f(buf)?;
         if n == 0 || n > MAX_PACKET {
             return Err(TcpError::Overflow);
         }
-        slot.len = n as u16;
+        *len = n as u16;
         self.len += 1;
         Ok(true)
     }
@@ -144,33 +135,50 @@ impl TxRing {
     /// packet — the slot is left in place so the caller can retry
     /// with a larger buffer.
     pub fn pop_into(&mut self, out: &mut [u8]) -> Result<usize, TcpError> {
-        if self.len == 0 {
+        let Some(n) = self.peek_head_len() else {
             return Ok(0);
-        }
-        let slot = self.slots.get(self.head).ok_or(TcpError::Overflow)?;
-        let n = slot.len as usize;
+        };
         if out.len() < n {
             return Err(TcpError::BufferTooSmall);
         }
-        let src = slot.buf.get(..n).ok_or(TcpError::Overflow)?;
+        let src = self
+            .bufs
+            .get(self.head)
+            .and_then(|b| b.get(..n))
+            .ok_or(TcpError::Overflow)?;
         let dst = out.get_mut(..n).ok_or(TcpError::BufferTooSmall)?;
         dst.copy_from_slice(src);
-        self.head = (self.head + 1) % TX_RING_CAP;
-        self.len -= 1;
+        self.advance();
         Ok(n)
     }
 
     /// Pop the head packet and lend its bytes to `f`; `None` if the ring
     /// is empty.
     pub fn pop_with<R>(&mut self, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
-        if self.len == 0 {
-            return None;
-        }
-        let slot = self.slots.get(self.head)?;
-        let r = f(slot.buf.get(..slot.len as usize)?);
+        let n = self.peek_head_len()?;
+        let r = f(self.bufs.get(self.head)?.get(..n)?);
+        self.advance();
+        Some(r)
+    }
+
+    /// Retire the head slot; a drained ring starts over at the first slot.
+    fn advance(&mut self) {
         self.head = (self.head + 1) % TX_RING_CAP;
         self.len -= 1;
-        Some(r)
+        if self.len == 0 {
+            self.head = 0;
+        }
+    }
+
+    /// The slot storage when no packet is staged (empty otherwise): bytes
+    /// the ring will not read before writing them again, for a host to
+    /// release or overwrite freely.
+    pub fn spare_mut(&mut self) -> &mut [u8] {
+        if self.len == 0 {
+            self.bufs.as_flattened_mut()
+        } else {
+            &mut []
+        }
     }
 }
 
@@ -338,5 +346,51 @@ mod tests {
             assert_eq!(buf[0], i);
         }
         assert!(r.is_empty());
+    }
+
+    #[test]
+    fn a_drained_ring_starts_over_at_the_first_slot() {
+        let mut r = TxRing::new();
+        let mut buf = [0u8; 8];
+        for i in 0..3u8 {
+            r.push_with(|b| {
+                b[0] = i;
+                Ok(1)
+            })
+            .unwrap();
+        }
+        assert_eq!(r.pop_into(&mut buf).unwrap(), 1);
+        assert_eq!(r.head, 1);
+        assert_eq!(r.pop_into(&mut buf).unwrap(), 1);
+        assert_eq!(r.pop_with(|p| p.to_vec()), Some(std::vec![2]));
+        assert_eq!((r.head, r.len), (0, 0), "drained: back to slot 0");
+        r.push_with(|b| {
+            b[0] = 9;
+            Ok(1)
+        })
+        .unwrap();
+        assert_eq!(r.bufs[0][0], 9, "the next packet reuses slot 0");
+    }
+
+    #[test]
+    fn spare_storage_is_every_slot_only_while_nothing_is_staged() {
+        let mut r = TxRing::new();
+        assert_eq!(r.spare_mut().len(), TX_RING_CAP * MAX_PACKET);
+        r.push_with(|b| {
+            b[..2].copy_from_slice(b"hi");
+            Ok(2)
+        })
+        .unwrap();
+        assert!(r.spare_mut().is_empty());
+        let mut out = [0u8; 8];
+        assert_eq!(r.pop_into(&mut out).unwrap(), 2);
+        r.spare_mut().fill(0xA5);
+        r.push_with(|b| {
+            b[..2].copy_from_slice(b"ok");
+            Ok(2)
+        })
+        .unwrap();
+        assert_eq!(r.pop_into(&mut out).unwrap(), 2);
+        assert_eq!(&out[..2], b"ok");
     }
 }

@@ -236,7 +236,26 @@ fn make_tcb(mode: u8) -> Tcb {
     if mode & 4 != 0 {
         let _ = tcb.set_mtu(576 + u16::from(mode >> 5) * 128);
     }
+    if mode & 8 != 0 {
+        // Small or autotuned rings: window edges and parked data near the
+        // capacity, and reclaimable storage overwritten at every step.
+        let (min, max) = if mode & 0x80 != 0 {
+            (0, usize::MAX)
+        } else {
+            let pinned = 4096 << ((mode >> 5) & 3);
+            (pinned, pinned)
+        };
+        let _ = no_internal(tcb.set_buffer_limits(min, max, min, max));
+    }
     tcb
+}
+
+/// Overwrite storage the TCB will not read before writing it again.
+fn poison(tcb: &mut Tcb) {
+    for s in tcb.reclaimable() {
+        let n = s.len().min(64 * 1024);
+        s[..n].fill(0xA5);
+    }
 }
 
 fuzz_target!(|data: &[u8]| {
@@ -349,6 +368,9 @@ fuzz_target!(|data: &[u8]| {
             observe_state(&mut prev_state, &tcb);
         }
         assert_monotonic(&mut mono, &tcb);
+        if mode & 8 != 0 {
+            poison(&mut tcb);
+        }
 
         // Advance time: 0..=255 ms, or a long jump that fires backed-off
         // timers (cookie buckets, TIME_WAIT, FIN_WAIT_2, probes).
