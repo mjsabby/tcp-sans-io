@@ -547,14 +547,16 @@ impl<const BUF: usize> Tcb<BUF> {
     }
 
     /// Wire window field and the byte window it represents. SYN windows are
-    /// unscaled (RFC 7323 §2.3). Rounding to the scale granularity does not
-    /// shrink the previously advertised right edge, as far as the ring has
-    /// room: every byte up to an edge we advertised must be accepted (RFC
-    /// 7323 §2.4 rule 1), and `receive_payload` can only take what fits in
-    /// the ring. Past the free space it rounds down instead — a sub-unit
-    /// retraction that window scaling makes unavoidable and §2.4 allows —
-    /// so the edge never creeps past the buffer, and a full one advertises
-    /// a zero window.
+    /// unscaled (RFC 7323 §2.3). The window never offers more than the free
+    /// space of the receive ring: bytes past it are trimmed on arrival, so a
+    /// peer filling such a window loses its tail and must repair the hole
+    /// with SACK recovery and a retransmission. Rounding to the scale
+    /// granularity therefore rounds up to keep the previously advertised
+    /// right edge only as far as that space allows, and otherwise down — a
+    /// sub-unit retraction that window scaling makes unavoidable (RFC 7323
+    /// §2.4). It loses nothing: segment acceptance is checked against the
+    /// free space, which never moves left, not against the last window. The
+    /// cap also lets a full buffer advertise a zero window.
     fn outbound_window(&self, is_syn: bool) -> (u16, u32) {
         let adv = self.advertised_window();
         if is_syn {
@@ -567,9 +569,9 @@ impl<const BUF: usize> Tcb<BUF> {
         } else {
             0
         };
-        let mut units = adv >> shift;
+        let fits = (self.recv_ring.free() as u32) >> shift;
+        let mut units = (adv >> shift).min(fits);
         if (units << shift) < cur {
-            let fits = self.recv_ring.free() as u32 >> shift;
             units = cur.div_ceil(1u32 << shift).min(fits);
         }
         let units = units.min(u32::from(u16::MAX));
