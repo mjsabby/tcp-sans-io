@@ -1935,12 +1935,12 @@ fn zero_window_probe_acknowledgment_is_processed() {
         ))
         .unwrap();
         for o in drain(&mut c) {
-            // Window scaling may round the advertised edge up by less than
-            // one unit, never further: it used to creep ~16 bytes per ACK at
-            // 1 MiB (shift 5), so a full buffer never advertised zero.
+            // The advertised edge never passes the buffer: it used to creep
+            // ~16 bytes per ACK at 1 MiB (shift 5), so a full buffer never
+            // advertised zero.
             let edge = o.ack + (u32::from(o.win) << shift);
             assert!(
-                edge < sseq + crate::BUF_CAP as u32 + (1 << shift),
+                edge <= sseq + crate::BUF_CAP as u32,
                 "edge {edge} past the buffer"
             );
         }
@@ -1980,6 +1980,80 @@ fn zero_window_probe_acknowledgment_is_processed() {
         (out[0].ack, out[0].win),
         (seq, 0),
         "probe data not accepted"
+    );
+}
+
+/// Window scaling may retract the advertised edge by less than one unit
+/// (RFC 7323 §2.4), but the edge must never pass the free space of the
+/// receive ring. Rounding up to keep the previous edge used to offer up to
+/// `2^shift - 1` bytes beyond it; a peer filling that window had those bytes
+/// trimmed on arrival, and every such hole cost it a SACK recovery and a
+/// retransmission (every few MiB of a guest upload through tinyvmm's NAT).
+#[test]
+fn peer_filling_every_advertised_window_loses_nothing() {
+    let (mut c, sseq, iss) = established(1000, true, false);
+    let shift = (0..15).find(|&s| (crate::BUF_CAP >> s) <= 0xffff).unwrap();
+    let chunk = [7u8; 1448];
+    let mut buf = [0u8; 4096];
+    let (mut seq, mut t, mut tsv) = (sseq, 1020u64, 10u32);
+    let (mut edge, mut read) = (sseq, 0u32);
+    // Every edge must lie within the ring: its capacity past what was read.
+    let absorb = |out: Vec<Out>, edge: &mut u32, read: u32| {
+        for o in out.iter().filter(|o| o.flags & flags::ACK != 0) {
+            let e = o.ack + (u32::from(o.win) << shift);
+            let limit = sseq + read + crate::BUF_CAP as u32;
+            assert!(e <= limit, "edge {e} past the receive ring ({limit})");
+            *edge = (*edge).max(e);
+        }
+    };
+    // The application reads odd amounts while the peer keeps sending up to
+    // the furthest edge ever advertised, so the edge lands on every
+    // alignment relative to the scale unit.
+    for round in 0..600u32 {
+        let mut sent_any = false;
+        while seq < edge || (round == 0 && !sent_any) {
+            let len = if round == 0 && !sent_any {
+                chunk.len()
+            } else {
+                ((edge - seq) as usize).min(chunk.len())
+            };
+            t += 1;
+            tsv += 1;
+            c.set_now(t);
+            c.inject_packet(&pkt(
+                SRV,
+                CLI,
+                seq,
+                iss + 1,
+                flags::ACK,
+                65535,
+                &ts(tsv, 0),
+                &chunk[..len],
+            ))
+            .unwrap();
+            seq += len as u32;
+            sent_any = true;
+            assert_eq!(
+                c.debug_snapshot().rcv_nxt,
+                seq,
+                "bytes sent inside the advertised window were dropped"
+            );
+            absorb(drain(&mut c), &mut edge, read);
+        }
+        if round > 0 {
+            let want = 997 + (round as usize * 37) % 1500;
+            read += c.recv(&mut buf[..want]).unwrap() as u32;
+        }
+        t += 50;
+        c.set_now(t);
+        c.tick().unwrap();
+        absorb(drain(&mut c), &mut edge, read);
+        c.debug_validate_invariants().unwrap();
+    }
+    // The window kept reopening as the application read.
+    assert!(
+        edge + 8192 >= sseq + read + crate::BUF_CAP as u32,
+        "window stuck: edge {edge}, read {read}"
     );
 }
 
