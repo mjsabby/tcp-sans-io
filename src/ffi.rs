@@ -107,6 +107,69 @@ pub unsafe extern "C" fn tcp_init(
     iss: u32,
     initial_rto_ms: u32,
 ) -> i32 {
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        init_handle(
+            storage,
+            local_ip,
+            local_port,
+            remote_ip,
+            remote_port,
+            iss,
+            initial_rto_ms,
+            false,
+        )
+    }
+}
+
+/// [`tcp_init`] for storage that is already all zero bytes — from `calloc`,
+/// or a fresh anonymous `mmap` — which it then does not zero again. Ring
+/// storage a connection never uses is never touched, so with autotuned
+/// buffers ([`tcp_set_buffer_limits`]) a handle's memory follows its ring
+/// capacities rather than `tcp_handle_size()`.
+///
+/// # Safety
+/// As [`tcp_init`], and all `tcp_handle_size()` bytes at `storage` must be
+/// zero.
+#[no_mangle]
+pub unsafe extern "C" fn tcp_init_zeroed(
+    storage: *mut TcpStreamHandle,
+    local_ip: *const u8,
+    local_port: u16,
+    remote_ip: *const u8,
+    remote_port: u16,
+    iss: u32,
+    initial_rto_ms: u32,
+) -> i32 {
+    // SAFETY: forwarded caller contract (including the all-zero storage).
+    unsafe {
+        init_handle(
+            storage,
+            local_ip,
+            local_port,
+            remote_ip,
+            remote_port,
+            iss,
+            initial_rto_ms,
+            true,
+        )
+    }
+}
+
+/// # Safety
+/// As [`tcp_init`]; with `zeroed`, all `tcp_handle_size()` bytes at
+/// `storage` must be zero.
+#[allow(clippy::too_many_arguments)]
+unsafe fn init_handle(
+    storage: *mut TcpStreamHandle,
+    local_ip: *const u8,
+    local_port: u16,
+    remote_ip: *const u8,
+    remote_port: u16,
+    iss: u32,
+    initial_rto_ms: u32,
+    zeroed: bool,
+) -> i32 {
     if storage.is_null() {
         return TcpError::NullPointer.as_code();
     }
@@ -131,11 +194,17 @@ pub unsafe extern "C" fn tcp_init(
         initial_rto_ms,
     };
     // SAFETY: `storage` is non-null, aligned (checked above) and writable for
-    // one handle (caller contract). The magic is written last so a failed
-    // init never leaves a "live" handle behind.
+    // one handle (caller contract); with `zeroed`, all of it is zero. The
+    // magic is written last so a failed init never leaves a "live" handle.
     unsafe {
         core::ptr::addr_of_mut!((*storage).magic).write(MAGIC_DEAD);
-        if let Err(e) = Tcb::init_in_place(core::ptr::addr_of_mut!((*storage).inner), cfg) {
+        let inner = core::ptr::addr_of_mut!((*storage).inner);
+        let r = if zeroed {
+            Tcb::init_in_place_zeroed(inner, cfg)
+        } else {
+            Tcb::init_in_place(inner, cfg)
+        };
+        if let Err(e) = r {
             return e.as_code();
         }
         core::ptr::addr_of_mut!((*storage).magic).write(MAGIC_LIVE);
@@ -556,6 +625,115 @@ pub unsafe extern "C" fn tcp_extract_packet(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Buffer sizing and memory
+// ---------------------------------------------------------------------------
+
+/// Bound the send and receive ring capacities (bytes; each clamped to
+/// `4096..=BUF_CAP` and rounded down to a power of two). Equal bounds pin a
+/// ring's capacity; distinct ones autotune it between them, starting each
+/// connection at 64 KiB (clamped). The default pins both at `BUF_CAP`, the
+/// fixed buffers of a handle that never calls this. A raised minimum
+/// applies at once; under a lowered maximum no new window or send space is
+/// offered beyond it and the ring shrinks once its contents and the window
+/// already advertised fit. Call before `tcp_connect` / `tcp_listen` to open
+/// at the initial capacity. `InvalidState` if a minimum exceeds its maximum.
+///
+/// # Safety
+/// `handle` must be NULL or a live handle from [`tcp_init`].
+#[no_mangle]
+pub unsafe extern "C" fn tcp_set_buffer_limits(
+    handle: *mut TcpStreamHandle,
+    snd_min: usize,
+    snd_max: usize,
+    rcv_min: usize,
+    rcv_max: usize,
+) -> i32 {
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        with_handle(handle, |h| {
+            h.set_buffer_limits(snd_min, snd_max, rcv_min, rcv_max)
+        })
+    }
+}
+
+/// Current send and receive ring capacities, in bytes.
+///
+/// # Safety
+/// `handle` as above; `out_snd` / `out_rcv` must each be NULL or writable.
+#[no_mangle]
+pub unsafe extern "C" fn tcp_get_buffer_sizes(
+    handle: *const TcpStreamHandle,
+    out_snd: *mut usize,
+    out_rcv: *mut usize,
+) -> i32 {
+    // SAFETY: forwarded caller contract.
+    let Some(h) = (unsafe { validate(handle) }) else {
+        return TcpError::InvalidState.as_code();
+    };
+    let (snd, rcv) = h.inner.buffer_capacity();
+    // SAFETY: caller-owned out parameters (or NULL).
+    unsafe {
+        write_out(out_snd, snd);
+        write_out(out_rcv, rcv);
+    }
+    0
+}
+
+/// One span of handle storage (see [`tcp_reclaimable`]).
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct TcpSpan {
+    pub ptr: *mut u8,
+    pub len: usize,
+}
+
+/// List up to `cap` non-empty spans of the handle's storage that the stack
+/// will not read before writing them again (at most 3: ring space past each
+/// ring's capacity or a whole empty ring, and the egress slots when nothing
+/// is staged); returns how many were written. A host that backs handles with
+/// lazily allocated memory (`tcp_init_zeroed` over `calloc` / `mmap`) may
+/// release the whole pages inside them — e.g. `madvise(MADV_DONTNEED)` once
+/// a connection has been idle for a while — or overwrite them; they are
+/// faulted back in when used. Valid until the next call on the handle.
+///
+/// # Safety
+/// `handle` as above; `out` must point to `cap` writable `TcpSpan`s (or be
+/// NULL with `cap == 0`).
+#[no_mangle]
+pub unsafe extern "C" fn tcp_reclaimable(
+    handle: *mut TcpStreamHandle,
+    out: *mut TcpSpan,
+    cap: usize,
+) -> i32 {
+    if cap != 0 && out.is_null() {
+        return TcpError::NullPointer.as_code();
+    }
+    let mut n = 0usize;
+    // SAFETY: forwarded caller contract; `out` holds `cap` spans.
+    let r = unsafe {
+        with_handle(handle, |h| {
+            for s in h.reclaimable().into_iter().filter(|s| !s.is_empty()) {
+                if n == cap {
+                    break;
+                }
+                let span = TcpSpan {
+                    ptr: s.as_mut_ptr(),
+                    len: s.len(),
+                };
+                // SAFETY: `n < cap` spans fit at `out` (caller contract).
+                out.add(n).write_unaligned(span);
+                n += 1;
+            }
+            Ok(())
+        })
+    };
+    if r != 0 {
+        return r;
+    }
+    i32::try_from(n).unwrap_or(i32::MAX)
+}
+
 /// Copy per-connection counters (`TcpStats` in the header) into `*out`.
 ///
 /// # Safety
@@ -695,5 +873,73 @@ where
     match f(&mut h.inner) {
         Ok(()) => 0,
         Err(e) => e.as_code(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
+    extern crate std;
+
+    use super::*;
+    use std::alloc::{alloc_zeroed, dealloc, Layout};
+
+    /// Buffer limits, sizes and reclaimable spans through the C ABI, on
+    /// zeroed storage initialised by `tcp_init_zeroed`.
+    #[test]
+    fn buffer_sizing_through_the_c_abi() {
+        let layout = Layout::from_size_align(tcp_handle_size(), tcp_handle_align()).unwrap();
+        let ip = [10u8, 0, 0, 1];
+        let empty = TcpSpan {
+            ptr: core::ptr::null_mut(),
+            len: 0,
+        };
+        // SAFETY: zeroed storage of the documented size and alignment,
+        // initialised once, destroyed once, then freed.
+        unsafe {
+            let storage = alloc_zeroed(layout);
+            assert!(!storage.is_null());
+            let h: *mut TcpStreamHandle = storage.cast();
+            assert_eq!(
+                tcp_init_zeroed(h, ip.as_ptr(), 1, ip.as_ptr(), 2, 7, 1000),
+                0
+            );
+            let (mut snd, mut rcv) = (0usize, 0usize);
+            assert_eq!(tcp_get_buffer_sizes(h, &mut snd, &mut rcv), 0);
+            assert_eq!((snd, rcv), (crate::BUF_CAP, crate::BUF_CAP));
+            assert_eq!(
+                tcp_set_buffer_limits(h, 8192, 4096, 0, 0),
+                TcpError::InvalidState.as_code()
+            );
+            assert_eq!(tcp_set_buffer_limits(h, 0, usize::MAX, 0, usize::MAX), 0);
+            assert_eq!(tcp_get_buffer_sizes(h, &mut snd, core::ptr::null_mut()), 0);
+            assert_eq!(snd, crate::INITIAL_RING_CAP.min(crate::BUF_CAP));
+
+            let mut spans = [empty; 4];
+            assert_eq!(tcp_reclaimable(h, spans.as_mut_ptr(), spans.len()), 3);
+            #[cfg(not(feature = "heap-buffers"))]
+            for s in &spans[..3] {
+                let (lo, p) = (storage as usize, s.ptr as usize);
+                assert!(
+                    p >= lo && p + s.len <= lo + layout.size(),
+                    "outside the handle"
+                );
+            }
+            for s in &spans[..3] {
+                core::ptr::write_bytes(s.ptr, 0xA5, s.len);
+            }
+            assert_eq!(tcp_reclaimable(h, spans.as_mut_ptr(), 1), 1);
+            assert_eq!(tcp_reclaimable(h, core::ptr::null_mut(), 0), 0);
+            assert_eq!(
+                tcp_reclaimable(h, core::ptr::null_mut(), 1),
+                TcpError::NullPointer.as_code()
+            );
+            assert!(tcp_reclaimable(core::ptr::null_mut(), spans.as_mut_ptr(), 3) < 0);
+            assert!(tcp_set_buffer_limits(core::ptr::null_mut(), 0, 0, 0, 0) < 0);
+            assert!(tcp_get_buffer_sizes(core::ptr::null(), &mut snd, &mut rcv) < 0);
+            assert_eq!(tcp_destroy(h), 0);
+            assert!(tcp_get_buffer_sizes(h, &mut snd, &mut rcv) < 0, "destroyed");
+            dealloc(storage, layout);
+        }
     }
 }

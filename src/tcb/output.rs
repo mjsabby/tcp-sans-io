@@ -530,15 +530,18 @@ impl<const BUF: usize> Tcb<BUF> {
 
     /// Receive window to advertise, in bytes (before scaling). Receiver SWS
     /// avoidance (RFC 9293 §3.8.6.2.2): the right edge only moves when at
-    /// least `min(BUF/2, MSS)` more space opened, and it never moves left.
+    /// least `min(buffer/2, MSS)` more space opened, and it never moves left.
+    /// Offers only space within the ring's target capacity, so a pending
+    /// shrink is never undone by a new promise.
     fn advertised_window(&self) -> u32 {
-        let free = self.recv_ring.free() as u32;
+        let free = self.recv_ring.room() as u32;
         let cur = if seq_gt(self.rcv_adv_edge, self.rcv_nxt) {
             self.rcv_adv_edge.wrapping_sub(self.rcv_nxt)
         } else {
             0
         };
-        let thresh = (BUF as u32 / 2).min(u32::from(self.local_mss));
+        let buf = self.recv_ring.capacity().min(self.recv_ring.target()) as u32;
+        let thresh = (buf / 2).min(u32::from(self.local_mss));
         if free >= cur.saturating_add(thresh) {
             free
         } else {

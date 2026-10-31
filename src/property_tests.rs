@@ -389,3 +389,130 @@ proptest! {
         prop_assert_eq!(all, stream);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Resizable ring — any interleaving of I/O and resizes matches a model
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+enum RingOp {
+    Write(usize),
+    Read(usize),
+    Park(usize, usize),
+    Commit(usize),
+    PeekAt(usize, usize),
+    Target(usize),
+    Resize(usize),
+}
+
+fn ring_op() -> impl Strategy<Value = RingOp> {
+    prop_oneof![
+        3 => (0usize..80).prop_map(RingOp::Write),
+        3 => (0usize..80).prop_map(RingOp::Read),
+        2 => (0usize..80, 1usize..24).prop_map(|(o, n)| RingOp::Park(o, n)),
+        1 => (0usize..80).prop_map(RingOp::Commit),
+        1 => (0usize..80, 0usize..80).prop_map(|(o, n)| RingOp::PeekAt(o, n)),
+        2 => (0usize..100).prop_map(RingOp::Target),
+        2 => (0usize..100).prop_map(RingOp::Resize),
+    ]
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 2048, ..ProptestConfig::default() })]
+
+    /// Any interleaving of writes, reads, out-of-order parking, commits,
+    /// retargets and resizes keeps the ring equal to a model: readable bytes
+    /// in order, parked bytes at their offset past the write cursor, the
+    /// capacity moving only when everything that must survive fits in the
+    /// target, and nothing offered (`room`) past a pending smaller target.
+    #[test]
+    fn resizable_ring_matches_model(ops in proptest::collection::vec(ring_op(), 1..200)) {
+        use std::collections::VecDeque;
+        const N: usize = 64;
+        let mut ring: Ring<N> = Ring::new().unwrap();
+        let mut data: VecDeque<u8> = VecDeque::new();
+        // Bytes parked past the write cursor, by offset.
+        let mut parked: Vec<Option<u8>> = Vec::new();
+        let (mut cap, mut target) = (N, N);
+        let mut next = 0u8;
+        let mut fresh = |n: usize| -> Vec<u8> {
+            (0..n).map(|_| { next = next.wrapping_add(1); next }).collect()
+        };
+        for op in ops {
+            match op {
+                RingOp::Write(n) => {
+                    let src = fresh(n);
+                    let w = ring.write(&src);
+                    prop_assert_eq!(w, n.min(cap - data.len()));
+                    data.extend(&src[..w]);
+                    // In-order bytes land where parked ones were.
+                    parked.drain(..w.min(parked.len()));
+                }
+                RingOp::Read(n) => {
+                    let mut buf = vec![0u8; n];
+                    let r = ring.read(&mut buf);
+                    prop_assert_eq!(r, n.min(data.len()));
+                    let want: Vec<u8> = data.drain(..r).collect();
+                    prop_assert_eq!(&buf[..r], &want[..]);
+                }
+                RingOp::Park(off, n) => {
+                    let src = fresh(n);
+                    let free = cap - data.len();
+                    let w = ring.write_at(off, &src);
+                    prop_assert_eq!(w, if off >= free { 0 } else { n.min(free - off) });
+                    if w > 0 {
+                        if parked.len() < off + w {
+                            parked.resize(off + w, None);
+                        }
+                        for (i, &b) in src[..w].iter().enumerate() {
+                            parked[off + i] = Some(b);
+                        }
+                    }
+                }
+                RingOp::Commit(n) => {
+                    let prefix = parked.iter().take_while(|b| b.is_some()).count();
+                    let c = ring.commit(n.min(prefix));
+                    prop_assert_eq!(c, n.min(prefix));
+                    data.extend(parked.drain(..c).map(Option::unwrap));
+                }
+                RingOp::PeekAt(off, n) => {
+                    let mut buf = vec![0u8; n];
+                    let p = ring.peek_at(off, &mut buf);
+                    let want: Vec<u8> = data.iter().skip(off).take(n).copied().collect();
+                    prop_assert_eq!(&buf[..p], &want[..]);
+                }
+                RingOp::Target(b) => {
+                    ring.set_target(b);
+                    target = 1 << b.clamp(1, N).ilog2();
+                    prop_assert_eq!(ring.target(), target);
+                }
+                RingOp::Resize(extra) => {
+                    let keep = parked.iter().rposition(Option::is_some).map_or(0, |i| i + 1);
+                    let reserve = extra % (N + 1);
+                    let fits = data.len() + keep.max(reserve) <= target;
+                    let ok = ring.try_resize(keep, reserve);
+                    prop_assert_eq!(ok, target == cap || fits);
+                    if ok {
+                        cap = target;
+                        prop_assert!(cap - data.len() >= keep.max(reserve) || target == cap);
+                    }
+                }
+            }
+            prop_assert_eq!(ring.capacity(), cap);
+            prop_assert_eq!(ring.len(), data.len());
+            prop_assert_eq!(ring.free(), cap - data.len());
+            prop_assert_eq!(ring.room(), cap.min(target).saturating_sub(data.len()));
+            prop_assert!(ring.debug_valid().is_ok());
+            let mut all = vec![0u8; data.len()];
+            prop_assert_eq!(ring.peek(&mut all), data.len());
+            prop_assert!(all.iter().eq(data.iter()));
+        }
+        // Parked bytes come out where they were put.
+        let prefix = parked.iter().take_while(|b| b.is_some()).count();
+        prop_assert_eq!(ring.commit(prefix), prefix);
+        data.extend(parked.drain(..prefix).map(Option::unwrap));
+        let mut all = vec![0u8; data.len()];
+        prop_assert_eq!(ring.read(&mut all), data.len());
+        prop_assert!(all.iter().eq(data.iter()));
+    }
+}

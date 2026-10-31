@@ -7,8 +7,8 @@
 //! with `wire::emit` (valid checksums) from fuzzer-chosen flags, sequence and
 //! acknowledgment numbers (biased to the live window edges), window,
 //! timestamp and SACK options, IPv4 ECN bits and payload, interleaved with
-//! application `send` / `recv` / `close` / `abort`, PMTU updates and clock
-//! jumps. It is the target that exercises the RFC 5961 / PAWS / ECN
+//! application `send` / `recv` / `close` / `abort`, PMTU updates, buffer
+//! limits, lent send space, overwritten reclaimable storage and clock jumps. It is the target that exercises the RFC 5961 / PAWS / ECN
 //! acceptance paths with off-path-style input.
 //!
 //! Oracles:
@@ -325,7 +325,32 @@ fuzz_target!(|data: &[u8]| {
                     2 => t.update_pmtu(576 + inp.u16() % 1000),
                     3 => t.set_user_timeout(u32::from(inp.u16())),
                     4 => t.set_keepalive(u32::from(inp.u16()), u32::from(inp.u16()), inp.u8()),
-                    _ => {}
+                    5 => {
+                        let mut size = || match inp.u8() {
+                            b @ 0..=239 => 1usize << (b % 22),
+                            b => usize::from(b) * 1000,
+                        };
+                        let (s0, s1, r0, r1) = (size(), size(), size(), size());
+                        let _ = no_internal(t.set_buffer_limits(s0, s1, r0, r1));
+                    }
+                    6 => {
+                        // Space lent to the host, filled, then (partly)
+                        // committed — or a stale loan ended.
+                        let max = usize::from(inp.u16());
+                        let fill = inp.u8();
+                        if let Ok((a, b)) = no_internal(t.send_reserve(max)) {
+                            a.fill(fill);
+                            b.fill(fill);
+                        }
+                        let _ = no_internal(t.send_commit(usize::from(inp.u16())));
+                    }
+                    _ => {
+                        // The host may overwrite reclaimable storage.
+                        for span in t.reclaimable() {
+                            let n = span.len().min(64 * 1024);
+                            span[..n].fill(0xA5);
+                        }
+                    }
                 }
                 check(&t, &mut prev);
                 drain(&mut t, &mut hi, &mut prev);

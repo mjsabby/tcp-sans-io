@@ -40,7 +40,9 @@
 //!
 //! 3. **Bound the number of connections.** Only the host can: each TCB is
 //!    independent and unaware of the others, and costs ≈ 2.08 MiB by default
-//!    (136 KiB under the `small-buffers` feature) — including the 60–120 s it
+//!    (136 KiB under the `small-buffers` feature; with lazily backed storage
+//!    and [`Tcb::set_buffer_limits`], resident memory follows the rings' much
+//!    smaller capacities) — including the 60–120 s it
 //!    spends in `TIME_WAIT`. The per-connection timers bound how long a
 //!    *stalled or vanished* peer, or one the host has closed on, holds a
 //!    connection — never the aggregate *count*, and never a live peer the host
@@ -164,7 +166,7 @@ pub mod wire;
 
 pub use error::TcpError;
 pub use state::State;
-pub use tcb::{Endpoint, Tcb, TcbConfig, TcbStats};
+pub use tcb::{Endpoint, Tcb, TcbConfig, TcbStats, INITIAL_RING_CAP, MIN_RING_CAP};
 
 /// Standard maximum segment size for an Ethernet-class path.
 pub const MSS: u16 = 1460;

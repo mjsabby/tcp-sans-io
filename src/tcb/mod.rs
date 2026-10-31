@@ -22,6 +22,9 @@ mod output;
 #[cfg(test)]
 mod tests;
 mod timers;
+mod tune;
+
+pub use tune::{INITIAL_RING_CAP, MIN_RING_CAP};
 
 use crate::congestion::{self, Reno};
 use crate::error::TcpError;
@@ -368,6 +371,15 @@ pub struct Tcb<const BUF: usize = BUF_CAP> {
     ooo_fin: Option<HeldFin>,
     /// D-SACK block to report on the next ACK (RFC 2883).
     dsack: Option<(u32, u32)>,
+    /// Capacity bounds of the send and receive rings, powers of two in
+    /// `MIN_RING_CAP.min(BUF)..=BUF` (see [`Tcb::set_buffer_limits`]). Equal
+    /// bounds pin a ring's capacity; otherwise it is autotuned (`tune.rs`).
+    snd_buf_min: usize,
+    snd_buf_max: usize,
+    rcv_buf_min: usize,
+    rcv_buf_max: usize,
+    /// Autotuning measurements.
+    tune: tune::Tune,
 
     // ---- RTT / RTO (RFC 6298).
     now_ms: u64,
@@ -507,15 +519,42 @@ impl<const BUF: usize> Tcb<BUF> {
             return Err(TcpError::Overflow);
         }
         // SAFETY: the caller guarantees `p` is valid and aligned for one
-        // `Self`. Zero-filling makes every field a valid value except the
-        // ones written explicitly below: every other field is an integer,
-        // bool, byte array, `Deadline` (zero = disarmed) or an all-integer
-        // struct, and the `State`/`CaState` enums use 0 for their initial
-        // variant. `Option` fields are written explicitly (their `None`
-        // encoding is not guaranteed to be all-zero). Only then is a
-        // reference created.
+        // `Self`; once zero-filled it meets `init_zeroed`'s contract.
         unsafe {
             core::ptr::write_bytes(p, 0, 1);
+            Self::init_zeroed(p, cfg)
+        }
+    }
+
+    /// [`Self::init_in_place`] for storage that already holds only zero bytes
+    /// (for example from `calloc`, or a fresh anonymous `mmap`), which it does
+    /// not zero again: ring storage a connection never uses is then never
+    /// touched, so lazily backed memory stays unbacked (see
+    /// [`Self::set_buffer_limits`] and [`Self::reclaimable`]).
+    ///
+    /// # Safety
+    /// As [`Self::init_in_place`], and all `size_of::<Self>()` bytes at `p`
+    /// must be zero.
+    pub unsafe fn init_in_place_zeroed(p: *mut Self, cfg: TcbConfig) -> Result<(), TcpError> {
+        if BUF == 0 || (BUF & (BUF - 1)) != 0 {
+            return Err(TcpError::Overflow);
+        }
+        // SAFETY: forwarded caller contract (valid, aligned and all zero).
+        unsafe { Self::init_zeroed(p, cfg) }
+    }
+
+    /// # Safety
+    /// `p` must be valid for writes of one `Self`, aligned, and all zero.
+    unsafe fn init_zeroed(p: *mut Self, cfg: TcbConfig) -> Result<(), TcpError> {
+        // SAFETY: the caller guarantees `p` is valid, aligned and all zero.
+        // Zero bytes make every field a valid value except the ones written
+        // explicitly below: every other field is an integer, bool, byte
+        // array, `Deadline` (zero = disarmed) or an all-integer struct
+        // (a ring's zero capacity shift means all of `BUF`), and the
+        // `State`/`CaState` enums use 0 for their initial variant. `Option`
+        // fields are written explicitly (their `None` encoding is not
+        // guaranteed to be all-zero). Only then is a reference created.
+        unsafe {
             core::ptr::addr_of_mut!((*p).state).write(State::Closed);
             core::ptr::addr_of_mut!((*p).error).write(None);
             core::ptr::addr_of_mut!((*p).tlp_end_seq).write(None);
@@ -568,6 +607,10 @@ impl<const BUF: usize> Tcb<BUF> {
         self.keepalive_count = DEFAULT_KEEPALIVE_COUNT;
         self.user_timeout_ms = DEFAULT_USER_TIMEOUT_MS;
         self.fin_wait2_timeout_ms = DEFAULT_FIN_WAIT2_TIMEOUT_MS;
+        self.snd_buf_min = BUF;
+        self.snd_buf_max = BUF;
+        self.rcv_buf_min = BUF;
+        self.rcv_buf_max = BUF;
         self.reset_connection_state();
         self.state = State::Closed;
     }
@@ -591,7 +634,7 @@ impl<const BUF: usize> Tcb<BUF> {
         self.snd_wl1 = 0;
         self.snd_wl2 = 0;
         self.rcv_nxt = 0;
-        self.rcv_wnd = BUF as u32;
+        self.rcv_wnd = tune::initial_cap(self.rcv_buf_min, self.rcv_buf_max) as u32;
         self.irs = 0;
         self.rcv_adv_edge = 0;
         self.last_ack_sent = 0;
@@ -636,6 +679,13 @@ impl<const BUF: usize> Tcb<BUF> {
         self.snd_acked = 0;
         self.send_ring.clear();
         self.recv_ring.clear();
+        // Both rings are empty, so the new capacities apply at once.
+        self.send_ring
+            .set_target(tune::initial_cap(self.snd_buf_min, self.snd_buf_max));
+        self.recv_ring
+            .set_target(tune::initial_cap(self.rcv_buf_min, self.rcv_buf_max));
+        let _ = self.send_ring.try_resize(0, 0);
+        let _ = self.recv_ring.try_resize(0, 0);
         self.ooo.clear();
         self.ooo_fin = None;
         self.dsack = None;
@@ -664,6 +714,7 @@ impl<const BUF: usize> Tcb<BUF> {
         self.ut_progress = 0;
         self.last_oow_ms = Deadline::OFF;
         self.stats = TcbStats::default();
+        self.tune = tune::Tune::start(self.now_ms);
     }
 
     /// Revert from a half-open passive state back to `LISTEN` (or `CLOSED`
@@ -803,6 +854,7 @@ impl<const BUF: usize> Tcb<BUF> {
                 return Err("staged packet exceeds MAX_PACKET");
             }
         }
+        self.debug_validate_buffers()?;
         Ok(())
     }
 
@@ -1135,7 +1187,11 @@ impl<const BUF: usize> Tcb<BUF> {
         if self.send_lent != 0 {
             return Err(TcpError::WouldBlock);
         }
-        let written = self.send_ring.write(data);
+        // Up to the target capacity, so that a pending shrink can drain.
+        let fits = data.get(..self.send_ring.room()).unwrap_or(data);
+        let written = self.send_ring.write(fits);
+        self.tune
+            .on_app_write(written < data.len(), self.send_ring.len());
         if written == 0 && !data.is_empty() {
             return Err(TcpError::WouldBlock);
         }
@@ -1161,8 +1217,10 @@ impl<const BUF: usize> Tcb<BUF> {
         if self.send_lent != 0 || !self.state.can_send() {
             return Err(TcpError::InvalidState);
         }
-        let (a, b) = self.send_ring.free_regions(max);
+        let len = self.send_ring.len();
+        let (a, b) = self.send_ring.free_regions(max.min(self.send_ring.room()));
         let n = a.len() + b.len();
+        self.tune.on_app_write(n < max, len);
         if n == 0 {
             return Err(TcpError::WouldBlock);
         }
@@ -1178,10 +1236,16 @@ impl<const BUF: usize> Tcb<BUF> {
     /// reset or been replaced: its bytes are then dropped.
     pub fn send_commit(&mut self, n: usize) -> Result<usize, TcpError> {
         let lent = core::mem::take(&mut self.send_lent);
-        if lent == 0 || self.send_lent_conn != self.conn_gen || !self.state.can_send() {
-            return Err(TcpError::InvalidState);
-        }
-        Ok(self.send_ring.commit(n.min(lent)))
+        let r = if lent == 0 || self.send_lent_conn != self.conn_gen || !self.state.can_send() {
+            Err(TcpError::InvalidState)
+        } else {
+            let n = self.send_ring.commit(n.min(lent));
+            self.tune.on_app_write(false, self.send_ring.len());
+            Ok(n)
+        };
+        // A resize the loan held back may go ahead now.
+        self.apply_buffer_targets();
+        r
     }
 
     /// Copy received in-order data out. Returns `ConnectionClosed` once the
@@ -1199,6 +1263,8 @@ impl<const BUF: usize> Tcb<BUF> {
                         .saturating_add(u64::from(self.fin_wait2_timeout_ms)),
                 );
             }
+            self.tune.on_app_read(n);
+            self.tune_buffers()?;
             self.maybe_send_window_update()?;
         }
         if n == 0 {
@@ -1313,7 +1379,7 @@ impl<const BUF: usize> Tcb<BUF> {
         if !self.recv_ring.is_empty() {
             ev |= events::READABLE;
         }
-        if self.state.can_send() && self.send_ring.free() > 0 && self.send_lent == 0 {
+        if self.state.can_send() && self.send_ring.room() > 0 && self.send_lent == 0 {
             ev |= events::WRITABLE;
         }
         if matches!(self.state, State::Established) {
@@ -1358,7 +1424,8 @@ impl<const BUF: usize> Tcb<BUF> {
     /// Feed an inbound IPv4+TCP datagram (checksums verified).
     pub fn inject_packet(&mut self, packet: &[u8]) -> Result<(), TcpError> {
         let seg = wire::parse(packet)?;
-        self.inject_segment(&seg)
+        let r = self.inject_segment(&seg);
+        r.and(self.tune_buffers())
     }
 
     /// Like [`Self::inject_packet`] but skips TCP checksum verification, for
@@ -1366,12 +1433,14 @@ impl<const BUF: usize> Tcb<BUF> {
     /// offload). Never use for packets from an untrusted wire.
     pub fn inject_packet_l4_csum_trusted(&mut self, packet: &[u8]) -> Result<(), TcpError> {
         let seg = wire::parse_opts(packet, false)?;
-        self.inject_segment(&seg)
+        let r = self.inject_segment(&seg);
+        r.and(self.tune_buffers())
     }
 
     /// Drive timers and push more data (see [`Self::next_deadline`]).
     pub fn tick(&mut self) -> Result<(), TcpError> {
-        self.run_timers()
+        let r = self.run_timers();
+        r.and(self.tune_buffers())
     }
 
     // ---------------------------------------------------------------------

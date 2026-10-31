@@ -3,7 +3,8 @@
 //! live state, from one of three peers, so the fuzzer reaches LISTEN /
 //! SYN_RCVD, hybrid SYN cookies (a busy half-open slot answered with
 //! cookies, cookie ACKs taking the slot over, key rotation), simultaneous
-//! open and every closing state — instead of dying in the parser.
+//! open and every closing state — instead of dying in the parser. Buffer
+//! limits, lent send space and overwritten reclaimable storage ride along.
 //!
 //! Oracles: internal errors never escape; `debug_validate_invariants` and
 //! `debug_check_liveness` hold; transitions are ones
@@ -285,7 +286,7 @@ fuzz_target!(|data: &[u8]| {
                 h.drain(None);
             }
             _ => {
-                match r.u8() % 7 {
+                match r.u8() % 10 {
                     0 => {
                         let _ = ni(h.t.close());
                     }
@@ -298,8 +299,31 @@ fuzz_target!(|data: &[u8]| {
                     3 => h.t.update_pmtu(r.u16()),
                     4 => h.t.set_cookie_secret(&[r.u8(); 16]),
                     5 => h.t.set_secret(&[r.u8(); 16]),
-                    _ => {
+                    6 => {
                         let _ = ni(h.t.connect());
+                    }
+                    7 => {
+                        let mut size = || match r.u8() {
+                            b @ 0..=239 => 1usize << (b % 22),
+                            b => usize::from(b) * 1000,
+                        };
+                        let (s0, s1, r0, r1) = (size(), size(), size(), size());
+                        let _ = ni(h.t.set_buffer_limits(s0, s1, r0, r1));
+                    }
+                    8 => {
+                        let max = usize::from(r.u16());
+                        let fill = r.u8();
+                        if let Ok((a, b)) = ni(h.t.send_reserve(max)) {
+                            a.fill(fill);
+                            b.fill(fill);
+                        }
+                        let _ = ni(h.t.send_commit(usize::from(r.u16())));
+                    }
+                    _ => {
+                        for span in h.t.reclaimable() {
+                            let n = span.len().min(64 * 1024);
+                            span[..n].fill(0xA5);
+                        }
                     }
                 }
                 h.observe();
