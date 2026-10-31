@@ -1018,3 +1018,76 @@ fn recovery_started_by_a_large_cumulative_ack_does_not_overshoot_prr() {
     );
     t.debug_validate_invariants().unwrap();
 }
+
+/// Every byte up to the right edge the TCB advertised fits in its receive
+/// ring. A peer that fills the offered window to the byte (as Linux does, in
+/// full segments and a short last one) must have all of it accepted, also
+/// when the application reads in amounts that aren't a multiple of the
+/// window-scale unit: rounding the window up to that unit must not promise
+/// bytes the ring can't hold, or they are trimmed on arrival and the peer
+/// has to recover them as if the network had lost them.
+#[test]
+fn every_byte_up_to_the_advertised_edge_is_accepted() {
+    let mut t = Box::new(Tcb::new(cfg(1000)).unwrap());
+    t.set_now(0);
+    t.connect().unwrap();
+    drain(&mut t);
+    let o = TcpOptions {
+        mss: Some(1460),
+        wscale: Some(7),
+        ..TcpOptions::NONE
+    };
+    t.set_now(10);
+    t.inject_packet(&peer_pkt(
+        PEER_ISS,
+        1001,
+        flags::SYN | flags::ACK,
+        65535,
+        &o,
+        &[],
+    ))
+    .unwrap();
+    drain(&mut t);
+    assert_eq!(t.state(), State::Established);
+    assert!(t.rcv_wscale > 0, "window scaling negotiated");
+    let data = [0x5au8; 1460];
+    let mut rb = [0u8; 1000];
+    let mut seq = PEER_ISS + 1;
+    let mut now = 10;
+    for round in 0..3000 {
+        loop {
+            let room = t.rcv_adv_edge.wrapping_sub(seq) as i32;
+            if room <= 0 {
+                break;
+            }
+            let n = (room as usize).min(data.len());
+            let before = t.rcv_nxt;
+            t.inject_packet(&peer_pkt(
+                seq,
+                1001,
+                flags::ACK,
+                65535,
+                &TcpOptions::NONE,
+                &data[..n],
+            ))
+            .unwrap();
+            assert_eq!(
+                t.rcv_nxt.wrapping_sub(before),
+                n as u32,
+                "round {round}: {n} bytes inside the advertised window, only {} accepted \
+                 ({} free)",
+                t.rcv_nxt.wrapping_sub(before),
+                t.recv_ring.free()
+            );
+            seq = seq.wrapping_add(n as u32);
+            drain(&mut t);
+        }
+        // The application reads a little; the delayed ACK carries the window.
+        assert_eq!(t.recv(&mut rb), Ok(rb.len()));
+        now += 50;
+        t.set_now(now);
+        t.tick().unwrap();
+        drain(&mut t);
+    }
+    t.debug_validate_invariants().unwrap();
+}
