@@ -20,11 +20,13 @@ use crate::stacks::{self, Opts, Pkt, Recv, Spec, St, Stack, Time};
 
 pub struct Profile {
     pub name: &'static str,
-    pub rtt_ms: u64,
+    pub rtt_us: Time,
     pub mbit: u64,
     pub loss_ppm: u32,
     pub queue: usize,
     pub reorder_ppm: u32,
+    /// How much later a reordered packet arrives.
+    pub reorder_us: Time,
     /// Data segments `[lo, hi)` (by link-entry index) are dropped.
     pub burst: (u64, u64),
     pub mib: u64,
@@ -32,7 +34,7 @@ pub struct Profile {
 
 const fn prof(
     name: &'static str,
-    rtt_ms: u64,
+    rtt_us: Time,
     mbit: u64,
     loss_ppm: u32,
     queue: usize,
@@ -40,55 +42,80 @@ const fn prof(
 ) -> Profile {
     Profile {
         name,
-        rtt_ms,
+        rtt_us,
         mbit,
         loss_ppm,
         queue,
         reorder_ppm: 0,
+        reorder_us: 4 * MS,
         burst: (0, 0),
         mib,
     }
 }
 
 pub const PROFILES: &[Profile] = &[
-    prof("lan", 1, 1000, 0, 200, 64),
-    prof("wan", 40, 100, 0, 160, 32),
-    prof("wan-0.1", 40, 100, 1_000, 160, 16),
-    prof("wan-1", 40, 100, 10_000, 160, 4),
-    prof("metro-0.1", 10, 200, 1_000, 80, 32),
-    prof("lossy-5", 20, 50, 50_000, 80, 2),
-    prof("shallow", 20, 100, 0, 16, 32),
+    prof("lan", MS, 1000, 0, 200, 64),
+    prof("wan", 40 * MS, 100, 0, 160, 32),
+    prof("wan-0.1", 40 * MS, 100, 1_000, 160, 16),
+    prof("wan-1", 40 * MS, 100, 10_000, 160, 4),
+    prof("metro-0.1", 10 * MS, 200, 1_000, 80, 32),
+    prof("lossy-5", 20 * MS, 50, 50_000, 80, 2),
+    prof("shallow", 20 * MS, 100, 0, 16, 32),
     Profile {
         reorder_ppm: 20_000,
-        ..prof("reorder-2", 20, 50, 0, 1000, 8)
+        ..prof("reorder-2", 20 * MS, 50, 0, 1000, 8)
     },
     Profile {
         burst: (300, 340),
-        ..prof("burst-40", 20, 100, 0, 1000, 4)
+        ..prof("burst-40", 20 * MS, 100, 0, 1000, 4)
+    },
+    // Virtual links (VMs or containers on one host): sub-millisecond RTTs.
+    prof("virt", 100, 10_000, 0, 256, 64),
+    Profile {
+        reorder_ppm: 10_000,
+        reorder_us: 100,
+        ..prof("virt-reorder", 100, 10_000, 0, 256, 32)
     },
 ];
 
+/// `us` in milliseconds, as short as exact ("40", "0.1").
+fn ms(us: Time) -> String {
+    format!("{}", us as f64 / 1e3)
+}
+
 impl Profile {
     fn links(&self) -> (LinkCfg, LinkCfg) {
-        let half = self.rtt_ms * 1000 / 2;
-        let fwd = LinkCfg::new(0, self.mbit, self.queue)
+        let half = self.rtt_us / 2;
+        let mut fwd = LinkCfg::new(0, self.mbit, self.queue)
             .delay_us(half)
             .loss(self.loss_ppm)
-            .reorder(self.reorder_ppm, 4)
+            .reorder_us(self.reorder_ppm, self.reorder_us)
             .drop_data(self.burst.0, self.burst.1);
+        // Above 1 Gbit/s a 1500 B packet no longer takes a whole number of
+        // µs; slower profiles keep the whole-µs model (exact for their
+        // full-size packets).
+        if self.mbit > 1000 {
+            fwd = fwd.exact_rate();
+        }
         let rev = LinkCfg::new(0, 0, 1 << 20).delay_us(half);
         (fwd, rev)
     }
     pub fn describe(&self) -> String {
         let mut s = format!(
             "{} ms, {} Mbit/s, {}-pkt queue",
-            self.rtt_ms, self.mbit, self.queue
+            ms(self.rtt_us),
+            self.mbit,
+            self.queue
         );
         if self.loss_ppm > 0 {
             s += &format!(", {}% loss", f64::from(self.loss_ppm) / 1e4);
         }
         if self.reorder_ppm > 0 {
-            s += &format!(", {}% +4 ms reorder", f64::from(self.reorder_ppm) / 1e4);
+            s += &format!(
+                ", {}% +{} ms reorder",
+                f64::from(self.reorder_ppm) / 1e4,
+                ms(self.reorder_us)
+            );
         }
         if self.burst.1 > self.burst.0 {
             s += &format!(", {} consecutive drops", self.burst.1 - self.burst.0);
@@ -113,6 +140,8 @@ pub struct SimCell {
     pub retx: Vec<u64>,
     pub drops: Vec<u64>,
     pub needless: Vec<u64>,
+    /// Seeds whose wire had not settled `sim::SETTLE` after delivery.
+    pub unsettled: usize,
 }
 
 fn median<T: Copy + PartialOrd>(v: &[T]) -> Option<T> {
@@ -147,6 +176,7 @@ pub fn sim_cell(p: &Profile, sender: Spec, receiver: Spec, seeds: u64, scale: u6
         c.retx.push(o.fwd.retx_pkts);
         c.drops.push(o.fwd.data_drops);
         c.needless.push(o.fwd.dup_delivered.div_ceil(1448));
+        c.unsettled += usize::from(o.unsettled);
     }
     c
 }
@@ -220,6 +250,7 @@ pub fn print_sim(r: &SimResults) {
     };
     let mut t = Table::new(head("Profile (sender → receiver)"));
     let mut e = Table::new(head("Profile"));
+    let mut unsettled = 0;
     for p in PROFILES {
         let mut row = vec![format!("**{}**: {}", p.name, p.describe())];
         let mut erow = vec![p.name.to_string()];
@@ -231,11 +262,13 @@ pub fn print_sim(r: &SimResults) {
                 .map(|x| &x.2);
             row.push(c.map_or("–".into(), goodput_cell));
             erow.push(c.map_or("–".into(), |c| {
+                unsettled += c.unsettled;
                 format!(
-                    "{} / {} / {}",
+                    "{} / {} / {}{}",
                     median(&c.retx).unwrap_or(0),
                     median(&c.drops).unwrap_or(0),
-                    median(&c.needless).unwrap_or(0)
+                    median(&c.needless).unwrap_or(0),
+                    if c.unsettled > 0 { " †" } else { "" }
                 )
             }));
         }
@@ -244,8 +277,21 @@ pub fn print_sim(r: &SimResults) {
     }
     println!("Goodput, Mbit/s: median (min–max) over seeds, from ESTABLISHED to the last byte delivered.\n");
     t.print();
-    println!("Sender efficiency, medians: retransmitted segments / data segments dropped by the link / retransmissions of data the link had already delivered (a receiver may still have discarded it).\n");
+    println!(
+        "Sender efficiency, medians: retransmitted segments / data segments dropped by the link / \
+         retransmissions of data the link had already delivered (a receiver may still have \
+         discarded it). Counted until the wire settles after delivery (both links idle, nothing \
+         unacknowledged; at most {} s), so late retransmissions, tail-loss probes and timeouts \
+         count too.\n",
+        sim::SETTLE / SEC
+    );
     e.print();
+    if unsettled > 0 {
+        println!(
+            "† {unsettled} run(s) had not settled {} s after delivery; their counts stop there.\n",
+            sim::SETTLE / SEC
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -318,9 +364,13 @@ fn next_time(now: Time, moved: bool, a: &mut dyn Stack, b: &mut dyn Stack) -> Ti
 
 /// `bytes` from `sender` to `receiver`, verified (outside the timing).
 /// `per_packet`: every datagram is handed over and acted on before the
-/// next (a host reading one packet per syscall); otherwise each side gets
-/// the whole flight, then acts once. Each side ticks once per round, after
-/// the application ran, as the tcp-sans-io host contract asks.
+/// next (a host reading one packet per syscall); otherwise ("batched") each
+/// side is handed the whole flight, then acts once — which only smoltcp can
+/// do: tcp-sans-io has no batched input API and acts on each datagram as it
+/// is handed over (its `process` does nothing), so it runs per packet in
+/// both modes. Each side polls once per round, after the application ran,
+/// as the tcp-sans-io host contract asks (its adapter ticks again only to
+/// refill an egress ring it drained full).
 pub fn bulk(sender: Spec, receiver: Spec, bytes: u64, per_packet: bool) -> Cpu {
     let (mut a, mut b) = endpoints(sender, receiver);
     let mut now: Time = 0;
@@ -557,7 +607,9 @@ pub fn run_cpu(quick: bool) {
         "{} MiB one way, median of {reps} interleaved runs (± half the range); Gbit/s of payload per \
          core-second spent in that endpoint. Per packet: each datagram is handed over and acted on \
          before the next (one read per packet, as from a TUN or WireGuard device). Batched: each side \
-         gets the whole flight, then acts once. Only time inside each stack's calls counts (send/recv \
+         is handed the whole flight, then acts once — which only smoltcp can do: tcp-sans-io has no \
+         batched input API and acts on each datagram as it is handed over, so it runs per packet in \
+         both columns. Only time inside each stack's calls counts (send/recv \
          copies, checksums, protocol work); the in-memory wire and the data verification are \
          excluded. Pin the process to one core for stable numbers.\n",
         bytes / MIB

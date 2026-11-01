@@ -44,6 +44,9 @@ pub mod seg_flags {
     pub const EVER_RETRANS: u8 = 1 << 3;
     /// The segment's last sequence number is a FIN.
     pub const FIN: u8 = 1 << 4;
+    /// Sent with PSH: it ended the queued data (a write), as Linux marks
+    /// the tail of a write; a retransmission repeats it.
+    pub const PSH: u8 = 1 << 5;
 }
 use seg_flags::*;
 
@@ -345,8 +348,8 @@ impl RtxQueue {
         None
     }
 
-    /// Split segment `i` at `at` (strictly inside it). The FIN, if any, stays
-    /// with the upper half. Returns `false` if there is no room.
+    /// Split segment `i` at `at` (strictly inside it). The FIN and PSH, if
+    /// any, stay with the upper half. Returns `false` if there is no room.
     pub fn split(&mut self, i: usize, at: u32) -> bool {
         let Some(s) = self.get(i).copied() else {
             return false;
@@ -368,7 +371,7 @@ impl RtxQueue {
         self.len += 1;
         let lower = Seg {
             end: at,
-            flags: s.flags & !FIN,
+            flags: s.flags & !(FIN | PSH),
             ..s
         };
         let upper = Seg { start: at, ..s };
@@ -541,13 +544,44 @@ impl RtxQueue {
     pub fn on_retransmit(&mut self, i: usize, now: u64) {
         if let Some(s) = self.get(i).copied() {
             self.set_flags(i, s.flags | RETRANS | EVER_RETRANS);
-            let xmit_seq = self.next_xmit;
-            if let Some(d) = self.get_mut(i) {
-                d.xmit_ts = now;
-                d.xmit_seq = xmit_seq;
-                self.next_xmit = xmit_seq.wrapping_add(1);
-            }
+            self.stamp_transmission(i, now);
         }
+    }
+
+    /// Record a tail loss probe that re-sent segment `i` at `now`. The
+    /// segment was not deemed lost, so, as in Linux (whose probe is not
+    /// counted in `retrans_out`), it stays out of [`Self::retrans_bytes`]
+    /// and `pipe` counts it once.
+    pub fn on_probe(&mut self, i: usize, now: u64) {
+        if let Some(s) = self.get(i).copied() {
+            self.set_flags(i, s.flags | EVER_RETRANS);
+            self.stamp_transmission(i, now);
+        }
+    }
+
+    fn stamp_transmission(&mut self, i: usize, now: u64) {
+        let xmit_seq = self.next_xmit;
+        if let Some(d) = self.get_mut(i) {
+            d.xmit_ts = now;
+            d.xmit_seq = xmit_seq;
+            self.next_xmit = xmit_seq.wrapping_add(1);
+        }
+    }
+
+    /// Segments whose retransmission is in flight (Linux `retrans_out`).
+    pub fn retrans_segs(&self) -> u32 {
+        let n = (0..self.len)
+            .filter(|&i| self.get(i).is_some_and(|s| s.has(RETRANS)))
+            .count();
+        u32::try_from(n).unwrap_or(u32::MAX)
+    }
+
+    /// Room for a new segment while keeping one slot free, so that a
+    /// retransmission that must be split (the path MSS shrank) can always
+    /// be: a full queue of segments needing a split could never shrink.
+    #[inline]
+    pub fn has_room_for_new(&self) -> bool {
+        self.len + 1 < RTX_QUEUE_CAP
     }
 
     /// Recount everything and check structural invariants.

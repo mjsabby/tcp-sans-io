@@ -968,10 +968,10 @@ fn established_sack() -> Box<Tcb> {
 fn recovery_started_by_a_large_cumulative_ack_does_not_overshoot_prr() {
     // Eight segments in flight. One ACK cumulatively acknowledges three of
     // them and SACKs four more, so segment 3 is lost at once (DupThresh
-    // segments SACKed above it). PRR must size the reduction from the
-    // flight *before* that ACK, because it also counts the ACK's delivered
-    // bytes; otherwise prr_delivered / RecoverFS exceeds 1 and later ACKs
-    // release unearned data.
+    // segments SACKed above it). PRR scales by the window before that ACK
+    // (Linux `prior_cwnd`) and also counts the ACK's delivered bytes;
+    // prr_delivered must not outrun it, or later ACKs release unearned
+    // data.
     let mut t = established_sack();
     t.send(&[5; 8 * 1460]).unwrap();
     t.set_now(20);
@@ -999,7 +999,11 @@ fn recovery_started_by_a_large_cumulative_ack_does_not_overshoot_prr() {
         "fast retransmit: {first:?} {:?}",
         t.stats()
     );
-    assert_eq!(t.stats().ssthresh, 4 * 1460, "half of the 8-segment flight");
+    assert_eq!(
+        t.stats().ssthresh,
+        5 * 1460,
+        "half of the 10-segment cwnd (Linux Reno)"
+    );
     // The same ACK again carries no new information: nothing may be sent.
     t.set_now(61);
     t.inject_packet(&peer_pkt(

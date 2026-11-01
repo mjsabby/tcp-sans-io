@@ -11,7 +11,8 @@
 //
 // The host loop is event-driven (epoll on the TUN + tcp_next_deadline) and
 // follows the library's host contract: the egress ring is drained after
-// every call. One JSON result line is printed on stdout.
+// every call, and when a drain empties a full ring the stack is ticked again
+// before the loop sleeps. One JSON result line is printed on stdout.
 package main
 
 import (
@@ -35,6 +36,11 @@ const (
 	iffNoPI   = 0x1000
 	tunSetIff = 0x400454CA
 )
+
+// txRingCap is the size of the stack's egress ring (TX_RING_CAP in
+// src/tx_ring.rs): once it is full the stack stages nothing more until the
+// host drains it and ticks.
+const txRingCap = 32
 
 func openTun(name string) (int, error) {
 	fd, err := syscall.Open("/dev/net/tun", syscall.O_RDWR|syscall.O_CLOEXEC, 0)
@@ -150,19 +156,23 @@ func main() {
 	for i := range app {
 		app[i] = byte(i * 7)
 	}
-	flush := func() {
+	// flush writes every staged datagram to the TUN and returns how many
+	// there were.
+	flush := func() int {
+		n := 0
 		for {
-			n, err := t.extract(tx)
+			k, err := t.extract(tx)
 			if err != nil {
 				fatal("%v", err)
 			}
-			if n == 0 {
-				return
+			if k == 0 {
+				return n
 			}
-			if _, err := syscall.Write(fd, tx[:n]); err != nil && !errors.Is(err, syscall.EAGAIN) {
+			if _, err := syscall.Write(fd, tx[:k]); err != nil && !errors.Is(err, syscall.EAGAIN) {
 				fatal("TUN write: %v", err)
 			}
 			pktsOut++
+			n++
 		}
 	}
 
@@ -252,7 +262,12 @@ func main() {
 		if err := t.tick(); err != nil {
 			fatal("%v", err)
 		}
-		flush()
+		// A full egress ring stops the stack staging, and no timer resumes
+		// it: after draining one (here or after an inject above), tick again
+		// before sleeping.
+		if flush() >= txRingCap {
+			progressed = true
+		}
 
 		st = t.state()
 		if closing && (st == stateTimeWait || st == stateClosed) {

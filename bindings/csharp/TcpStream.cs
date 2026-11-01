@@ -186,6 +186,15 @@ internal sealed class TcpStream : IDisposable
     }
 
     /// <summary>
+    /// TCP_NODELAY. By default (as Linux) Nagle holds a short segment while
+    /// an earlier short one is unacknowledged; true sends at once.
+    /// </summary>
+    public void SetNoDelay(ulong nowMs, bool noDelay)
+    {
+        lock (_sync) Check(Native.tcp_set_nodelay(_storage, nowMs, noDelay ? (byte)1 : (byte)0));
+    }
+
+    /// <summary>
     /// Absolute nowMs at which Tick next has timer work, or null when no
     /// timer is armed. Sleep until the earlier of this and the next datagram.
     /// </summary>

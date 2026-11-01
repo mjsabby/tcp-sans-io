@@ -10,7 +10,7 @@
 //! congestion avoidance otherwise.
 
 use super::{seq_ge, seq_gt, seq_le, seq_lt, Deadline, Tcb, TLP_MIN_PTO_MS, TLP_WC_DELACK_MS};
-use crate::congestion::CaState;
+use crate::congestion::{CaState, UndoSeed};
 use crate::error::TcpError;
 use crate::rtx_queue::seg_flags;
 use crate::state::State;
@@ -42,10 +42,8 @@ impl<const BUF: usize> Tcb<BUF> {
         }
 
         let prior_una = self.snd_una;
-        // FlightSize before this ACK. A reduction this ACK starts (loss or
-        // ECE) is sized from it, because PRR counts this ACK's delivered
-        // bytes too: RecoverFS must include them (RFC 6937 §3) or
-        // prr_delivered / RecoverFS overshoots and PRR releases a burst.
+        // FlightSize before this ACK: an ECN-Echo starts a reduction only if
+        // data was outstanding (as Linux, even when this ACK drained it).
         let prior_flight = self.snd_nxt.wrapping_sub(self.data_una());
         let now = self.now_ms;
         let mss = self.mss_payload();
@@ -55,6 +53,13 @@ impl<const BUF: usize> Tcb<BUF> {
         };
         let mut delivered: u32 = 0;
         self.rack.on_ack_start();
+        self.rack.tlp_probe_end = self.tlp_end_seq.filter(|_| self.tlp_is_retrans);
+        // ECN-Echo during a loss episode: the reduction stands, whatever
+        // undo may follow (Linux `tcp_fastretrans_alert`).
+        let ece = self.ecn_enabled && seg.has(flags::ECE);
+        if ece && self.cc.in_loss_recovery() {
+            self.cc.keep_reduction();
+        }
 
         // ---- SACK / D-SACK (RFC 2018, RFC 2883) ------------------------
         let mut dsack: Option<(u32, u32)> = None;
@@ -70,17 +75,31 @@ impl<const BUF: usize> Tcb<BUF> {
                 if is_dsack && self.dsack_valid(l0, r0, mss) {
                     dsack = Some((l0, r0));
                     self.stats.dsacks_received = self.stats.dsacks_received.saturating_add(1);
-                    self.rack.on_dsack(self.snd_una, self.snd_nxt);
+                    // A duplicate tail loss probe says nothing about
+                    // reordering: the timer, not RACK, sent it (Linux
+                    // `FLAG_DSACK_TLP`).
+                    let tlp_dsack = self.tlp_end_seq == Some(r0) && r0.wrapping_sub(l0) <= mss;
+                    if !tlp_dsack {
+                        self.rack.on_dsack(self.snd_una, self.snd_nxt);
+                    }
                     if self.cc.on_dsack(l0, r0, mss) {
                         // Spurious episode: restore the window (done) and drop
                         // loss marks that were never acted on.
                         self.rtx.unmark_lost();
-                        self.rack.on_recovery_exit();
+                        self.rack.on_dsack_undo();
                     }
                 }
+                let (una, nxt) = (self.snd_una, self.snd_nxt);
                 let rack = &mut self.rack;
                 let rtx = &mut self.rtx;
                 for &(l, r) in blocks.iter().skip(usize::from(is_dsack)) {
+                    // Linux `tcp_is_sackblock_valid`: a block reaching past
+                    // SND.NXT, or starting at or below SND.UNA, is ignored
+                    // whole — clipped, it would report delivery of data the
+                    // receiver never claimed.
+                    if !seq_lt(l, r) || seq_gt(r, nxt) || !seq_gt(l, una) {
+                        continue;
+                    }
                     // An ACK for out-of-order data echoes the TSval of the
                     // last in-order segment (RFC 7323 §4.3), never that of
                     // the segment it SACKs, so TSecr cannot disambiguate a
@@ -93,6 +112,7 @@ impl<const BUF: usize> Tcb<BUF> {
 
         // ---- Cumulative ACK --------------------------------------------
         let acked = ack.wrapping_sub(prior_una);
+        let mut hold_detection = false;
         if acked > 0 {
             let syn_acked = self.syn_outstanding();
             let fin_acked =
@@ -155,9 +175,7 @@ impl<const BUF: usize> Tcb<BUF> {
                 }
             }
             self.note_progress(data_acked.saturating_add(u32::from(fin_acked)));
-            if let Some(t) = tsecr_ms {
-                self.ts_undo(t);
-            }
+            hold_detection = self.try_undo_delayed(tsecr_ms);
         }
         self.pmtu_probe_on_ack();
 
@@ -166,22 +184,22 @@ impl<const BUF: usize> Tcb<BUF> {
         self.update_send_window(seg, prior_una);
 
         // ---- ECN-Echo (RFC 3168 §6.1.2): reduce once per window, never
-        // retransmit — nothing was lost.
-        if self.ecn_enabled
-            && seg.has(flags::ECE)
-            && self.cc.state() == CaState::Open
-            && self.snd_una != self.snd_nxt
-        {
-            self.cc.enter_cwr(prior_flight, self.snd_nxt, mss);
+        // retransmit — nothing was lost. As in Linux, also when this ACK
+        // drained the flight: the mark was still for data we sent.
+        if ece && self.cc.state() == CaState::Open && prior_flight > 0 {
+            self.cc.enter_cwr(self.snd_nxt, mss, self.snd_wnd);
             self.send_cwr_pending = true;
         }
 
         // ---- Loss detection --------------------------------------------
         // RACK whenever SACK is negotiated. Duplicate ACKs that carry no SACK
         // blocks at all (non-SACK peer, or blocks stripped by a middlebox)
-        // fall back to RFC 6675 DupThresh / RFC 6582 NewReno.
-        let mut newly_lost = self.sack_enabled && self.rack_detect();
-        if !sack_present {
+        // fall back to RFC 6675 DupThresh / RFC 6582 NewReno. Not when this
+        // ACK showed a hole filled by a delayed original while
+        // retransmissions are still out (Linux `tcp_try_undo_partial`):
+        // reordering is deeper than assumed, so nothing more is marked lost.
+        let mut newly_lost = self.sack_enabled && !hold_detection && self.rack_detect();
+        if !sack_present && !hold_detection {
             let (lost, dup) = self.newreno_detect(seg, acked, wnd_before);
             newly_lost |= lost;
             if dup && !self.sack_enabled {
@@ -195,11 +213,18 @@ impl<const BUF: usize> Tcb<BUF> {
         let outstanding = self.snd_nxt.wrapping_sub(self.data_una());
         self.reno_sacked = self.reno_sacked.min(outstanding);
         if self.rtx.lost_bytes() > 0 && !self.cc.in_loss_recovery() {
-            self.enter_fast_recovery(prior_flight);
+            self.enter_fast_recovery();
         }
 
         // ---- Tail loss probe outcome (RFC 8985 §7.4.2) -----------------
-        self.tlp_on_ack(ack, dsack, sack_present, delivered);
+        // Linux's "pure dupack": nothing acknowledged or newly SACKed, no
+        // data, no FIN, no window change.
+        let pure_dupack = acked == 0
+            && delivered == 0
+            && seg.payload.is_empty()
+            && !seg.has(flags::FIN)
+            && self.snd_wnd == wnd_before;
+        self.tlp_on_ack(ack, dsack, pure_dupack);
 
         // ---- Congestion control ----------------------------------------
         if self.cc.maybe_exit(self.snd_una) {
@@ -208,7 +233,7 @@ impl<const BUF: usize> Tcb<BUF> {
         if !self.retx_outstanding() {
             self.cc.on_retransmissions_settled();
         }
-        let limited = self.take_cwnd_limited();
+        let limited = self.cwnd_is_limited();
         if self.cc.in_reduction() {
             let pipe = self.pipe();
             self.cc
@@ -218,14 +243,31 @@ impl<const BUF: usize> Tcb<BUF> {
         }
 
         // ---- Timers (RFC 6298 §5.2/5.3) ---------------------------------
+        // Linux `tcp_check_sack_reneging`: the cumulative ACK stopped at a
+        // segment the receiver had SACKed, so it dropped out-of-order data
+        // it reported. Give it max(SRTT/2, 10 ms) to fill the hole before
+        // the timeout forgets the SACK state and resends (not a whole RTO).
+        let reneged = acked > 0 && self.rtx.get(0).is_some_and(|s| s.has(seg_flags::SACKED));
         if self.snd_una == self.snd_nxt {
             self.rto_deadline = Deadline::OFF;
             self.tlp_deadline = Deadline::OFF;
             self.rack_deadline = Deadline::OFF;
+        } else if reneged {
+            let grace = u64::from(self.srtt_ms / 2).max(10);
+            self.rto_deadline = Deadline::at(self.now_ms.saturating_add(grace));
         } else if acked > 0 {
             self.arm_rto();
         }
+        // Only an ACK of new data restarts the probe timer (Linux
+        // `FLAG_SET_XMIT_TIMER`): duplicate ACKs, window updates and the
+        // peer's data must not keep pushing a pending probe back to the RTO.
+        let prior_tlp = self.tlp_deadline;
         self.maybe_arm_tlp();
+        if acked == 0 {
+            if let (Some(p), Some(n)) = (prior_tlp.get(), self.tlp_deadline.get()) {
+                self.tlp_deadline = Deadline::at(p.min(n));
+            }
+        }
 
         // ---- Our FIN acknowledged --------------------------------------
         if self.fin_sent && self.snd_una == self.snd_nxt {
@@ -321,31 +363,35 @@ impl<const BUF: usize> Tcb<BUF> {
         true
     }
 
-    /// Timestamp undo: Eifel detection (RFC 3522) with Linux's response
+    /// Undo a loss episode an ACK that advanced `SND.UNA` shows was
+    /// spurious: Linux `tcp_packet_delayed` (see
+    /// [`crate::congestion::Reno::packet_delayed`]) with Linux's response
     /// (`tcp_try_undo_partial`, `tcp_try_undo_recovery`,
-    /// `tcp_try_undo_loss`). An ACK that advanced `SND.UNA` during loss
-    /// recovery while echoing a TSval from before the episode's first
-    /// retransmission was triggered by an original transmission: the hole
+    /// `tcp_try_undo_loss`). An original transmission filled the hole: it
     /// was delayed, not lost. From receivers that send no D-SACK (smoltcp,
     /// for one) this is the only evidence of a spurious episode. In fast
     /// recovery it proves reordering (RACK then allows its reordering
     /// window, which, as in Linux, only D-SACKs widen), and the reduction
     /// is undone once no retransmission is left in flight (any may still be
-    /// repairing a real loss) or the episode ends with this ACK; a spurious
+    /// repairing a real loss) or the episode ends with this ACK; until then
+    /// returns `true`: mark nothing more lost on this ACK. A spurious
     /// timeout is undone at once.
-    fn ts_undo(&mut self, tsecr_ms: u32) {
-        if !self.cc.ack_predates_retransmission(tsecr_ms) {
-            return;
+    fn try_undo_delayed(&mut self, tsecr_ms: Option<u32>) -> bool {
+        if !self
+            .cc
+            .packet_delayed(tsecr_ms, self.snd_una, self.sack_enabled)
+        {
+            return false;
         }
         if self.cc.state() == CaState::Recovery {
             self.rack.reordering_seen = true;
             if self.rtx.retrans_bytes() > 0 && seq_lt(self.snd_una, self.cc.recovery_point()) {
-                return;
+                return true;
             }
         }
         self.cc.undo();
         self.rtx.unmark_lost();
-        self.rack.on_recovery_exit();
+        false
     }
 
     /// Linux `tcp_any_retrans_done`: a retransmission is in flight, or the
@@ -357,6 +403,23 @@ impl<const BUF: usize> Tcb<BUF> {
                 .rtx
                 .get(0)
                 .is_some_and(|s| s.has(seg_flags::EVER_RETRANS))
+    }
+
+    /// What a loss episode starting now inherits (Linux `tcp_init_undo`):
+    /// `retrans_in_flight` retransmissions still in flight plus an
+    /// unresolved tail-loss-probe retransmission.
+    pub(super) fn undo_seed(&self, retrans_in_flight: u32) -> UndoSeed {
+        let probe = self.tlp_end_seq.is_some() && self.tlp_is_retrans;
+        UndoSeed {
+            retx_outstanding: self.retx_outstanding(),
+            retrans_in_flight: retrans_in_flight.saturating_add(u32::from(probe)),
+        }
+    }
+
+    /// RFC 8985 §7.2 / Linux `tcp_schedule_loss_probe`: probes run while
+    /// Open or reducing for ECN (CWR), never in loss recovery.
+    pub(super) fn tlp_state_ok(&self) -> bool {
+        matches!(self.cc.state(), CaState::Open | CaState::Cwr)
     }
 
     /// Re-arm the USER TIMEOUT only on meaningful progress: at least one
@@ -425,38 +488,23 @@ impl<const BUF: usize> Tcb<BUF> {
         (false, false)
     }
 
-    /// Start fast recovery. `flight` is the FlightSize the reduction is
-    /// based on (RecoverFS): before the triggering ACK, if there is one.
-    pub(super) fn enter_fast_recovery(&mut self, flight: u32) {
+    /// Start fast recovery.
+    pub(super) fn enter_fast_recovery(&mut self) {
         let mss = self.mss_payload();
         if self.cc.state() == CaState::Cwr {
             self.cc.cwr_to_recovery();
         } else {
-            let retx = self.retx_outstanding();
+            let seed = self.undo_seed(self.rtx.retrans_segs());
             self.cc
-                .enter_recovery(flight, self.snd_una, self.snd_nxt, mss, retx);
+                .enter_recovery(self.snd_una, self.snd_nxt, mss, seed, self.snd_wnd);
         }
         self.stats.fast_recoveries = self.stats.fast_recoveries.saturating_add(1);
         self.tlp_end_seq = None;
         self.tlp_deadline = Deadline::OFF;
     }
 
-    /// Whether the sender used its window this round (gates cwnd growth),
-    /// then roll the round over once it has been acknowledged.
-    fn take_cwnd_limited(&mut self) -> bool {
-        let in_ss = self.cc.cwnd < self.cc.ssthresh;
-        let limited =
-            self.cwnd_limited || (in_ss && self.pipe_hiwat.saturating_mul(2) > self.cc.cwnd);
-        if seq_ge(self.snd_una, self.cwnd_limited_seq) {
-            self.cwnd_limited = false;
-            self.pipe_hiwat = self.pipe();
-            self.cwnd_limited_seq = self.snd_nxt;
-        }
-        limited
-    }
-
-    /// RFC 8985 §7.4.2 `TLP_process_ack`.
-    fn tlp_on_ack(&mut self, ack: u32, dsack: Option<(u32, u32)>, sack: bool, delivered: u32) {
+    /// RFC 8985 §7.4.2 `TLP_process_ack` (Linux `tcp_process_tlp_ack`).
+    fn tlp_on_ack(&mut self, ack: u32, dsack: Option<(u32, u32)>, pure_dupack: bool) {
         let Some(end) = self.tlp_end_seq else {
             return;
         };
@@ -464,22 +512,22 @@ impl<const BUF: usize> Tcb<BUF> {
             return;
         }
         if !self.tlp_is_retrans {
-            self.tlp_end_seq = None;
-            return;
-        }
-        if dsack.is_some_and(|(_, r)| r == end) {
-            self.tlp_end_seq = None; // the probe was unnecessary
-            return;
-        }
-        if seq_gt(ack, end) || (!sack && delivered == 0) {
+            self.tlp_end_seq = None; // a probe of new data was delivered
+        } else if dsack.is_some_and(|(_, r)| r == end) {
+            self.tlp_end_seq = None; // original and probe both arrived
+        } else if seq_gt(ack, end) {
             // The probe repaired a lost tail: one congestion response.
             self.tlp_end_seq = None;
             if self.cc.state() == CaState::Open {
                 let mss = self.mss_payload();
-                let w = self.cc.cwnd;
+                let w = self.cc.cwnd.min(self.snd_wnd);
                 self.cc.ssthresh = (w / 2).max(mss.saturating_mul(2));
                 self.cc.cwnd = self.cc.ssthresh;
             }
+        } else if pure_dupack {
+            // A plain duplicate ACK at the probe's end: a receiver without
+            // D-SACK saw both copies, so nothing was lost (case 2).
+            self.tlp_end_seq = None;
         }
     }
 
@@ -487,7 +535,7 @@ impl<const BUF: usize> Tcb<BUF> {
     /// connection is not recovering, and the PTO would fire before the RTO.
     pub(super) fn maybe_arm_tlp(&mut self) {
         let eligible = self.sack_enabled
-            && self.cc.state() == CaState::Open
+            && self.tlp_state_ok()
             && self.tlp_end_seq.is_none()
             && self.snd_una != self.snd_nxt
             && matches!(

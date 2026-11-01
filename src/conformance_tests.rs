@@ -1137,7 +1137,7 @@ fn piggybacked_acks_are_not_dup_acks() {
 ///
 /// Post-PRR (RFC 6937) behavior: cwnd is NOT collapsed to 1*MSS — that's
 /// the Tahoe behavior the original test asserted. Instead PRR sets
-/// `ssthresh = max(FlightSize/2, 2*MSS)`, leaves `cwnd` at its pre-loss
+/// `ssthresh = max(cwnd/2, 2*MSS)` (Linux Reno), leaves `cwnd` at its pre-loss
 /// value, and gates per-ACK sends via `snd_credit` (initial budget = 1 MSS
 /// for the immediate retransmit).
 #[test]
@@ -1178,8 +1178,13 @@ fn pure_dup_acks_trigger_fast_retransmit() {
     }
 
     let snap = tcb.debug_snapshot();
-    // ssthresh = max(FlightSize/2, 2*SMSS) with FlightSize = 1460 bytes.
-    assert_eq!(snap.ssthresh, 2 * SMSS, "RFC 5681 / 6937 ssthresh on loss");
+    // Linux Reno (`tcp_reno_ssthresh`): ssthresh = max(cwnd/2, 2*SMSS),
+    // and cwnd is still the initial window.
+    assert_eq!(
+        snap.ssthresh,
+        crate::congestion::initial_window(SMSS) / 2,
+        "ssthresh on loss"
+    );
     assert_eq!(
         retx, 1,
         "exactly one fast retransmit of SND.UNA on the 3rd dup ACK"
@@ -1254,7 +1259,7 @@ fn out_of_order_segment_emits_sack_block_when_negotiated() {
 
 /// SACK-driven fast retransmit: a single ACK at `snd_una` carrying a SACK
 /// block MUST trigger fast retransmit immediately (cwnd → 1*MSS, ssthresh
-/// → max(flight/2, 2*MSS)) — without waiting for three duplicate ACKs.
+/// → max(cwnd/2, 2*MSS)) — without waiting for three duplicate ACKs.
 /// This is the entire point of SACK in our stack: the chaos `loss-*`
 /// profiles' bidirectional bulk produces piggybacked dup-ACKs that the
 /// RFC 5681 §3.2 detector won't count, so without this the connection
@@ -1303,11 +1308,11 @@ fn sack_block_triggers_fast_retransmit_after_one_ack() {
     while try_pop(&mut tcb).is_some() {}
 
     let snap = tcb.debug_snapshot();
-    // ssthresh = max(FlightSize/2, 2*SMSS); FlightSize = 2920.
+    // Linux Reno: ssthresh = max(cwnd/2, 2*SMSS); cwnd is still the IW.
     assert_eq!(
         snap.ssthresh,
-        2 * SMSS,
-        "ssthresh = max(flight/2, 2*SMSS) at SACK-driven loss event",
+        crate::congestion::initial_window(SMSS) / 2,
+        "ssthresh = max(cwnd/2, 2*SMSS) at SACK-driven loss event",
     );
     assert_eq!(
         retx.seq, snd_una_at_loss,
@@ -1386,7 +1391,7 @@ fn sack_triggers_fast_retransmit_on_piggybacked_ack() {
     );
     assert_eq!(
         snap.ssthresh,
-        2 * SMSS,
+        crate::congestion::initial_window(SMSS) / 2,
         "and to a PRR fast-recovery reduction"
     );
 }
@@ -1434,7 +1439,10 @@ fn sack_does_not_retrigger_within_recovery_epoch() {
     let _ = tick_until_packet(&mut tcb, &mut now, 50).expect("fast retransmit");
     while try_pop(&mut tcb).is_some() {}
     let after_first = tcb.debug_snapshot();
-    assert_eq!(after_first.ssthresh, 2 * SMSS);
+    assert_eq!(
+        after_first.ssthresh,
+        crate::congestion::initial_window(SMSS) / 2
+    );
 
     // Three more identical SACK ACKs in the same epoch: no further
     // reduction and no further retransmission of the hole.
@@ -1462,8 +1470,7 @@ fn sack_does_not_retrigger_within_recovery_epoch() {
     }
     let after_more = tcb.debug_snapshot();
     assert_eq!(
-        after_more.ssthresh,
-        2 * SMSS,
+        after_more.ssthresh, after_first.ssthresh,
         "additional SACK ACKs in the same recovery epoch must NOT re-trigger a reduction",
     );
     assert_eq!(
@@ -2134,8 +2141,8 @@ fn prr_exits_recovery_with_cwnd_equal_ssthresh() {
     let ssthresh_at_recovery = pre_exit.ssthresh;
     assert_eq!(
         ssthresh_at_recovery,
-        2 * SMSS,
-        "ssthresh = max(FlightSize/2, 2*SMSS)"
+        crate::congestion::initial_window(SMSS) / 2,
+        "ssthresh = max(cwnd/2, 2*SMSS) (Linux Reno)"
     );
 
     // Cumulative ACK at snd_max (the recovery_point) — must exit recovery.
@@ -2577,7 +2584,7 @@ fn rack_reorder_timer_marks_old_unsacked_segments_lost() {
         tcb.tick().expect("tick");
         match try_pop(&mut tcb) {
             Some(s) => {
-                if s.flags & flags::PSH != 0 && !s.payload.is_empty() && seq_lt(s.seq, s4_seq) {
+                if !s.payload.is_empty() && seq_lt(s.seq, s4_seq) {
                     rack_retx += 1;
                 }
             }
@@ -3160,6 +3167,7 @@ fn send_reserve_fills_the_stream_in_place() {
     let mut tcb = make_tcb();
     let mut now = 0u64;
     let _ = handshake_with_ts(&mut tcb, &mut now);
+    tcb.set_nodelay(true); // every committed byte goes out at once
     tcb.send(b"head:").expect("send");
     let (a, b) = tcb.send_reserve(3000).expect("reserve");
     assert_eq!((a.len(), b.len()), (3000, 0));
@@ -3682,6 +3690,8 @@ fn partial_overlap_segment_delivers_fresh_suffix() {
     while try_pop(&mut tcb).is_some() {}
     let mut buf = [0u8; 64];
     assert_eq!(tcb.recv(&mut buf).expect("recv"), 10);
+    // Reading the short segment sends its held ACK (`tcp_cleanup_rbuf`).
+    while try_pop(&mut tcb).is_some() {}
 
     // Peer retransmits a *larger* segment from the same SEQ: 10 old bytes
     // plus 10 fresh ones.

@@ -369,6 +369,27 @@ pub unsafe extern "C" fn tcp_set_fin_wait2_timeout(
     }
 }
 
+/// `TCP_NODELAY` (non-zero) or Nagle (zero, the default, as Linux): see
+/// [`Tcb::set_nodelay`]. Takes effect at the next `tcp_tick`.
+///
+/// # Safety
+/// `handle` must be NULL or a live handle from [`tcp_init`].
+#[no_mangle]
+pub unsafe extern "C" fn tcp_set_nodelay(
+    handle: *mut TcpStreamHandle,
+    now_ms: u64,
+    nodelay: u8,
+) -> i32 {
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        with_handle(handle, |h| {
+            h.set_now(now_ms);
+            h.set_nodelay(nodelay != 0);
+            Ok(())
+        })
+    }
+}
+
 /// Abort: queue a RST+ACK, drop all state, surface `ConnectionReset`.
 /// Drain the egress ring once afterwards to emit the RST.
 ///

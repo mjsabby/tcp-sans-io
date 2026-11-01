@@ -23,6 +23,11 @@ use crate::rtx_queue::{seg_flags, RtxQueue, Seg};
 pub const MIN_RTT_WINDOW_MS: u64 = 300_000;
 /// RFC 8985 DupThresh used for the "enough SACKed" reordering heuristic.
 const DUP_THRESH: u32 = 3;
+/// Least reordering window (ms) wherever RACK allows one. Linux computes
+/// `min_rtt / 4` in microseconds, which is never zero on a real path; in
+/// whole milliseconds it truncates to 0 below a 4 ms RTT, and a 1 ms window
+/// can still round to nothing, so two ticks guarantee a settling time.
+const REO_WND_MIN_MS: u32 = 2;
 
 #[inline]
 fn seq_gt(a: u32, b: u32) -> bool {
@@ -140,6 +145,9 @@ pub struct Rack {
     reo_wnd_persist: u32,
     dsack_round_active: bool,
     dsack_round: u32,
+    /// End sequence of an outstanding tail-loss-probe retransmission, set
+    /// for each ACK (see [`Self::on_delivered`]).
+    pub tlp_probe_end: Option<u32>,
 }
 
 impl Rack {
@@ -159,6 +167,7 @@ impl Rack {
             reo_wnd_persist: 0,
             dsack_round_active: false,
             dsack_round: 0,
+            tlp_probe_end: None,
         }
     }
 
@@ -198,8 +207,13 @@ impl Rack {
                     return; // the ACK echoes an earlier transmission
                 }
             }
+            // A tail loss probe leaves at least a PTO after the original,
+            // so a fast delivery of it is the probe itself. Below 1 ms the
+            // clock reads its RTT as 0 against a `min_rtt` floored at 1,
+            // and filtering it would leave the rest of a lost tail to the
+            // RTO.
             if let Some(m) = self.min_rtt.get() {
-                if rtt < m {
+                if rtt < m && self.tlp_probe_end != Some(seg.end) {
                     return; // implausibly fast: acks the original
                 }
             }
@@ -228,12 +242,20 @@ impl Rack {
         self.reordering_seen = true;
     }
 
-    /// Called when fast or RTO recovery ends.
+    /// Called when fast or RTO recovery ends without being undone: the
+    /// widened window lapses after 16 such recoveries (Linux
+    /// `tcp_try_undo_recovery`).
     pub fn on_recovery_exit(&mut self) {
         self.reo_wnd_persist = self.reo_wnd_persist.saturating_sub(1);
         if self.reo_wnd_persist == 0 {
             self.reo_wnd_extra = 0;
         }
+    }
+
+    /// D-SACKs showed a recovery spurious: keep the widened window one
+    /// recovery longer (Linux `tcp_try_undo_dsack`).
+    pub fn on_dsack_undo(&mut self) {
+        self.reo_wnd_persist = self.reo_wnd_persist.saturating_add(1).min(16);
     }
 
     /// Step 4: the reordering window in ms.
@@ -243,7 +265,9 @@ impl Rack {
             return 0;
         }
         let base = self.min_rtt.get().unwrap_or(srtt) / 4;
-        base.saturating_mul(self.reo_wnd_extra + 1).min(srtt.max(1))
+        base.saturating_mul(self.reo_wnd_extra + 1)
+            .max(REO_WND_MIN_MS)
+            .min(srtt.max(REO_WND_MIN_MS))
     }
 }
 

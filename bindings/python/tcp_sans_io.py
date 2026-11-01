@@ -163,6 +163,9 @@ _lib.tcp_update_pmtu.argtypes = [c_void_p, c_uint64, c_uint16]
 _lib.tcp_set_fin_wait2_timeout.restype = c_int32
 _lib.tcp_set_fin_wait2_timeout.argtypes = [c_void_p, c_uint64, c_uint32]
 
+_lib.tcp_set_nodelay.restype = c_int32
+_lib.tcp_set_nodelay.argtypes = [c_void_p, c_uint64, c_uint8]
+
 _lib.tcp_next_deadline.restype = c_uint64
 _lib.tcp_next_deadline.argtypes = [c_void_p]
 
@@ -499,6 +502,14 @@ class TcpStream:
         with self._lock:
             _check(_lib.tcp_set_fin_wait2_timeout(
                 self._handle, c_uint64(now_ms), c_uint32(timeout_ms),
+            ))
+
+    def set_nodelay(self, now_ms: int, nodelay: bool) -> None:
+        """TCP_NODELAY. By default (as Linux) Nagle holds a short segment
+        while an earlier short one is unacknowledged; True sends at once."""
+        with self._lock:
+            _check(_lib.tcp_set_nodelay(
+                self._handle, c_uint64(now_ms), c_uint8(1 if nodelay else 0),
             ))
 
     def tick(self, now_ms: int) -> None:

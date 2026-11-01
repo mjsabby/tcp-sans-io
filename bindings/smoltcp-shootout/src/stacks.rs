@@ -11,6 +11,7 @@ use smoltcp::socket::tcp;
 use smoltcp::time::Instant;
 use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address};
 use tcp_sans_io::tcb::events;
+use tcp_sans_io::tx_ring::TX_RING_CAP;
 use tcp_sans_io::{Endpoint, State, Tcb, TcbConfig, TcbStats, TcpError};
 
 /// Microseconds (virtual time in simulations).
@@ -113,6 +114,13 @@ impl St {
     pub fn synchronized(self) -> bool {
         !matches!(self, St::Closed | St::Listen | St::SynSent | St::SynRcvd)
     }
+    /// Our SYN or FIN is sent (or owed) and not yet acknowledged.
+    pub fn ctl_unacked(self) -> bool {
+        matches!(
+            self,
+            St::SynSent | St::SynRcvd | St::FinWait1 | St::Closing | St::LastAck
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -133,7 +141,8 @@ pub trait Stack {
     /// Hand one inbound datagram to the stack.
     fn input(&mut self, now: Time, pkt: Pkt);
     /// Make the stack act on what `input` handed over, without running
-    /// timers (tcp-sans-io acts inside `input`; smoltcp needs a poll).
+    /// timers (tcp-sans-io acts inside `input`, which ticks only to refill
+    /// an egress ring it has just drained full; smoltcp needs a poll).
     fn process(&mut self, now: Time) {
         self.poll(now);
     }
@@ -150,6 +159,9 @@ pub trait Stack {
     /// Abortive close: RST.
     fn abort(&mut self, now: Time);
     fn state(&self) -> St;
+    /// Nothing left to (re)transmit: every byte, SYN and FIN sent has been
+    /// acknowledged and no data is queued, so no retransmission can follow.
+    fn settled(&self) -> bool;
     /// The connection ended abnormally (RST received, local abort, timeout).
     fn was_reset(&self) -> bool;
     /// Internal consistency, where the stack exposes a checker.
@@ -297,9 +309,15 @@ pub fn build(spec: Spec, o: &Opts) -> Box<dyn Stack> {
 // tcp-sans-io
 // ---------------------------------------------------------------------------
 
+/// Full egress rings drained in a row before `Ours::flush` gives up and
+/// reports the stack as runaway: a 1 MiB send ring empties in ~23.
+const FULL_RING_GUARD: usize = 1024;
+
 pub struct Ours<const B: usize> {
     tcb: Box<Tcb<B>>,
     out: Vec<Pkt>,
+    /// `flush` hit `FULL_RING_GUARD` (reported by `invariants`).
+    runaway: bool,
 }
 
 impl<const B: usize> Ours<B> {
@@ -333,6 +351,7 @@ impl<const B: usize> Ours<B> {
         Self {
             tcb,
             out: Vec::new(),
+            runaway: false,
         }
     }
 
@@ -340,10 +359,29 @@ impl<const B: usize> Ours<B> {
         self.tcb.set_now(now / 1000);
     }
 
+    /// Move out every staged datagram. The TCB stops staging when its
+    /// egress ring (`TX_RING_CAP` datagrams) is full, and no timer resumes
+    /// it, so whenever a drain finds the ring full, tick and drain again
+    /// until one comes up short, as the host contract asks.
     fn flush(&mut self) {
+        let mut full = 0;
+        while self.drain_ring() >= TX_RING_CAP {
+            full += 1;
+            if full > FULL_RING_GUARD {
+                self.runaway = true;
+                return;
+            }
+            self.tcb.tick().expect("tick");
+        }
+    }
+
+    fn drain_ring(&mut self) -> usize {
+        let mut n = 0;
         while let Some(p) = self.tcb.extract_packet_with(Pkt::from_slice) {
             self.out.push(p);
+            n += 1;
         }
+        n
     }
 }
 
@@ -421,10 +459,19 @@ impl<const B: usize> Stack for Ours<B> {
             State::TimeWait => St::TimeWait,
         }
     }
+    fn settled(&self) -> bool {
+        let s = self.tcb.debug_snapshot();
+        !self.state().ctl_unacked() && s.snd_una == s.snd_nxt && s.send_ring_len == 0
+    }
     fn was_reset(&self) -> bool {
         self.tcb.poll() & events::ERROR != 0
     }
     fn invariants(&self) -> Result<(), String> {
+        if self.runaway {
+            return Err(format!(
+                "egress ring still full after {FULL_RING_GUARD} ticks in a row"
+            ));
+        }
         self.tcb.debug_validate_invariants().map_err(String::from)
     }
     fn stats(&self) -> Option<TcbStats> {
@@ -639,6 +686,10 @@ impl Stack for Smol {
             tcp::State::LastAck => St::LastAck,
             tcp::State::TimeWait => St::TimeWait,
         }
+    }
+    fn settled(&self) -> bool {
+        // The send buffer holds everything not yet acknowledged.
+        !self.state().ctl_unacked() && self.sock().send_queue() == 0
     }
     fn was_reset(&self) -> bool {
         self.reset

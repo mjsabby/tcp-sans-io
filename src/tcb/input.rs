@@ -11,8 +11,9 @@
 //! retransmission (see `may_answer_at_once`).
 
 use super::{
-    seq_ge, seq_gt, seq_in_range, seq_le, seq_lt, Deadline, Endpoint, HeldFin, Tcb, DELAYED_ACK_MS,
-    MIN_PEER_MSS, PAWS_IDLE_MS, TIME_WAIT_MAX_MS, TIME_WAIT_MS,
+    seq_ge, seq_gt, seq_in_range, seq_le, seq_lt, Deadline, Endpoint, HeldFin, Tcb, ACK_PUSHED,
+    ACK_PUSHED2, DELAYED_ACK_MS, MIN_PEER_MSS, PAWS_IDLE_MS, RCV_MSS_INITIAL, TIME_WAIT_MAX_MS,
+    TIME_WAIT_MS,
 };
 use crate::congestion::{self, Reno};
 use crate::error::TcpError;
@@ -317,6 +318,11 @@ impl<const BUF: usize> Tcb<BUF> {
         if !self.acceptable(seg.seq, seg_len) {
             return self.send_oow_ack();
         }
+        // An old duplicate cannot complete the handshake (Linux
+        // `tcp_check_req`'s PAWS check).
+        if self.paws_reject(seg) {
+            return self.send_oow_ack();
+        }
         self.complete_passive_open(seg)
     }
 
@@ -331,7 +337,14 @@ impl<const BUF: usize> Tcb<BUF> {
             self.scale_peer_window(seg.window)
         };
         self.max_snd_wnd = self.max_snd_wnd.max(self.snd_wnd);
-        self.snd_wl1 = seg.seq;
+        // As in `update_send_window`: a third ACK with a "future" sequence
+        // number (in the window, but not at RCV.NXT) must not freeze the
+        // window against the peer's genuine segments.
+        self.snd_wl1 = if seq_gt(seg.seq, self.rcv_nxt) {
+            self.rcv_nxt
+        } else {
+            seg.seq
+        };
         self.snd_wl2 = seg.ack;
         if self.syn_rcvd_retries > 0 {
             self.syn_retransmitted = true;
@@ -355,7 +368,12 @@ impl<const BUF: usize> Tcb<BUF> {
         self.cwnd_limited = false;
         self.cwnd_limited_seq = self.snd_nxt;
         self.pipe_hiwat = 0;
+        self.cwnd_used = 0;
+        self.cwnd_stamp_ms = self.now_ms;
+        self.snd_sml = self.snd_nxt;
+        self.pushed_seq = self.snd_nxt;
         self.last_data_send_ms = self.now_ms;
+        self.rcv_mss = RCV_MSS_INITIAL.min(self.local_mss);
         if !seq_gt(self.rcv_adv_edge, self.rcv_nxt) {
             self.rcv_adv_edge = self.rcv_nxt;
         }
@@ -418,8 +436,13 @@ impl<const BUF: usize> Tcb<BUF> {
             return self.on_unacceptable(seg, payload_len, fin);
         }
         if self.paws_reject(seg) {
-            // RFC 7323 §5.3 R1: ACK and drop (paws_reject implies data or
-            // a FIN; the ACK is immediate only if `may_answer_at_once`).
+            // RFC 7323 §5.3 R1: ACK and drop. An old pure ACK below RCV.NXT
+            // is dropped silently, as Linux (an ACK of it would only
+            // repeat ours); data or a FIN is ACKed at once only if
+            // `may_answer_at_once`.
+            if payload_len == 0 && !fin && seq_lt(seg.seq, self.rcv_nxt) {
+                return Ok(());
+            }
             return if self.may_answer_at_once(seg) {
                 self.send_pure_ack()
             } else {
@@ -499,6 +522,9 @@ impl<const BUF: usize> Tcb<BUF> {
             ack_now |= self.maybe_consume_ooo_fin();
         }
         let advanced = self.rcv_nxt != prev_rcv_nxt;
+        if advanced && payload_len > 0 {
+            self.note_data_received(payload_len, seg.has(flags::PSH));
+        }
 
         if ack_now {
             self.send_pure_ack()?;
@@ -596,34 +622,57 @@ impl<const BUF: usize> Tcb<BUF> {
             && (!self.ts_enabled || seg.options.ts.is_some())
     }
 
-    /// RFC 7323 §5 PAWS: drop a data-bearing segment whose timestamp is
-    /// older than `TS.Recent` (a wrapped-sequence duplicate). Pure ACKs are
-    /// exempt so reordered ACKs are never discarded.
+    /// RFC 7323 §5 PAWS, as Linux `tcp_validate_incoming`: a segment whose
+    /// TSval is more than a tick older than TS.Recent is dropped — a pure
+    /// ACK too, or a reordered old ACK could close the window — except a
+    /// duplicate ACK that reordering alone explains (see
+    /// [`Self::disordered_ack`]). A RST is never dropped for its timestamp.
     fn paws_reject(&self, seg: &Segment<'_>) -> bool {
-        if !self.ts_enabled
-            || seg.has(flags::RST)
-            || (seg.payload.is_empty() && !seg.has(flags::FIN))
-        {
+        if !self.ts_enabled || seg.has(flags::RST) {
             return false;
         }
         let Some((tsval, _)) = seg.options.ts else {
             return false;
         };
-        if self.now_ms.saturating_sub(self.ts_recent_stamp) > PAWS_IDLE_MS {
+        !self.paws_ok(tsval, 1) && !self.disordered_ack(seg, tsval)
+    }
+
+    /// Linux `tcp_paws_check`: `tsval` is at most `win` ticks older than
+    /// TS.Recent, or TS.Recent cannot be trusted — expired after a long
+    /// idle, or 0 from a peer that stamps its SYN with 0 (a later real
+    /// clock may look "negative" against it).
+    fn paws_ok(&self, tsval: u32, win: i32) -> bool {
+        (self.ts_recent.wrapping_sub(tsval) as i32) <= win
+            || self.now_ms.saturating_sub(self.ts_recent_stamp) > PAWS_IDLE_MS
+            || self.ts_recent == 0
+    }
+
+    /// Linux `tcp_disordered_ack_check`: a pure duplicate ACK at RCV.NXT
+    /// that cannot change the window, with a TSval within an RTO of
+    /// TS.Recent (`tcp_tsval_replay`: a clock of up to 1200 Hz), is merely
+    /// reordered and harmless.
+    fn disordered_ack(&self, seg: &Segment<'_>, tsval: u32) -> bool {
+        let pure = seg.payload.is_empty() && !seg.has(flags::FIN) && !seg.has(flags::SYN);
+        if !seg.has(flags::ACK) || !pure || seg.seq != self.rcv_nxt || seg.ack != self.snd_una {
             return false;
         }
-        seq_lt(tsval, self.ts_recent)
+        let nwin = self.scale_peer_window(seg.window);
+        let updates_window = seq_gt(seg.seq, self.snd_wl1)
+            || (seg.seq == self.snd_wl1 && (nwin > self.snd_wnd || nwin == 0));
+        let replay = i32::try_from(self.rto_ms.saturating_mul(6) / 5).unwrap_or(i32::MAX);
+        !updates_window && (self.ts_recent.wrapping_sub(tsval) as i32) <= replay
     }
 
     /// RFC 7323 §4.3: TS.Recent follows only segments that cover the left
     /// window edge we last acknowledged (`Last.ACK.sent`), so an
-    /// out-of-order or forged segment cannot push it forward.
+    /// out-of-order or forged segment cannot push it forward; an expired or
+    /// zero TS.Recent is replaced outright (Linux `tcp_replace_ts_recent`).
     fn update_ts_recent(&mut self, seg: &Segment<'_>) {
         if !self.ts_enabled {
             return;
         }
         if let Some((tsval, _)) = seg.options.ts {
-            if seq_le(seg.seq, self.last_ack_sent) && seq_ge(tsval, self.ts_recent) {
+            if seq_le(seg.seq, self.last_ack_sent) && self.paws_ok(tsval, 0) {
                 self.ts_recent = tsval;
                 self.ts_recent_stamp = self.now_ms;
             }
@@ -631,15 +680,28 @@ impl<const BUF: usize> Tcb<BUF> {
     }
 
     fn on_reset_received(&mut self) {
-        let report = matches!(
-            self.state,
-            State::Established | State::FinWait1 | State::FinWait2 | State::CloseWait
-        );
-        if report {
-            self.abort_local();
-        } else {
-            self.close_clean();
+        match self.state {
+            State::Established | State::FinWait1 | State::FinWait2 | State::CloseWait => {
+                self.abort_local();
+            }
+            // The peer's stream is complete (its FIN arrived), but ours may
+            // not be: a reset that discards data of ours not yet
+            // acknowledged must say so, keeping the peer's bytes readable
+            // first (Linux `tcp_reset` reports ECONNRESET here even when
+            // only our FIN was outstanding; then nothing was lost).
+            State::Closing | State::LastAck if self.send_data_undelivered() => {
+                self.close_clean();
+                self.error = Some(TcpError::ConnectionReset);
+            }
+            _ => self.close_clean(),
         }
+    }
+
+    /// Data of ours is unsent or unacknowledged (beyond a lone FIN).
+    fn send_data_undelivered(&self) -> bool {
+        let unacked = self.snd_nxt.wrapping_sub(self.snd_una);
+        let fin_only = self.fin_sent && unacked == 1 && self.snd_una == self.fin_seq;
+        self.unsent_bytes() > 0 || (unacked > 0 && !fin_only)
     }
 
     /// Accept payload into the receive ring. In-order bytes are appended;
@@ -648,19 +710,20 @@ impl<const BUF: usize> Tcb<BUF> {
     /// `seg_fin` is this segment's FIN, if it is to be processed: parked
     /// bytes absorbed after in-order ones stop there.
     /// Returns `true` when an immediate ACK is due (out-of-order arrival,
-    /// a filled hole, or duplicate data).
+    /// in-order data while out-of-order data is held — a hole filled in
+    /// whole or in part, RFC 5681 §4.2 — or duplicate data).
     fn receive_payload(&mut self, seg: &Segment<'_>, seg_fin: Option<u32>) -> bool {
         let mut seq = seg.seq;
         let mut data = seg.payload;
         let mut ack_now = false;
         if seq_lt(seq, self.rcv_nxt) {
-            let lead = self.rcv_nxt.wrapping_sub(seq) as usize;
+            let lead = (self.rcv_nxt.wrapping_sub(seq) as usize).min(data.len());
+            self.stats.dup_bytes_received =
+                self.stats.dup_bytes_received.saturating_add(lead as u64);
+            self.note_dsack(seq, seq.wrapping_add(lead as u32));
             let Some(rest) = data.get(lead..).filter(|r| !r.is_empty()) else {
                 return true;
             };
-            self.stats.dup_bytes_received =
-                self.stats.dup_bytes_received.saturating_add(lead as u64);
-            self.note_dsack(seq, self.rcv_nxt);
             data = rest;
             seq = self.rcv_nxt;
             ack_now = true;
@@ -675,8 +738,17 @@ impl<const BUF: usize> Tcb<BUF> {
             return true;
         };
         if off == 0 {
+            let held = !self.ooo.is_empty();
             let n = self.recv_ring.write(data);
-            self.rcv_nxt = self.rcv_nxt.wrapping_add(n as u32);
+            let end = self.rcv_nxt.wrapping_add(n as u32);
+            // Parked data this in-order text covers arrived twice: report
+            // it (Linux `tcp_ofo_queue`).
+            if let (Some((l, r)), dup) = self.ooo.overlap_below(end, self.rcv_nxt) {
+                self.stats.dup_bytes_received =
+                    self.stats.dup_bytes_received.saturating_add(u64::from(dup));
+                self.note_dsack(l, r);
+            }
+            self.rcv_nxt = end;
             self.stats.bytes_received = self.stats.bytes_received.saturating_add(n as u64);
             // In-order text is processed ahead of a FIN held out of order; if
             // it covers the FIN's sequence number, that FIN was not the end
@@ -684,7 +756,7 @@ impl<const BUF: usize> Tcb<BUF> {
             if self.ooo_fin.is_some_and(|h| seq_gt(self.rcv_nxt, h.seq)) {
                 self.ooo_fin = None;
             }
-            return self.absorb_ooo(seg_fin) || ack_now;
+            return self.absorb_ooo(seg_fin) || ack_now || held;
         }
         let end = seq.wrapping_add(take as u32);
         match self.ooo.insert(seq, end, self.rcv_nxt) {
@@ -829,15 +901,40 @@ impl<const BUF: usize> Tcb<BUF> {
         self.user_timeout_deadline = Deadline::OFF;
     }
 
+    /// In-order data arrived (Linux `tcp_event_data_recv` /
+    /// `tcp_measure_rcv_mss`): note when, learn the receive MSS, and mark
+    /// the held ACK "pushed" when the segment ended a write — a short one,
+    /// or a full one with PSH; a second short one marks it twice.
+    fn note_data_received(&mut self, payload_len: u32, psh: bool) {
+        self.last_data_recv_ms = Some(self.now_ms);
+        let rcv_mss = u32::from(self.rcv_mss.max(1));
+        if payload_len >= rcv_mss {
+            self.rcv_mss = u16::try_from(payload_len)
+                .unwrap_or(u16::MAX)
+                .min(self.local_mss);
+            if psh {
+                self.ack_pushed |= ACK_PUSHED;
+            }
+        } else {
+            if self.ack_pushed & ACK_PUSHED != 0 {
+                self.ack_pushed |= ACK_PUSHED2;
+            }
+            self.ack_pushed |= ACK_PUSHED;
+        }
+    }
+
     /// RFC 5681 §4.2 / RFC 9293 §3.8.6.3: ACK at least every second
     /// full-sized segment, otherwise within `DELAYED_ACK_MS`. A coalesced
-    /// segment counts as the number of MSS-sized segments it spans.
+    /// segment counts as the number of MSS-sized segments it spans, and,
+    /// as in Linux (`__tcp_ack_snd_check`), more than one receive MSS of
+    /// unacknowledged data is ACKed at once whatever the segment sizes.
     fn schedule_delayed_ack(&mut self, payload_len: u32) {
         let full = payload_len / u32::from(self.local_mss.max(1));
         let units = full.clamp(1, u32::from(u8::MAX)) as u8;
         self.delayed_ack_count = self.delayed_ack_count.saturating_add(units);
         self.pending_ack = true;
-        if self.delayed_ack_count >= 2 {
+        let unacked = self.rcv_nxt.wrapping_sub(self.last_ack_sent);
+        if self.delayed_ack_count >= 2 || unacked > u32::from(self.rcv_mss.max(1)) {
             let _ = self.send_pure_ack();
         } else if !self.ack_deadline.is_armed() {
             self.ack_deadline = Deadline::at(self.now_ms.saturating_add(DELAYED_ACK_MS));

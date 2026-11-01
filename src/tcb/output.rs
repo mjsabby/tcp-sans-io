@@ -6,7 +6,10 @@
 //! (RFC 9293 §3.8.6.2.1). Sequence numbers are never rewound; a
 //! retransmission re-sends a queued segment in place.
 
-use super::{seq_gt, seq_lt, Deadline, Tcb, BLACKHOLE_MSS1, PMTU_PROBE_MAX_MS, PMTU_PROBE_MIN_MS};
+use super::{
+    seq_ge, seq_gt, seq_lt, Deadline, Tcb, BLACKHOLE_MSS1, DELAYED_ACK_MS, PMTU_PROBE_MAX_MS,
+    PMTU_PROBE_MIN_MS,
+};
 use crate::congestion;
 use crate::error::TcpError;
 use crate::rtx_queue::{seg_flags, Seg};
@@ -40,6 +43,7 @@ impl<const BUF: usize> Tcb<BUF> {
             return Ok(());
         }
         let mut guard = 0u32;
+        let mut sent = false;
         while !self.egress_full() {
             if crate::loop_budget_exhausted(&mut guard, TX_RING_CAP as u32 + 2, "maybe_send_data") {
                 break;
@@ -47,18 +51,65 @@ impl<const BUF: usize> Tcb<BUF> {
             if !self.send_one()? {
                 break;
             }
+            sent = true;
+        }
+        let is_limited = core::mem::take(&mut self.cwnd_hit) || self.pipe() >= self.cc.cwnd;
+        if sent || is_limited {
+            self.cwnd_validate(is_limited);
         }
         self.update_persist();
         Ok(())
     }
 
+    /// Linux `tcp_cwnd_validate` after a send attempt: per round of data
+    /// (until `SND.UNA` passes what was outstanding), remember whether the
+    /// sender filled cwnd and the most it had in flight — cwnd may only
+    /// grow while it is being used (RFC 7661 in spirit). A sender that has
+    /// used less than its window for an RTO decays it (Linux
+    /// `tcp_cwnd_application_limited`), so a stale window is not burst out
+    /// later.
+    fn cwnd_validate(&mut self, is_limited: bool) {
+        let pipe = self.pipe();
+        if seq_ge(self.snd_una, self.cwnd_limited_seq)
+            || is_limited
+            || (!self.cwnd_limited && pipe > self.pipe_hiwat)
+        {
+            self.cwnd_limited = is_limited;
+            self.pipe_hiwat = pipe;
+            self.cwnd_limited_seq = self.snd_nxt;
+        }
+        if self.cwnd_is_limited() {
+            self.cwnd_used = 0;
+            self.cwnd_stamp_ms = self.now_ms;
+            return;
+        }
+        let outstanding = self.snd_nxt.wrapping_sub(self.snd_una);
+        self.cwnd_used = self.cwnd_used.max(outstanding);
+        if self.now_ms.saturating_sub(self.cwnd_stamp_ms) >= u64::from(self.rto_ms) {
+            // Not if the application is blocked on a full send buffer.
+            if self.cc.state() == congestion::CaState::Open && self.send_ring.free() > 0 {
+                let iw = congestion::initial_window(self.mss_payload());
+                self.cc.on_application_limited(iw, self.cwnd_used);
+                self.cwnd_used = 0;
+            }
+            self.cwnd_stamp_ms = self.now_ms;
+        }
+    }
+
+    /// Linux `tcp_is_cwnd_limited`: cwnd was full this round — or, in slow
+    /// start, at least half used, so it grows to twice what was sent.
+    pub(super) fn cwnd_is_limited(&self) -> bool {
+        self.cwnd_limited
+            || (self.cc.cwnd < self.cc.ssthresh && self.pipe_hiwat.saturating_mul(2) > self.cc.cwnd)
+    }
+
     fn send_one(&mut self) -> Result<bool, TcpError> {
         if let Some(i) = self.rtx.next_lost() {
             if self.pipe() >= self.cc.cwnd {
-                self.cwnd_limited = true;
+                self.cwnd_hit = true;
                 return Ok(false);
             }
-            return self.retransmit(i);
+            return self.retransmit(i, false);
         }
         self.send_new()
     }
@@ -85,16 +136,16 @@ impl<const BUF: usize> Tcb<BUF> {
         let unsent = self.unsent_bytes();
         if unsent == 0 {
             // A bare FIN owes no window or congestion credit.
-            if self.fin_owed() && !self.rtx.is_full() {
+            if self.fin_owed() && self.rtx.has_room_for_new() {
                 return self.emit_new(0, true);
             }
             return Ok(false);
         }
-        if self.rtx.is_full() {
+        if !self.rtx.has_room_for_new() {
             return Ok(false);
         }
         if self.pipe() >= self.cc.cwnd {
-            self.cwnd_limited = true;
+            self.cwnd_hit = true;
             return Ok(false);
         }
         let mss = self.mss_payload();
@@ -111,13 +162,26 @@ impl<const BUF: usize> Tcb<BUF> {
         } else {
             return Ok(false);
         };
-        // RFC 5681 §4.1 restart window after an idle period.
-        if self.snd_una == self.snd_nxt
-            && self.now_ms.saturating_sub(self.last_data_send_ms) > u64::from(self.rto_ms)
-        {
-            self.cc.on_idle_restart(congestion::initial_window(mss));
-        }
         let fin = self.fin_owed() && len == unsent;
+        // Nagle (RFC 9293 §3.7.4) in Minshall's variant, as Linux
+        // `tcp_nagle_check`: a short segment waits while an earlier short
+        // one is unacknowledged, unless it carries the FIN.
+        if len < mss
+            && !fin
+            && !self.nodelay
+            && seq_gt(self.snd_sml, self.snd_una)
+            && !seq_gt(self.snd_sml, self.snd_nxt)
+        {
+            return Ok(false);
+        }
+        // Restart after idle (Linux `tcp_cwnd_restart`).
+        let idle_ms = self.now_ms.saturating_sub(self.last_data_send_ms);
+        if self.snd_una == self.snd_nxt && idle_ms > u64::from(self.rto_ms) {
+            let iw = congestion::initial_window(mss);
+            self.cc.on_idle_restart(iw, idle_ms, self.rto_ms);
+            self.cwnd_used = 0;
+            self.cwnd_stamp_ms = self.now_ms;
+        }
         let seq = self.snd_nxt;
         let sent = self.emit_new(len, fin)?;
         if let (true, Some((plen, cap))) = (sent, probe) {
@@ -166,7 +230,11 @@ impl<const BUF: usize> Tcb<BUF> {
             .saturating_add(u64::from(self.pmtu_probe_backoff_ms));
     }
 
-    /// Transmit `len` new bytes at `SND.NXT` (plus a FIN if `fin`).
+    /// Transmit `len` new bytes at `SND.NXT` (plus a FIN if `fin`). PSH
+    /// marks the end of the queued data — the tail of what the application
+    /// wrote — and, as Linux `forced_push`, at least every half of the
+    /// peer's largest window; not every segment, so a GRO receiver can
+    /// coalesce the run between.
     pub(super) fn emit_new(&mut self, len: u32, fin: bool) -> Result<bool, TcpError> {
         let seq = self.snd_nxt;
         let payload = RingSlice {
@@ -176,10 +244,19 @@ impl<const BUF: usize> Tcb<BUF> {
         if len > u32::from(MSS) {
             return Err(TcpError::Overflow);
         }
-        let fl =
-            flags::ACK | if len > 0 { flags::PSH } else { 0 } | if fin { flags::FIN } else { 0 };
+        let end = seq.wrapping_add(len);
+        let push = len > 0
+            && (len >= self.unsent_bytes()
+                || end.wrapping_sub(self.pushed_seq) > self.max_snd_wnd / 2);
+        let fl = flags::ACK | if push { flags::PSH } else { 0 } | if fin { flags::FIN } else { 0 };
         if !self.emit_data_segment(fl, seq, payload, len > 0)? {
             return Ok(false);
+        }
+        if push {
+            self.pushed_seq = end;
+        }
+        if len > 0 && len < self.mss_payload() {
+            self.snd_sml = end; // Linux `tcp_minshall_update`
         }
         let seq_len = len + u32::from(fin);
         let pushed = self.rtx.push(Seg {
@@ -187,7 +264,7 @@ impl<const BUF: usize> Tcb<BUF> {
             end: seq.wrapping_add(seq_len),
             xmit_ts: self.now_ms,
             xmit_seq: 0,
-            flags: if fin { seg_flags::FIN } else { 0 },
+            flags: if fin { seg_flags::FIN } else { 0 } | if push { seg_flags::PSH } else { 0 },
         });
         if !pushed {
             return Err(TcpError::Overflow);
@@ -198,10 +275,17 @@ impl<const BUF: usize> Tcb<BUF> {
         }
         self.snd_nxt = seq.wrapping_add(seq_len);
         self.cc.on_send(seq_len);
-        self.pipe_hiwat = self.pipe_hiwat.max(self.pipe());
         if len > 0 {
             self.last_data_send_ms = self.now_ms;
             self.stats.bytes_sent = self.stats.bytes_sent.saturating_add(u64::from(len));
+            // A reply within a delayed-ACK interval of the peer's data makes
+            // the connection interactive (Linux `tcp_event_data_sent`).
+            if self
+                .last_data_recv_ms
+                .is_some_and(|t| self.now_ms.saturating_sub(t) < DELAYED_ACK_MS)
+            {
+                self.pingpong = true;
+            }
         }
         if !self.rto_deadline.is_armed() {
             self.arm_rto();
@@ -211,8 +295,9 @@ impl<const BUF: usize> Tcb<BUF> {
     }
 
     /// Retransmit queued segment `i` (splitting it first if the path MSS
-    /// shrank below its size).
-    pub(super) fn retransmit(&mut self, i: usize) -> Result<bool, TcpError> {
+    /// shrank below its size). `probe`: a tail loss probe re-sending a
+    /// segment not deemed lost (see [`crate::rtx_queue::RtxQueue::on_probe`]).
+    pub(super) fn retransmit(&mut self, i: usize, probe: bool) -> Result<bool, TcpError> {
         let mss = self.mss_payload();
         let Some(mut s) = self.rtx.get(i).copied() else {
             return Ok(false);
@@ -223,7 +308,13 @@ impl<const BUF: usize> Tcb<BUF> {
         {
             self.pmtu_probe_failed();
         }
-        if s.payload_len() > mss && self.rtx.split(i, s.start.wrapping_add(mss)) {
+        if s.payload_len() > mss {
+            if !self.rtx.split(i, s.start.wrapping_add(mss)) {
+                // No slot for the split: sending the first MSS while
+                // marking the whole segment retransmitted would strand the
+                // rest until the RTO. Wait for an ACK to free a slot.
+                return Ok(false);
+            }
             if let Some(n) = self.rtx.get(i).copied() {
                 s = n;
             }
@@ -237,18 +328,25 @@ impl<const BUF: usize> Tcb<BUF> {
             return Err(TcpError::Overflow);
         }
         let fin = s.has(seg_flags::FIN) && plen == s.payload_len();
-        let fl =
-            flags::ACK | if plen > 0 { flags::PSH } else { 0 } | if fin { flags::FIN } else { 0 };
+        let push = plen > 0 && s.has(seg_flags::PSH) && plen == s.payload_len();
+        let fl = flags::ACK | if push { flags::PSH } else { 0 } | if fin { flags::FIN } else { 0 };
         if !self.emit_data_segment(fl, s.start, payload, false)? {
             return Ok(false);
         }
-        self.rtx.on_retransmit(i, self.now_ms);
+        if probe {
+            self.rtx.on_probe(i, self.now_ms);
+        } else {
+            self.rtx.on_retransmit(i, self.now_ms);
+        }
         self.cc.on_send(s.seq_len());
         self.cc.on_retransmit(self.now_ms);
         self.stats.segs_retrans = self.stats.segs_retrans.saturating_add(1);
         self.stats.bytes_retrans = self.stats.bytes_retrans.saturating_add(u64::from(plen));
         self.stats.bytes_sent = self.stats.bytes_sent.saturating_add(u64::from(plen));
-        if !self.rto_deadline.is_armed() {
+        // Re-sending the head restarts the RTO (Linux
+        // `tcp_xmit_retransmit_queue`): its retransmission needs a round
+        // trip, which a timer armed for the original may not leave.
+        if i == 0 || !self.rto_deadline.is_armed() {
             self.arm_rto();
         }
         Ok(true)
@@ -332,6 +430,7 @@ impl<const BUF: usize> Tcb<BUF> {
             // The ACK rides on this segment.
             self.pending_ack = false;
             self.delayed_ack_count = 0;
+            self.ack_pushed = 0;
             self.ack_deadline = Deadline::OFF;
         }
         Ok(queued)
@@ -356,6 +455,7 @@ impl<const BUF: usize> Tcb<BUF> {
         )? {
             self.pending_ack = false;
             self.delayed_ack_count = 0;
+            self.ack_pushed = 0;
             self.ack_deadline = Deadline::OFF;
         }
         Ok(())

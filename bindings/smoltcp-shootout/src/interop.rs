@@ -308,8 +308,13 @@ pub fn print_outcome(o: &Outcome) {
         if o.server_reset { " (reset)" } else { "" }
     );
     let t = |x: Option<u64>| x.map_or("-".into(), |v| format!("{:.3} s", v as f64 / 1e6));
+    let settled = if o.unsettled {
+        format!("not within {} s", sim::SETTLE / SEC)
+    } else {
+        t(o.settled_at)
+    };
     println!(
-        "  established {}  c→s done {}  s→c done {}  closed {}",
+        "  established {}  c→s done {}  s→c done {}  settled {settled}  closed {}",
         t(o.established_at),
         t(o.fwd_done),
         t(o.rev_done),

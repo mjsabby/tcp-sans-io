@@ -17,6 +17,10 @@ pub const SEC: Time = 1_000_000;
 pub const KIB: u64 = 1024;
 pub const MIB: u64 = 1024 * 1024;
 
+/// How long a `Goal::Delivered` run goes on after delivery for the wire to
+/// settle (see [`run`]).
+pub const SETTLE: Time = 10 * SEC;
+
 // ---------------------------------------------------------------------------
 // Stream contents: a random table with a prime period, so a byte delivered
 // at the wrong offset (by a segment, window or ring size) never matches.
@@ -254,6 +258,12 @@ pub struct Outcome {
     pub fwd_done: Option<Time>,
     pub rev_done: Option<Time>,
     pub closed_at: Option<Time>,
+    /// `Goal::Delivered`: when, after delivery, both links were idle and
+    /// neither stack had anything unacknowledged.
+    pub settled_at: Option<Time>,
+    /// `Goal::Delivered`: the wire had not settled `SETTLE` after delivery,
+    /// so the statistics stop there.
+    pub unsettled: bool,
     pub fwd: WireStats,
     pub rev: WireStats,
     pub client_stats: Option<TcbStats>,
@@ -308,6 +318,9 @@ pub enum Goal {
     Reset,
     /// Run until the server has sent a SYN-ACK (seed search).
     SynAck,
+    /// Nothing left to happen: both links idle, and neither stack has data,
+    /// a SYN or a FIN unacknowledged (so no retransmission can follow).
+    Settled,
 }
 
 impl Sim {
@@ -437,11 +450,24 @@ impl Sim {
                 peer_saw && c.stack.state() == St::Closed && s.stack.state() == St::Closed
             }
             Goal::SynAck => self.rev.stats.syn > 0,
+            Goal::Settled => {
+                self.fwd.idle() && self.rev.idle() && c.stack.settled() && s.stack.settled()
+            }
         }
     }
 
     /// Advance until `goal` (Ok) or a failure (Err).
     pub fn run(&mut self, goal: Goal, limit: Time) -> Result<(), String> {
+        if self.advance(goal, limit)? {
+            Ok(())
+        } else {
+            Err(format!("not done by {:.1} s", limit as f64 / 1e6))
+        }
+    }
+
+    /// Advance until `goal` (`Ok(true)`), until nothing is due by `limit`
+    /// (`Ok(false)`), or a failure (`Err`).
+    fn advance(&mut self, goal: Goal, limit: Time) -> Result<bool, String> {
         let mut stuck = 0u32;
         loop {
             for side in [&mut self.client, &mut self.server] {
@@ -458,7 +484,7 @@ impl Sim {
                 self.established_at = Some(self.now);
             }
             if self.reached(goal) {
-                return Ok(());
+                return Ok(true);
             }
             if goal == Goal::Reset {
                 let aborted = self.client.aborted_at.or(self.server.aborted_at);
@@ -501,7 +527,7 @@ impl Sim {
                 return Err("stalled: no timer armed and nothing in flight".into());
             };
             if next > limit {
-                return Err(format!("not done by {:.1} s", limit as f64 / 1e6));
+                return Ok(false);
             }
             if next <= self.now {
                 stuck += 1;
@@ -522,6 +548,8 @@ impl Sim {
             fwd_done: self.server.done_at.filter(|_| self.client.app.send > 0),
             rev_done: self.client.done_at.filter(|_| self.server.app.send > 0),
             closed_at: None,
+            settled_at: None,
+            unsettled: false,
             fwd: self.fwd.stats.clone(),
             rev: self.rev.stats.clone(),
             client_stats: self.client.stack.stats(),
@@ -542,25 +570,90 @@ impl Sim {
     pub fn states(&self) -> (St, St) {
         (self.client.stack.state(), self.server.stack.state())
     }
+
+    /// Advance to `goal` within the scenario's budget and report; for
+    /// `Goal::Delivered`, go on until the wire settles first (see [`run`]).
+    pub fn conclude(&mut self, sc: &Scenario, goal: Goal) -> Outcome {
+        let mut r = self.run(goal, sc.limit);
+        let (mut settled_at, mut unsettled) = (None, false);
+        if r.is_ok() && goal == Goal::Delivered {
+            match self.advance(Goal::Settled, self.now + SETTLE) {
+                Ok(true) => settled_at = Some(self.now),
+                Ok(false) => unsettled = true,
+                Err(e) => r = Err(format!("after delivery: {e}")),
+            }
+        }
+        let mut o = self.outcome(r.err().map(|e| {
+            let (f, b) = self.received();
+            let (cs, ss) = self.states();
+            format!(
+                "{e} (t={:.3}s, delivered {f}/{} and {b}/{} B, states {cs:?}/{ss:?})",
+                self.now as f64 / 1e6,
+                sc.client_app.send,
+                sc.server_app.send
+            )
+        }));
+        o.settled_at = settled_at;
+        o.unsettled = unsettled;
+        if o.ok() && goal == Goal::CleanClose {
+            o.closed_at = Some(self.now);
+        }
+        o
+    }
 }
 
-/// Run a scenario to `goal`, then (for transfers) let the wire go quiet so
-/// late retransmissions are counted.
+/// Run a scenario to `goal`. A `Goal::Delivered` run then goes on until the
+/// wire settles (both links idle, nothing unacknowledged; at most `SETTLE`
+/// past delivery, flagged as `unsettled` if that runs out), so that late
+/// retransmissions, tail-loss probes and timeouts are counted; transfer
+/// times and goodput still end at delivery.
 pub fn run(sc: &Scenario, goal: Goal) -> Outcome {
-    let mut sim = Sim::new(sc);
-    let r = sim.run(goal, sc.limit);
-    let mut o = sim.outcome(r.err().map(|e| {
-        let (f, b) = sim.received();
-        let (cs, ss) = sim.states();
-        format!(
-            "{e} (t={:.3}s, delivered {f}/{} and {b}/{} B, states {cs:?}/{ss:?})",
-            sim.now as f64 / 1e6,
-            sc.client_app.send,
-            sc.server_app.send
-        )
-    }));
-    if o.ok() && goal == Goal::CleanClose {
-        o.closed_at = Some(sim.now);
+    Sim::new(sc).conclude(sc, goal)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 64 bytes client → server over a 10 Gbit/s link with 100 µs each
+    /// way; both sides keep the connection open.
+    fn small_upload() -> Scenario {
+        let link = LinkCfg::new(0, 10_000, 1024).delay_us(100);
+        let mut sc = Scenario::new(Spec::Ours, Spec::Ours, link);
+        sc.client_app = App::sender(64);
+        sc.client_app.close = ClosePolicy::Never;
+        sc.server_app.close = ClosePolicy::Never;
+        sc
     }
-    o
+
+    #[test]
+    fn delivered_runs_on_until_the_wire_settles() {
+        let o = run(&small_upload(), Goal::Delivered);
+        assert!(o.ok(), "{:?}", o.error);
+        assert!(!o.unsettled);
+        assert!(o.settled_at > o.fwd_done && o.fwd_done.is_some());
+    }
+
+    #[test]
+    fn retransmissions_after_delivery_are_counted() {
+        let sc = small_upload();
+        let mut s = Sim::new(&sc);
+        s.run(Goal::SynAck, sc.limit).unwrap();
+        // Every ACK from here on is lost: the data arrives, but its sender
+        // goes on probing and retransmitting after delivery.
+        s.rev.cfg.loss_ppm = 1_000_000;
+        s.run(Goal::Delivered, sc.limit).unwrap();
+        let delivered = s.now;
+        assert_eq!(s.fwd.stats.retx_pkts, 0);
+        let o = s.conclude(&sc, Goal::Delivered);
+        assert!(o.ok(), "{:?}", o.error);
+        assert_eq!(o.fwd_done, Some(delivered));
+        assert!(o.unsettled && o.settled_at.is_none());
+        let st = o.client_stats.expect("tcp-sans-io stats");
+        assert!(
+            o.fwd.retx_pkts >= 2 && st.tlp_count >= 1 && st.rto_count >= 1,
+            "{:?} {st:?}",
+            o.fwd
+        );
+    }
 }

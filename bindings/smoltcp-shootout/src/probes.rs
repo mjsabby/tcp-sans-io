@@ -95,6 +95,9 @@ fn describe(s: &Seg) -> String {
     for (a, b) in s.sack_blocks() {
         o += &format!(" sack={a}-{b}");
     }
+    if let Some((v, e)) = s.ts {
+        o += &format!(" ts={v}/{e}");
+    }
     o
 }
 
@@ -110,7 +113,11 @@ pub struct Lab {
     pub rcv_nxt: u32,
     pub sut_iss: u32,
     pub ts_on: bool,
+    /// What the peer echoes in TSecr: the TSval of the latest segment the
+    /// stack sent, except while a `Receiver` keeps it (see `send_through`).
     pub ts_recent: u32,
+    /// A `Receiver` keeps `ts_recent` (RFC 7323 §4.3).
+    ts_by_rx: bool,
     pub sack_on: bool,
     pub win: u16,
     ip_id: u16,
@@ -140,6 +147,7 @@ impl Lab {
             sut_iss: 0,
             ts_on: false,
             ts_recent: 0,
+            ts_by_rx: false,
             sack_on: false,
             win: 65535,
             ip_id: 1,
@@ -197,7 +205,9 @@ impl Lab {
                     continue;
                 }
                 if let Some((v, _)) = seg.ts {
-                    self.ts_recent = v;
+                    if !self.ts_by_rx {
+                        self.ts_recent = v;
+                    }
                 }
                 self.got.push_back(Got { at: self.now, seg });
             }
@@ -387,10 +397,7 @@ impl Lab {
     /// 2 KB).
     pub fn warm_up(&mut self) -> Result<(), String> {
         let mut rx = Receiver::new(self.rcv_nxt);
-        if self.app_send(64 * 1024) < 64 * 1024 {
-            return Err("send buffer too small".into());
-        }
-        transfer(self, &mut rx, 64 * 1024, &[], 10 * SEC)?;
+        send_through(self, &mut rx, 64 * 1024, &[], 10 * SEC)?;
         self.advance(50 * MS);
         self.take();
         Ok(())
@@ -407,8 +414,9 @@ impl Lab {
 }
 
 /// A receiver for the stack's data: tracks what arrived, ACKs every data
-/// segment with the cumulative ACK and SACK blocks (most recent first), and
-/// counts retransmissions of data it already had.
+/// segment with the cumulative ACK and SACK blocks (most recent first),
+/// keeps the TS.Recent those ACKs echo (RFC 7323 §4.3), and counts
+/// retransmissions of data it already had.
 struct Receiver {
     base: u32,
     have: crate::net::RangeSet,
@@ -449,6 +457,16 @@ impl Receiver {
         if !deliver {
             return None;
         }
+        // RFC 7323 §4.3: TS.Recent takes SEG.TSval only from a segment that
+        // arrives and does not start beyond Last.ACK.sent (this receiver's
+        // cumulative ACK: it ACKs every segment), never from a lost segment
+        // or one beyond a hole, and never moves back.
+        let last_ack_sent = self.base.wrapping_add(self.cum() as u32);
+        if let Some((tsval, _)) = s.ts {
+            if seq_le(s.seq, last_ack_sent) && seq_le(l.ts_recent, tsval) {
+                l.ts_recent = tsval;
+            }
+        }
         self.have.insert(lo, hi);
         self.recent.retain(|&(a, b)| b < lo || a > hi);
         self.recent.insert(0, (lo, hi));
@@ -482,6 +500,32 @@ impl Receiver {
 
 /// Round trip of the path the loss-recovery probes model.
 const RTT: Time = 10 * MS;
+
+/// `a` is at or before `b` in sequence (or timestamp) space.
+fn seq_le(a: u32, b: u32) -> bool {
+    (b.wrapping_sub(a) as i32) >= 0
+}
+
+/// Queue `n` bytes on the stack and deliver them to `rx` (see `transfer`).
+/// Until then TS.Recent follows `rx` (RFC 7323 §4.3) instead of every
+/// segment the stack sends, so a segment the receiver loses, or gets
+/// beyond a hole, does not change what it echoes.
+fn send_through(
+    l: &mut Lab,
+    rx: &mut Receiver,
+    n: usize,
+    lost: &[usize],
+    limit: Time,
+) -> Result<Time, String> {
+    l.ts_by_rx = true;
+    let r = if l.app_send(n) < n {
+        Err("send buffer too small".into())
+    } else {
+        transfer(l, rx, n as u64, lost, limit)
+    };
+    l.ts_by_rx = false;
+    r
+}
 
 /// Feed the stack's data segments to `rx`, whose ACKs reach the stack one
 /// RTT later, until `total` bytes arrived in order. First transmissions
@@ -1105,10 +1149,7 @@ fn recovery(
 ) -> Result<(Time, usize, usize), String> {
     l.warm_up()?;
     let mut rx = Receiver::new(l.rcv_nxt);
-    if l.app_send(n * 1448) < n * 1448 {
-        return Err("send buffer too small".into());
-    }
-    let t = transfer(l, &mut rx, (n * 1448) as u64, lost, limit)?;
+    let t = send_through(l, &mut rx, n * 1448, lost, limit)?;
     Ok((t, rx.retx, rx.needless))
 }
 

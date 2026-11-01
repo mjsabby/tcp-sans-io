@@ -25,6 +25,7 @@ use std::println;
 use std::vec::Vec;
 
 use crate::tcb::{events, Endpoint, Tcb, TcbConfig, TcbStats};
+use crate::tx_ring::TX_RING_CAP;
 use crate::State;
 use crate::MAX_PACKET;
 
@@ -83,6 +84,15 @@ impl LinkCfg {
     const fn reorder(mut self, ppm: u32, extra_ms: u64) -> Self {
         self.reorder_ppm = ppm;
         self.reorder_extra_us = extra_ms * 1000;
+        self
+    }
+    const fn delay_us(mut self, us: u64) -> Self {
+        self.delay_us = us;
+        self
+    }
+    const fn reorder_us(mut self, ppm: u32, extra_us: u64) -> Self {
+        self.reorder_ppm = ppm;
+        self.reorder_extra_us = extra_us;
         self
     }
     const fn drop_data(mut self, lo: u64, hi: u64) -> Self {
@@ -338,14 +348,17 @@ struct Sim {
     start_us: u64,
 }
 
-fn drain_into(t: &mut Tcb, link: &mut Link, now_us: u64) {
+fn drain_into(t: &mut Tcb, link: &mut Link, now_us: u64) -> usize {
     let mut buf = [0u8; MAX_PACKET];
+    let mut packets = 0;
     while let Ok(n) = t.extract_packet(&mut buf) {
         if n == 0 {
             break;
         }
         link.send(now_us, buf[..n].to_vec());
+        packets += 1;
     }
+    packets
 }
 
 impl Sim {
@@ -409,8 +422,14 @@ impl Sim {
         let ms = self.now_us / 1000;
         for (t, link) in [(&mut self.a, &mut self.ab), (&mut self.b, &mut self.ba)] {
             t.set_now(ms);
-            t.tick().unwrap();
-            drain_into(t, link, self.now_us);
+            // The host contract: tick again after draining a full egress
+            // ring, which stopped the stack mid-window.
+            for _ in 0..64 {
+                t.tick().unwrap();
+                if drain_into(t, link, self.now_us) < TX_RING_CAP {
+                    break;
+                }
+            }
             t.debug_validate_invariants().unwrap();
             if let Some(d) = t.debug_next_deadline() {
                 assert!(
@@ -724,6 +743,126 @@ fn reordering_is_tolerated_without_dsack() {
         "retransmission storm"
     );
     assert_eq!(o.a.rto_count, 0);
+}
+
+/// A virtual link (200 µs RTT) whose ring overflows at the end of a burst:
+/// the probe's SACK must let RACK mark the rest of the tail lost. With a
+/// millisecond clock the probe's RTT reads 0 against a 1 ms `min_rtt`, and
+/// the ambiguity filter used to leave the tail to a 200 ms RTO; and the
+/// receiver must ACK the partial fill of the hole at once, not 40 ms later.
+#[test]
+fn sub_millisecond_tail_loss_is_repaired_without_rto() {
+    let link = LinkCfg::new(0, 10_000, 1024).delay_us(100);
+    let bytes = 10 * 1448;
+    let mut s = Sim::new(link.drop_data(7, 10), link, 4, bytes, 0);
+    let o = s.run_transfer(10_000_000);
+    o.report("virtual link 200us, last 3 of 10 lost", bytes);
+    assert_eq!(o.a.rto_count, 0, "tail left to the RTO");
+    assert_eq!((o.a.tlp_count, o.a.segs_retrans), (1, 3));
+    assert!(o.secs < 0.02, "repaired in {:.3} s", o.secs);
+}
+
+/// Mild reordering on a virtual link (100 µs RTT, 1 % of packets 100 µs
+/// late) is absorbed by RACK's reordering window. In whole milliseconds
+/// `min_rtt / 4` is 0 below a 4 ms RTT, and every reordered packet used to
+/// be retransmitted (hundreds per 32 MiB) with D-SACKs unable to widen 0.
+#[test]
+fn sub_millisecond_reordering_is_tolerated() {
+    let fwd = LinkCfg::new(0, 10_000, 1024)
+        .delay_us(50)
+        .reorder_us(10_000, 100);
+    let rev = LinkCfg::new(0, 10_000, 1024).delay_us(50);
+    let bytes = 32 * MIB;
+    let mut s = Sim::new(fwd, rev, 7, bytes, 0);
+    let o = s.run_transfer(60_000_000);
+    o.report("virtual link 100us, 1% +100us reorder", bytes);
+    let spurious = o.b.dup_bytes_received as f64 / SMSS;
+    assert!(spurious <= 10.0, "{spurious:.0} spurious retransmissions");
+    assert_eq!(o.a.rto_count, 0);
+}
+
+/// The same reordering through a shallow queue (256 packets): once
+/// reordering is seen, RACK waits out its window (at least 2 ms with a
+/// millisecond clock) before declaring a queue drop lost, while the sender
+/// keeps filling the peer's window past the hole. Halving FlightSize, which
+/// counts that SACKed data, then left cwnd where it was, and every round
+/// overflowed the queue again; halving cwnd, as Linux does, settles.
+#[test]
+fn sub_millisecond_reordering_through_a_shallow_queue_halves_the_window() {
+    let fwd = LinkCfg::new(0, 10_000, 256)
+        .delay_us(50)
+        .reorder_us(10_000, 100);
+    let rev = LinkCfg::new(0, 10_000, 256).delay_us(50);
+    let bytes = 32 * MIB;
+    let mut s = Sim::new(fwd, rev, 7, bytes, 0);
+    let o = s.run_transfer(60_000_000);
+    o.report(
+        "virtual link 100us, 1% +100us reorder, 256-pkt queue",
+        bytes,
+    );
+    assert!(
+        o.a.fast_recoveries <= 6,
+        "{} recoveries",
+        o.a.fast_recoveries
+    );
+    assert!(
+        o.fwd.data_dropped * 100 <= o.fwd.data_in * 3,
+        "{} of {} segments dropped",
+        o.fwd.data_dropped,
+        o.fwd.data_in
+    );
+    assert_eq!(o.a.rto_count, 0);
+}
+
+/// Request/response over a clean virtual link (200 µs RTT, 10 Gbit/s), from
+/// 1 B to 1 MiB, odd segment counts included: no retransmission, probe or
+/// timeout on either side, and no exchange waits on a delayed ACK.
+#[test]
+fn virtual_link_request_response_is_clean() {
+    let link = LinkCfg::new(0, 10_000, 1024).delay_us(100);
+    let quiet = |s: &Sim| {
+        [&s.a, &s.b].iter().all(|t| {
+            let d = t.debug_snapshot();
+            d.snd_una == d.snd_nxt && d.tx_len == 0
+        }) && s.ab.flight.is_empty()
+            && s.ba.flight.is_empty()
+    };
+    for (req, resp) in [
+        (1, 1),
+        (100, 100),
+        (1449, 1),
+        (4344, 64),
+        (64, 4345),
+        (MIB, 64),
+        (64, MIB),
+    ] {
+        let mut s = Sim::new(link, link, 5, 0, 0);
+        assert!(s.run(1_000_000, |s| {
+            s.a.state() == State::Established && s.b.state() == State::Established
+        }));
+        let mut worst = 0;
+        for _ in 0..16 {
+            let start = s.now_us;
+            s.f_ab.total += req;
+            s.f_ab.done_us = None;
+            assert!(s.run(start + 5_000_000, |s| s.f_ab.recvd == s.f_ab.total));
+            s.f_ba.total += resp;
+            s.f_ba.done_us = None;
+            assert!(s.run(start + 5_000_000, |s| s.f_ba.recvd == s.f_ba.total));
+            worst = worst.max(s.now_us - start);
+        }
+        let limit = s.now_us + 2_000_000;
+        assert!(s.run(limit, quiet), "{req}/{resp}: did not settle");
+        for t in [s.a.stats(), s.b.stats()] {
+            assert_eq!(
+                (t.segs_retrans, t.tlp_count, t.rto_count),
+                (0, 0, 0),
+                "{req}/{resp}: {t:?}"
+            );
+        }
+        // A delayed ACK holding up an exchange costs 40 ms.
+        assert!(worst < 20_000, "{req}/{resp}: worst exchange {worst} µs");
+    }
 }
 
 #[test]

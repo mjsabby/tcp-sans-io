@@ -87,6 +87,8 @@ pump loop*. The non-obvious rules that bindings get wrong:
 - One handle is single-threaded — the stack has no internal locking. If
   your language can call into one handle from several threads (e.g. ctypes
   releases the GIL), serialize the calls per handle in the wrapper.
+- Nagle is on by default (as Linux). Expose `tcp_set_nodelay` so
+  request/response users can turn it off, as with `TCP_NODELAY`.
 
 ## Step 3 — Tier-1 certification: self-loopback hash test (REQUIRED)
 

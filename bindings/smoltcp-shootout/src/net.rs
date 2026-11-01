@@ -43,6 +43,10 @@ pub struct LinkCfg {
     pub delay_us: u64,
     /// Bottleneck rate in bit/s (0 = unlimited).
     pub rate_bps: u64,
+    /// Serialize at exactly `rate_bps`, to the ns. Otherwise each packet
+    /// takes a whole number of µs, rounded up: right for 1500 B at 1 Gbit/s
+    /// (12 µs), but at 10 Gbit/s their 1.2 µs would become 2 µs.
+    pub exact_rate: bool,
     /// Bottleneck queue in packets (tail drop).
     pub queue: usize,
     pub loss_ppm: u32,
@@ -61,6 +65,7 @@ impl LinkCfg {
         Self {
             delay_us: delay_ms * 1000,
             rate_bps: rate_mbit * 1_000_000,
+            exact_rate: false,
             queue,
             loss_ppm: 0,
             reorder_ppm: 0,
@@ -75,13 +80,20 @@ impl LinkCfg {
         self.delay_us = us;
         self
     }
+    pub const fn exact_rate(mut self) -> Self {
+        self.exact_rate = true;
+        self
+    }
     pub const fn loss(mut self, ppm: u32) -> Self {
         self.loss_ppm = ppm;
         self
     }
-    pub const fn reorder(mut self, ppm: u32, extra_ms: u64) -> Self {
+    pub const fn reorder(self, ppm: u32, extra_ms: u64) -> Self {
+        self.reorder_us(ppm, extra_ms * 1000)
+    }
+    pub const fn reorder_us(mut self, ppm: u32, extra_us: u64) -> Self {
         self.reorder_ppm = ppm;
-        self.reorder_us = extra_ms * 1000;
+        self.reorder_us = extra_us;
         self
     }
     pub const fn dup(mut self, ppm: u32) -> Self {
@@ -250,7 +262,8 @@ impl Ord for InFlight {
 pub struct Link {
     pub cfg: LinkCfg,
     rng: Rng,
-    busy_until: Time,
+    /// When the bottleneck finishes sending what it holds (ns).
+    busy_ns: u64,
     departures: VecDeque<Time>,
     flight: BinaryHeap<InFlight>,
     order: u64,
@@ -307,7 +320,7 @@ impl Link {
         Self {
             cfg,
             rng: Rng::new(seed),
-            busy_until: 0,
+            busy_ns: 0,
             departures: VecDeque::new(),
             flight: BinaryHeap::new(),
             order: 0,
@@ -361,10 +374,15 @@ impl Link {
             if self.departures.len() >= self.cfg.queue {
                 return drop(self, "QDROP");
             }
-            let tx_us = (p.len() as u64 * 8 * 1_000_000).div_ceil(self.cfg.rate_bps);
-            self.busy_until = self.busy_until.max(now) + tx_us;
-            self.departures.push_back(self.busy_until);
-            depart = self.busy_until;
+            let bits = p.len() as u64 * 8;
+            let tx_ns = if self.cfg.exact_rate {
+                (bits * 1_000_000_000).div_ceil(self.cfg.rate_bps)
+            } else {
+                (bits * 1_000_000).div_ceil(self.cfg.rate_bps) * 1000
+            };
+            self.busy_ns = self.busy_ns.max(now * 1000) + tx_ns;
+            depart = self.busy_ns.div_ceil(1000);
+            self.departures.push_back(depart);
         }
         let mut at = depart + self.cfg.delay_us;
         let mut what = "send";

@@ -80,6 +80,12 @@ const RTO_MAX_MS: u32 = 60_000;
 const RTO_MIN_MS: u32 = 200;
 /// Delayed-ACK quantum (Linux default is 40 ms; RFC 5681 caps at 500 ms).
 const DELAYED_ACK_MS: u64 = 40;
+/// [`Tcb::ack_pushed`] bits (Linux `ICSK_ACK_PUSHED`, `ICSK_ACK_PUSHED2`).
+const ACK_PUSHED: u8 = 1;
+const ACK_PUSHED2: u8 = 2;
+/// Receive MSS assumed before a full segment arrives (Linux
+/// `TCP_MSS_DEFAULT`, the initial `icsk_ack.rcv_mss`).
+const RCV_MSS_INITIAL: u16 = 536;
 /// Peer MSS assumed when the SYN carries no MSS option (RFC 9293 §3.7.1).
 const DEFAULT_PEER_MSS: u16 = 536;
 /// Smallest peer MSS honoured. A peer may legitimately ask for tiny
@@ -332,13 +338,29 @@ pub struct Tcb<const BUF: usize = BUF_CAP> {
     /// `dsack_dups`); never more than `stats.segs_retrans`.
     dsack_segs: u64,
     cc: Reno,
-    /// Sender was cwnd-limited in the current round (gates cwnd growth).
+    /// Sender was cwnd-limited in the current round (gates cwnd growth;
+    /// Linux `is_cwnd_limited`).
     cwnd_limited: bool,
+    /// `SND.NXT` that closes the current round (Linux `cwnd_usage_seq`).
     cwnd_limited_seq: u32,
-    /// Highest `pipe` observed this round (slow-start cwnd-limited test).
+    /// Highest `pipe` sent into this round (Linux `max_packets_out`).
     pipe_hiwat: u32,
+    /// The last send attempt stopped at cwnd (transient, per attempt).
+    cwnd_hit: bool,
+    /// Most in flight since the window was last full, and when it was
+    /// last full or decayed (Linux `snd_cwnd_used`, `snd_cwnd_stamp`).
+    cwnd_used: u32,
+    cwnd_stamp_ms: u64,
     /// Time of the last new-data transmission (idle restart, RFC 5681 §4.1).
     last_data_send_ms: u64,
+    /// `TCP_NODELAY`: send sub-MSS segments at once instead of holding them
+    /// while an earlier one is unacknowledged (Nagle, Minshall's variant
+    /// as in Linux; on by default).
+    nodelay: bool,
+    /// End of the last sub-MSS segment sent (Linux `snd_sml`).
+    snd_sml: u32,
+    /// End of the last segment sent with PSH (Linux `pushed_seq`).
+    pushed_seq: u32,
     /// Time of the SYN / SYN-ACK transmission (handshake RTT sample).
     syn_xmit_ms: u64,
     syn_retransmitted: bool,
@@ -369,13 +391,23 @@ pub struct Tcb<const BUF: usize = BUF_CAP> {
     /// D-SACK block to report on the next ACK (RFC 2883).
     dsack: Option<(u32, u32)>,
 
-    // ---- RTT / RTO (RFC 6298).
+    // ---- RTT / RTO (RFC 6298, Linux `tcp_rtt_estimator`).
     now_ms: u64,
     init_rto_ms: u32,
     rto_ms: u32,
     srtt_ms: u32,
     rttvar_ms: u32,
     rtt_first_sample: bool,
+    /// SRTT ×8 and its mean deviation ×4, in ms (Linux `srtt_us`,
+    /// `mdev_us`): fixed point, so sub-millisecond steps accumulate.
+    srtt_x8: u32,
+    mdev_x4: u32,
+    /// Largest `mdev_x4` this round trip, and the variation the RTO adds
+    /// (Linux `mdev_max_us`, `rttvar_us`; never below `RTO_MIN_MS`).
+    mdev_max_x4: u32,
+    rttvar_x4: u32,
+    /// `SND.NXT` when the current RTT round began (Linux `rtt_seq`).
+    rtt_seq: u32,
     rto_deadline: Deadline,
     /// Consecutive RTOs / unanswered probes with no proof of life (R2).
     rtx_count: u8,
@@ -384,6 +416,22 @@ pub struct Tcb<const BUF: usize = BUF_CAP> {
     pending_ack: bool,
     delayed_ack_count: u8,
     ack_deadline: Deadline,
+    /// Linux `ICSK_ACK_PUSHED` / `ICSK_ACK_PUSHED2` for the held ACK: a
+    /// short or pushed segment ended a write (two short ones), so a read
+    /// that empties the receive queue sends the ACK at once
+    /// (`__tcp_cleanup_rbuf`).
+    ack_pushed: u8,
+    /// Interactive connection (Linux pingpong mode): we sent data within a
+    /// delayed-ACK interval of receiving some, so a held ACK can wait to
+    /// ride on the reply. Left when a delayed ACK had to fire on its own.
+    pingpong: bool,
+    /// When in-order data last arrived (Linux `icsk_ack.lrcvtime`); `None`
+    /// before the first, when Linux's `ato` is still 0 and sending cannot
+    /// make the connection interactive.
+    last_data_recv_ms: Option<u64>,
+    /// Receive MSS estimate (Linux `icsk_ack.rcv_mss`): the largest
+    /// segment seen, at most our MSS; 0 until established.
+    rcv_mss: u16,
 
     // ---- Persist / sender-SWS override timer.
     persist_deadline: Deadline,
@@ -568,6 +616,7 @@ impl<const BUF: usize> Tcb<BUF> {
         self.keepalive_count = DEFAULT_KEEPALIVE_COUNT;
         self.user_timeout_ms = DEFAULT_USER_TIMEOUT_MS;
         self.fin_wait2_timeout_ms = DEFAULT_FIN_WAIT2_TIMEOUT_MS;
+        self.nodelay = false;
         self.reset_connection_state();
         self.state = State::Closed;
     }
@@ -629,7 +678,12 @@ impl<const BUF: usize> Tcb<BUF> {
         self.cwnd_limited = false;
         self.cwnd_limited_seq = self.iss;
         self.pipe_hiwat = 0;
+        self.cwnd_hit = false;
+        self.cwnd_used = 0;
+        self.cwnd_stamp_ms = self.now_ms;
         self.last_data_send_ms = self.now_ms;
+        self.snd_sml = self.iss;
+        self.pushed_seq = self.iss;
         self.syn_xmit_ms = 0;
         self.syn_retransmitted = false;
         self.syn_unacked = false;
@@ -643,6 +697,11 @@ impl<const BUF: usize> Tcb<BUF> {
         self.srtt_ms = 0;
         self.rttvar_ms = 0;
         self.rtt_first_sample = false;
+        self.srtt_x8 = 0;
+        self.mdev_x4 = 0;
+        self.mdev_max_x4 = 0;
+        self.rttvar_x4 = 0;
+        self.rtt_seq = 0;
         self.rto_deadline = Deadline::OFF;
         self.rtx_count = 0;
         self.pending_ack = false;
@@ -650,6 +709,10 @@ impl<const BUF: usize> Tcb<BUF> {
         self.ack_deadline = Deadline::OFF;
         self.persist_deadline = Deadline::OFF;
         self.persist_backoff_ms = 0;
+        self.ack_pushed = 0;
+        self.pingpong = false;
+        self.last_data_recv_ms = None;
+        self.rcv_mss = 0;
         self.fin_sent = false;
         self.fin_seq = 0;
         self.time_wait_deadline = Deadline::OFF;
@@ -841,12 +904,16 @@ impl<const BUF: usize> Tcb<BUF> {
     /// drained, and resuming after [`Self::set_egress_paused`] (output owed
     /// while paused — an ACK, a keepalive probe — is not reported here).
     pub fn next_deadline(&self) -> Option<u64> {
-        let ack = if self.pending_ack && !self.egress_paused {
+        // ACKs and keepalives wait for egress room: while it is paused or
+        // the ring is full (the host drains, then ticks), they are not a
+        // reason to wake.
+        let blocked = self.egress_full();
+        let ack = if self.pending_ack && !blocked {
             self.ack_deadline
         } else {
             Deadline::OFF
         };
-        let keepalive = if self.egress_paused {
+        let keepalive = if blocked {
             Deadline::OFF
         } else {
             self.keepalive_deadline
@@ -978,6 +1045,16 @@ impl<const BUF: usize> Tcb<BUF> {
         } else {
             Deadline::OFF
         };
+    }
+
+    /// `TCP_NODELAY`. By default (as Linux) a segment shorter than the MSS
+    /// is held while an earlier short one is unacknowledged (Nagle,
+    /// RFC 9293 §3.7.4, in Minshall's variant), so a stream of small
+    /// writes coalesces. `true` sends every segment as soon as the windows
+    /// allow; turning it on also releases anything held, at the next
+    /// [`Tcb::tick`].
+    pub fn set_nodelay(&mut self, nodelay: bool) {
+        self.nodelay = nodelay;
     }
 
     /// Set the IPv4 MTU of the path toward the peer (clamped to
@@ -1189,6 +1266,11 @@ impl<const BUF: usize> Tcb<BUF> {
     /// abort. In `FIN_WAIT_2`, consuming data restarts the FIN_WAIT_2 timeout.
     pub fn recv(&mut self, dst: &mut [u8]) -> Result<usize, TcpError> {
         if let Some(e) = self.error {
+            // A reset after the peer's FIN keeps its completed stream
+            // readable; the error follows the last byte (as Linux `recvmsg`).
+            if self.state == State::Closed && !self.recv_ring.is_empty() {
+                return Ok(self.recv_ring.read(dst));
+            }
             return Err(e);
         }
         let n = self.recv_ring.read(dst);
@@ -1199,7 +1281,19 @@ impl<const BUF: usize> Tcb<BUF> {
                         .saturating_add(u64::from(self.fin_wait2_timeout_ms)),
                 );
             }
-            self.maybe_send_window_update()?;
+            // Linux `__tcp_cleanup_rbuf`: a read that empties the receive
+            // queue sends a held ACK at once if a short or pushed segment
+            // ended a write — unless the connection is interactive, where
+            // the reply will carry it — and after two short ones anyway. A
+            // peer holding its next small write for that ACK (Nagle) would
+            // otherwise wait out the delayed-ACK timer.
+            let pushed = self.ack_pushed & ACK_PUSHED2 != 0
+                || (self.ack_pushed & ACK_PUSHED != 0 && !self.pingpong);
+            if self.pending_ack && pushed && self.recv_ring.is_empty() {
+                self.send_pure_ack()?;
+            } else {
+                self.maybe_send_window_update()?;
+            }
         }
         if n == 0 {
             match self.state {
@@ -1471,23 +1565,52 @@ impl<const BUF: usize> Tcb<BUF> {
         self.rto_deadline = Deadline::at(self.now_ms.saturating_add(u64::from(self.rto_ms)));
     }
 
-    /// RFC 6298 §2 SRTT/RTTVAR/RTO update.
+    /// RTT estimator and RTO, as Linux `tcp_rtt_estimator` / `tcp_set_rto`
+    /// (RFC 6298 in spirit): SRTT and the mean deviation in fixed point
+    /// (×8, ×4), a decrease in RTT moving the deviation with a finer gain,
+    /// and RTO = SRTT + the largest 4·deviation of the last round trip, at
+    /// least `RTO_MIN_MS` — so a steady path keeps a 200 ms margin rather
+    /// than collapsing to SRTT + 1 ms.
     fn update_rtt(&mut self, r_ms: u32) {
-        let r = r_ms.max(1);
+        let m = r_ms.max(1);
         if !self.rtt_first_sample {
-            self.srtt_ms = r;
-            self.rttvar_ms = (r / 2).max(1);
+            self.srtt_x8 = m.saturating_mul(8);
+            self.mdev_x4 = m.saturating_mul(2);
+            self.rttvar_x4 = self.mdev_x4.max(RTO_MIN_MS);
+            self.mdev_max_x4 = self.rttvar_x4;
+            self.rtt_seq = self.snd_nxt;
             self.rtt_first_sample = true;
         } else {
-            let diff = self.srtt_ms.abs_diff(r);
-            self.rttvar_ms = (3u32.saturating_mul(self.rttvar_ms).saturating_add(diff)) / 4;
-            self.srtt_ms = (7u32.saturating_mul(self.srtt_ms).saturating_add(r)) / 8;
+            let srtt = i64::from(self.srtt_x8);
+            let mut err = i64::from(m) - (srtt >> 3);
+            self.srtt_x8 = u32::try_from((srtt + err).max(1)).unwrap_or(u32::MAX);
+            let mdev = i64::from(self.mdev_x4);
+            if err < 0 {
+                err = -err - (mdev >> 2);
+                if err > 0 {
+                    err >>= 3;
+                }
+            } else {
+                err -= mdev >> 2;
+            }
+            self.mdev_x4 = u32::try_from((mdev + err).max(0)).unwrap_or(u32::MAX);
+            if self.mdev_x4 > self.mdev_max_x4 {
+                self.mdev_max_x4 = self.mdev_x4;
+                self.rttvar_x4 = self.rttvar_x4.max(self.mdev_max_x4);
+            }
+            if seq_gt(self.snd_una, self.rtt_seq) {
+                if self.mdev_max_x4 < self.rttvar_x4 {
+                    self.rttvar_x4 -= (self.rttvar_x4 - self.mdev_max_x4) >> 2;
+                }
+                self.rtt_seq = self.snd_nxt;
+                self.mdev_max_x4 = RTO_MIN_MS;
+            }
         }
-        let rto = self
-            .srtt_ms
-            .saturating_add(core::cmp::max(1, self.rttvar_ms.saturating_mul(4)));
+        self.srtt_ms = (self.srtt_x8 >> 3).max(1);
+        self.rttvar_ms = self.mdev_x4 >> 2;
+        let rto = (self.srtt_x8 >> 3).saturating_add(self.rttvar_x4);
         self.rto_ms = rto.clamp(RTO_MIN_MS, RTO_MAX_MS);
-        self.rack.sample_rtt(self.now_ms, r);
+        self.rack.sample_rtt(self.now_ms, m);
     }
 
     #[inline]

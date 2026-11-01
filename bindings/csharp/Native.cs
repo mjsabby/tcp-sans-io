@@ -125,6 +125,9 @@ internal static class Native
     public static extern int tcp_set_fin_wait2_timeout(IntPtr handle, ulong nowMs, uint timeoutMs);
 
     [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int tcp_set_nodelay(IntPtr handle, ulong nowMs, byte nodelay);
+
+    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
     public static extern ulong tcp_next_deadline(IntPtr handle);
 
     [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]

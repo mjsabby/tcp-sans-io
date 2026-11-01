@@ -641,7 +641,7 @@ fn ones_complement_csum(data: &[u8]) -> u16 {
 // ===========================================================================
 
 /// Three duplicate ACKs of `snd_una` should fire a fast-retransmit loss
-/// event under PRR (RFC 6937): `ssthresh = max(FlightSize/2, 2*MSS)`,
+/// event under PRR (RFC 6937): `ssthresh = max(cwnd/2, 2*MSS)` (Linux Reno),
 /// `snd_nxt → snd_una`, immediate retransmit of one MSS. (Cwnd is NOT
 /// collapsed to 1*MSS — that was the old Tahoe behavior, replaced by
 /// PRR-SSRB pacing.)

@@ -260,6 +260,28 @@ impl OooList {
             .map(|r| (r.start, r.end))
     }
 
+    /// Held bytes below `end` (in-order data from `rcv_nxt` up to `end`
+    /// arrived, so they were received twice): the lowest such run and the
+    /// total.
+    pub fn overlap_below(&self, end: u32, rcv_nxt: u32) -> (Option<(u32, u32)>, u32) {
+        let lim = off(end, rcv_nxt);
+        let mut first = None;
+        let mut total = 0u32;
+        for r in self.slice() {
+            if off(r.start, rcv_nxt) >= lim {
+                break;
+            }
+            let stop = if off(r.end, rcv_nxt) < lim {
+                r.end
+            } else {
+                end
+            };
+            first.get_or_insert((r.start, stop));
+            total = total.saturating_add(stop.wrapping_sub(r.start));
+        }
+        (first, total)
+    }
+
     /// Debug invariant: sorted, disjoint, non-adjacent, all above `rcv_nxt`.
     pub fn debug_valid(&self, rcv_nxt: u32) -> bool {
         let mut prev_end: Option<u32> = None;

@@ -30,6 +30,10 @@ impl<const BUF: usize> Tcb<BUF> {
         match self.state {
             State::SynSent => self.syn_sent_timer()?,
             State::SynRcvd => self.syn_rcvd_timer()?,
+            // Closed in SYN-RECEIVED (RFC 9293 §3.10.4): the FIN waits
+            // behind a SYN-ACK the peer may never have received, so keep
+            // repeating that (Linux does the same for a Fast Open socket).
+            State::FinWait1 if self.syn_unacked => self.syn_rcvd_timer()?,
             _ => {}
         }
         // A due tail-loss probe goes first: it re-arms the RTO (RFC 8985 §7.3).
@@ -44,11 +48,12 @@ impl<const BUF: usize> Tcb<BUF> {
         }
         if self.rack_deadline.due(now) {
             self.rack_deadline = Deadline::OFF;
-            if self.rack_detect() {
-                if !self.cc.in_loss_recovery() {
-                    let flight = self.snd_nxt.wrapping_sub(self.data_una());
-                    self.enter_fast_recovery(flight);
-                }
+            if self.rack_detect() && !self.cc.in_loss_recovery() {
+                // Linux `tcp_rack_reo_timeout`. Already recovering, cwnd
+                // stands and the newly lost segments leave pipe, so they
+                // go out below; a PRR step here (no ACK clocked it) could
+                // set cwnd = pipe and send nothing.
+                self.enter_fast_recovery();
                 // No ACK clocked this: credit one segment so PRR may send.
                 let (pipe, mss) = (self.pipe(), self.mss_payload());
                 self.cc.prr_update(mss, pipe, mss, false);
@@ -67,6 +72,9 @@ impl<const BUF: usize> Tcb<BUF> {
         }
         self.maybe_send_data()?;
         if self.pending_ack && self.ack_deadline.due(now) {
+            // The reply did not come in time to carry it: not interactive
+            // after all (Linux `tcp_delack_timer_handler`).
+            self.pingpong = false;
             self.send_pure_ack()?;
         }
         Ok(())
@@ -131,10 +139,17 @@ impl<const BUF: usize> Tcb<BUF> {
         if self.rtx.get(0).is_some_and(|s| s.has(seg_flags::SACKED)) {
             self.rtx.clear_sacked();
         }
-        let flight = self.snd_nxt.wrapping_sub(self.data_una());
-        let retx = self.retx_outstanding();
-        self.cc
-            .on_rto(flight, self.snd_una, self.snd_nxt, self.mss_payload(), retx);
+        // Linux `tcp_enter_loss` marks everything lost before seeding the
+        // undo state, so of earlier retransmissions only a tail loss probe
+        // still needs a D-SACK.
+        let seed = self.undo_seed(0);
+        self.cc.on_rto(
+            self.snd_una,
+            self.snd_nxt,
+            self.mss_payload(),
+            seed,
+            self.snd_wnd,
+        );
         self.rtx.mark_all_lost();
         self.reno_sacked = 0;
         self.tlp_end_seq = None;
@@ -174,10 +189,12 @@ impl<const BUF: usize> Tcb<BUF> {
 
     /// RFC 8985 §7.3: probe with new data if possible, else re-send the
     /// highest segment, to elicit an ACK that RACK can act on before RTO.
+    /// As in Linux `tcp_schedule_loss_probe`, a probe may also go out
+    /// during an ECN window reduction (CWR), just not in loss recovery.
     fn fire_tlp(&mut self) -> Result<(), TcpError> {
         self.tlp_deadline = Deadline::OFF;
         let eligible = self.sack_enabled
-            && self.cc.state() == crate::congestion::CaState::Open
+            && self.tlp_state_ok()
             && self.tlp_end_seq.is_none()
             && self.snd_una != self.snd_nxt;
         if !eligible {
@@ -192,18 +209,19 @@ impl<const BUF: usize> Tcb<BUF> {
         let unsent = self.unsent_bytes();
         let mss = self.mss_payload();
         let usable = self.usable_window();
-        let (sent, is_retrans) = if unsent > 0 && usable >= unsent.min(mss) && !self.rtx.is_full() {
-            let len = unsent.min(mss);
-            let fin = self.fin_owed() && len == unsent;
-            (self.emit_new(len, fin)?, false)
-        } else {
-            match self.rtx.len().checked_sub(1) {
-                Some(i) if self.rtx.get(i).is_some_and(|s| !s.has(seg_flags::SACKED)) => {
-                    (self.retransmit(i)?, true)
+        let (sent, is_retrans) =
+            if unsent > 0 && usable >= unsent.min(mss) && self.rtx.has_room_for_new() {
+                let len = unsent.min(mss);
+                let fin = self.fin_owed() && len == unsent;
+                (self.emit_new(len, fin)?, false)
+            } else {
+                match self.rtx.len().checked_sub(1) {
+                    Some(i) if self.rtx.get(i).is_some_and(|s| !s.has(seg_flags::SACKED)) => {
+                        (self.retransmit(i, true)?, true)
+                    }
+                    _ => (false, false),
                 }
-                _ => (false, false),
-            }
-        };
+            };
         if sent {
             self.stats.tlp_count = self.stats.tlp_count.saturating_add(1);
             self.tlp_end_seq = Some(self.snd_nxt);
@@ -230,7 +248,7 @@ impl<const BUF: usize> Tcb<BUF> {
             return Ok(());
         }
         let usable = self.usable_window();
-        if usable > 0 && !self.rtx.is_full() {
+        if usable > 0 && self.rtx.has_room_for_new() {
             let len = usable.min(unsent).min(self.mss_payload());
             let fin = self.fin_owed() && len == unsent;
             let _ = self.emit_new(len, fin)?;

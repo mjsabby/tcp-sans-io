@@ -159,6 +159,12 @@ int32_t tcp_update_pmtu(TcpStreamHandle* handle, uint64_t now_ms, uint16_t mtu);
 int32_t tcp_set_fin_wait2_timeout(TcpStreamHandle* handle, uint64_t now_ms,
                                   uint32_t timeout_ms);
 
+/* TCP_NODELAY. By default (0, as Linux) Nagle is on: a segment shorter than
+ * the MSS waits while an earlier short one is unacknowledged (Minshall's
+ * variant), so small writes coalesce. Non-zero sends every segment as soon
+ * as the windows allow; anything held goes out at the next tcp_tick. */
+int32_t tcp_set_nodelay(TcpStreamHandle* handle, uint64_t now_ms, uint8_t nodelay);
+
 /* ---- State / polling --------------------------------------------------- */
 uint8_t  tcp_state(const TcpStreamHandle* handle);
 uint32_t tcp_poll (const TcpStreamHandle* handle);

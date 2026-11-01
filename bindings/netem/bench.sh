@@ -27,12 +27,17 @@
 # of the library in DIR (built with `go build -tags oldabi`).
 #
 # TSB_PCAP=DIR captures packet headers at the receiver's interface for every
-# run into DIR/<profile>-<dir>-<stack>-<run>.pcap. TSB_CPU=N picks the CPU a
-# sending tcp-sans-io endpoint is pinned to (default 2). TSB_NS=PREFIX names
-# the run's network namespaces (default tsb<pid>, so concurrent runs from
-# different checkouts never tear down each other's path); runs on one host
-# are serialized by /run/lock/tcp-sans-io-bench.lock so they do not compete
-# for the link or the pinned CPU.
+# run into DIR/<profile>-<dir>-<stack>-<run>.pcap. TSB_CPU=N picks the CPU
+# both endpoints of every run are pinned to (default 2), in either direction
+# and for every stack: the endpoint under test (tsbench, or kernel_peer.py
+# for a Linux stack) and the kernel_peer.py server. A packet an endpoint
+# sends lands on the backlog of the CPU it runs on, so after a migration it
+# can overtake packets still queued on the previous CPU: unpinned endpoints
+# see reordering no real path would add (on the TUN path in particular).
+# TSB_NS=PREFIX names the run's network namespaces (default tsb<pid>, so
+# concurrent runs from different checkouts never tear down each other's
+# path); runs on one host are serialized by /run/lock/tcp-sans-io-bench.lock
+# so they do not compete for the link or the pinned CPU.
 set -euo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -47,6 +52,7 @@ wan-1      40   100   1     160  8
 metro-0.1  10   200   0.1   80   64
 lossy-5    20   50    5     80   4
 shallow    20   100   0     16   128
+virt       0.1  10000 0     256  256
 EOF
 )
 
@@ -64,7 +70,7 @@ while [[ $# -gt 0 ]]; do
         --stacks) stacks=$2; shift 2 ;;
         --baseline-lib) baseline_lib=$(cd "$2" && pwd); shift 2 ;;
         --out) out=$2; shift 2 ;;
-        -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,/^[^#]/{/^#/p}' "$0"; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -199,12 +205,15 @@ one_run() { # profile direction stack run rtt rate loss queue mib
     local bytes=$((mib * 1024 * 1024)) srv_out=$TMP/server.json cli_out=$TMP/client.json
     setup "$rtt" "$rate" "$loss" "$queue" "$direction"
     rm -f "$TMP/ready" "$srv_out" "$cli_out"
+    # Both endpoints on one CPU, whatever the direction and the stack (see
+    # TSB_CPU above).
+    local pin=(taskset -c "${TSB_CPU:-2}")
     if [[ $direction == up ]]; then
-        ip netns exec $RX python3 "$HERE/kernel_peer.py" sink --listen $RX_IP:$PORT \
-            --ready "$TMP/ready" >"$srv_out" &
+        ip netns exec $RX "${pin[@]}" python3 "$HERE/kernel_peer.py" sink \
+            --listen $RX_IP:$PORT --ready "$TMP/ready" >"$srv_out" &
     else
-        ip netns exec $RX python3 "$HERE/kernel_peer.py" source --listen $RX_IP:$PORT \
-            --bytes $bytes --cc cubic --ready "$TMP/ready" >"$srv_out" &
+        ip netns exec $RX "${pin[@]}" python3 "$HERE/kernel_peer.py" source \
+            --listen $RX_IP:$PORT --bytes $bytes --cc cubic --ready "$TMP/ready" >"$srv_out" &
     fi
     local srv=$!
     pids=($srv)
@@ -223,21 +232,16 @@ one_run() { # profile direction stack run rtt rate loss queue mib
     case $stack in
         tcp-sans-io|tcp-sans-io@base)
             local bin=$HERE/tsbench; [[ $stack == *@base ]] && bin=$HERE/tsbench-base
-            # When sending, pin to one CPU: TUN writes from a migrating thread
-            # land on different CPUs' backlogs and can be forwarded out of
-            # order (reordering no Linux sender would see).
-            local pin=()
-            [[ $mode == upload ]] && pin=(taskset -c "${TSB_CPU:-2}")
             ip netns exec $TX "${pin[@]}" "$bin" -mode $mode -tun tsb0 \
                 -tun-addr 10.203.1.1/30 -local $OUR_IP -remote $RX_IP:$PORT -bytes $bytes \
                 -timeout 600s >"$cli_out" || ok=0 ;;
         *)
             if [[ $direction == up ]]; then
-                ip netns exec $TX python3 "$HERE/kernel_peer.py" send --connect $RX_IP:$PORT \
-                    --bytes $bytes --cc "$stack" >"$cli_out" || ok=0
+                ip netns exec $TX "${pin[@]}" python3 "$HERE/kernel_peer.py" send \
+                    --connect $RX_IP:$PORT --bytes $bytes --cc "$stack" >"$cli_out" || ok=0
             else
-                ip netns exec $TX python3 "$HERE/kernel_peer.py" recv --connect $RX_IP:$PORT \
-                    >"$cli_out" || ok=0
+                ip netns exec $TX "${pin[@]}" python3 "$HERE/kernel_peer.py" recv \
+                    --connect $RX_IP:$PORT >"$cli_out" || ok=0
             fi ;;
     esac
     wait $srv || ok=0
