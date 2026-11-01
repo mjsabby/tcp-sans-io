@@ -1055,11 +1055,12 @@ fn more_than_one_full_segment_unacked_is_acked_at_once() {
     assert_eq!(ack.ack, seq.wrapping_add(1548));
 }
 
-/// The application reading data while an ACK is held back sends that ACK
-/// at once, with the window the read opened (Linux `tcp_cleanup_rbuf`): a
-/// peer waiting on it (Nagle, or our window) need not wait for the timer.
+/// Reading a segment shorter than a full one makes the held ACK due at
+/// once: its sender may be holding its next segment for it (Nagle, as with
+/// a request written in two parts). The next tick sends it, with the window
+/// the read reopened, and nothing is owed after that.
 #[test]
-fn read_with_an_ack_pending_sends_it() {
+fn read_of_a_short_segment_acks_by_the_next_tick() {
     let mut tcb = make_tcb();
     let mut now = 0u64;
     let _ = handshake_with_ts(&mut tcb, &mut now);
@@ -1069,19 +1070,67 @@ fn read_with_an_ack_pending_sends_it() {
 
     let mut buf = [0u8; 100];
     assert_eq!(tcb.recv(&mut buf).expect("recv"), 100);
-    let ack = try_pop(&mut tcb).expect("the read sends the pending ACK");
-    assert_eq!(ack.ack, PSS.wrapping_add(101));
-    assert!(ack.payload.is_empty());
+    assert!(try_pop(&mut tcb).is_none(), "left for the next tick");
+    assert_eq!(tcb.next_deadline(), Some(now), "due at once");
+    tcb.tick().expect("tick");
+    let ack = try_pop(&mut tcb).expect("the tick sends the ACK the read made due");
+    assert_eq!((ack.ack, ack.payload.len()), (PSS.wrapping_add(101), 0));
     assert!(
         tcb.stats().rcv_wnd >= window_before,
         "carries the reopened window"
     );
 
-    // Nothing is owed any more: the delayed-ACK timer stays quiet.
     now += 100;
     tcb.set_now(now);
     tcb.tick().expect("tick");
-    assert!(try_pop(&mut tcb).is_none());
+    assert!(try_pop(&mut tcb).is_none(), "nothing more is owed");
+}
+
+/// A reply written in the same step as the read carries the ACK the read
+/// made due: one segment, not a pure ACK and then the reply (Linux gets the
+/// same from its interactive "pingpong" mode).
+#[test]
+fn reply_carries_the_ack_a_read_made_due() {
+    let mut tcb = make_tcb();
+    let mut now = 0u64;
+    let _ = handshake_with_ts(&mut tcb, &mut now);
+    data_in(&mut tcb, now, PSS.wrapping_add(1), 100);
+    let mut buf = [0u8; 100];
+    assert_eq!(tcb.recv(&mut buf).expect("recv"), 100);
+    assert_eq!(tcb.send(b"reply").expect("send"), 5);
+    tcb.tick().expect("tick");
+    let seg = try_pop(&mut tcb).expect("the reply");
+    assert_eq!(
+        (seg.ack, seg.payload),
+        (PSS.wrapping_add(101), b"reply".to_vec())
+    );
+    assert!(try_pop(&mut tcb).is_none(), "no separate pure ACK");
+}
+
+/// A bulk receiver reading each full-sized segment as it arrives (the usual
+/// sans-IO loop) still ACKs every second one, as Linux does: a read hastens
+/// the ACK only after a segment shorter than a full one.
+#[test]
+fn full_segments_read_as_they_arrive_are_acked_every_second_one() {
+    let mut tcb = make_tcb();
+    let mut now = 0u64;
+    let _ = handshake_with_ts(&mut tcb, &mut now);
+    let mut seq = PSS.wrapping_add(1);
+    let mut buf = vec![0u8; SMSS as usize];
+    for i in 1..=6u32 {
+        now += 1;
+        data_in(&mut tcb, now, seq, SMSS as usize);
+        seq = seq.wrapping_add(SMSS);
+        assert_eq!(tcb.recv(&mut buf).expect("recv"), SMSS as usize);
+        tcb.tick().expect("tick");
+        let acks: Vec<_> = core::iter::from_fn(|| try_pop(&mut tcb)).collect();
+        if i % 2 == 0 {
+            assert_eq!(acks.len(), 1, "segment {i}: ACKed");
+            assert_eq!(acks[0].ack, seq, "segment {i}");
+        } else {
+            assert!(acks.is_empty(), "segment {i}: delayed, {acks:?}");
+        }
+    }
 }
 
 /// Peer RST while ESTABLISHED transitions us straight to CLOSED, sets the
@@ -3904,9 +3953,6 @@ fn partial_overlap_segment_delivers_fresh_suffix() {
     while try_pop(&mut tcb).is_some() {}
     let mut buf = [0u8; 64];
     assert_eq!(tcb.recv(&mut buf).expect("recv"), 10);
-    // The read sends the ACK those 10 bytes were held for.
-    let read_ack = try_pop(&mut tcb).expect("the read sends the pending ACK");
-    assert_eq!(read_ack.ack, PSS.wrapping_add(11));
 
     // Peer retransmits a *larger* segment from the same SEQ: 10 old bytes
     // plus 10 fresh ones.

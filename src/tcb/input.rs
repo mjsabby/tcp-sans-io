@@ -836,12 +836,16 @@ impl<const BUF: usize> Tcb<BUF> {
     /// Linux (`__tcp_ack_snd_check`), more than one full segment's worth of
     /// unacknowledged data is also ACKed at once: a peer whose burst ends in
     /// one-and-a-bit segments would otherwise hear nothing for the whole
-    /// timeout, and its tail-loss probe (two RTTs) fires first.
+    /// timeout, and its tail-loss probe (two RTTs) fires first. A segment
+    /// shorter than a full one lets a read hasten the ACK (see [`Tcb::recv`]).
     fn schedule_delayed_ack(&mut self, payload_len: u32) {
         let full = payload_len / u32::from(self.local_mss.max(1));
         let units = full.clamp(1, u32::from(u8::MAX)) as u8;
         self.delayed_ack_count = self.delayed_ack_count.saturating_add(units);
         self.pending_ack = true;
+        if payload_len < self.full_rcv_payload() {
+            self.short_seg_unacked = true;
+        }
         let unacked = self.rcv_nxt.wrapping_sub(self.last_ack_sent);
         if self.delayed_ack_count >= 2
             || unacked > u32::from(self.local_mss)

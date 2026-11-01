@@ -55,7 +55,7 @@ shows what that costs against Linux CUBIC on lossy long paths.
 | Silly-window avoidance, sender and receiver | RFC 9293 §3.8.6.2 | ✅ |
 | Window-update rule (SND.WL1 / WL2) | RFC 9293 §3.10.7.4 | ✅ a forged future WL1 cannot freeze it |
 | Zero-window persist probes | RFC 9293 §3.8.6.1 | ✅ Linux-style probe at `SND.UNA − 1` |
-| Delayed ACK (2nd full segment, more than one full segment's worth unacknowledged, or an application read with an ACK pending; else 40 ms, configurable down to none; immediate for out-of-order and duplicates) | RFC 1122 §4.2.3.2, RFC 5681 §4.2 | ✅ |
+| Delayed ACK (2nd full segment or more than one full segment's worth unacknowledged; once the application reads a segment shorter than a full one, by the next tick unless a reply carries it; else 40 ms, configurable down to none; immediate for out-of-order and duplicates) | RFC 1122 §4.2.3.2, RFC 5681 §4.2 | ✅ |
 | R2 retransmission limit, USER TIMEOUT, keepalive | RFC 9293 §3.8.3–3.8.4 | ✅ on by default |
 | FIN_WAIT_2 timeout | Linux `tcp_fin_timeout` | ✅ 60 s, restarted only by the application reading |
 | TIME_WAIT, re-ACK and restart on a retransmitted FIN | RFC 9293 §3.10.7.4 | ✅ 60 s; restarts capped at 120 s after entry |
@@ -271,7 +271,7 @@ that cannot track deadlines tick every ~10 ms instead.
 |---|---|---|
 | RACK reorder window | `min_RTT/4` (× D-SACK multiplier, ≤ SRTT) | Loss declared slightly later on low-RTT reordering paths. |
 | TLP PTO | `max(2·SRTT, 10 ms)` | Tail-loss probe fires up to one tick late. |
-| Delayed ACK | 40 ms (`set_delayed_ack`; `0`: none) | ACK latency rises by up to one tick. With `0`, ACKs leave with the segment that earned them, independent of the tick. |
+| Delayed ACK | 40 ms (`set_delayed_ack`; `0`: none) | ACK latency rises by up to one tick, as does an ACK that a read made due. With `0`, ACKs leave with the segment that earned them, independent of the tick. |
 | RTO | `200 ms … 60 s` | Negligible: a 10 ms tick is 20× finer than the floor. |
 | `TIME_WAIT` | 60 s | Irrelevant to cadence. |
 

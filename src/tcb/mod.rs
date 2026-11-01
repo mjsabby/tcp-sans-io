@@ -397,6 +397,10 @@ pub struct Tcb<const BUF: usize = BUF_CAP> {
     ack_deadline: Deadline,
     /// Delayed-ACK timeout (`0`: every data segment is ACKed at once).
     delayed_ack_ms: u32,
+    /// The ACK held back covers a segment shorter than a full one (Linux
+    /// `ICSK_ACK_PUSHED`): its sender may be holding its next segment until
+    /// the ACK arrives (Nagle), so a read makes the ACK due at once.
+    short_seg_unacked: bool,
 
     // ---- Persist / sender-SWS override timer.
     persist_deadline: Deadline,
@@ -664,6 +668,7 @@ impl<const BUF: usize> Tcb<BUF> {
         self.pending_ack = false;
         self.delayed_ack_count = 0;
         self.ack_deadline = Deadline::OFF;
+        self.short_seg_unacked = false;
         self.persist_deadline = Deadline::OFF;
         self.persist_backoff_ms = 0;
         self.fin_sent = false;
@@ -1214,8 +1219,12 @@ impl<const BUF: usize> Tcb<BUF> {
     /// Copy received in-order data out. Returns `ConnectionClosed` once the
     /// ring is empty and the peer has FINned, `ConnectionReset` after an
     /// abort. In `FIN_WAIT_2`, consuming data restarts the FIN_WAIT_2 timeout.
-    /// A read that consumes data while an ACK is held back sends that ACK now,
-    /// carrying the window the read opened (as Linux `tcp_cleanup_rbuf`).
+    /// If the ACK held back covers a segment shorter than a full one, a read
+    /// that consumes data makes it due at once: the sender may be holding
+    /// its next segment until it arrives (Nagle; Linux `tcp_cleanup_rbuf`
+    /// also ACKs on read here). The next [`Self::tick`] sends it unless data
+    /// queued first carries it, so a reply written in the same step needs no
+    /// pure ACK. Full-sized segments keep the delayed-ACK rules.
     pub fn recv(&mut self, dst: &mut [u8]) -> Result<usize, TcpError> {
         if let Some(e) = self.error {
             return Err(e);
@@ -1228,8 +1237,8 @@ impl<const BUF: usize> Tcb<BUF> {
                         .saturating_add(u64::from(self.fin_wait2_timeout_ms)),
                 );
             }
-            if self.pending_ack {
-                self.send_pure_ack()?;
+            if self.pending_ack && self.short_seg_unacked {
+                self.ack_deadline = Deadline::at(self.now_ms);
             } else {
                 self.maybe_send_window_update()?;
             }
@@ -1338,6 +1347,7 @@ impl<const BUF: usize> Tcb<BUF> {
         self.keepalive_probes = 0;
         self.user_timeout_deadline = Deadline::OFF;
         self.pending_ack = false;
+        self.short_seg_unacked = false;
     }
 
     /// Aggregate event flags for the host async runtime.
@@ -1471,6 +1481,15 @@ impl<const BUF: usize> Tcb<BUF> {
         let cap = self.local_mss.min(self.peer_mss).min(self.pmtu_mss);
         let ts = if self.ts_enabled { 12 } else { 0 };
         u32::from(cap).saturating_sub(ts).max(1)
+    }
+
+    /// Payload of a full-sized segment from the peer: what both MSS options
+    /// allow (an MSS-clamping middlebox lowers both), less the timestamp
+    /// option. A peer sending less (a smaller path MTU, SACK blocks) looks
+    /// short, which costs an earlier ACK, never a later one.
+    fn full_rcv_payload(&self) -> u32 {
+        let ts = if self.ts_enabled { 12 } else { 0 };
+        u32::from(self.local_mss.min(self.peer_mss)).saturating_sub(ts)
     }
 
     #[cfg(any(test, feature = "std"))]

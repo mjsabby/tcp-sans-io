@@ -164,8 +164,10 @@ int32_t tcp_set_fin_wait2_timeout(TcpStreamHandle* handle, uint64_t now_ms,
  * at once, which suits a host relaying the stream (a NAT or proxy): there the
  * reply rarely arrives in time, and a held ACK only stalls a peer waiting on
  * it (Nagle) or on its window. Regardless, more than one full segment of
- * unacknowledged data, and a tcp_recv that consumes data while an ACK is
- * held, send the ACK at once. Applies from the next segment received. */
+ * unacknowledged data is ACKed at once, and a tcp_recv that consumes a
+ * segment shorter than a full one makes its ACK due at the next tcp_tick
+ * (data queued before then carries it instead). Applies from the next
+ * segment received. */
 int32_t tcp_set_delayed_ack(TcpStreamHandle* handle, uint64_t now_ms,
                             uint32_t delayed_ack_ms);
 
