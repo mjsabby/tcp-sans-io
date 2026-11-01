@@ -333,6 +333,7 @@ impl<const BUF: usize> Tcb<BUF> {
             self.pending_ack = false;
             self.delayed_ack_count = 0;
             self.ack_deadline = Deadline::OFF;
+            self.short_seg_unacked = false;
         }
         Ok(queued)
     }
@@ -357,6 +358,7 @@ impl<const BUF: usize> Tcb<BUF> {
             self.pending_ack = false;
             self.delayed_ack_count = 0;
             self.ack_deadline = Deadline::OFF;
+            self.short_seg_unacked = false;
         }
         Ok(())
     }

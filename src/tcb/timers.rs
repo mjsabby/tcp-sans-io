@@ -4,6 +4,7 @@ use super::{
     Deadline, Tcb, BLACKHOLE_MSS1, BLACKHOLE_MSS2, BLACKHOLE_RTO_STEP1, BLACKHOLE_RTO_STEP2,
     MAX_RETRANSMITS, MAX_SYN_RCVD_RETRIES, MAX_SYN_RETRIES, PMTU_PROBE_MIN_MS, RTO_MAX_MS,
 };
+use crate::congestion::CaState;
 use crate::error::TcpError;
 use crate::rtx_queue::seg_flags;
 use crate::state::State;
@@ -130,6 +131,20 @@ impl<const BUF: usize> Tcb<BUF> {
         // reneged: forget all SACK state (RFC 2018 §8).
         if self.rtx.get(0).is_some_and(|s| s.has(seg_flags::SACKED)) {
             self.rtx.clear_sacked();
+        }
+        // Eifel detection (RFC 3522): when a timeout opens a new episode
+        // (from Open: not during a fast recovery, whose earlier losses it
+        // must not undo) by re-sending a head that went out only once, note
+        // when. If the ACK that first advances SND.UNA echoes a TSval from
+        // before then, the original arrived and the timeout was spurious
+        // (see `process_ack`). A head re-sent earlier (fast retransmit,
+        // tail-loss probe) is left out: an echo could name that copy.
+        if self.cc.state() == CaState::Open {
+            let head_sent_once = self
+                .rtx
+                .get(0)
+                .is_some_and(|s| !s.has(seg_flags::EVER_RETRANS));
+            self.eifel_stamp = (self.ts_enabled && head_sent_once).then_some(self.now_ms as u32);
         }
         let flight = self.snd_nxt.wrapping_sub(self.data_una());
         self.cc

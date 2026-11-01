@@ -155,6 +155,22 @@ impl<const BUF: usize> Tcb<BUF> {
             }
             self.note_progress(data_acked.saturating_add(u32::from(fin_acked)));
         }
+        // ---- Spurious timeout (Eifel detection, RFC 3522) ---------------
+        // The first ACK to advance SND.UNA after a timeout decides: if it
+        // echoes a TSval sent before the timeout, the original transmission
+        // triggered it — it was only delayed (a peer descheduled past our
+        // RTO, a delay spike). Restore the window (RFC 4015) and drop the
+        // loss marks the timeout set, so originals still in flight are not
+        // sent again.
+        if acked > 0 {
+            if let Some(stamp) = self.eifel_stamp.take() {
+                if tsecr_ms.is_some_and(|t| seq_lt(t, stamp)) && self.cc.undo_spurious_rto() {
+                    self.rtx.unmark_lost();
+                    self.rack.on_recovery_exit();
+                    self.stats.spurious_rtos = self.stats.spurious_rtos.saturating_add(1);
+                }
+            }
+        }
         self.pmtu_probe_on_ack();
 
         // ---- Send window (RFC 9293 §3.10.7.4, hardened) -----------------

@@ -11,8 +11,8 @@
 //! retransmission (see `may_answer_at_once`).
 
 use super::{
-    seq_ge, seq_gt, seq_in_range, seq_le, seq_lt, Deadline, Endpoint, HeldFin, Tcb, DELAYED_ACK_MS,
-    MIN_PEER_MSS, PAWS_IDLE_MS, TIME_WAIT_MAX_MS, TIME_WAIT_MS,
+    seq_ge, seq_gt, seq_in_range, seq_le, seq_lt, Deadline, Endpoint, HeldFin, Tcb, MIN_PEER_MSS,
+    PAWS_IDLE_MS, TIME_WAIT_MAX_MS, TIME_WAIT_MS,
 };
 use crate::congestion::{self, Reno};
 use crate::error::TcpError;
@@ -830,17 +830,31 @@ impl<const BUF: usize> Tcb<BUF> {
     }
 
     /// RFC 5681 §4.2 / RFC 9293 §3.8.6.3: ACK at least every second
-    /// full-sized segment, otherwise within `DELAYED_ACK_MS`. A coalesced
-    /// segment counts as the number of MSS-sized segments it spans.
+    /// full-sized segment, otherwise within the delayed-ACK timeout (see
+    /// [`Tcb::set_delayed_ack`]; `0` ACKs every segment at once). A coalesced
+    /// segment counts as the number of MSS-sized segments it spans. As in
+    /// Linux (`__tcp_ack_snd_check`), more than one full segment's worth of
+    /// unacknowledged data is also ACKed at once: a peer whose burst ends in
+    /// one-and-a-bit segments would otherwise hear nothing for the whole
+    /// timeout, and its tail-loss probe (two RTTs) fires first. A segment
+    /// shorter than a full one lets a read hasten the ACK (see [`Tcb::recv`]).
     fn schedule_delayed_ack(&mut self, payload_len: u32) {
         let full = payload_len / u32::from(self.local_mss.max(1));
         let units = full.clamp(1, u32::from(u8::MAX)) as u8;
         self.delayed_ack_count = self.delayed_ack_count.saturating_add(units);
         self.pending_ack = true;
-        if self.delayed_ack_count >= 2 {
+        if payload_len < self.full_rcv_payload() {
+            self.short_seg_unacked = true;
+        }
+        let unacked = self.rcv_nxt.wrapping_sub(self.last_ack_sent);
+        if self.delayed_ack_count >= 2
+            || unacked > u32::from(self.local_mss)
+            || self.delayed_ack_ms == 0
+        {
             let _ = self.send_pure_ack();
         } else if !self.ack_deadline.is_armed() {
-            self.ack_deadline = Deadline::at(self.now_ms.saturating_add(DELAYED_ACK_MS));
+            self.ack_deadline =
+                Deadline::at(self.now_ms.saturating_add(u64::from(self.delayed_ack_ms)));
         }
     }
 }

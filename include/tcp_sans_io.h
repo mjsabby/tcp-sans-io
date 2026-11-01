@@ -159,6 +159,18 @@ int32_t tcp_update_pmtu(TcpStreamHandle* handle, uint64_t now_ms, uint16_t mtu);
 int32_t tcp_set_fin_wait2_timeout(TcpStreamHandle* handle, uint64_t now_ms,
                                   uint32_t timeout_ms);
 
+/* Delayed-ACK timeout (default 40 ms, capped at 500 ms): how long an ACK for
+ * in-order data may wait for a reply to carry it. 0 ACKs every data segment
+ * at once, which suits a host relaying the stream (a NAT or proxy): there the
+ * reply rarely arrives in time, and a held ACK only stalls a peer waiting on
+ * it (Nagle) or on its window. Regardless, more than one full segment of
+ * unacknowledged data is ACKed at once, and a tcp_recv that consumes a
+ * segment shorter than a full one makes its ACK due at the next tcp_tick
+ * (data queued before then carries it instead). Applies from the next
+ * segment received. */
+int32_t tcp_set_delayed_ack(TcpStreamHandle* handle, uint64_t now_ms,
+                            uint32_t delayed_ack_ms);
+
 /* ---- State / polling --------------------------------------------------- */
 uint8_t  tcp_state(const TcpStreamHandle* handle);
 uint32_t tcp_poll (const TcpStreamHandle* handle);
@@ -211,7 +223,8 @@ typedef struct TcpStats {
     uint32_t rcv_wnd;
     uint8_t  ca_state;            /* 0 open, 1 recovery, 2 loss, 3 cwr       */
     uint8_t  state;               /* TCP_STATE_*                             */
-    uint8_t  _reserved[2];
+    uint16_t spurious_rtos;       /* timeouts undone: TSecr showed the       */
+                                  /* original arrived (RFC 3522)            */
 } TcpStats;
 
 int32_t tcp_get_stats(const TcpStreamHandle* handle, TcpStats* out);

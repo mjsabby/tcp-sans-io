@@ -969,6 +969,170 @@ fn recv_drain_sends_window_update() {
     assert!(try_pop(&mut tcb).is_none());
 }
 
+/// Inject `len` bytes of in-order data at `seq` (TSval 60).
+fn data_in(tcb: &mut Tcb, now: u64, seq: u32, len: usize) {
+    let pkt = build_in(
+        flags::ACK,
+        seq,
+        ISS.wrapping_add(1),
+        PEER_WIN,
+        None,
+        Some((60, 0)),
+        &vec![0x33; len],
+    );
+    tcb.set_now(now);
+    tcb.inject_packet(&pkt).expect("inject");
+}
+
+/// `set_delayed_ack(0)` (a host relaying the stream) ACKs every segment at
+/// once, even a single small one that would otherwise wait out the timer.
+#[test]
+fn delayed_ack_zero_acks_every_segment_at_once() {
+    let mut tcb = make_tcb();
+    let mut now = 0u64;
+    let _ = handshake_with_ts(&mut tcb, &mut now);
+    tcb.set_delayed_ack(0);
+    let mut seq = PSS.wrapping_add(1);
+    for _ in 0..3 {
+        data_in(&mut tcb, now, seq, 100);
+        seq = seq.wrapping_add(100);
+        let ack = try_pop(&mut tcb).expect("ACKed at once");
+        assert_eq!((ack.ack, ack.payload.len()), (seq, 0));
+        assert!(try_pop(&mut tcb).is_none());
+    }
+}
+
+/// The delayed-ACK timeout is configurable (default 40 ms) and capped at
+/// RFC 9293's 500 ms.
+#[test]
+fn delayed_ack_timeout_is_configurable_and_capped() {
+    for (set, fires) in [(None, 40u64), (Some(5), 5), (Some(10_000), 500)] {
+        let mut tcb = make_tcb();
+        let mut now = 0u64;
+        let _ = handshake_with_ts(&mut tcb, &mut now);
+        if let Some(ms) = set {
+            tcb.set_delayed_ack(ms);
+        }
+        let start = now;
+        data_in(&mut tcb, now, PSS.wrapping_add(1), 100);
+        assert!(try_pop(&mut tcb).is_none(), "{set:?}: held back");
+        tcb.set_now(start + fires - 1);
+        tcb.tick().expect("tick");
+        assert!(try_pop(&mut tcb).is_none(), "{set:?}: not yet");
+        tcb.set_now(start + fires);
+        tcb.tick().expect("tick");
+        let ack = try_pop(&mut tcb).expect("delayed ACK");
+        assert_eq!(ack.ack, PSS.wrapping_add(101), "{set:?}");
+    }
+}
+
+/// As Linux (`__tcp_ack_snd_check`): more than one full segment's worth of
+/// unacknowledged data is ACKed at once, also when it arrives as one
+/// coalesced segment of 1.5 MSS (a GSO/TSO tail), which used to count as
+/// one segment and wait out the timer while the peer's tail-loss probe
+/// fired first. One full-sized segment alone is still delay-ACKed.
+#[test]
+fn more_than_one_full_segment_unacked_is_acked_at_once() {
+    let mut tcb = make_tcb();
+    let mut now = 0u64;
+    let _ = handshake_with_ts(&mut tcb, &mut now);
+    let mut seq = PSS.wrapping_add(1);
+
+    data_in(&mut tcb, now, seq, 1448 + 724);
+    seq = seq.wrapping_add(1448 + 724);
+    let ack = try_pop(&mut tcb).expect("1.5 segments: ACKed at once");
+    assert_eq!(ack.ack, seq);
+
+    now += 1;
+    data_in(&mut tcb, now, seq, 1448);
+    assert!(
+        try_pop(&mut tcb).is_none(),
+        "one full segment: delayed as before"
+    );
+    now += 1;
+    data_in(&mut tcb, now, seq.wrapping_add(1448), 100);
+    let ack = try_pop(&mut tcb).expect("a second segment: ACKed at once");
+    assert_eq!(ack.ack, seq.wrapping_add(1548));
+}
+
+/// Reading a segment shorter than a full one makes the held ACK due at
+/// once: its sender may be holding its next segment for it (Nagle, as with
+/// a request written in two parts). The next tick sends it, with the window
+/// the read reopened, and nothing is owed after that.
+#[test]
+fn read_of_a_short_segment_acks_by_the_next_tick() {
+    let mut tcb = make_tcb();
+    let mut now = 0u64;
+    let _ = handshake_with_ts(&mut tcb, &mut now);
+    data_in(&mut tcb, now, PSS.wrapping_add(1), 100);
+    assert!(try_pop(&mut tcb).is_none(), "delayed ACK pending");
+    let window_before = tcb.stats().rcv_wnd;
+
+    let mut buf = [0u8; 100];
+    assert_eq!(tcb.recv(&mut buf).expect("recv"), 100);
+    assert!(try_pop(&mut tcb).is_none(), "left for the next tick");
+    assert_eq!(tcb.next_deadline(), Some(now), "due at once");
+    tcb.tick().expect("tick");
+    let ack = try_pop(&mut tcb).expect("the tick sends the ACK the read made due");
+    assert_eq!((ack.ack, ack.payload.len()), (PSS.wrapping_add(101), 0));
+    assert!(
+        tcb.stats().rcv_wnd >= window_before,
+        "carries the reopened window"
+    );
+
+    now += 100;
+    tcb.set_now(now);
+    tcb.tick().expect("tick");
+    assert!(try_pop(&mut tcb).is_none(), "nothing more is owed");
+}
+
+/// A reply written in the same step as the read carries the ACK the read
+/// made due: one segment, not a pure ACK and then the reply (Linux gets the
+/// same from its interactive "pingpong" mode).
+#[test]
+fn reply_carries_the_ack_a_read_made_due() {
+    let mut tcb = make_tcb();
+    let mut now = 0u64;
+    let _ = handshake_with_ts(&mut tcb, &mut now);
+    data_in(&mut tcb, now, PSS.wrapping_add(1), 100);
+    let mut buf = [0u8; 100];
+    assert_eq!(tcb.recv(&mut buf).expect("recv"), 100);
+    assert_eq!(tcb.send(b"reply").expect("send"), 5);
+    tcb.tick().expect("tick");
+    let seg = try_pop(&mut tcb).expect("the reply");
+    assert_eq!(
+        (seg.ack, seg.payload),
+        (PSS.wrapping_add(101), b"reply".to_vec())
+    );
+    assert!(try_pop(&mut tcb).is_none(), "no separate pure ACK");
+}
+
+/// A bulk receiver reading each full-sized segment as it arrives (the usual
+/// sans-IO loop) still ACKs every second one, as Linux does: a read hastens
+/// the ACK only after a segment shorter than a full one.
+#[test]
+fn full_segments_read_as_they_arrive_are_acked_every_second_one() {
+    let mut tcb = make_tcb();
+    let mut now = 0u64;
+    let _ = handshake_with_ts(&mut tcb, &mut now);
+    let mut seq = PSS.wrapping_add(1);
+    let mut buf = vec![0u8; SMSS as usize];
+    for i in 1..=6u32 {
+        now += 1;
+        data_in(&mut tcb, now, seq, SMSS as usize);
+        seq = seq.wrapping_add(SMSS);
+        assert_eq!(tcb.recv(&mut buf).expect("recv"), SMSS as usize);
+        tcb.tick().expect("tick");
+        let acks: Vec<_> = core::iter::from_fn(|| try_pop(&mut tcb)).collect();
+        if i % 2 == 0 {
+            assert_eq!(acks.len(), 1, "segment {i}: ACKed");
+            assert_eq!(acks[0].ack, seq, "segment {i}");
+        } else {
+            assert!(acks.is_empty(), "segment {i}: delayed, {acks:?}");
+        }
+    }
+}
+
 /// Peer RST while ESTABLISHED transitions us straight to CLOSED, sets the
 /// ConnectionReset error flag, and emits no further packets.
 #[test]
@@ -2205,6 +2369,113 @@ fn rto_still_collapses_cwnd_to_one_mss() {
         "RTO must collapse cwnd to 1*SMSS (RFC 5681 §3)",
     );
     assert!(snap.ssthresh >= 2 * SMSS, "RTO must set ssthresh ≥ 2*SMSS",);
+}
+
+/// Ten segments in flight, then silence until the RTO fires (after a
+/// tail-loss probe). Returns the TSval of the first transmission, the
+/// TSval of the timeout's retransmission of the head, and the window
+/// before the timeout.
+fn ten_segments_then_rto(tcb: &mut Tcb, now: &mut u64) -> (u32, u32, u32) {
+    let _ = handshake_with_ts(tcb, now);
+    tcb.send(&[0x5a; 10 * SMSS as usize]).expect("send");
+    tcb.set_now(*now);
+    tcb.tick().expect("tick");
+    let mut first = Vec::new();
+    while let Some(p) = try_pop(tcb) {
+        first.push(p);
+    }
+    assert_eq!(first.len(), 10);
+    let (orig_tsval, _) = first[0].ts.expect("ts");
+    let cwnd_before = tcb.stats().cwnd;
+    let mut head_retrans = None;
+    for _ in 0..2_000 {
+        *now += 1;
+        tcb.set_now(*now);
+        tcb.tick().expect("tick");
+        while let Some(p) = try_pop(tcb) {
+            if p.seq == ISS.wrapping_add(1) {
+                head_retrans = p.ts;
+            }
+        }
+        if tcb.stats().rto_count == 1 {
+            break;
+        }
+    }
+    let s = tcb.stats();
+    assert_eq!((s.rto_count, s.tlp_count, s.cwnd), (1, 1, SMSS));
+    let (rto_tsval, _) = head_retrans.expect("the timeout re-sends the head");
+    (orig_tsval, rto_tsval, cwnd_before)
+}
+
+/// Bytes `[ISS+1, ISS+1+n)` acknowledged, the ACK echoing `tsecr`.
+fn ack_echoing(tcb: &mut Tcb, now: u64, n: u32, tsecr: u32) {
+    let ack = build_in(
+        flags::ACK,
+        PSS.wrapping_add(1),
+        ISS.wrapping_add(1).wrapping_add(n),
+        PEER_WIN,
+        None,
+        Some((500, tsecr)),
+        &[],
+    );
+    tcb.set_now(now);
+    tcb.inject_packet(&ack).expect("inject ACK");
+}
+
+/// RFC 3522 / RFC 4015 (Eifel): when the first ACK to advance SND.UNA after
+/// a timeout echoes a TSval sent before it, the original transmission
+/// arrived — it was only delayed, e.g. the peer was descheduled past our
+/// RTO — so the timeout is undone: the window comes back, and the
+/// originals still in flight are not sent again.
+#[test]
+fn spurious_rto_is_undone_when_the_ack_echoes_the_original() {
+    let mut tcb = make_tcb();
+    let mut now = 0u64;
+    let (orig_tsval, _, cwnd_before) = ten_segments_then_rto(&mut tcb, &mut now);
+
+    now += 1;
+    ack_echoing(&mut tcb, now, 5 * SMSS, orig_tsval);
+    let s = tcb.stats();
+    assert_eq!(s.spurious_rtos, 1);
+    assert_eq!(s.ca_state, crate::congestion::CaState::Open as u8);
+    assert!(
+        s.cwnd >= cwnd_before,
+        "window restored: {} < {cwnd_before}",
+        s.cwnd
+    );
+
+    // The other five originals are still in flight, not lost: nothing is
+    // re-sent, even after a few ticks.
+    for _ in 0..5 {
+        now += 1;
+        tcb.set_now(now);
+        tcb.tick().expect("tick");
+        assert!(
+            try_pop(&mut tcb).is_none(),
+            "no retransmission after the undo"
+        );
+    }
+    ack_echoing(&mut tcb, now, 10 * SMSS, orig_tsval);
+    assert_eq!(tcb.stats().spurious_rtos, 1, "decided once per timeout");
+}
+
+/// Control: the same timeout answered by its own retransmission (the ACK
+/// echoes the retransmission's TSval: the head really was lost) keeps the
+/// RTO response — loss window, and the rest of the window re-sent.
+#[test]
+fn rto_answered_by_the_retransmission_is_not_undone() {
+    let mut tcb = make_tcb();
+    let mut now = 0u64;
+    let (_, rto_tsval, cwnd_before) = ten_segments_then_rto(&mut tcb, &mut now);
+
+    now += 1;
+    ack_echoing(&mut tcb, now, 5 * SMSS, rto_tsval);
+    let s = tcb.stats();
+    assert_eq!(s.spurious_rtos, 0);
+    assert_eq!(s.ca_state, crate::congestion::CaState::Loss as u8);
+    assert!(s.cwnd < cwnd_before, "slow start from the loss window");
+    let resent = try_pop(&mut tcb).expect("the rest is re-sent");
+    assert_eq!(resent.seq, ISS.wrapping_add(1).wrapping_add(5 * SMSS));
 }
 
 // ---------------------------------------------------------------------------
