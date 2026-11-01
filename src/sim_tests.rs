@@ -59,6 +59,8 @@ struct LinkCfg {
     reorder_extra_us: u64,
     /// Drop payload-carrying packets whose link-entry index is in `[lo, hi)`.
     drop_data: (u64, u64),
+    /// Remove D-SACK blocks, as from a receiver that never sends them.
+    strip_dsack: bool,
 }
 
 impl LinkCfg {
@@ -71,6 +73,7 @@ impl LinkCfg {
             reorder_ppm: 0,
             reorder_extra_us: 0,
             drop_data: (0, 0),
+            strip_dsack: false,
         }
     }
     const fn loss(mut self, ppm: u32) -> Self {
@@ -84,6 +87,10 @@ impl LinkCfg {
     }
     const fn drop_data(mut self, lo: u64, hi: u64) -> Self {
         self.drop_data = (lo, hi);
+        self
+    }
+    const fn strip_dsack(mut self) -> Self {
+        self.strip_dsack = true;
         self
     }
 }
@@ -114,6 +121,55 @@ fn payload_len(pkt: &[u8]) -> usize {
     total - ihl - doff
 }
 
+fn be32(p: &[u8], at: usize) -> u32 {
+    u32::from_be_bytes([p[at], p[at + 1], p[at + 2], p[at + 3]])
+}
+
+/// Rewrite a leading D-SACK block (RFC 2883) out of the SACK option,
+/// replacing the freed bytes with NOPs, and fix the TCP checksum.
+fn strip_dsack(pkt: &mut [u8]) {
+    let le = |a: u32, b: u32| (a.wrapping_sub(b) as i32) <= 0;
+    let total = usize::from(u16::from_be_bytes([pkt[2], pkt[3]]));
+    let ihl = usize::from(pkt[0] & 0x0f) * 4;
+    let ack = be32(pkt, ihl + 8);
+    let opts_end = ihl + usize::from(pkt[ihl + 12] >> 4) * 4;
+    let mut i = ihl + 20;
+    while i < opts_end && pkt[i] != 0 {
+        if pkt[i] == 1 {
+            i += 1;
+            continue;
+        }
+        let len = usize::from(pkt[i + 1]);
+        if pkt[i] == 5 && len >= 10 {
+            let (l0, r0) = (be32(pkt, i + 2), be32(pkt, i + 6));
+            let dsack = le(r0, ack)
+                || (len >= 18 && le(be32(pkt, i + 10), l0) && le(r0, be32(pkt, i + 14)));
+            if !dsack {
+                return;
+            }
+            if len == 10 {
+                pkt[i..i + len].fill(1);
+            } else {
+                pkt.copy_within(i + 10..i + len, i + 2);
+                pkt[i + 1] = (len - 8) as u8;
+                pkt[i + len - 8..i + len].fill(1);
+            }
+            let seg = ihl..total;
+            pkt[ihl + 16..ihl + 18].fill(0);
+            let mut sum = 6 + (total - ihl) as u64;
+            for c in pkt[12..20].chunks(2).chain(pkt[seg].chunks(2)) {
+                sum += u64::from(u16::from_be_bytes([c[0], c.get(1).copied().unwrap_or(0)]));
+            }
+            while sum > 0xffff {
+                sum = (sum & 0xffff) + (sum >> 16);
+            }
+            pkt[ihl + 16..ihl + 18].copy_from_slice(&(!(sum as u16)).to_be_bytes());
+            return;
+        }
+        i += len.max(2);
+    }
+}
+
 impl Link {
     fn new(cfg: LinkCfg, seed: u64) -> Self {
         Self {
@@ -127,7 +183,10 @@ impl Link {
         }
     }
 
-    fn send(&mut self, now: u64, pkt: Vec<u8>) {
+    fn send(&mut self, now: u64, mut pkt: Vec<u8>) {
+        if self.cfg.strip_dsack {
+            strip_dsack(&mut pkt);
+        }
         let data = payload_len(&pkt) > 0;
         if data {
             let idx = self.stats.data_in;
@@ -640,6 +699,30 @@ fn reordering_is_learned_and_tolerated() {
     let spurious = o.b.dup_bytes_received as f64 / SMSS;
     assert!(spurious <= 5.0, "{spurious:.0} spurious retransmissions");
     assert!(o.a.dsacks_received > 0 || spurious == 0.0);
+    assert_eq!(o.a.rto_count, 0);
+}
+
+/// The same reordering against a receiver that never sends D-SACKs
+/// (smoltcp, for one): the timestamp echo alone must show that each "lost"
+/// segment was only delayed and undo the reduction; otherwise every
+/// reordering event cuts the window for good (1.6 MB/s here).
+#[test]
+fn reordering_is_tolerated_without_dsack() {
+    let fwd = LinkCfg::new(10, 50, 1000).reorder(20_000, 4);
+    let rev = LinkCfg::new(10, 50, 1000).strip_dsack();
+    let bytes = 8 * MIB;
+    let mut s = Sim::new(fwd, rev, 5, bytes, 0);
+    let o = s.run_transfer(60_000_000);
+    o.report("reorder 2% +4ms, no D-SACK", bytes);
+    assert_eq!(o.a.dsacks_received, 0, "a D-SACK got through");
+    let line = 50e6 / 8.0 * SMSS / 1500.0;
+    assert!(o.goodput(bytes) >= 0.8 * line, "underfilled link");
+    // Only D-SACKs widen RACK's reordering window (as in Linux), so some
+    // reordering still costs a retransmission, but never the window.
+    assert!(
+        o.a.segs_retrans * 100 <= o.fwd.data_in,
+        "retransmission storm"
+    );
     assert_eq!(o.a.rto_count, 0);
 }
 

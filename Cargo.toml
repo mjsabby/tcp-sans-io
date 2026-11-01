@@ -57,7 +57,7 @@ indexing_slicing = "warn"
 
 [dev-dependencies]
 proptest = "1"
-smoltcp = { version = "0.13", default-features = false, features = [
+smoltcp = { version = "0.14", default-features = false, features = [
     "alloc",
     "std",
     "medium-ip",

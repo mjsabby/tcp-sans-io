@@ -8,11 +8,14 @@
 //! `cwnd = pipe + sndcnt` on every ACK so the sender's ordinary
 //! "send while `pipe < cwnd`" rule paces retransmissions and new data.
 //!
-//! A loss-triggered reduction (fast recovery or RTO) is undone if D-SACKs
-//! later show that every retransmission of the episode was needless
-//! (RFC 3708 detection with an Eifel-style response, as Linux
-//! `tcp_try_undo_dsack`): reordering or a delay spike must not cost the
-//! window.
+//! A loss-triggered reduction (fast recovery or RTO) is undone once it is
+//! shown to be spurious, with an Eifel-style response: reordering or a
+//! delay spike must not cost the window. The evidence is either D-SACKs
+//! for every retransmission of the episode (RFC 3708, as Linux
+//! `tcp_try_undo_dsack`) or an ACK echoing a timestamp from before the
+//! episode's first retransmission, so an original transmission filled the
+//! hole (Eifel detection, RFC 3522, as Linux `tcp_packet_delayed`). The
+//! latter also covers receivers that never send D-SACKs.
 
 /// Congestion-avoidance state (named after Linux's `tcp_ca_state`).
 #[repr(u8)]
@@ -71,6 +74,10 @@ pub struct Reno {
     undo_marker: u32,
     /// Retransmissions of the episode not yet shown needless by a D-SACK.
     undo_retrans: u32,
+    /// Host clock (ms, truncated like our TSvals) of the first
+    /// retransmission that may still fill a hole (Linux `retrans_stamp`):
+    /// an ACK echoing an earlier TSval was triggered by an original.
+    first_retx_ms: Option<u32>,
 }
 
 impl Reno {
@@ -89,6 +96,7 @@ impl Reno {
             undo_valid: false,
             undo_marker: 0,
             undo_retrans: 0,
+            first_retx_ms: None,
         }
     }
 
@@ -154,17 +162,32 @@ impl Reno {
     }
 
     /// Remember the window a loss episode starting now could be undone to.
-    fn arm_undo(&mut self, snd_una: u32) {
+    /// The episode's first retransmission starts the timestamp-undo clock
+    /// unless `retx_outstanding`: an earlier retransmission may still fill
+    /// a hole, so its send time stays the reference (Linux
+    /// `tcp_retrans_stamp_cleanup`).
+    fn arm_undo(&mut self, snd_una: u32, retx_outstanding: bool) {
         self.prior_cwnd = self.cwnd;
         self.prior_ssthresh = self.ssthresh;
         self.undo_valid = true;
         self.undo_marker = snd_una;
         self.undo_retrans = 0;
+        if !retx_outstanding {
+            self.first_retx_ms = None;
+        }
     }
 
     /// Enter fast recovery (RFC 6937): halve `ssthresh`, pace with PRR.
-    pub fn enter_recovery(&mut self, flight: u32, snd_una: u32, snd_nxt: u32, mss: u32) {
-        self.arm_undo(snd_una);
+    /// `retx_outstanding`: see [`Self::arm_undo`].
+    pub fn enter_recovery(
+        &mut self,
+        flight: u32,
+        snd_una: u32,
+        snd_nxt: u32,
+        mss: u32,
+        retx_outstanding: bool,
+    ) {
+        self.arm_undo(snd_una, retx_outstanding);
         self.begin_reduction(CaState::Recovery, flight, snd_nxt, mss);
     }
 
@@ -184,11 +207,50 @@ impl Reno {
         }
     }
 
-    /// Count a retransmission against the current loss episode.
-    pub fn on_retransmit(&mut self) {
+    /// A retransmission left at `now_ms`: count it against the current
+    /// loss episode, and start the timestamp-undo clock if not running.
+    pub fn on_retransmit(&mut self, now_ms: u64) {
+        if self.first_retx_ms.is_none() {
+            self.first_retx_ms = Some(now_ms as u32);
+        }
         if self.undo_valid && self.in_loss_recovery() {
             self.undo_retrans = self.undo_retrans.saturating_add(1);
         }
+    }
+
+    /// Eifel detection (RFC 3522; Linux `tcp_packet_delayed`): during an
+    /// undoable loss episode, an ACK echoing `tsecr_ms` (its TSecr mapped
+    /// back onto the host clock) from before the first retransmission was
+    /// triggered by an original transmission, not a retransmission.
+    pub fn ack_predates_retransmission(&self, tsecr_ms: u32) -> bool {
+        self.undo_valid
+            && self.in_loss_recovery()
+            && self
+                .first_retx_ms
+                .is_some_and(|t| (tsecr_ms.wrapping_sub(t) as i32) < 0)
+    }
+
+    /// No retransmission is left that could still fill a hole: outside a
+    /// loss episode, forget the first-retransmission time (Linux
+    /// `tcp_try_to_open`), so the next retransmission (a tail loss probe,
+    /// say) starts a fresh clock. A stale one would hide later spurious
+    /// episodes and, 2^31 ms on, wrap into false ones.
+    pub fn on_retransmissions_settled(&mut self) {
+        if !self.in_loss_recovery() {
+            self.first_retx_ms = None;
+        }
+    }
+
+    /// The episode was spurious: restore the window from before it and
+    /// leave loss recovery (Linux `tcp_undo_cwnd_reduction`).
+    pub fn undo(&mut self) {
+        self.cwnd = self.cwnd.max(self.prior_cwnd);
+        self.ssthresh = self.ssthresh.max(self.prior_ssthresh);
+        if self.in_loss_recovery() {
+            self.state = CaState::Open;
+        }
+        self.ca_acc = 0;
+        self.undo_valid = false;
     }
 
     /// A D-SACK reported `[start, end)` as received twice. Once every
@@ -204,13 +266,7 @@ impl Reno {
         if self.undo_retrans > 0 {
             return false;
         }
-        self.cwnd = self.cwnd.max(self.prior_cwnd);
-        self.ssthresh = self.ssthresh.max(self.prior_ssthresh);
-        if self.in_loss_recovery() {
-            self.state = CaState::Open;
-        }
-        self.ca_acc = 0;
-        self.undo_valid = false;
+        self.undo();
         true
     }
 
@@ -258,14 +314,22 @@ impl Reno {
 
     /// RFC 5681 §3.1 retransmission timeout. `ssthresh` is only reduced for
     /// the first timeout of an episode (not again while recovering the same
-    /// window); `cwnd` collapses to one segment.
-    pub fn on_rto(&mut self, flight: u32, snd_una: u32, snd_nxt: u32, mss: u32) {
+    /// window); `cwnd` collapses to one segment. `retx_outstanding`: see
+    /// [`Self::arm_undo`].
+    pub fn on_rto(
+        &mut self,
+        flight: u32,
+        snd_una: u32,
+        snd_nxt: u32,
+        mss: u32,
+        retx_outstanding: bool,
+    ) {
         let episode_over = seq_ge(snd_una, self.recovery_point);
         if matches!(self.state, CaState::Open | CaState::Cwr) || episode_over {
             if self.state == CaState::Cwr {
                 self.undo_valid = false;
             } else {
-                self.arm_undo(snd_una);
+                self.arm_undo(snd_una, retx_outstanding);
             }
             self.ssthresh = (flight / 2).max(mss.saturating_mul(2));
         }
@@ -323,7 +387,7 @@ mod tests {
     #[test]
     fn prr_reduces_proportionally_and_exits_at_ssthresh() {
         let mut r = Reno::new(20 * M);
-        r.enter_recovery(20 * M, 0, 5000, M);
+        r.enter_recovery(20 * M, 0, 5000, M, false);
         assert_eq!(r.ssthresh, 10 * M);
         // First ACK: one segment delivered, pipe still above ssthresh.
         r.prr_update(M, 18 * M, M, false);
@@ -342,7 +406,7 @@ mod tests {
     #[test]
     fn prr_ssrb_grows_back_toward_ssthresh_when_pipe_is_low() {
         let mut r = Reno::new(20 * M);
-        r.enter_recovery(20 * M, 0, 5000, M);
+        r.enter_recovery(20 * M, 0, 5000, M, false);
         r.on_send(M);
         r.prr_update(2 * M, 2 * M, M, true);
         // limit = max(2000-1000, 2000) + MSS = 3000; min(ssthresh-pipe=8000, 3000).
@@ -353,9 +417,9 @@ mod tests {
     fn dsack_for_every_retransmission_undoes_the_episode() {
         let mut r = Reno::new(20 * M);
         r.ssthresh = 30 * M;
-        r.enter_recovery(20 * M, 1000, 21_000, M);
-        r.on_retransmit();
-        r.on_retransmit();
+        r.enter_recovery(20 * M, 1000, 21_000, M, false);
+        r.on_retransmit(0);
+        r.on_retransmit(0);
         r.prr_update(M, 18 * M, M, false);
         assert!(
             !r.on_dsack(500, 1500, M),
@@ -373,17 +437,17 @@ mod tests {
     #[test]
     fn late_dsack_undoes_after_recovery_ended_and_rto_too() {
         let mut r = Reno::new(20 * M);
-        r.enter_recovery(20 * M, 1000, 21_000, M);
-        r.on_retransmit();
+        r.enter_recovery(20 * M, 1000, 21_000, M, false);
+        r.on_retransmit(0);
         assert!(r.maybe_exit(21_000));
         assert_eq!(r.cwnd, 10 * M);
-        r.on_retransmit(); // outside the episode: not counted
+        r.on_retransmit(0); // outside the episode: not counted
         assert!(r.on_dsack(1000, 2000, M));
         assert_eq!(r.cwnd, 20 * M);
 
         let mut r = Reno::new(40 * M);
-        r.on_rto(40 * M, 100, 9000, M);
-        r.on_retransmit();
+        r.on_rto(40 * M, 100, 9000, M, false);
+        r.on_retransmit(0);
         assert!(r.on_dsack(100, 1100, M), "spurious timeout");
         assert_eq!((r.cwnd, r.state()), (40 * M, CaState::Open));
     }
@@ -393,17 +457,51 @@ mod tests {
         let mut r = Reno::new(20 * M);
         r.enter_cwr(20 * M, 21_000, M);
         r.cwr_to_recovery();
-        r.on_retransmit();
+        r.on_retransmit(50);
         assert!(!r.on_dsack(0, 1000, M));
+        assert!(!r.ack_predates_retransmission(10));
         assert_eq!(r.ssthresh, 10 * M);
+    }
+
+    #[test]
+    fn echo_from_before_the_first_retransmission_shows_a_delay() {
+        let mut r = Reno::new(20 * M);
+        r.enter_recovery(20 * M, 1000, 21_000, M, false);
+        assert!(!r.ack_predates_retransmission(90), "nothing resent yet");
+        r.on_retransmit(100);
+        r.on_retransmit(105);
+        assert!(
+            !r.ack_predates_retransmission(100),
+            "echoes a retransmission"
+        );
+        assert!(r.ack_predates_retransmission(99));
+        r.undo();
+        assert_eq!((r.cwnd, r.state()), (20 * M, CaState::Open));
+        assert!(!r.ack_predates_retransmission(99), "nothing left to undo");
+
+        // An episode that starts while an earlier retransmission may still
+        // fill a hole keeps that retransmission's send time: its echo must
+        // not pass for an original's.
+        r.enter_recovery(20 * M, 5000, 25_000, M, true);
+        r.on_retransmit(300);
+        r.on_retransmissions_settled(); // still recovering: kept
+        assert!(!r.ack_predates_retransmission(200));
+        assert!(r.ack_predates_retransmission(99));
+        // Otherwise the episode's own first retransmission is the reference,
+        // across the wrap of the 32-bit timestamp clock.
+        r.on_rto(20 * M, 25_000, 30_000, M, false);
+        r.on_retransmit((1u64 << 32) + 10);
+        r.on_retransmit((1u64 << 32) + 20);
+        assert!(r.ack_predates_retransmission(u32::MAX - 5));
+        assert!(!r.ack_predates_retransmission(10));
     }
 
     #[test]
     fn rto_collapses_window_and_reduces_ssthresh_once_per_episode() {
         let mut r = Reno::new(40 * M);
-        r.on_rto(40 * M, 100, 9000, M);
+        r.on_rto(40 * M, 100, 9000, M, false);
         assert_eq!((r.cwnd, r.ssthresh, r.state()), (M, 20 * M, CaState::Loss));
-        r.on_rto(40 * M, 100, 9000, M); // backoff of the same episode
+        r.on_rto(40 * M, 100, 9000, M, true); // backoff of the same episode
         assert_eq!(r.ssthresh, 20 * M, "not halved again");
         assert!(r.maybe_exit(9000));
         assert_eq!(r.cwnd, M, "slow start continues after RTO recovery");

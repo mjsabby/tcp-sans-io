@@ -23,6 +23,7 @@ on:
       - "src/**"
       - "bindings/netem/**"
       - "bindings/bpf/**"
+      - "bindings/smoltcp-shootout/**"
       - ".github/workflows/perf-bench.yml"
       - "Cargo.toml"
       - "Cargo.lock"
@@ -230,7 +231,17 @@ jobs:
             > "$RUNNER_TEMP/artifacts/bpftrace_uprobes.txt"
 
       # ---------------------------------------------------------------
-      # 4. Render a summary into the workflow run page.
+      # 4. tcp-sans-io vs smoltcp: the full shootout report (probes,
+      #    interop, fuzzing, simulated-link goodput, CPU cost, memory).
+      # ---------------------------------------------------------------
+      - name: smoltcp shootout (full report)
+        run: |
+          set -o pipefail
+          cargo run --release --manifest-path bindings/smoltcp-shootout/Cargo.toml \
+            > "$RUNNER_TEMP/artifacts/smoltcp-shootout.md"
+
+      # ---------------------------------------------------------------
+      # 5. Render a summary into the workflow run page.
       # ---------------------------------------------------------------
       - name: Workflow summary
         if: always()
@@ -254,12 +265,19 @@ jobs:
             fi
             echo '```'
             echo ""
+            if [[ -s "$RUNNER_TEMP/artifacts/smoltcp-shootout.md" ]]; then
+              echo "# tcp-sans-io vs smoltcp"
+              echo ""
+              cat "$RUNNER_TEMP/artifacts/smoltcp-shootout.md"
+              echo ""
+            fi
             echo "## Artifacts"
             echo "Download from the workflow run page:"
             echo "* \`flamegraph.svg\`, \`flamegraph-reverse.svg\` — CPU flamegraphs"
             echo "* \`bpftrace_uprobes.txt\` — uprobe latency histograms"
             echo "* \`results.jsonl\` — raw per-run results (all stacks, both directions)"
             echo "* \`folded.txt\` — folded perf stacks (for re-rendering)"
+            echo "* \`smoltcp-shootout.md\` — tcp-sans-io vs smoltcp report"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload artifacts

@@ -40,6 +40,11 @@ jobs:
       - name: self-loopback conformance harness (chaos, hash-verified)
         run: cargo run --release --manifest-path bindings/conformance/Cargo.toml
 
+      - name: smoltcp shootout (RFC probes, interop matrix, fuzzing)
+        run: |
+          cargo test --release --manifest-path bindings/smoltcp-shootout/Cargo.toml
+          cargo run --release --manifest-path bindings/smoltcp-shootout/Cargo.toml -- --check
+
       - name: Upload cdylib + header
         uses: actions/upload-artifact@v4
         with:

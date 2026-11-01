@@ -244,7 +244,7 @@ impl<const BUF: usize> Tcb<BUF> {
         }
         self.rtx.on_retransmit(i, self.now_ms);
         self.cc.on_send(s.seq_len());
-        self.cc.on_retransmit();
+        self.cc.on_retransmit(self.now_ms);
         self.stats.segs_retrans = self.stats.segs_retrans.saturating_add(1);
         self.stats.bytes_retrans = self.stats.bytes_retrans.saturating_add(u64::from(plen));
         self.stats.bytes_sent = self.stats.bytes_sent.saturating_add(u64::from(plen));

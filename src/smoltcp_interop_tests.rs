@@ -4,7 +4,9 @@
 //! other through an in-memory channel. The two stacks are entirely
 //! independent codebases — different authors, different state
 //! machines, different option-handling — so anything that flows
-//! across this boundary is a strong correctness signal.
+//! across this boundary is a strong correctness signal. The full
+//! comparison (RFC probes, an impairment matrix in both roles, fuzzing
+//! and performance) is `bindings/smoltcp-shootout/`.
 //!
 //! Architecture:
 //!

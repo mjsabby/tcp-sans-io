@@ -132,8 +132,9 @@ impl<const BUF: usize> Tcb<BUF> {
             self.rtx.clear_sacked();
         }
         let flight = self.snd_nxt.wrapping_sub(self.data_una());
+        let retx = self.retx_outstanding();
         self.cc
-            .on_rto(flight, self.snd_una, self.snd_nxt, self.mss_payload());
+            .on_rto(flight, self.snd_una, self.snd_nxt, self.mss_payload(), retx);
         self.rtx.mark_all_lost();
         self.reno_sacked = 0;
         self.tlp_end_seq = None;

@@ -3,7 +3,8 @@
 //! Per ACK: validate (RFC 9293 + RFC 5961 §5), absorb SACK blocks (D-SACK
 //! per RFC 2883 is detected, validated, and *never* treated as loss), apply
 //! the cumulative ACK, take an RTT sample (our send times; TSecr only when
-//! retransmitted data is acknowledged), update the send window, run loss
+//! retransmitted data is acknowledged), undo a loss episode the D-SACKs or
+//! the timestamp echo show was spurious, update the send window, run loss
 //! detection (RACK with SACK, RFC 6582 NewReno without), then let
 //! congestion control react: PRR during a reduction, slow start /
 //! congestion avoidance otherwise.
@@ -154,6 +155,9 @@ impl<const BUF: usize> Tcb<BUF> {
                 }
             }
             self.note_progress(data_acked.saturating_add(u32::from(fin_acked)));
+            if let Some(t) = tsecr_ms {
+                self.ts_undo(t);
+            }
         }
         self.pmtu_probe_on_ack();
 
@@ -200,6 +204,9 @@ impl<const BUF: usize> Tcb<BUF> {
         // ---- Congestion control ----------------------------------------
         if self.cc.maybe_exit(self.snd_una) {
             self.rack.on_recovery_exit();
+        }
+        if !self.retx_outstanding() {
+            self.cc.on_retransmissions_settled();
         }
         let limited = self.take_cwnd_limited();
         if self.cc.in_reduction() {
@@ -314,6 +321,44 @@ impl<const BUF: usize> Tcb<BUF> {
         true
     }
 
+    /// Timestamp undo: Eifel detection (RFC 3522) with Linux's response
+    /// (`tcp_try_undo_partial`, `tcp_try_undo_recovery`,
+    /// `tcp_try_undo_loss`). An ACK that advanced `SND.UNA` during loss
+    /// recovery while echoing a TSval from before the episode's first
+    /// retransmission was triggered by an original transmission: the hole
+    /// was delayed, not lost. From receivers that send no D-SACK (smoltcp,
+    /// for one) this is the only evidence of a spurious episode. In fast
+    /// recovery it proves reordering (RACK then allows its reordering
+    /// window, which, as in Linux, only D-SACKs widen), and the reduction
+    /// is undone once no retransmission is left in flight (any may still be
+    /// repairing a real loss) or the episode ends with this ACK; a spurious
+    /// timeout is undone at once.
+    fn ts_undo(&mut self, tsecr_ms: u32) {
+        if !self.cc.ack_predates_retransmission(tsecr_ms) {
+            return;
+        }
+        if self.cc.state() == CaState::Recovery {
+            self.rack.reordering_seen = true;
+            if self.rtx.retrans_bytes() > 0 && seq_lt(self.snd_una, self.cc.recovery_point()) {
+                return;
+            }
+        }
+        self.cc.undo();
+        self.rtx.unmark_lost();
+        self.rack.on_recovery_exit();
+    }
+
+    /// Linux `tcp_any_retrans_done`: a retransmission is in flight, or the
+    /// segment at `SND.UNA` was retransmitted, so an earlier retransmission
+    /// may still fill a hole in a loss episode starting now.
+    pub(super) fn retx_outstanding(&self) -> bool {
+        self.rtx.retrans_bytes() > 0
+            || self
+                .rtx
+                .get(0)
+                .is_some_and(|s| s.has(seg_flags::EVER_RETRANS))
+    }
+
     /// Re-arm the USER TIMEOUT only on meaningful progress: at least one
     /// full segment acknowledged since the last re-arm (or all work done).
     fn note_progress(&mut self, acked: u32) {
@@ -387,8 +432,9 @@ impl<const BUF: usize> Tcb<BUF> {
         if self.cc.state() == CaState::Cwr {
             self.cc.cwr_to_recovery();
         } else {
+            let retx = self.retx_outstanding();
             self.cc
-                .enter_recovery(flight, self.snd_una, self.snd_nxt, mss);
+                .enter_recovery(flight, self.snd_una, self.snd_nxt, mss, retx);
         }
         self.stats.fast_recoveries = self.stats.fast_recoveries.saturating_add(1);
         self.tlp_end_seq = None;

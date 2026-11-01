@@ -20,6 +20,7 @@ use std::boxed::Box;
 use std::vec;
 use std::vec::Vec;
 
+use crate::congestion::CaState;
 use crate::tcb::{Endpoint, Tcb, TcbConfig};
 use crate::wire::{self, flags, SackBlocks, TcpOptions};
 use crate::{State, TcpError, MAX_PACKET};
@@ -1399,6 +1400,159 @@ fn dsack_is_believed_only_for_retransmitted_data() {
     }
     ack_with_dsack(&mut c, sseq, now + 10, segs[1].1, retx.unwrap());
     assert_eq!(c.stats().dsacks_received, 1);
+}
+
+/// An ACK from the scripted server echoing `tsecr`, optionally with SACK
+/// blocks (never a D-SACK); returns what `c` sent in response.
+fn ts_ack(c: &mut Tcb, sseq: u32, now: u64, ack: u32, tsecr: u32, sack: &[(u32, u32)]) -> Vec<Out> {
+    c.set_now(now);
+    let o = TcpOptions {
+        ts: Some((7, tsecr)),
+        sack: SackBlocks::from_slice(sack),
+        ..TcpOptions::NONE
+    };
+    c.inject_packet(&pkt(SRV, CLI, sseq, ack, flags::ACK, 0xffff, &o, &[]))
+        .unwrap();
+    drain(c)
+}
+
+/// Opens the scaled window, then sends `n` full segments at 1020 ms.
+fn ts_burst(c: &mut Tcb, sseq: u32, iss: u32, n: usize) -> Vec<Out> {
+    ts_ack(c, sseq, 1020, iss + 1, 1010, &[]);
+    c.send(&vec![0x5a; n * 1448]).unwrap();
+    c.tick().unwrap();
+    let burst: Vec<Out> = drain(c).into_iter().filter(|o| o.len > 0).collect();
+    assert_eq!(burst.len(), n);
+    burst
+}
+
+fn tsval(o: &Out) -> u32 {
+    o.opts.ts.unwrap().0
+}
+
+/// Eifel detection (RFC 3522) with Linux's response: in fast recovery, an
+/// ACK filling the hole that echoes the original's TSval rather than the
+/// retransmission's shows the segment was delayed, not lost. The reduction
+/// is undone without any D-SACK (smoltcp never sends one); an echo of the
+/// retransmission keeps it.
+#[test]
+fn timestamp_echo_undoes_only_a_spurious_fast_recovery() {
+    for delayed in [true, false] {
+        let (mut c, sseq, iss) = established(1000, true, false);
+        let burst = ts_burst(&mut c, sseq, iss, 10);
+        let end = |k: usize| burst[k].seq + burst[k].len as u32;
+        let before = c.stats();
+        // Segment 0 is held up; three later ones are SACKed (TS.Recent still
+        // echoes the handshake), so RACK declares segment 0 lost.
+        let mut retx = Vec::new();
+        for k in 1..=3 {
+            let out = ts_ack(&mut c, sseq, 1030, iss + 1, 1010, &[(burst[1].seq, end(k))]);
+            retx.extend(out.into_iter().filter(|o| o.len > 0));
+        }
+        assert_eq!(retx.len(), 1, "one fast retransmission");
+        assert_eq!(retx[0].seq, burst[0].seq);
+        assert_eq!(c.stats().ca_state, CaState::Recovery as u8);
+        assert!(tsval(&burst[0]) < tsval(&retx[0]));
+        // The hole is filled by the original or by the retransmission.
+        let echo = tsval(if delayed { &burst[0] } else { &retx[0] });
+        ts_ack(&mut c, sseq, 1040, end(3), echo, &[]);
+        let s = c.stats();
+        assert_eq!(s.dsacks_received, 0);
+        if delayed {
+            assert_eq!(s.ca_state, CaState::Open as u8, "spurious recovery undone");
+            assert_eq!(s.ssthresh, before.ssthresh);
+            assert!(s.cwnd >= before.cwnd, "cwnd {} < {}", s.cwnd, before.cwnd);
+        } else {
+            assert_eq!(s.ca_state, CaState::Recovery as u8, "real loss: kept");
+            assert!(s.ssthresh < before.ssthresh);
+        }
+    }
+}
+
+/// The same detection after a timeout (Linux `tcp_try_undo_loss`): an ACK
+/// echoing the original transmission's TSval shows the RTO was spurious (a
+/// delay spike, not loss), so the collapsed window is restored at once.
+#[test]
+fn timestamp_echo_undoes_only_a_spurious_timeout() {
+    for spurious in [true, false] {
+        let (mut c, sseq, iss) = established(1000, false, false);
+        let burst = ts_burst(&mut c, sseq, iss, 4);
+        let before = c.stats();
+        let mut now = 1020;
+        let retx = loop {
+            now += 5;
+            assert!(now < 5000, "no retransmission timeout");
+            c.set_now(now);
+            c.tick().unwrap();
+            if let Some(o) = drain(&mut c).into_iter().find(|o| o.len > 0) {
+                break o;
+            }
+        };
+        assert_eq!((c.stats().rto_count, retx.seq), (1, burst[0].seq));
+        let echo = tsval(if spurious { &burst[0] } else { &retx });
+        let all = burst[3].seq + burst[3].len as u32;
+        ts_ack(&mut c, sseq, now + 10, all, echo, &[]);
+        let s = c.stats();
+        if spurious {
+            assert_eq!(s.ca_state, CaState::Open as u8);
+            assert_eq!(s.ssthresh, before.ssthresh);
+            assert!(s.cwnd >= before.cwnd, "cwnd {} < {}", s.cwnd, before.cwnd);
+        } else {
+            assert!(s.ssthresh < before.ssthresh && s.cwnd < before.cwnd);
+        }
+    }
+}
+
+/// The first-retransmission time is forgotten once an episode's
+/// retransmissions are all acknowledged, so a later tail loss probe and
+/// timeout are judged against the probe's own send time. A stamp left over
+/// from an earlier episode used to hide a spurious timeout and, 2^31 ms on,
+/// to wrap and "undo" a genuine one.
+#[test]
+fn timestamp_undo_restarts_its_clock_after_each_episode() {
+    for (gap, spurious) in [(1_000u64, true), (1u64 << 31, false)] {
+        let (mut c, sseq, iss) = established(1000, true, false);
+        // An earlier fast recovery that repaired a real loss.
+        let burst = ts_burst(&mut c, sseq, iss, 10);
+        let mut retx = Vec::new();
+        for k in 1..=3 {
+            let sack = [(burst[1].seq, burst[k].seq + burst[k].len as u32)];
+            let out = ts_ack(&mut c, sseq, 1030, iss + 1, 1010, &sack);
+            retx.extend(out.into_iter().filter(|o| o.len > 0));
+        }
+        let all = burst[9].seq + burst[9].len as u32;
+        ts_ack(&mut c, sseq, 1040, all, tsval(&retx[0]), &[]);
+        assert_eq!(c.stats().ca_state, CaState::Open as u8);
+        // Much later, a tail that is never acknowledged: TLP, then RTO.
+        let mut now = 1040 + gap;
+        c.set_now(now);
+        c.send(&vec![0x5a; 4 * 1448]).unwrap();
+        c.tick().unwrap();
+        let tail: Vec<Out> = drain(&mut c).into_iter().filter(|o| o.len > 0).collect();
+        assert_eq!(tail.len(), 4);
+        let before = c.stats();
+        let rto_retx = loop {
+            now += 5;
+            assert!(now < 1040 + gap + 5000, "no retransmission timeout");
+            c.set_now(now);
+            c.tick().unwrap();
+            let out = drain(&mut c);
+            if c.stats().rto_count == 1 {
+                break out.into_iter().find(|o| o.seq == tail[0].seq).unwrap();
+            }
+        };
+        assert_eq!(c.stats().tlp_count, 1);
+        let echo = tsval(if spurious { &tail[0] } else { &rto_retx });
+        let all = tail[3].seq + tail[3].len as u32;
+        ts_ack(&mut c, sseq, now + 10, all, echo, &[]);
+        let s = c.stats();
+        if spurious {
+            assert_eq!(s.ca_state, CaState::Open as u8);
+            assert_eq!(s.ssthresh, before.ssthresh, "spurious timeout kept");
+        } else {
+            assert!(s.ssthresh < before.ssthresh, "genuine timeout undone");
+        }
+    }
 }
 
 /// RTT comes from our own send times whenever the ACK covers no

@@ -1,0 +1,41 @@
+# tcp-sans-io vs smoltcp: RFC probes, an interop matrix, robustness fuzzing
+# and performance, all in one process. Everything except the CPU
+# benchmarks runs in virtual time and is deterministic.
+#
+#   cargo run --release -- --check     # CI gate: probes, interop, fuzz
+#   cargo run --release                # everything, including performance
+#
+# Workspace-ignored (like bindings/conformance) so it can link std, unwind
+# (a stack's panic is counted, not fatal) and use its own profile.
+[package]
+name = "tcp-sans-io-smoltcp-shootout"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[workspace]
+
+[[bin]]
+name = "shootout"
+path = "src/main.rs"
+
+[dependencies]
+tcp-sans-io = { path = "../..", features = ["std"] }
+# smoltcp set up for its best showing: both congestion controllers compiled
+# in (its default build has none) and the largest out-of-order tracker (the
+# default holds 4 ranges). No libc: no phy-* features.
+smoltcp = { version = "0.14", default-features = false, features = [
+    "std",
+    "medium-ip",
+    "proto-ipv4",
+    "socket-tcp",
+    "socket-tcp-reno",
+    "socket-tcp-cubic",
+    "assembler-max-segment-count-32",
+] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "unwind"
