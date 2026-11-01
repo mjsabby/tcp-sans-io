@@ -196,7 +196,7 @@ class TcpStats(ctypes.Structure):
         ("rcv_wnd", c_uint32),
         ("ca_state", c_uint8),
         ("state", c_uint8),
-        ("_reserved", c_uint8 * 2),
+        ("spurious_rtos", c_uint16),
     ]
 
 

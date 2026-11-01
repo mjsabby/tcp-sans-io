@@ -44,6 +44,7 @@ shows what that costs against Linux CUBIC on lossy long paths.
 | SACK, both directions; receiver holds the whole window out of order | RFC 2018 | ✅ |
 | D-SACK, both directions (drives RACK's reordering window) | RFC 2883, RFC 3708 | ✅ |
 | RTO with Karn's algorithm | RFC 6298 | ✅ |
+| Spurious-timeout detection and response (Eifel: the first ACK after a timeout echoes a TSval from before it → the timeout is undone) | RFC 3522, RFC 4015 | ✅ with timestamps |
 | Slow start / congestion avoidance (byte counting, cwnd-limited growth) | RFC 5681, RFC 3465, RFC 7661 (spirit) | ✅ |
 | Proportional Rate Reduction | RFC 6937 | ✅ |
 | Initial window of 10 segments | RFC 6928 | ✅ |
@@ -54,7 +55,7 @@ shows what that costs against Linux CUBIC on lossy long paths.
 | Silly-window avoidance, sender and receiver | RFC 9293 §3.8.6.2 | ✅ |
 | Window-update rule (SND.WL1 / WL2) | RFC 9293 §3.10.7.4 | ✅ a forged future WL1 cannot freeze it |
 | Zero-window persist probes | RFC 9293 §3.8.6.1 | ✅ Linux-style probe at `SND.UNA − 1` |
-| Delayed ACK (2nd full segment / 40 ms; immediate for out-of-order and duplicates) | RFC 1122 §4.2.3.2, RFC 5681 §4.2 | ✅ |
+| Delayed ACK (2nd full segment, more than one full segment's worth unacknowledged, or an application read with an ACK pending; else 40 ms, configurable down to none; immediate for out-of-order and duplicates) | RFC 1122 §4.2.3.2, RFC 5681 §4.2 | ✅ |
 | R2 retransmission limit, USER TIMEOUT, keepalive | RFC 9293 §3.8.3–3.8.4 | ✅ on by default |
 | FIN_WAIT_2 timeout | Linux `tcp_fin_timeout` | ✅ 60 s, restarted only by the application reading |
 | TIME_WAIT, re-ACK and restart on a retransmitted FIN | RFC 9293 §3.10.7.4 | ✅ 60 s; restarts capped at 120 s after entry |
@@ -158,7 +159,7 @@ mis-ordering, corruption, a panic, or an unbounded loop.
 | `INITIAL_WINDOW` | 10 × SMSS (14,480 B with timestamps) | `congestion.rs` | RFC 6928 initial cwnd. |
 | `MIN_PEER_MSS` | 64 B | `tcb/mod.rs` | Floor on a peer-requested MSS (bounds per-byte header and queue cost). |
 | `RTO_MIN` / `RTO_MAX` | 200 ms / 60 s | `tcb/mod.rs` | RTO clamp; exponential backoff is capped at `RTO_MAX`. |
-| TLP PTO floor / delayed ACK / `TIME_WAIT` | 10 ms / 40 ms / 60 s (≤ 120 s) | `tcb/mod.rs` | Probe timeout floor, delayed-ACK timer, 2·MSL; a retransmitted FIN restarts 2·MSL, at most 120 s after entry. |
+| TLP PTO floor / delayed ACK / `TIME_WAIT` | 10 ms / 40 ms (`set_delayed_ack`, ≤ 500 ms) / 60 s (≤ 120 s) | `tcb/mod.rs` | Probe timeout floor, delayed-ACK timer, 2·MSL; a retransmitted FIN restarts 2·MSL, at most 120 s after entry. |
 | `MAX_SYN_RETRIES` / `MAX_SYN_RCVD_RETRIES` | 6 / 5 | `tcb/mod.rs` | SYN retransmissions before an active open fails; SYN-ACK retransmissions before a half-open reverts to `LISTEN`. |
 | `MAX_RETRANSMITS` | 10 | `tcb/mod.rs` | RFC 9293 §3.8.3 "R2": consecutive timeouts (data, FIN or unanswered zero-window probes) with no proof of life before abort. |
 | USER TIMEOUT | 300 s | `tcb/mod.rs` | Max time with outstanding send work but less than one full segment acknowledged; reaps stalled, zero-window and sub-MSS-trickle peers. A reader acknowledging a full segment per period is live progress, not a stall (see *Threat model*). `set_user_timeout(0)` disables. |
@@ -270,7 +271,7 @@ that cannot track deadlines tick every ~10 ms instead.
 |---|---|---|
 | RACK reorder window | `min_RTT/4` (× D-SACK multiplier, ≤ SRTT) | Loss declared slightly later on low-RTT reordering paths. |
 | TLP PTO | `max(2·SRTT, 10 ms)` | Tail-loss probe fires up to one tick late. |
-| Delayed ACK | 40 ms | ACK latency rises by up to one tick. |
+| Delayed ACK | 40 ms (`set_delayed_ack`; `0`: none) | ACK latency rises by up to one tick. With `0`, ACKs leave with the segment that earned them, independent of the tick. |
 | RTO | `200 ms … 60 s` | Negligible: a 10 ms tick is 20× finer than the floor. |
 | `TIME_WAIT` | 60 s | Irrelevant to cadence. |
 

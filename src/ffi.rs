@@ -369,6 +369,28 @@ pub unsafe extern "C" fn tcp_set_fin_wait2_timeout(
     }
 }
 
+/// Set the delayed-ACK timeout (default 40 ms, capped at 500 ms); `0`
+/// acknowledges every data segment at once (a NAT or proxy relaying the
+/// stream). Applies from the next segment received.
+///
+/// # Safety
+/// `handle` must be NULL or a live handle from [`tcp_init`].
+#[no_mangle]
+pub unsafe extern "C" fn tcp_set_delayed_ack(
+    handle: *mut TcpStreamHandle,
+    now_ms: u64,
+    delayed_ack_ms: u32,
+) -> i32 {
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        with_handle(handle, |h| {
+            h.set_now(now_ms);
+            h.set_delayed_ack(delayed_ack_ms);
+            Ok(())
+        })
+    }
+}
+
 /// Abort: queue a RST+ACK, drop all state, surface `ConnectionReset`.
 /// Drain the egress ring once afterwards to emit the RST.
 ///
