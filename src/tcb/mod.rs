@@ -28,9 +28,9 @@ use crate::error::TcpError;
 use crate::ooo::OooList;
 use crate::rack::Rack;
 use crate::ring::Ring;
-use crate::rtx_queue::RtxQueue;
+use crate::rtx_queue::{RtxQueue, RTX_QUEUE_CAP};
 use crate::state::State;
-use crate::tx_ring::TxRing;
+use crate::tx_ring::{TxRing, TX_RING_CAP};
 use crate::wire;
 use crate::BUF_CAP;
 
@@ -252,7 +252,19 @@ pub struct TcbStats {
 const _: () = assert!(core::mem::size_of::<TcbStats>() == 128);
 
 /// Per-connection state.
-pub struct Tcb<const BUF: usize = BUF_CAP> {
+///
+/// `BUF` is the capacity of each of the send and receive rings, `RTX` the
+/// most segments in flight (the retransmission queue) and `TXQ` the most
+/// packets staged for [`Tcb::extract_packet`] (the egress ring). The
+/// defaults are sized for the default 1 MiB rings; a TCB with smaller rings
+/// needs proportionally less of the other two, which
+/// [`rtx_cap_for`](crate::rtx_cap_for) and [`tx_slots_for`](crate::tx_slots_for)
+/// recommend: `Tcb<65536, { rtx_cap_for(65536) }, { tx_slots_for(65536) }>`.
+pub struct Tcb<
+    const BUF: usize = BUF_CAP,
+    const RTX: usize = RTX_QUEUE_CAP,
+    const TXQ: usize = TX_RING_CAP,
+> {
     state: State,
     local: Endpoint,
     remote: Endpoint,
@@ -315,7 +327,7 @@ pub struct Tcb<const BUF: usize = BUF_CAP> {
     send_cwr_pending: bool,
 
     // ---- Loss recovery.
-    rtx: RtxQueue,
+    rtx: RtxQueue<RTX>,
     rack: Rack,
     rack_deadline: Deadline,
     tlp_deadline: Deadline,
@@ -400,7 +412,7 @@ pub struct Tcb<const BUF: usize = BUF_CAP> {
     error: Option<TcpError>,
 
     // ---- Egress staging.
-    tx_ring: TxRing,
+    tx_ring: TxRing<TXQ>,
     /// Host back-pressure (see [`Tcb::set_egress_paused`]).
     egress_paused: bool,
     /// Leave TCP checksums to the host (see [`Tcb::set_tx_csum_offload`]).
@@ -479,7 +491,7 @@ struct HeldFin {
     seq: u32,
 }
 
-impl<const BUF: usize> Tcb<BUF> {
+impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
     /// Window-scale shift advertised for this ring capacity (compile-time).
     const WS: u8 = local_ws_shift(BUF);
 
@@ -503,6 +515,10 @@ impl<const BUF: usize> Tcb<BUF> {
     /// to `align_of::<Self>()`. Any previous value is overwritten without
     /// being dropped.
     pub unsafe fn init_in_place(p: *mut Self, cfg: TcbConfig) -> Result<(), TcpError> {
+        // The queues are zero-filled below rather than built by their
+        // `new`, so check their capacities here (at compile time).
+        let () = RtxQueue::<RTX>::VALID;
+        let () = TxRing::<TXQ>::VALID;
         if BUF == 0 || (BUF & (BUF - 1)) != 0 {
             return Err(TcpError::Overflow);
         }
@@ -828,6 +844,12 @@ impl<const BUF: usize> Tcb<BUF> {
             return Err("liveness: data queued with nothing in flight and no persist timer");
         }
         Ok(())
+    }
+
+    /// Segments in flight (records in the retransmission queue).
+    #[cfg(test)]
+    pub(crate) fn rtx_len(&self) -> usize {
+        self.rtx.len()
     }
 
     /// Absolute host time (ms) at which [`Self::tick`] next has timer work,

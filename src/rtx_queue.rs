@@ -8,15 +8,24 @@
 //! SACKed / lost / in flight, and when was it last sent?" — has exactly one
 //! answer.
 //!
+//! An entry the path MSS has shrunk below is split before it is resent. When
+//! the queue is full there is no record to split it into, so only its first
+//! MSS goes out and the entry is flagged [`seg_flags::PARTIAL`] with the
+//! length of that prefix, which alone counts as in flight. Once the whole
+//! prefix is acknowledged, the rest is lost again and resent at once rather
+//! than at the next RTO.
+//!
 //! In-flight accounting follows RFC 6675 `pipe` (and Linux):
 //! `pipe = outstanding - sacked - lost + retrans`, where `lost` counts
 //! segments marked lost and `retrans` those whose retransmission is still
 //! believed to be in flight. Counters are maintained incrementally and are
 //! checked against a full recount by [`RtxQueue::debug_valid`].
 //!
-//! Capacity is bounded by [`RTX_QUEUE_CAP`]; the sender never transmits new
-//! data while the queue is full, so the bound is a cap on segments in flight
-//! (≈1.4 MiB at a 1448-byte MSS — above the default 1 MiB window).
+//! Capacity is the const parameter `CAP` (default [`RTX_QUEUE_CAP`]); the
+//! sender never transmits new data while the queue is full, so the bound is
+//! a cap on segments in flight (≈1.4 MiB at a 1448-byte MSS by default —
+//! above the default 1 MiB window; [`rtx_cap_for`] keeps that ratio for
+//! smaller rings).
 //!
 //! A per-slot bitmap mirrors the `SACKED` flag so SACK processing and the
 //! RACK scan step over SACKed runs a 64-slot word at a time: an ACK whose
@@ -24,13 +33,29 @@
 //! episode — or a hostile peer repeating one) costs a binary search and at
 //! most 16 bitmap words per block, not a walk over every segment.
 
-/// Maximum number of segments in flight.
+/// Default, and largest, number of segments in flight.
 pub const RTX_QUEUE_CAP: usize = 1024;
 
-/// Words in the per-slot SACKed bitmap (the capacity is a multiple of 64,
-/// so a word never spans the ring's wrap point).
+/// Words in the per-slot SACKed bitmap, sized for the largest capacity (a
+/// `[u64; CAP / 64]` would need `generic_const_exprs`): a queue uses the
+/// first `CAP / 64`. `CAP` is a multiple of 64, so a word never spans the
+/// ring's wrap point.
 const SACK_WORDS: usize = RTX_QUEUE_CAP / 64;
-const _: () = assert!(RTX_QUEUE_CAP.is_multiple_of(64));
+
+/// Retransmission-queue capacity for a `buf`-byte send ring: one record per
+/// KiB (as the default 1024 for 1 MiB: ≈1.4 per 1448-byte segment the ring
+/// holds), rounded up to a multiple of 64 and clamped to
+/// `64..=`[`RTX_QUEUE_CAP`]. For [`crate::Tcb`]'s `RTX` parameter.
+pub const fn rtx_cap_for(buf: usize) -> usize {
+    let cap = (buf / 1024).div_ceil(64) * 64;
+    if cap < 64 {
+        64
+    } else if cap > RTX_QUEUE_CAP {
+        RTX_QUEUE_CAP
+    } else {
+        cap
+    }
+}
 
 /// Per-segment state bits.
 pub mod seg_flags {
@@ -44,6 +69,11 @@ pub mod seg_flags {
     pub const EVER_RETRANS: u8 = 1 << 3;
     /// The segment's last sequence number is a FIN.
     pub const FIN: u8 = 1 << 4;
+    /// Only a prefix of the segment, [`super::Seg::sent`] bytes, went out in
+    /// its last retransmission (no record to split it at the path MSS). Set
+    /// with `RETRANS`; once that whole prefix is acknowledged the rest is
+    /// marked `LOST`.
+    pub const PARTIAL: u8 = 1 << 5;
 }
 use seg_flags::*;
 
@@ -60,7 +90,13 @@ pub struct Seg {
     /// ties are common; RACK orders transmissions by this instead.
     pub xmit_seq: u32,
     pub flags: u8,
+    /// With [`PARTIAL`]: how many bytes from `start` the last retransmission
+    /// sent that are not yet acknowledged; 0 otherwise.
+    pub sent: u16,
 }
+
+// Records stay 24 bytes: `sent` lives in what was padding.
+const _: () = assert!(core::mem::size_of::<Seg>() == 24);
 
 impl Seg {
     #[inline]
@@ -87,9 +123,20 @@ fn seq_le(a: u32, b: u32) -> bool {
     (a.wrapping_sub(b) as i32) <= 0
 }
 
-/// Bounded FIFO of [`Seg`]s.
-pub struct RtxQueue {
-    segs: [Seg; RTX_QUEUE_CAP],
+/// Bytes of a `RETRANS` segment its retransmission put back in flight: just
+/// the prefix of a partial one.
+#[inline]
+fn retrans_len(s: &Seg) -> u32 {
+    if s.has(PARTIAL) {
+        u32::from(s.sent)
+    } else {
+        s.seq_len()
+    }
+}
+
+/// Bounded FIFO of [`Seg`]s, `CAP` of them at most.
+pub struct RtxQueue<const CAP: usize = RTX_QUEUE_CAP> {
+    segs: [Seg; CAP],
     /// Bit `p` is set iff the segment in physical slot `p` is SACKed.
     sacked_map: [u64; SACK_WORDS],
     head: usize,
@@ -103,14 +150,25 @@ pub struct RtxQueue {
     next_xmit: u32,
 }
 
-impl Default for RtxQueue {
+impl<const CAP: usize> Default for RtxQueue<CAP> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl RtxQueue {
+impl<const CAP: usize> RtxQueue<CAP> {
+    /// Bitmap words in use.
+    const WORDS: usize = CAP / 64;
+
+    /// Compile-time check that the bitmap covers `CAP` (evaluated wherever
+    /// a queue of this capacity is built).
+    pub(crate) const VALID: () = assert!(
+        CAP > 0 && CAP.is_multiple_of(64) && CAP <= RTX_QUEUE_CAP,
+        "RtxQueue capacity must be a multiple of 64 in 64..=1024"
+    );
+
     pub const fn new() -> Self {
+        let () = Self::VALID;
         Self {
             segs: [Seg {
                 start: 0,
@@ -118,7 +176,8 @@ impl RtxQueue {
                 xmit_ts: 0,
                 xmit_seq: 0,
                 flags: 0,
-            }; RTX_QUEUE_CAP],
+                sent: 0,
+            }; CAP],
             sacked_map: [0; SACK_WORDS],
             head: 0,
             len: 0,
@@ -150,7 +209,7 @@ impl RtxQueue {
     }
     #[inline]
     pub fn is_full(&self) -> bool {
-        self.len == RTX_QUEUE_CAP
+        self.len == CAP
     }
     #[inline]
     pub fn sacked_bytes(&self) -> u32 {
@@ -176,7 +235,7 @@ impl RtxQueue {
 
     #[inline]
     fn phys(&self, i: usize) -> usize {
-        (self.head + i) % RTX_QUEUE_CAP
+        (self.head + i) % CAP
     }
 
     #[inline]
@@ -206,14 +265,14 @@ impl RtxQueue {
         let mut left = count;
         while left > 0 {
             // The highest remaining source bit and the run below it in its word.
-            let hi = (from + left - 1) % RTX_QUEUE_CAP;
+            let hi = (from + left - 1) % CAP;
             let (w, top) = (hi / 64, hi % 64);
             let n = left.min(top + 1);
             let lo = top + 1 - n;
             let src = (self.sacked_map.get(w).copied().unwrap_or(0) >> lo) & low_mask(n);
             // Bit 63 carries into bit 0 of the next word (wrapping the ring).
             let stay = if top == 63 {
-                if let Some(next) = self.sacked_map.get_mut((w + 1) % SACK_WORDS) {
+                if let Some(next) = self.sacked_map.get_mut((w + 1) % Self::WORDS) {
                     *next = (*next & !1) | (src >> (n - 1));
                 }
                 n - 1
@@ -289,35 +348,43 @@ impl RtxQueue {
     }
 
     fn add_counts(&mut self, s: &Seg, sign: bool) {
-        let n = s.seq_len();
-        let apply = |c: &mut u32| {
+        let apply = |c: &mut u32, n: u32| {
             *c = if sign {
                 c.saturating_add(n)
             } else {
                 c.saturating_sub(n)
             }
         };
+        let n = s.seq_len();
         if s.has(SACKED) {
-            apply(&mut self.sacked);
+            apply(&mut self.sacked, n);
         }
         if s.has(LOST) {
-            apply(&mut self.lost);
+            apply(&mut self.lost, n);
         }
         if s.has(RETRANS) {
-            apply(&mut self.retrans);
+            apply(&mut self.retrans, retrans_len(s));
         }
     }
 
     /// Replace segment `i`'s flags, keeping the counters consistent.
     fn set_flags(&mut self, i: usize, flags: u8) {
+        let sent = self.get(i).map_or(0, |s| s.sent);
+        self.set_state(i, flags, sent);
+    }
+
+    /// Replace segment `i`'s flags and [`Seg::sent`] (dropped without
+    /// `PARTIAL`), keeping the counters consistent.
+    fn set_state(&mut self, i: usize, flags: u8, sent: u16) {
         let Some(old) = self.get(i).copied() else {
             return;
         };
+        let sent = if flags & PARTIAL != 0 { sent } else { 0 };
+        let new = Seg { flags, sent, ..old };
         self.add_counts(&old, false);
-        let new = Seg { flags, ..old };
         self.add_counts(&new, true);
         if let Some(s) = self.get_mut(i) {
-            s.flags = flags;
+            *s = new;
         }
         let p = self.phys(i);
         self.set_sacked_bit(p, flags & SACKED != 0);
@@ -366,12 +433,30 @@ impl RtxQueue {
         }
         self.shift_sacked_bits_up(self.phys(i + 1), self.len - (i + 1));
         self.len += 1;
-        let lower = Seg {
+        let mut lower = Seg {
             end: at,
             flags: s.flags & !FIN,
             ..s
         };
-        let upper = Seg { start: at, ..s };
+        let mut upper = Seg { start: at, ..s };
+        if s.has(PARTIAL) {
+            // Each half keeps the part of the resent prefix it holds; a half
+            // the prefix does not reach is lost.
+            let (below, sent) = (at.wrapping_sub(s.start), u32::from(s.sent));
+            if below <= sent {
+                lower.flags &= !PARTIAL;
+                lower.sent = 0;
+            }
+            if below < sent {
+                upper.sent = (sent - below) as u16;
+            } else {
+                upper.flags = (s.flags | LOST) & !(RETRANS | PARTIAL);
+                upper.sent = 0;
+            }
+            self.add_counts(&s, false);
+            self.add_counts(&lower, true);
+            self.add_counts(&upper, true);
+        }
         if let Some(d) = self.get_mut(i) {
             *d = lower;
         }
@@ -382,6 +467,9 @@ impl RtxQueue {
         self.set_sacked_bit(p, s.has(SACKED));
         if i + 1 < self.lost_hint {
             self.lost_hint += 1;
+        }
+        if s.has(PARTIAL) && upper.has(LOST) && !upper.has(RETRANS) {
+            self.lost_hint = self.lost_hint.min(i + 1);
         }
         true
     }
@@ -396,16 +484,28 @@ impl RtxQueue {
                 f(&s, !s.has(SACKED));
                 self.add_counts(&s, false);
                 removed = removed.saturating_add(s.seq_len());
-                self.head = (self.head + 1) % RTX_QUEUE_CAP;
+                self.head = (self.head + 1) % CAP;
                 self.len -= 1;
                 self.lost_hint = self.lost_hint.saturating_sub(1);
             } else if seq_lt(s.start, una) {
                 // Partially acknowledged: trim the head.
                 f(&s, !s.has(SACKED));
                 self.add_counts(&s, false);
-                let trimmed = Seg { start: una, ..s };
+                let acked = una.wrapping_sub(s.start);
+                let mut trimmed = Seg { start: una, ..s };
+                if s.has(PARTIAL) {
+                    if acked < u32::from(s.sent) {
+                        // Part of the resent prefix is still in flight.
+                        trimmed.sent = (u32::from(s.sent) - acked) as u16;
+                    } else {
+                        // All of it arrived; the rest was not resent.
+                        trimmed.flags = (s.flags | LOST) & !(RETRANS | PARTIAL);
+                        trimmed.sent = 0;
+                        self.lost_hint = 0;
+                    }
+                }
                 self.add_counts(&trimmed, true);
-                removed = removed.saturating_add(una.wrapping_sub(s.start));
+                removed = removed.saturating_add(acked);
                 if let Some(d) = self.get_mut(0) {
                     *d = trimmed;
                 }
@@ -472,7 +572,7 @@ impl RtxQueue {
                 continue;
             }
             if seq_le(l, s.start) {
-                let nf = (s.flags | SACKED) & !(LOST | RETRANS);
+                let nf = (s.flags | SACKED) & !(LOST | RETRANS | PARTIAL);
                 self.set_flags(i, nf);
                 newly = newly.saturating_add(s.seq_len());
                 f(&s);
@@ -486,7 +586,7 @@ impl RtxQueue {
     pub fn mark_lost(&mut self, i: usize) {
         if let Some(s) = self.get(i).copied() {
             if !s.has(SACKED) && !(s.has(LOST) && !s.has(RETRANS)) {
-                self.set_flags(i, (s.flags | LOST) & !RETRANS);
+                self.set_flags(i, (s.flags | LOST) & !(RETRANS | PARTIAL));
             }
         }
     }
@@ -539,8 +639,21 @@ impl RtxQueue {
 
     /// Record a retransmission of segment `i` at `now`.
     pub fn on_retransmit(&mut self, i: usize, now: u64) {
+        self.retransmitted(i, now, 0);
+    }
+
+    /// Record a retransmission at `now` of only the first `sent` (> 0) bytes
+    /// of segment `i` (see [`seg_flags::PARTIAL`]).
+    pub fn on_partial_retransmit(&mut self, i: usize, now: u64, sent: u16) {
+        self.retransmitted(i, now, sent);
+    }
+
+    /// `sent` > 0: only that prefix was resent.
+    fn retransmitted(&mut self, i: usize, now: u64, sent: u16) {
         if let Some(s) = self.get(i).copied() {
-            self.set_flags(i, s.flags | RETRANS | EVER_RETRANS);
+            let partial = if sent > 0 { PARTIAL } else { 0 };
+            let flags = ((s.flags | RETRANS | EVER_RETRANS) & !PARTIAL) | partial;
+            self.set_state(i, flags, sent);
             let xmit_seq = self.next_xmit;
             if let Some(d) = self.get_mut(i) {
                 d.xmit_ts = now;
@@ -575,6 +688,16 @@ impl RtxQueue {
             if s.has(RETRANS) && !s.has(EVER_RETRANS) {
                 return Err("rtx: RETRANS without EVER_RETRANS");
             }
+            if s.has(PARTIAL) {
+                if !s.has(RETRANS) {
+                    return Err("rtx: PARTIAL without RETRANS");
+                }
+                if s.sent == 0 || u32::from(s.sent) >= s.payload_len() {
+                    return Err("rtx: PARTIAL prefix not inside the segment");
+                }
+            } else if s.sent != 0 {
+                return Err("rtx: resent prefix without PARTIAL");
+            }
             if s.has(FIN) && i + 1 != self.len {
                 return Err("rtx: FIN is not the last segment");
             }
@@ -586,7 +709,7 @@ impl RtxQueue {
                 lost += s.seq_len();
             }
             if s.has(RETRANS) {
-                retrans += s.seq_len();
+                retrans += retrans_len(s);
             }
         }
         if (sacked, lost, retrans) != (self.sacked, self.lost, self.retrans) {
@@ -615,6 +738,7 @@ mod tests {
                 xmit_ts: u64::from(k),
                 xmit_seq: 0,
                 flags: 0,
+                sent: 0,
             }));
         }
         q
@@ -683,9 +807,41 @@ mod tests {
         q.debug_valid(1000, 1500).unwrap();
     }
 
+    /// A partial retransmission puts only its prefix back in flight. An ACK
+    /// inside the prefix just shortens it; once all of it is acknowledged,
+    /// by a cumulative ACK or a SACK block that splits it off, the rest of
+    /// the segment, never resent, is lost.
+    #[test]
+    fn partial_retransmission_leaves_the_rest_lost() {
+        let mut q = q_with(3, 1000);
+        q.on_partial_retransmit(0, 9, 500); // a tail-loss probe: not marked lost
+        assert_eq!(q.next_lost(), None);
+        q.ack_to(1001, |_, _| ());
+        assert_eq!(q.next_lost(), None, "the rest of the prefix is in flight");
+        assert_eq!((q.lost_bytes(), q.retrans_bytes()), (0, 499));
+        q.debug_valid(1001, 4000).unwrap();
+        q.ack_to(1500, |_, _| ());
+        assert_eq!(q.next_lost(), Some(0));
+        assert_eq!((q.lost_bytes(), q.retrans_bytes()), (500, 0));
+        q.debug_valid(1500, 4000).unwrap();
+
+        let mut q = q_with(3, 1000);
+        q.mark_lost(1);
+        q.on_partial_retransmit(1, 9, 500);
+        assert_eq!(q.pipe(3000), 2500, "only the prefix is in flight");
+        assert_eq!(q.sack(2000, 2200, |_| ()), 200);
+        assert_eq!(q.next_lost(), None, "the rest of the prefix is in flight");
+        assert_eq!(q.retrans_bytes(), 300);
+        assert_eq!(q.sack(2200, 2500, |_| ()), 300);
+        assert_eq!(q.next_lost(), Some(3));
+        assert_eq!(q.get(3).map(|s| (s.start, s.end)), Some((2500, 3000)));
+        assert_eq!((q.lost_bytes(), q.retrans_bytes()), (500, 0));
+        q.debug_valid(1000, 4000).unwrap();
+    }
+
     #[test]
     fn find_and_wraparound() {
-        let mut q = RtxQueue::new();
+        let mut q: RtxQueue = RtxQueue::new();
         let base = u32::MAX - 150;
         for k in 0..4u32 {
             q.push(Seg {
@@ -703,8 +859,15 @@ mod tests {
         q.debug_valid(base, base.wrapping_add(400)).unwrap();
     }
 
+    /// Also at capacities below the bitmap's: their last word wraps to word 0.
     #[test]
     fn sacked_bitmap_shift_matches_a_bit_by_bit_move() {
+        shift_matches_a_bit_by_bit_move::<RTX_QUEUE_CAP>();
+        shift_matches_a_bit_by_bit_move::<256>();
+        shift_matches_a_bit_by_bit_move::<64>();
+    }
+
+    fn shift_matches_a_bit_by_bit_move<const CAP: usize>() {
         let mut x = 0x9e37_79b9_7f4a_7c15u64;
         let mut rnd = || {
             x ^= x << 13;
@@ -713,21 +876,21 @@ mod tests {
             x
         };
         for _ in 0..2_000 {
-            let mut q = RtxQueue::new();
+            let mut q = RtxQueue::<CAP>::new();
             for w in q.sacked_map.iter_mut() {
                 *w = rnd();
             }
-            let from = (rnd() % RTX_QUEUE_CAP as u64) as usize;
-            let count = (rnd() % RTX_QUEUE_CAP as u64) as usize;
+            let from = (rnd() % CAP as u64) as usize;
+            let count = (rnd() % CAP as u64) as usize;
             let mut want = q.sacked_map;
             let bit = |m: &[u64; SACK_WORDS], p: usize| m[p / 64] >> (p % 64) & 1;
             for k in (0..count).rev() {
-                let (s, d) = ((from + k) % RTX_QUEUE_CAP, (from + k + 1) % RTX_QUEUE_CAP);
+                let (s, d) = ((from + k) % CAP, (from + k + 1) % CAP);
                 let b = bit(&want, s);
                 want[d / 64] = (want[d / 64] & !(1 << (d % 64))) | (b << (d % 64));
             }
             q.shift_sacked_bits_up(from, count);
-            assert_eq!(q.sacked_map, want, "from {from} count {count}");
+            assert_eq!(q.sacked_map, want, "cap {CAP} from {from} count {count}");
         }
     }
 

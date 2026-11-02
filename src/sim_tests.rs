@@ -24,13 +24,20 @@ use std::collections::{BinaryHeap, VecDeque};
 use std::println;
 use std::vec::Vec;
 
+use crate::rtx_queue::RTX_QUEUE_CAP;
 use crate::tcb::{events, Endpoint, Tcb, TcbConfig, TcbStats};
+use crate::tx_ring::TX_RING_CAP;
 use crate::State;
-use crate::MAX_PACKET;
+use crate::{BUF_CAP, MAX_PACKET};
 
 const A_IP: [u8; 4] = [10, 0, 0, 2];
 const B_IP: [u8; 4] = [10, 0, 0, 1];
 const SMSS: f64 = 1448.0;
+
+/// A 64 KiB ring with the queue sizes recommended for it.
+const BUF_64K: usize = 64 * 1024;
+const RTX_64K: usize = crate::rtx_cap_for(BUF_64K);
+const TXQ_64K: usize = crate::tx_slots_for(BUF_64K);
 
 /// xorshift64* — deterministic, dependency-free.
 struct Rng(u64);
@@ -188,6 +195,11 @@ struct Flow {
     total: usize,
     sent: usize,
     recvd: usize,
+    /// Writer sends this many bytes per write and flushes each at once,
+    /// Nagle off (None = 16 KiB writes, flushed by the next tick).
+    write_size: Option<usize>,
+    /// Most segments the writer had in flight.
+    peak_rtx: usize,
     /// Reader drains at most this many bytes per ms (None = immediately).
     read_rate: Option<usize>,
     read_budget: usize,
@@ -202,6 +214,8 @@ impl Flow {
             total,
             sent: 0,
             recvd: 0,
+            write_size: None,
+            peak_rtx: 0,
             read_rate: None,
             read_budget: 0,
             last_read_ms: 0,
@@ -209,7 +223,7 @@ impl Flow {
         }
     }
 
-    fn pump_send(&mut self, t: &mut Tcb) {
+    fn pump_send<const B: usize, const R: usize, const X: usize>(&mut self, t: &mut Tcb<B, R, X>) {
         let mut chunk = [0u8; 16 * 1024];
         while self.sent < self.total {
             let n = chunk.len().min(self.total - self.sent);
@@ -223,7 +237,37 @@ impl Flow {
         }
     }
 
-    fn pump_recv(&mut self, t: &mut Tcb, now_us: u64) {
+    /// The Nagle-off writer: up to `2 * R` writes per step, each flushed by
+    /// a `tick`, so a fast writer can fill the retransmission queue.
+    fn pump_tiny<const B: usize, const R: usize, const X: usize>(
+        &mut self,
+        t: &mut Tcb<B, R, X>,
+        size: usize,
+        link: &mut Link,
+        now_us: u64,
+    ) {
+        for _ in 0..2 * R {
+            let n = size.min(self.total - self.sent);
+            let chunk: Vec<u8> = (0..n)
+                .map(|k| pattern(self.stream, self.sent + k))
+                .collect();
+            match t.send(&chunk) {
+                Ok(w) if w > 0 => self.sent += w,
+                _ => break,
+            }
+            t.set_now(now_us / 1000);
+            t.tick().unwrap();
+            drain_into(t, link, now_us);
+            t.debug_validate_invariants().unwrap();
+            self.peak_rtx = self.peak_rtx.max(t.rtx_len());
+        }
+    }
+
+    fn pump_recv<const B: usize, const R: usize, const X: usize>(
+        &mut self,
+        t: &mut Tcb<B, R, X>,
+        now_us: u64,
+    ) {
         let now_ms = now_us / 1000;
         if let Some(rate) = self.read_rate {
             let dt = usize::try_from(now_ms - self.last_read_ms).unwrap();
@@ -259,8 +303,8 @@ impl Flow {
     }
 }
 
-fn boxed_tcb(cfg: TcbConfig) -> Box<Tcb> {
-    let mut slot: Box<MaybeUninit<Tcb>> = Box::new_uninit();
+fn boxed_tcb<const B: usize, const R: usize, const X: usize>(cfg: TcbConfig) -> Box<Tcb<B, R, X>> {
+    let mut slot: Box<MaybeUninit<Tcb<B, R, X>>> = Box::new_uninit();
     // SAFETY: `init_in_place` fully initialises the storage on success.
     unsafe {
         Tcb::init_in_place(slot.as_mut_ptr(), cfg).unwrap();
@@ -268,10 +312,11 @@ fn boxed_tcb(cfg: TcbConfig) -> Box<Tcb> {
     }
 }
 
-struct Sim {
+/// Two `Tcb<B, R, X>`s over a pair of links.
+struct SimOf<const B: usize, const R: usize, const X: usize> {
     now_us: u64,
-    a: Box<Tcb>,
-    b: Box<Tcb>,
+    a: Box<Tcb<B, R, X>>,
+    b: Box<Tcb<B, R, X>>,
     ab: Link,
     ba: Link,
     f_ab: Flow,
@@ -279,7 +324,14 @@ struct Sim {
     start_us: u64,
 }
 
-fn drain_into(t: &mut Tcb, link: &mut Link, now_us: u64) {
+/// Default-sized TCBs.
+type Sim = SimOf<BUF_CAP, RTX_QUEUE_CAP, TX_RING_CAP>;
+
+fn drain_into<const B: usize, const R: usize, const X: usize>(
+    t: &mut Tcb<B, R, X>,
+    link: &mut Link,
+    now_us: u64,
+) {
     let mut buf = [0u8; MAX_PACKET];
     while let Ok(n) = t.extract_packet(&mut buf) {
         if n == 0 {
@@ -289,7 +341,7 @@ fn drain_into(t: &mut Tcb, link: &mut Link, now_us: u64) {
     }
 }
 
-impl Sim {
+impl<const B: usize, const R: usize, const X: usize> SimOf<B, R, X> {
     fn new(fwd: LinkCfg, rev: LinkCfg, seed: u64, ab_bytes: usize, ba_bytes: usize) -> Self {
         Self::with_iss(
             fwd,
@@ -384,8 +436,15 @@ impl Sim {
         if self.a.state() == State::Established && self.start_us == 0 {
             self.start_us = self.now_us;
         }
-        self.f_ab.pump_send(&mut self.a);
-        self.f_ba.pump_send(&mut self.b);
+        for (f, t, link) in [
+            (&mut self.f_ab, &mut self.a, &mut self.ab),
+            (&mut self.f_ba, &mut self.b, &mut self.ba),
+        ] {
+            match f.write_size {
+                Some(size) => f.pump_tiny(t, size, link, self.now_us),
+                None => f.pump_send(t),
+            }
+        }
         self.f_ab.pump_recv(&mut self.b, self.now_us);
         self.f_ba.pump_recv(&mut self.a, self.now_us);
     }
@@ -449,7 +508,7 @@ impl Sim {
         let end = self.f_ab.done_us.unwrap().max(self.f_ba.done_us.unwrap());
         // Let in-flight segments land so late spurious retransmissions are
         // counted by the receiver.
-        let quiet = |t: &Tcb| {
+        let quiet = |t: &Tcb<B, R, X>| {
             let d = t.debug_snapshot();
             d.snd_una == d.snd_nxt && d.tx_len == 0
         };
@@ -471,7 +530,7 @@ impl Sim {
     fn close_both(&mut self) {
         self.a.close().unwrap();
         self.b.close().unwrap();
-        let closed = |t: &Tcb| matches!(t.state(), State::TimeWait | State::Closed);
+        let closed = |t: &Tcb<B, R, X>| matches!(t.state(), State::TimeWait | State::Closed);
         let limit = self.now_us + 120_000_000;
         assert!(
             self.run(limit, |s| closed(&s.a) && closed(&s.b)),
@@ -547,12 +606,30 @@ const MIB: usize = 1024 * 1024;
 
 #[test]
 fn clean_bottleneck_is_filled_without_spurious_retransmits() {
-    let fwd = LinkCfg::new(10, 50, 64);
-    let rev = LinkCfg::new(10, 50, 64);
+    clean_bottleneck::<BUF_CAP, RTX_QUEUE_CAP, TX_RING_CAP>(10);
+}
+
+/// 64 KiB rings fill a path whose bandwidth-delay product they hold, with
+/// an 8-slot egress ring.
+#[test]
+fn clean_bottleneck_is_filled_without_spurious_retransmits_64k() {
+    clean_bottleneck::<BUF_64K, RTX_64K, TXQ_64K>(2);
+}
+
+fn clean_bottleneck<const B: usize, const R: usize, const X: usize>(delay_ms: u64) {
+    let fwd = LinkCfg::new(delay_ms, 50, 64);
+    let rev = LinkCfg::new(delay_ms, 50, 64);
     let bytes = 8 * MIB;
-    let mut s = Sim::new(fwd, rev, 1, bytes, 0);
+    let mut s = SimOf::<B, R, X>::new(fwd, rev, 1, bytes, 0);
     let o = s.run_transfer(60_000_000);
-    o.report("clean 50Mbit/20ms q64", bytes);
+    o.report(
+        &std::format!(
+            "clean 50Mbit/{}ms q64, {} KiB rings",
+            2 * delay_ms,
+            B / 1024
+        ),
+        bytes,
+    );
     let line = 50e6 / 8.0 * SMSS / 1500.0;
     assert!(o.goodput(bytes) >= 0.85 * line, "underfilled link");
     assert_eq!(
@@ -596,12 +673,26 @@ fn random_loss_goodput_tracks_mathis() {
 
 #[test]
 fn burst_loss_in_one_window_is_repaired_in_a_round_trip() {
+    burst_loss_is_repaired_by_sack::<BUF_CAP, RTX_QUEUE_CAP, TX_RING_CAP>();
+}
+
+/// With 64 KiB rings the 40-packet burst is most of a window, and its
+/// retransmissions queue behind an 8-slot egress ring.
+#[test]
+fn burst_loss_is_repaired_by_sack_64k() {
+    burst_loss_is_repaired_by_sack::<BUF_64K, RTX_64K, TXQ_64K>();
+}
+
+fn burst_loss_is_repaired_by_sack<const B: usize, const R: usize, const X: usize>() {
     let fwd = LinkCfg::new(10, 100, 1000).drop_data(300, 340);
     let rev = LinkCfg::new(10, 100, 1000);
     let bytes = 4 * MIB;
-    let mut s = Sim::new(fwd, rev, 3, bytes, 0);
+    let mut s = SimOf::<B, R, X>::new(fwd, rev, 3, bytes, 0);
     let o = s.run_transfer(60_000_000);
-    o.report("burst 40 pkts", bytes);
+    o.report(
+        &std::format!("burst 40 pkts, {} KiB rings", B / 1024),
+        bytes,
+    );
     assert_eq!(o.a.rto_count, 0, "a SACKed burst must not need RTO");
     assert_eq!(o.a.fast_recoveries, 1);
     o.assert_no_spurious_storm(0);
@@ -687,16 +778,57 @@ fn slow_reader_flow_controls_without_retransmission() {
 
 #[test]
 fn chaos_seeds_complete_with_integrity() {
+    chaos_seeds_complete::<BUF_CAP, RTX_QUEUE_CAP, TX_RING_CAP>();
+}
+
+#[test]
+fn chaos_seeds_complete_with_integrity_64k() {
+    chaos_seeds_complete::<BUF_64K, RTX_64K, TXQ_64K>();
+}
+
+fn chaos_seeds_complete<const B: usize, const R: usize, const X: usize>() {
     // Loss, reordering and ACK loss in both directions, sequence numbers
     // wrapping mid-transfer, small queue. Every seed must complete, deliver
     // intact data and close cleanly.
     for seed in 100..106u64 {
         let link = LinkCfg::new(8, 30, 40).loss(20_000).reorder(30_000, 3);
         let iss = (u32::MAX - 300_000, u32::MAX - 200_000);
-        let mut s = Sim::with_iss(link, link, seed, 768 * 1024, 512 * 1024, iss);
+        let mut s = SimOf::<B, R, X>::with_iss(link, link, seed, 768 * 1024, 512 * 1024, iss);
         let o = s.run_transfer(900_000_000);
-        o.report(&std::format!("chaos seed {seed}"), 1280 * 1024);
+        o.report(
+            &std::format!("chaos seed {seed}, {} KiB rings", B / 1024),
+            1280 * 1024,
+        );
         assert!(o.a.rto_count + o.b.rto_count <= 6, "RTO-driven recovery");
         s.close_both();
     }
+}
+
+/// Nagle-off traffic (7-byte writes, each flushed at once) fills the
+/// retransmission queue long before the window or cwnd. New data then waits
+/// for a free record and leaves coalesced; under loss and reordering the
+/// stream still arrives intact and both sides close.
+#[test]
+fn tiny_writes_fill_the_retransmission_queue_without_stalling() {
+    tiny_writes_fill_the_retransmission_queue::<BUF_CAP, RTX_QUEUE_CAP, TX_RING_CAP>();
+}
+
+#[test]
+fn tiny_writes_fill_the_retransmission_queue_without_stalling_64k() {
+    tiny_writes_fill_the_retransmission_queue::<BUF_64K, RTX_64K, TXQ_64K>();
+}
+
+fn tiny_writes_fill_the_retransmission_queue<const B: usize, const R: usize, const X: usize>() {
+    // Segments 20..24 of the first, tiny-segment burst are lost too, so
+    // recovery runs while the queue is full.
+    let link = LinkCfg::new(5, 20, 100)
+        .loss(10_000)
+        .reorder(10_000, 2)
+        .drop_data(20, 24);
+    let mut s = SimOf::<B, R, X>::new(link, link, 12, 64 * 1024, 256 * 1024);
+    s.f_ab.write_size = Some(7);
+    let o = s.run_transfer(600_000_000);
+    o.report(&std::format!("tiny writes, {R}-segment queue"), 320 * 1024);
+    assert_eq!(s.f_ab.peak_rtx, R, "the writer filled its queue");
+    s.close_both();
 }

@@ -9,7 +9,7 @@ use crate::rtx_queue::seg_flags;
 use crate::state::State;
 use crate::wire::flags;
 
-impl<const BUF: usize> Tcb<BUF> {
+impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
     pub(super) fn run_timers(&mut self) -> Result<(), TcpError> {
         let now = self.now_ms;
         if self.time_wait_deadline.due(now) {

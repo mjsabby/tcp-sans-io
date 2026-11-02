@@ -251,7 +251,12 @@ impl Rack {
 /// whose deadline (`xmit_ts + RACK.rtt + reo_wnd`) has passed. Returns
 /// whether anything was newly marked and, if some candidates are still
 /// inside the reordering window, the delay (ms) after which to re-run.
-pub fn detect_loss(rack: &Rack, q: &mut RtxQueue, now: u64, reo_wnd: u32) -> (bool, Option<u64>) {
+pub fn detect_loss<const CAP: usize>(
+    rack: &Rack,
+    q: &mut RtxQueue<CAP>,
+    now: u64,
+    reo_wnd: u32,
+) -> (bool, Option<u64>) {
     if !rack.valid {
         return (false, None);
     }
@@ -310,6 +315,7 @@ mod tests {
                 xmit_ts: *t,
                 xmit_seq: 0,
                 flags: 0,
+                sent: 0,
             });
         }
         q
@@ -395,6 +401,7 @@ mod tests {
             xmit_ts: 150,
             xmit_seq: 0,
             flags: 0,
+            sent: 0,
         });
         q.mark_lost(0);
         q.on_retransmit(0, 150);

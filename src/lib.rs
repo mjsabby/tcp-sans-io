@@ -163,8 +163,10 @@ pub mod tx_ring;
 pub mod wire;
 
 pub use error::TcpError;
+pub use rtx_queue::rtx_cap_for;
 pub use state::State;
 pub use tcb::{Endpoint, Tcb, TcbConfig, TcbStats};
+pub use tx_ring::tx_slots_for;
 
 /// Standard maximum segment size for an Ethernet-class path.
 pub const MSS: u16 = 1460;
