@@ -109,6 +109,17 @@ The 1 MiB default lets the receive window fill typical WAN paths (1 MiB per
 RTT ≈ 168 Mbit/s at 50 ms); raise `BUF_CAP` (a power of two) for fatter
 pipes or use `small-buffers` for many mostly-idle connections.
 
+Rust hosts can size TCBs per connection class instead: `Tcb<BUF, RTX, TXQ>`
+takes the ring capacity, the retransmission queue's records and the egress
+ring's slots as const parameters (defaults `BUF_CAP`, 1024 and 32, so `Tcb`
+and `Tcb<BUF>` are as above). The two queues only need to scale with the
+rings: `rtx_cap_for(buf)` recommends one record per KiB of ring (a multiple
+of 64, 64–1024) and `tx_slots_for(buf)` 8, 16 or 32 slots up to 64 KiB,
+256 KiB or above. With `heap-buffers` (rings allocated separately), a `Tcb`
+is 79,768 bytes on x86-64 whatever `BUF` is, but
+`Tcb<65536, { rtx_cap_for(65536) }, { tx_slots_for(65536) }>` is 20,680
+bytes and the 256 KiB equivalent 37,304.
+
 `tcp_init` / `Tcb::init_in_place` build the TCB directly in its storage and
 need under 32 KiB of the calling thread's stack. `Tcb::new` returns the
 whole TCB by value, so pure-Rust callers should box it (or use
@@ -152,8 +163,8 @@ mis-ordering, corruption, a panic, or an unbounded loop.
 | `BUF_CAP` | 1 MiB (32 KiB w/ `small-buffers`) | `lib.rs` | Send + receive ring capacity: the receive window, out-of-order storage and the in-flight ceiling per RTT. Power of two; the window-scale shift derives from it (5 at 1 MiB). |
 | `MSS` / `MAX_PACKET` | 1460 / 1500 B | `lib.rs` | Largest payload / datagram. `tcp_set_mtu` lowers both (576–1500). |
 | `OOO_MAX_RANGES` | 512 (32 w/ `small-buffers`) | `ooo.rs` | Disjoint out-of-order ranges held in the receive ring: one per two full segments of buffer, enough for a full window with every other segment lost. |
-| `RTX_QUEUE_CAP` | 1024 | `rtx_queue.rs` | Segments in flight. When full, new data waits for ACKs; nothing is evicted, so every in-flight segment keeps SACK/RACK coverage. |
-| `TX_RING_CAP` | 32 | `tx_ring.rs` | Egress packets staged before the host must drain. |
+| `RTX_QUEUE_CAP` | 1024 | `rtx_queue.rs` | Segments in flight. When full, new data waits for ACKs; nothing is evicted, so every in-flight segment keeps SACK/RACK coverage. The default (and maximum) of `Tcb`'s `RTX`; `rtx_cap_for` sizes it for smaller rings. |
+| `TX_RING_CAP` | 32 | `tx_ring.rs` | Egress packets staged before the host must drain. The default of `Tcb`'s `TXQ`; `tx_slots_for` sizes it for smaller rings. |
 | SACK blocks emitted | ≤ 4 (≤ 3 with timestamps) | `tcb/output.rs` | Bounded by the 40-byte option area; dropped from full-sized data segments rather than shrinking the payload. |
 | `INITIAL_WINDOW` | 10 × SMSS (14,480 B with timestamps) | `congestion.rs` | RFC 6928 initial cwnd. |
 | `MIN_PEER_MSS` | 64 B | `tcb/mod.rs` | Floor on a peer-requested MSS (bounds per-byte header and queue cost). |
@@ -179,10 +190,12 @@ and the peer retransmits it. Concretely:
   dropped, never SACKed, and resent by the peer. Nothing already SACKed is
   ever discarded (no reneging). The application can never observe a gap.
 - **Retransmission queue full** → no new segment is sent until an ACK frees
-  a record; recovery state is never lost.
-- **`TX_RING_CAP` full** → emit returns "ring full" and bookkeeping
-  (`snd_nxt`, FIN state) is not advanced, so nothing is skipped; the host
-  drains and ticks again.
+  a record; recovery state is never lost. A lost segment the path MSS has
+  shrunk below, with no record left to split it, is resent an MSS at a
+  time, each piece as soon as the previous one is acknowledged.
+- **Egress ring full** → emit returns "ring full" and bookkeeping
+  (`snd_nxt`, FIN state, a retransmission's lost mark, an owed ACK) is not
+  advanced, so nothing is skipped; the host drains and ticks again.
 - **Receive ring full** (application not reading) → the advertised window
   shrinks to zero, the peer stalls on flow control, and persist probes keep
   the connection alive until the USER TIMEOUT applies.
@@ -215,10 +228,11 @@ hostile peer:
 - **No busy timers.** After `tick()` at `now`, `tcp_next_deadline()` is
   always later than `now`, so an event-driven host never spins (checked by
   the link simulation on every step).
-- **No amplification.** One inbound segment stages at most `TX_RING_CAP`
-  packets, and replies to unacceptable segments are rate-limited per
-  connection; only a data or FIN segment carrying an acceptable ACK (and a
-  timestamp when negotiated) is answered at once, with a single ACK.
+- **No amplification.** One inbound segment stages at most an egress
+  ring's worth of packets (`TX_RING_CAP` by default), and replies to
+  unacceptable segments are rate-limited per connection; only a data or
+  FIN segment carrying an acceptable ACK (and a timestamp when negotiated)
+  is answered at once, with a single ACK.
 - **No state exhaustion inside a TCB.** One half-open per listener TCB
   with a bounded SYN-ACK budget, and stateless SYN cookies for every other
   peer while it is busy; no allocator to drain. (Bounding the *number* of
@@ -703,7 +717,9 @@ loop {
 }
 ```
 
-`Tcb<const BUF>` is generic over ring capacity (default `BUF_CAP` = 1 MiB).
+`Tcb<BUF, RTX, TXQ>` is generic over ring capacity (default `BUF_CAP` =
+1 MiB) and the retransmission-queue and egress-ring sizes that go with it
+(`rtx_cap_for(BUF)` and `tx_slots_for(BUF)` for smaller rings).
 A `Tcb` is ~2.08 MiB, so build it in place in heap storage
 (`Tcb::init_in_place`, as `tcp_init` does) or box it, rather than holding it
 as a stack local (or use `small-buffers` for many idle TCBs) — see *Memory

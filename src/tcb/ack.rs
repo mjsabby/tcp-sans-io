@@ -15,7 +15,7 @@ use crate::rtx_queue::seg_flags;
 use crate::state::State;
 use crate::wire::{flags, Segment};
 
-impl<const BUF: usize> Tcb<BUF> {
+impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
     /// RFC 9293 §3.10.7.4 step 5 hardened by RFC 5961 §5.2: SEG.ACK is
     /// acceptable within `[SND.UNA − MAX.SND.WND, SND.NXT]`, and, as in
     /// Linux, never below the sequence space acknowledged so far: an ACK of

@@ -13,10 +13,17 @@ use std::boxed::Box;
 use std::vec::Vec;
 
 use super::{events, Endpoint, Tcb, TcbConfig, MAX_RETRANSMITS, MAX_SYN_RETRIES};
+use crate::rtx_queue::RTX_QUEUE_CAP;
+use crate::tx_ring::TX_RING_CAP;
 use crate::wire::{self, flags, SackBlocks, TcpOptions};
-use crate::{State, TcpError, MAX_PACKET};
+use crate::{State, TcpError, BUF_CAP, MAX_PACKET};
 
 const PEER_ISS: u32 = 7_000_000;
+
+/// A 64 KiB ring with the queue sizes recommended for it.
+const BUF_64K: usize = 64 * 1024;
+const RTX_64K: usize = crate::rtx_cap_for(BUF_64K);
+const TXQ_64K: usize = crate::tx_slots_for(BUF_64K);
 
 fn cfg(iss: u32) -> TcbConfig {
     TcbConfig {
@@ -55,7 +62,9 @@ fn peer_pkt(seq: u32, ack: u32, fl: u8, win: u16, opts: &TcpOptions, payload: &[
     b
 }
 
-fn drain(t: &mut Tcb) -> Vec<(u32, u32, u8, usize)> {
+fn drain<const B: usize, const R: usize, const X: usize>(
+    t: &mut Tcb<B, R, X>,
+) -> Vec<(u32, u32, u8, usize)> {
     let mut out = Vec::new();
     let mut buf = [0u8; MAX_PACKET];
     while let Ok(n) = t.extract_packet(&mut buf) {
@@ -70,12 +79,20 @@ fn drain(t: &mut Tcb) -> Vec<(u32, u32, u8, usize)> {
 
 /// Established client (no timestamps/SACK, so packets are easy to script).
 fn established() -> Box<Tcb> {
+    established_sized(false)
+}
+
+/// Established client without timestamps, with SACK if `sack`.
+fn established_sized<const B: usize, const R: usize, const X: usize>(
+    sack: bool,
+) -> Box<Tcb<B, R, X>> {
     let mut t = Box::new(Tcb::new(cfg(1000)).unwrap());
     t.set_now(0);
     t.connect().unwrap();
     drain(&mut t);
     let o = TcpOptions {
         mss: Some(1460),
+        sack_permitted: sack,
         ..TcpOptions::NONE
     };
     t.set_now(10);
@@ -93,7 +110,7 @@ fn established() -> Box<Tcb> {
     t
 }
 
-fn ack(t: &mut Tcb, ack: u32, win: u16) {
+fn ack<const B: usize, const R: usize, const X: usize>(t: &mut Tcb<B, R, X>, ack: u32, win: u16) {
     t.inject_packet(&peer_pkt(
         PEER_ISS + 1,
         ack,
@@ -735,7 +752,7 @@ fn user_timeout_rearmed_by_full_segment_progress() {
 
 #[test]
 fn close_from_syn_rcvd_keeps_invariants() {
-    let mut t = Box::new(Tcb::new(cfg(5000)).unwrap());
+    let mut t: Box<Tcb> = Box::new(Tcb::new(cfg(5000)).unwrap());
     t.set_now(0);
     t.set_secret(&[3; 16]);
     t.listen().unwrap();
@@ -832,7 +849,7 @@ fn partial_ack_inside_a_segment_then_retransmit_is_well_formed() {
 fn sack_blocks_never_push_a_segment_over_the_mss() {
     // Bidirectional transfer with held out-of-order data: data segments must
     // still fit the MSS (SACK blocks are dropped from full segments).
-    let mut t = Box::new(Tcb::new(cfg(1000)).unwrap());
+    let mut t: Box<Tcb> = Box::new(Tcb::new(cfg(1000)).unwrap());
     t.set_now(0);
     t.connect().unwrap();
     drain(&mut t);
@@ -940,28 +957,7 @@ fn next_deadline_covers_time_wait_and_is_none_when_closed() {
 
 /// Established client that negotiated SACK (no timestamps).
 fn established_sack() -> Box<Tcb> {
-    let mut t = Box::new(Tcb::new(cfg(1000)).unwrap());
-    t.set_now(0);
-    t.connect().unwrap();
-    drain(&mut t);
-    let o = TcpOptions {
-        mss: Some(1460),
-        sack_permitted: true,
-        ..TcpOptions::NONE
-    };
-    t.set_now(10);
-    t.inject_packet(&peer_pkt(
-        PEER_ISS,
-        1001,
-        flags::SYN | flags::ACK,
-        65535,
-        &o,
-        &[],
-    ))
-    .unwrap();
-    drain(&mut t);
-    assert_eq!(t.state(), State::Established);
-    t
+    established_sized(true)
 }
 
 #[test]
@@ -1019,6 +1015,183 @@ fn recovery_started_by_a_large_cumulative_ack_does_not_overshoot_prr() {
     t.debug_validate_invariants().unwrap();
 }
 
+/// An application writing a few bytes at a time, each flushed at once
+/// (Nagle off), fills the retransmission queue long before the window or
+/// cwnd. New data then just waits, with no error and its timers armed, and
+/// leaves coalesced once ACKs free records.
+#[test]
+fn tiny_segments_fill_the_retransmission_queue_without_stalling() {
+    tiny_segments_fill_the_retransmission_queue::<BUF_CAP, RTX_QUEUE_CAP, TX_RING_CAP>();
+    tiny_segments_fill_the_retransmission_queue::<BUF_64K, RTX_64K, TXQ_64K>();
+}
+
+fn tiny_segments_fill_the_retransmission_queue<const B: usize, const R: usize, const X: usize>() {
+    let data = |seq: u32, len: usize| (seq, PEER_ISS + 1, flags::ACK | flags::PSH, len);
+    let mut t = established_sized::<B, R, X>(true);
+    let mut nxt = 1001u32;
+    for k in 0..R {
+        t.send(&[k as u8; 3]).unwrap();
+        t.tick().unwrap();
+        assert_eq!(drain(&mut t), [data(nxt, 3)]);
+        nxt += 3;
+    }
+    assert!(t.rtx.is_full());
+    for _ in 0..100 {
+        assert_eq!(t.send(&[0xEE; 3]), Ok(3));
+        t.tick().unwrap();
+        assert!(drain(&mut t).is_empty(), "no record left for new data");
+    }
+    // A SACK block that cuts segments 4 and 8: with no record left to split
+    // them off, only the three whole segments between are marked.
+    let sack = TcpOptions {
+        sack: SackBlocks::one(1001 + 13, 1001 + 26),
+        ..TcpOptions::NONE
+    };
+    t.inject_packet(&peer_pkt(PEER_ISS + 1, 1001, flags::ACK, 65535, &sack, &[]))
+        .unwrap();
+    assert_eq!(t.rtx.sacked_bytes(), 9);
+    assert!(drain(&mut t).is_empty());
+    assert_eq!(t.poll() & events::ERROR, 0);
+    t.debug_validate_invariants().unwrap();
+    t.debug_check_liveness().unwrap();
+    // Half the queue acknowledged: the 300 bytes written since leave as one
+    // segment.
+    ack(&mut t, 1001 + 3 * (R as u32 / 2), 65535);
+    assert_eq!(drain(&mut t), [data(nxt, 300)]);
+    ack(&mut t, nxt + 300, 65535);
+    assert!(t.rtx.is_empty());
+    assert_eq!(t.send_ring.len(), 0);
+    t.debug_validate_invariants().unwrap();
+}
+
+/// A full egress ring costs the host extra extract/tick cycles, nothing
+/// else: new data and retransmissions that did not fit stay owed and go
+/// out on the next tick after the drain, none skipped or sent twice.
+#[test]
+fn full_egress_ring_defers_output_to_the_next_tick() {
+    full_egress_ring_defers_output::<BUF_CAP, RTX_QUEUE_CAP, TX_RING_CAP>();
+    full_egress_ring_defers_output::<BUF_64K, RTX_64K, TXQ_64K>();
+}
+
+/// Drain, then tick and drain again until a tick stages nothing (the host
+/// contract after a full egress ring). Returns the data segments' sequence
+/// numbers and the size of each non-empty drain.
+fn flush<const B: usize, const R: usize, const X: usize>(
+    t: &mut Tcb<B, R, X>,
+) -> (Vec<u32>, Vec<usize>) {
+    let (mut seqs, mut drains) = (Vec::new(), Vec::new());
+    let mut out = drain(t);
+    loop {
+        if !out.is_empty() {
+            drains.push(out.len());
+            seqs.extend(out.iter().filter(|p| p.3 > 0).map(|p| p.0));
+        }
+        t.tick().unwrap();
+        out = drain(t);
+        if out.is_empty() {
+            return (seqs, drains);
+        }
+    }
+}
+
+fn full_egress_ring_defers_output<const B: usize, const R: usize, const X: usize>() {
+    let seg = |k: u32| 1001 + k * 1460;
+    let segs = |r: core::ops::Range<u32>| r.map(seg).collect::<Vec<_>>();
+    // Drain sizes of `n` packets through an X-slot ring.
+    let fit = |n: usize| (0..n).step_by(X).map(|i| X.min(n - i)).collect::<Vec<_>>();
+    let mut t = established_sized::<B, R, X>(true);
+    t.send(&std::vec![7; 40 * 1460]).unwrap();
+    // The initial window.
+    t.set_now(20);
+    assert_eq!(flush(&mut t), (segs(0..10), fit(10)));
+    // Its ACK doubles cwnd.
+    t.set_now(40);
+    ack(&mut t, seg(10), 65535);
+    assert_eq!(flush(&mut t), (segs(10..30), fit(20)));
+    // The last ten arrive and the first ten don't: RACK marks those lost at
+    // once (enough is SACKed) and PRR lets all ten retransmissions out.
+    t.set_now(60);
+    let sack = TcpOptions {
+        sack: SackBlocks::one(seg(20), seg(30)),
+        ..TcpOptions::NONE
+    };
+    t.inject_packet(&peer_pkt(
+        PEER_ISS + 1,
+        seg(10),
+        flags::ACK,
+        65535,
+        &sack,
+        &[],
+    ))
+    .unwrap();
+    assert_eq!(flush(&mut t), (segs(10..20), fit(10)));
+    assert_eq!(t.stats().segs_retrans, 10);
+    t.debug_validate_invariants().unwrap();
+}
+
+/// A segment the path MSS shrank below, that a full retransmission queue has
+/// no record to split, goes out an MSS at a time: each further piece as soon
+/// as the previous one is all acknowledged, and not before. (The rest used to
+/// stay marked as retransmitted, so only the RTO resent it.)
+#[test]
+fn unsplittable_segment_is_resent_piece_by_piece_without_rto() {
+    unsplittable_segment_is_resent_piece_by_piece::<BUF_CAP, RTX_QUEUE_CAP, TX_RING_CAP>();
+    unsplittable_segment_is_resent_piece_by_piece::<BUF_64K, RTX_64K, TXQ_64K>();
+}
+
+fn unsplittable_segment_is_resent_piece_by_piece<const B: usize, const R: usize, const X: usize>() {
+    let data = |seq: u32, len: usize| (seq, PEER_ISS + 1, flags::ACK | flags::PSH, len);
+    let mut t = established_sized::<B, R, X>(true);
+    // A full-sized segment, then tiny ones until the queue is full.
+    t.send(&[1; 1460]).unwrap();
+    t.tick().unwrap();
+    assert_eq!(drain(&mut t), [data(1001, 1460)]);
+    for k in 1..R {
+        t.send(&[k as u8; 3]).unwrap();
+        t.tick().unwrap();
+        drain(&mut t);
+    }
+    assert!(t.rtx.is_full());
+    let (tiny, end) = (2461, 2461 + 3 * (R as u32 - 1));
+    // The path MTU drops to 576: a 536-byte MSS, and the first segment was
+    // lost. Only its first 536 bytes can go out.
+    t.update_pmtu(576);
+    assert_eq!(drain(&mut t), [data(1001, 536)]);
+    // The peer holds the tiny segments and acknowledges each piece one round
+    // trip later (the RTO is 200 ms away).
+    let sack = TcpOptions {
+        sack: SackBlocks::one(tiny, end),
+        ..TcpOptions::NONE
+    };
+    let ack_at = |t: &mut Tcb<B, R, X>, now: u64, acked: u32| {
+        t.set_now(now);
+        t.inject_packet(&peer_pkt(
+            PEER_ISS + 1,
+            acked,
+            flags::ACK,
+            65535,
+            &sack,
+            &[],
+        ))
+        .unwrap();
+        t.debug_validate_invariants().unwrap();
+        drain(t)
+    };
+    // ACKs that each cover one more byte of a piece leave the rest of it in
+    // flight: they resend nothing (each used to resend an MSS).
+    for acked in 1002..1012 {
+        assert!(ack_at(&mut t, 25, acked).is_empty(), "ACK of {acked}");
+    }
+    assert_eq!(ack_at(&mut t, 30, 1537), [data(1537, 536)]);
+    assert!(ack_at(&mut t, 40, 1538).is_empty());
+    assert_eq!(ack_at(&mut t, 50, 2073), [data(2073, 388)]);
+    t.set_now(70);
+    ack(&mut t, end, 65535);
+    assert!(t.rtx.is_empty());
+    let s = t.stats();
+    assert_eq!((s.segs_retrans, s.rto_count), (3, 0));
+}
+
 /// Every byte up to the right edge the TCB advertised fits in its receive
 /// ring. A peer that fills the offered window to the byte (as Linux does, in
 /// full segments and a short last one) must have all of it accepted, also
@@ -1028,7 +1201,7 @@ fn recovery_started_by_a_large_cumulative_ack_does_not_overshoot_prr() {
 /// has to recover them as if the network had lost them.
 #[test]
 fn every_byte_up_to_the_advertised_edge_is_accepted() {
-    let mut t = Box::new(Tcb::new(cfg(1000)).unwrap());
+    let mut t: Box<Tcb> = Box::new(Tcb::new(cfg(1000)).unwrap());
     t.set_now(0);
     t.connect().unwrap();
     drain(&mut t);

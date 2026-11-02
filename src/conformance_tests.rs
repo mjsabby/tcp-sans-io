@@ -25,9 +25,11 @@ extern crate std;
 use std::vec;
 use std::vec::Vec;
 
+use crate::rtx_queue::RTX_QUEUE_CAP;
 use crate::tcb::{events, Endpoint, Tcb, TcbConfig};
+use crate::tx_ring::TX_RING_CAP;
 use crate::wire::{self, flags, SackBlocks, Segment, TcpOptions};
-use crate::{State, MAX_PACKET};
+use crate::{State, BUF_CAP, MAX_PACKET};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -42,11 +44,20 @@ const PSS: u32 = 0x9000_0000; // peer's ISS
 const PEER_WIN: u16 = 65_535;
 const INIT_RTO_MS: u32 = 1000;
 
+/// A 64 KiB ring with the queue sizes recommended for it.
+const BUF_64K: usize = 64 * 1024;
+const RTX_64K: usize = crate::rtx_cap_for(BUF_64K);
+const TXQ_64K: usize = crate::tx_slots_for(BUF_64K);
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
 fn make_tcb() -> Tcb {
+    make_tcb_sized()
+}
+
+fn make_tcb_sized<const B: usize, const R: usize, const X: usize>() -> Tcb<B, R, X> {
     let cfg = TcbConfig {
         local: Endpoint {
             ip: CLIENT_IP,
@@ -64,7 +75,9 @@ fn make_tcb() -> Tcb {
 
 /// Pop one staged outbound packet, parse it, return both raw bytes and the
 /// parsed segment. Panics if no packet is pending.
-fn pop(tcb: &mut Tcb) -> (Vec<u8>, ParsedOut) {
+fn pop<const B: usize, const R: usize, const X: usize>(
+    tcb: &mut Tcb<B, R, X>,
+) -> (Vec<u8>, ParsedOut) {
     let mut buf = [0u8; MAX_PACKET];
     let n = tcb.extract_packet(&mut buf).expect("extract");
     assert!(n > 0, "expected outbound packet, got 0");
@@ -95,7 +108,9 @@ fn tick_until_packet(tcb: &mut Tcb, now: &mut u64, max_ms: u64) -> Option<Parsed
 }
 
 /// Try to pop a packet; return None if the staging buffer is empty.
-fn try_pop(tcb: &mut Tcb) -> Option<ParsedOut> {
+fn try_pop<const B: usize, const R: usize, const X: usize>(
+    tcb: &mut Tcb<B, R, X>,
+) -> Option<ParsedOut> {
     let mut buf = [0u8; MAX_PACKET];
     let n = tcb.extract_packet(&mut buf).expect("extract");
     if n == 0 {
@@ -240,7 +255,10 @@ fn build_in_full_ws(
 
 /// Drive the standard 3-way handshake using Timestamps. Returns the peer's
 /// own TSval echoed by us (i.e. what we'll see as `tsecr` on data).
-fn handshake_with_ts(tcb: &mut Tcb, now: &mut u64) -> u32 {
+fn handshake_with_ts<const B: usize, const R: usize, const X: usize>(
+    tcb: &mut Tcb<B, R, X>,
+    now: &mut u64,
+) -> u32 {
     tcb.set_now(*now);
     tcb.connect().expect("connect");
 
@@ -3055,7 +3073,16 @@ fn ack_owed_while_egress_paused_is_sent_on_resume() {
 /// after the host drains the ring.
 #[test]
 fn ack_owed_while_egress_ring_full_is_sent_after_drain() {
-    let mut tcb = make_tcb();
+    ack_owed_behind_a_full_egress_ring::<BUF_CAP, RTX_QUEUE_CAP, TX_RING_CAP>();
+}
+
+#[test]
+fn ack_owed_while_egress_ring_full_is_sent_after_drain_64k() {
+    ack_owed_behind_a_full_egress_ring::<BUF_64K, RTX_64K, TXQ_64K>();
+}
+
+fn ack_owed_behind_a_full_egress_ring<const B: usize, const R: usize, const X: usize>() {
+    let mut tcb = make_tcb_sized::<B, R, X>();
     let mut now = 0u64;
     let _ = handshake_with_ts(&mut tcb, &mut now);
     let base = PSS.wrapping_add(1);
@@ -3072,7 +3099,7 @@ fn ack_owed_while_egress_ring_full_is_sent_after_drain() {
     };
 
     // A segment, then duplicates of it until their D-SACK ACKs fill the ring.
-    for _ in 0..=crate::tx_ring::TX_RING_CAP {
+    for _ in 0..=X {
         tcb.inject_packet(&seg(base)).expect("inject");
     }
     tcb.inject_packet(&seg(base.wrapping_add(1460)))

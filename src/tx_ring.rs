@@ -2,11 +2,11 @@
 //!
 //! Replaces the single-packet `tx_buf` slot that historically capped
 //! the stack at one emitted packet per host extract/inject cycle. With
-//! a 32-slot ring (48 KiB per connection), `maybe_send_data` can emit
-//! up to 32 back-to-back segments before yielding back to the host —
-//! enough to drain a typical burst (IW=10, congestion-window growth
-//! after each ACK, RACK / RFC 6675 retransmit fan-out) without the
-//! ping-pong overhead of one FFI round-trip per packet.
+//! the default 32-slot ring (48 KiB per connection), `maybe_send_data`
+//! can emit up to 32 back-to-back segments before yielding back to the
+//! host — enough to drain a typical burst (IW=10, congestion-window
+//! growth after each ACK, RACK / RFC 6675 retransmit fan-out) without
+//! the ping-pong overhead of one FFI round-trip per packet.
 //!
 //! The ring is strict FIFO: the host's `tcp_extract_packet` pops from
 //! the head; emit paths push at the tail. TCP relies on
@@ -23,11 +23,18 @@
 //! enough buffering to amortize syscall overhead within a single
 //! tick / inject cycle.
 //!
+//! The slot count is the const parameter `SLOTS` (the `TXQ` parameter of
+//! [`crate::Tcb`]); [`tx_slots_for`] picks a smaller one for smaller rings.
+//! A full ring never loses or stalls output: emission stops with
+//! nothing advanced (no sequence space consumed, a retransmission stays
+//! marked lost, an owed ACK stays owed) and resumes on the next
+//! `tick()` after the host drains it.
+//!
 //! ## Invariants
 //!
-//! * `head + len` (mod `TX_RING_CAP`) == `tail` (computed; not
+//! * `head + len` (mod `SLOTS`) == `tail` (computed; not
 //!   stored).
-//! * `len <= TX_RING_CAP`.
+//! * `len <= SLOTS`.
 //! * Slots in `[head .. head + len)` hold valid packet bytes;
 //!   slots outside are uninitialized as far as the consumer is
 //!   concerned.
@@ -36,10 +43,29 @@
 use crate::error::TcpError;
 use crate::MAX_PACKET;
 
-/// Number of staging slots in the egress ring. Sized for one full
+/// Default number of staging slots in the egress ring. Sized for one full
 /// IW=10 burst plus RACK / RFC 6675 retransmit fan-out, with a
 /// comfortable safety margin.
 pub const TX_RING_CAP: usize = 32;
+
+/// Egress-ring slot count for a `buf`-byte send ring: 8 up to 64 KiB, 16 up
+/// to 256 KiB, else the default [`TX_RING_CAP`]. For [`crate::Tcb`]'s `TXQ`
+/// parameter.
+///
+/// One host call stages what the windows release at once: a few segments
+/// per ACK (slow-start growth, PRR's share of a recovery, one RTO or TLP
+/// retransmission), never more than the send ring holds (~45 full-sized
+/// segments at 64 KiB, ~180 at 256 KiB). A larger burst, such as IW=10
+/// through 8 slots, takes another extract/`tick()` cycle, never a stall.
+pub const fn tx_slots_for(buf: usize) -> usize {
+    if buf <= 64 * 1024 {
+        8
+    } else if buf <= 256 * 1024 {
+        16
+    } else {
+        TX_RING_CAP
+    }
+}
 
 /// A single packet slot. `len` is the number of valid bytes in `buf`
 /// (always `<= MAX_PACKET`).
@@ -58,17 +84,22 @@ impl Slot {
     }
 }
 
-/// Bounded FIFO ring of outbound packet slots.
-pub struct TxRing {
-    slots: [Slot; TX_RING_CAP],
+/// Bounded FIFO ring of `SLOTS` outbound packet slots.
+pub struct TxRing<const SLOTS: usize = TX_RING_CAP> {
+    slots: [Slot; SLOTS],
     head: usize,
     len: usize,
 }
 
-impl TxRing {
+impl<const SLOTS: usize> TxRing<SLOTS> {
+    /// Compile-time check that the ring has a slot (evaluated wherever a
+    /// ring of this size is built).
+    pub(crate) const VALID: () = assert!(SLOTS > 0, "TxRing needs at least one slot");
+
     pub const fn new() -> Self {
+        let () = Self::VALID;
         Self {
-            slots: [Slot::new(); TX_RING_CAP],
+            slots: [Slot::new(); SLOTS],
             head: 0,
             len: 0,
         }
@@ -81,7 +112,7 @@ impl TxRing {
 
     #[inline]
     pub fn is_full(&self) -> bool {
-        self.len == TX_RING_CAP
+        self.len == SLOTS
     }
 
     #[inline]
@@ -123,10 +154,10 @@ impl TxRing {
     where
         F: FnOnce(&mut [u8]) -> Result<usize, TcpError>,
     {
-        if self.len == TX_RING_CAP {
+        if self.len == SLOTS {
             return Ok(false);
         }
-        let tail = (self.head + self.len) % TX_RING_CAP;
+        let tail = (self.head + self.len) % SLOTS;
         let slot = self.slots.get_mut(tail).ok_or(TcpError::Overflow)?;
         let n = f(&mut slot.buf)?;
         if n == 0 || n > MAX_PACKET {
@@ -155,7 +186,7 @@ impl TxRing {
         let src = slot.buf.get(..n).ok_or(TcpError::Overflow)?;
         let dst = out.get_mut(..n).ok_or(TcpError::BufferTooSmall)?;
         dst.copy_from_slice(src);
-        self.head = (self.head + 1) % TX_RING_CAP;
+        self.head = (self.head + 1) % SLOTS;
         self.len -= 1;
         Ok(n)
     }
@@ -168,13 +199,13 @@ impl TxRing {
         }
         let slot = self.slots.get(self.head)?;
         let r = f(slot.buf.get(..slot.len as usize)?);
-        self.head = (self.head + 1) % TX_RING_CAP;
+        self.head = (self.head + 1) % SLOTS;
         self.len -= 1;
         Some(r)
     }
 }
 
-impl Default for TxRing {
+impl<const SLOTS: usize> Default for TxRing<SLOTS> {
     fn default() -> Self {
         Self::new()
     }
@@ -190,6 +221,9 @@ mod tests {
     )]
 
     use super::*;
+
+    /// The default-sized ring, unless a test names another size.
+    type TxRing = super::TxRing;
 
     #[test]
     fn empty_ring_pops_nothing() {
@@ -220,8 +254,13 @@ mod tests {
 
     #[test]
     fn fills_to_capacity_then_refuses() {
-        let mut r = TxRing::new();
-        for i in 0..TX_RING_CAP {
+        fills_to_capacity_then_refuses_at::<TX_RING_CAP>();
+        fills_to_capacity_then_refuses_at::<8>();
+    }
+
+    fn fills_to_capacity_then_refuses_at<const SLOTS: usize>() {
+        let mut r = super::TxRing::<SLOTS>::new();
+        for i in 0..SLOTS {
             assert!(r
                 .push_with(|b| {
                     b[0] = i as u8;
@@ -230,14 +269,29 @@ mod tests {
                 .unwrap());
         }
         assert!(r.is_full());
-        // 33rd push: ring full, returns false (not Err).
+        // One push too many: ring full, returns false (not Err).
         assert!(!r
             .push_with(|b| {
                 b[0] = 0xFF;
                 Ok(1)
             })
             .unwrap());
-        assert_eq!(r.len(), TX_RING_CAP);
+        assert_eq!(r.len(), SLOTS);
+        // Popping one frees one slot, at the wrap point.
+        let mut out = [0u8; 8];
+        assert_eq!(r.pop_into(&mut out).unwrap(), 1);
+        assert_eq!(out[0], 0);
+        assert!(r
+            .push_with(|b| {
+                b[0] = SLOTS as u8;
+                Ok(1)
+            })
+            .unwrap());
+        for i in 1..=SLOTS {
+            assert_eq!(r.pop_into(&mut out).unwrap(), 1);
+            assert_eq!(out[0], i as u8);
+        }
+        assert!(r.is_empty());
     }
 
     #[test]

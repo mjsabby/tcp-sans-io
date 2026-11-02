@@ -11,7 +11,6 @@ use crate::congestion;
 use crate::error::TcpError;
 use crate::rtx_queue::{seg_flags, Seg};
 use crate::state::State;
-use crate::tx_ring::TX_RING_CAP;
 use crate::wire::{self, flags, SackBlocks, Segment, TcpOptions};
 use crate::MSS;
 
@@ -24,7 +23,7 @@ struct RingSlice {
 
 const NO_PAYLOAD: RingSlice = RingSlice { off: 0, len: 0 };
 
-impl<const BUF: usize> Tcb<BUF> {
+impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
     /// Emit as many segments as the congestion window, the peer's window
     /// and the egress ring allow; then (re)arm the persist timer if data is
     /// stuck with nothing in flight.
@@ -41,7 +40,7 @@ impl<const BUF: usize> Tcb<BUF> {
         }
         let mut guard = 0u32;
         while !self.egress_full() {
-            if crate::loop_budget_exhausted(&mut guard, TX_RING_CAP as u32 + 2, "maybe_send_data") {
+            if crate::loop_budget_exhausted(&mut guard, TXQ as u32 + 2, "maybe_send_data") {
                 break;
             }
             if !self.send_one()? {
@@ -188,6 +187,7 @@ impl<const BUF: usize> Tcb<BUF> {
             xmit_ts: self.now_ms,
             xmit_seq: 0,
             flags: if fin { seg_flags::FIN } else { 0 },
+            sent: 0,
         });
         if !pushed {
             return Err(TcpError::Overflow);
@@ -211,7 +211,8 @@ impl<const BUF: usize> Tcb<BUF> {
     }
 
     /// Retransmit queued segment `i` (splitting it first if the path MSS
-    /// shrank below its size).
+    /// shrank below its size; with no record to split it into, only its
+    /// first MSS goes out, see [`seg_flags::PARTIAL`]).
     pub(super) fn retransmit(&mut self, i: usize) -> Result<bool, TcpError> {
         let mss = self.mss_payload();
         let Some(mut s) = self.rtx.get(i).copied() else {
@@ -242,8 +243,13 @@ impl<const BUF: usize> Tcb<BUF> {
         if !self.emit_data_segment(fl, s.start, payload, false)? {
             return Ok(false);
         }
-        self.rtx.on_retransmit(i, self.now_ms);
-        self.cc.on_send(s.seq_len());
+        if plen < s.payload_len() {
+            // `plen` is at most one MSS.
+            self.rtx.on_partial_retransmit(i, self.now_ms, plen as u16);
+        } else {
+            self.rtx.on_retransmit(i, self.now_ms);
+        }
+        self.cc.on_send(plen + u32::from(fin));
         self.cc.on_retransmit();
         self.stats.segs_retrans = self.stats.segs_retrans.saturating_add(1);
         self.stats.bytes_retrans = self.stats.bytes_retrans.saturating_add(u64::from(plen));

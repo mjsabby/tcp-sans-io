@@ -42,7 +42,7 @@ pub(super) struct CookieOpts {
     pub prev_key: bool,
 }
 
-impl<const BUF: usize> Tcb<BUF> {
+impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
     /// The keyed secret for per-connection derivations, if any.
     fn host_key(&self) -> Option<&[u8; 16]> {
         if self.secret_set {

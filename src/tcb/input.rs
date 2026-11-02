@@ -20,7 +20,7 @@ use crate::ooo::Insert;
 use crate::state::State;
 use crate::wire::{ecn, flags, Segment};
 
-impl<const BUF: usize> Tcb<BUF> {
+impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
     pub(super) fn inject_segment(&mut self, seg: &Segment<'_>) -> Result<(), TcpError> {
         if seg.dst_ip != self.local.ip || seg.dst_port != self.local.port {
             return Err(TcpError::NotForUs);
