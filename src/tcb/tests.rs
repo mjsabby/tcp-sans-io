@@ -1316,3 +1316,213 @@ fn an_ack_that_delivers_nothing_runs_no_rack_detection() {
         "{out:?}"
     );
 }
+
+// ---------------------------------------------------------------------
+// Audit iteration 6
+// ---------------------------------------------------------------------
+
+fn data_out(t: &mut Tcb) -> Vec<(u32, usize)> {
+    drain(t)
+        .into_iter()
+        .filter(|p| p.3 > 0)
+        .map(|p| (p.0, p.3))
+        .collect()
+}
+
+/// A peer that shrinks its window (RFC 9293 §3.8.6 asks it not to) bounds
+/// retransmissions too, as Linux `__tcp_retransmit_skb`: the timeout
+/// resends only what fits, and the ACK of that clocks out the next part.
+/// Resent whole, the segments counted as in flight beyond the edge, and
+/// only the next timeout moved the transfer on.
+#[test]
+fn retransmissions_stay_inside_a_shrunken_window() {
+    let mut t = established();
+    t.send(&[0x5a; 2920]).unwrap();
+    t.tick().unwrap();
+    assert_eq!(data_out(&mut t).len(), 2);
+    t.set_now(20);
+    ack(&mut t, 1101, 100);
+    drain(&mut t);
+    assert_eq!(t.snd_wnd, 100);
+    let rto = t.rto_deadline.get().unwrap();
+    t.set_now(rto);
+    t.tick().unwrap();
+    assert_eq!(data_out(&mut t), [(1101, 100)]);
+    t.set_now(rto + 1);
+    ack(&mut t, 1201, 100);
+    assert_eq!(data_out(&mut t), [(1201, 100)], "the ACK clocks the next");
+}
+
+/// Into a zero window only the head is resent, as the window probe (Linux
+/// `__tcp_retransmit_skb`), not every segment in flight.
+#[test]
+fn a_timeout_into_a_zero_window_resends_only_the_head() {
+    let mut t = established();
+    t.set_nodelay(true);
+    for _ in 0..3 {
+        t.send(&[0x5a; 100]).unwrap();
+        t.tick().unwrap();
+        drain(&mut t);
+    }
+    ack(&mut t, 1001, 0);
+    drain(&mut t);
+    let rto = t.rto_deadline.get().unwrap();
+    t.set_now(rto);
+    t.tick().unwrap();
+    assert_eq!(data_out(&mut t), [(1001, 100)]);
+}
+
+/// A connection that times out keeps what it received readable, ahead of
+/// the error, as after a peer's RST: Linux `tcp_done` purges only the
+/// write queue, and `tcp_recvmsg` returns queued data before `sk_err`.
+/// USER TIMEOUT (with the peer's stream open, and complete), keepalive and
+/// R2 all discarded it.
+#[test]
+fn timeouts_keep_received_data_readable() {
+    const BODY: &[u8] = b"response already received";
+    fn deliver(t: &mut Tcb, fin: bool) {
+        let fl = flags::ACK | flags::PSH | if fin { flags::FIN } else { 0 };
+        t.inject_packet(&peer_pkt(
+            PEER_ISS + 1,
+            1001,
+            fl,
+            65535,
+            &TcpOptions::NONE,
+            BODY,
+        ))
+        .unwrap();
+        drain(t);
+    }
+    fn check(t: &mut Tcb, what: &str) {
+        assert_eq!(t.state(), State::Closed, "{what}");
+        let mut buf = [0u8; 64];
+        assert_eq!(t.recv(&mut buf), Ok(BODY.len()), "{what}");
+        assert_eq!(&buf[..BODY.len()], BODY, "{what}");
+        assert_eq!(t.recv(&mut buf), Err(TcpError::ConnectionReset), "{what}");
+    }
+    for fin in [false, true] {
+        let mut t = established();
+        t.set_user_timeout(25);
+        t.send(b"unacknowledged request").unwrap();
+        t.tick().unwrap();
+        drain(&mut t);
+        t.set_now(20);
+        deliver(&mut t, fin);
+        t.set_now(40);
+        t.tick().unwrap();
+        check(
+            &mut t,
+            if fin {
+                "USER TIMEOUT after FIN"
+            } else {
+                "USER TIMEOUT"
+            },
+        );
+    }
+    let mut t = established();
+    t.set_keepalive(10, 5, 1);
+    deliver(&mut t, false);
+    run_timers(&mut t, 10, |t| t.state() == State::Closed);
+    check(&mut t, "keepalive");
+    let mut t = established();
+    t.set_user_timeout(0);
+    t.send(&[0xAB; 1000]).unwrap();
+    t.tick().unwrap();
+    drain(&mut t);
+    deliver(&mut t, false);
+    run_timers(&mut t, 100, |t| t.state() == State::Closed);
+    check(&mut t, "R2");
+}
+
+/// An abort by the application discards what it has not read.
+#[test]
+fn abort_discards_unread_data() {
+    let mut t = established();
+    t.inject_packet(&peer_pkt(
+        PEER_ISS + 1,
+        1001,
+        flags::ACK | flags::PSH,
+        65535,
+        &TcpOptions::NONE,
+        b"unread",
+    ))
+    .unwrap();
+    drain(&mut t);
+    t.abort().unwrap();
+    let mut buf = [0u8; 16];
+    assert_eq!(t.recv(&mut buf), Err(TcpError::ConnectionReset));
+}
+
+/// An immediate ACK a full egress ring held back leaves alone, ahead of a
+/// tail loss probe of new data due in the same tick: the probe carried it,
+/// and a peer counting duplicate ACKs saw none (see *Immediate ACKs* in
+/// the README).
+#[test]
+fn a_held_immediate_ack_leaves_ahead_of_a_tail_loss_probe() {
+    let mut t = established_sack();
+    let mut now = 10;
+    for _ in 0..3 {
+        let n = t.stats().cwnd as usize;
+        assert_eq!(t.send(&std::vec![0x5a; n]), Ok(n));
+        t.tick().unwrap();
+        while t.snd_una != t.snd_nxt || t.unsent_bytes() > 0 {
+            drain(&mut t);
+            now += 10;
+            t.set_now(now);
+            let nxt = t.snd_nxt;
+            ack(&mut t, nxt, 65535);
+        }
+        drain(&mut t);
+    }
+    t.send(&std::vec![0x5a; 128 * 1460]).unwrap();
+    t.tick().unwrap();
+    assert!(t.tx_ring.is_full());
+    let tlp_at = t.tlp_deadline.get().unwrap();
+    t.set_now(tlp_at);
+    // Out-of-order data from the peer: an immediate ACK, held by the ring.
+    t.inject_packet(&peer_pkt(
+        PEER_ISS + 2,
+        t.snd_una,
+        flags::ACK | flags::PSH,
+        65535,
+        &TcpOptions::NONE,
+        b"x",
+    ))
+    .unwrap();
+    assert!(t.pending_ack && t.ack_deadline.due(t.now_ms));
+    assert!(t.tlp_deadline.due(t.now_ms));
+    drain(&mut t);
+    t.tick().unwrap();
+    let out = drain(&mut t);
+    assert_eq!(
+        out.first().map(|p| (p.1, p.3)),
+        Some((PEER_ISS + 1, 0)),
+        "{out:?}"
+    );
+    assert!(out.iter().skip(1).any(|p| p.3 > 0), "{out:?}");
+}
+
+/// An MSS option of 0 is no option (Linux `tcp_parse_options`): the
+/// default of 536 stands, not the 64-byte floor.
+#[test]
+fn an_mss_option_of_zero_leaves_the_default() {
+    let mut t = Box::new(Tcb::new(cfg(1000)).unwrap());
+    t.set_now(0);
+    t.connect().unwrap();
+    drain(&mut t);
+    let o = TcpOptions {
+        mss: Some(0),
+        ..TcpOptions::NONE
+    };
+    t.inject_packet(&peer_pkt(
+        PEER_ISS,
+        1001,
+        flags::SYN | flags::ACK,
+        65535,
+        &o,
+        &[],
+    ))
+    .unwrap();
+    assert_eq!(t.state(), State::Established);
+    assert_eq!(t.peer_mss, 536);
+}

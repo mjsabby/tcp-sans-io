@@ -401,13 +401,25 @@ impl<const BUF: usize> Tcb<BUF> {
     }
 
     /// Retransmit queued segment `i` (splitting it first if the path MSS
-    /// shrank below its size). `probe`: a tail loss probe re-sending a
-    /// segment not deemed lost (see [`crate::rtx_queue::RtxQueue::on_probe`]).
+    /// shrank below its size, or the peer's window ends inside it).
+    /// `probe`: a tail loss probe re-sending a segment not deemed lost (see
+    /// [`crate::rtx_queue::RtxQueue::on_probe`]).
     pub(super) fn retransmit(&mut self, i: usize, probe: bool) -> Result<bool, TcpError> {
-        let mss = self.mss_payload();
+        let mut mss = self.mss_payload();
         let Some(mut s) = self.rtx.get(i).copied() else {
             return Ok(false);
         };
+        // The peer's window bounds retransmissions too (Linux
+        // `__tcp_retransmit_skb`): after it shrinks, what lies beyond its
+        // edge waits, and a segment that straddles it is split, so the ACK
+        // of the part inside clocks out the next. Into a zero window the
+        // head still goes, as the window probe.
+        let edge = self.snd_una.wrapping_add(self.snd_wnd);
+        if seq_lt(s.start, edge) {
+            mss = mss.min(edge.wrapping_sub(s.start));
+        } else if s.start != self.snd_una {
+            return Ok(false);
+        }
         if self.pmtu_probe_inflight
             && seq_lt(s.start, self.pmtu_probe_end)
             && seq_gt(s.end, self.pmtu_probe_start)

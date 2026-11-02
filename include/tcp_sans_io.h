@@ -111,9 +111,10 @@ int32_t tcp_set_cookie_secret(TcpStreamHandle* handle, const uint8_t* secret);
  * ESTABLISHED, or half-closed in CLOSE_WAIT or FIN_WAIT_2 as in Linux, up
  * to `count` probes are sent `intvl_ms` apart; if none is answered the
  * connection aborts as a vanished peer (ConnectionReset via tcp_poll ERROR /
- * tcp_recv), no RST emitted. In CLOSE_WAIT the peer's stream is complete, so
- * it closes instead (tcp_poll CLOSED) and unread bytes stay readable until
- * EOF. Any inbound segment resets the idle timer.
+ * tcp_recv, after the bytes already received), no RST emitted. In CLOSE_WAIT
+ * the peer's stream is complete, so it closes instead (tcp_poll CLOSED) and
+ * unread bytes stay readable until EOF. Any inbound segment resets the idle
+ * timer.
  * ON BY DEFAULT (10 min idle / 60 s interval / 4 probes ~= 14 min to reap),
  * so an abandoned idle connection cannot pin its buffers forever; pass
  * `idle_ms == 0` to disable. */
@@ -122,8 +123,8 @@ int32_t tcp_set_keepalive(TcpStreamHandle* handle, uint64_t now_ms,
 
 /* Set the RFC 9293 3.8.3 USER TIMEOUT: max time the connection may go without
  * forward progress (snd_una advancing) while it still has unacknowledged send
- * data, before it aborts (ConnectionReset via tcp_poll ERROR / tcp_recv, no
- * RST). ON BY DEFAULT (5 min) — bounds the zero-window / dribbled-ACK DoS (an
+ * data, before it aborts (ConnectionReset via tcp_poll ERROR / tcp_recv, after
+ * the bytes already received; no RST). ON BY DEFAULT (5 min) — bounds the zero-window / dribbled-ACK DoS (an
  * alive-but-stalling peer answering probes while never opening its window).
  * Resets only on real progress, so it is immune to that proof-of-life trick.
  * `user_timeout_ms == 0` disables it. */

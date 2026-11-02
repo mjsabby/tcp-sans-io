@@ -160,6 +160,7 @@ impl<const BUF: usize> Tcb<BUF> {
         let peer_mss = seg
             .options
             .mss
+            .filter(|&m| m != 0)
             .unwrap_or(DEFAULT_PEER_MSS)
             .max(MIN_PEER_MSS);
         let mss_idx = cookie_mss_index(peer_mss);

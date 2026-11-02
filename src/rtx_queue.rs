@@ -401,8 +401,10 @@ impl RtxQueue {
     /// is acknowledged needs another for every retransmission, and nothing
     /// could be acknowledged without them. The merged segment keeps the
     /// later send time, counts as retransmitted if either half was, and is
-    /// split again when it is retransmitted. Returns whether a record was
-    /// freed.
+    /// split again when it is retransmitted. Failing such a pair, the newest
+    /// two are merged regardless, to be sent again. Returns whether a record
+    /// was freed: always when two segments follow `i` and the first of
+    /// them carries no FIN.
     pub fn coalesce_after(&mut self, i: usize) -> bool {
         const STATE: u8 = SACKED | LOST | RETRANS;
         let mut j = match self.len.checked_sub(2) {
@@ -449,7 +451,38 @@ impl RtxQueue {
             }
             j -= 1;
         }
-        false
+        // No pair merges as it stands (say, SACKed and lost segments
+        // alternate): merge the newest pair anyway, as one segment to send
+        // again, forgetting that the receiver holds part of it. Otherwise
+        // the head could not be split, and nothing would be sent until R2
+        // gave up; Linux can always fragment the head (`tcp_fragment`
+        // exempts it from the memory limit).
+        let Some(j) = self.len.checked_sub(2).filter(|&j| j > i) else {
+            return false;
+        };
+        let (Some(a), Some(b)) = (self.get(j).copied(), self.get(j + 1).copied()) else {
+            return false;
+        };
+        if a.has(FIN) || a.end != b.start {
+            return false;
+        }
+        self.add_counts(&a, false);
+        self.add_counts(&b, false);
+        let merged = Seg {
+            start: a.start,
+            flags: LOST | ((a.flags | b.flags) & EVER_RETRANS) | (b.flags & (FIN | PSH)),
+            ..b
+        };
+        self.add_counts(&merged, true);
+        if let Some(d) = self.get_mut(j) {
+            *d = merged;
+        }
+        let (pj, last) = (self.phys(j), self.phys(j + 1));
+        self.set_sacked_bit(pj, false);
+        self.set_sacked_bit(last, false);
+        self.len -= 1;
+        self.lost_hint = self.lost_hint.min(j);
+        true
     }
 
     /// Cumulative ACK up to `una`: remove (or trim) covered segments,
@@ -489,16 +522,22 @@ impl RtxQueue {
         removed
     }
 
-    /// Mark every segment fully inside `[left, right)` as SACKed, splitting
-    /// segments the block only partially covers while that leaves the slot
-    /// [`Self::has_room_for_new`] keeps free for a retransmission split
-    /// (otherwise the partial coverage is ignored, as Linux
-    /// `tcp_match_skb_to_sack` ignores it for a single-segment skb).
+    /// Mark every segment fully inside `[left, right)` as SACKed. A segment
+    /// the block covers only in part is split at a multiple of `mss` from
+    /// its start, as Linux `tcp_match_skb_to_sack` splits a multi-segment
+    /// skb, while that leaves the slot [`Self::has_room_for_new`] keeps
+    /// free for a retransmission split; less than `mss` of it is ignored,
+    /// so a segment of one `mss` or less is never split (Linux ignores
+    /// partial coverage of a single-segment skb). Only segments longer than
+    /// `mss` — a path-MTU probe, data sent before the path MTU dropped, two
+    /// merged by [`Self::coalesce_after`] — are split, and a peer cannot
+    /// shatter the queue with blocks of a few bytes (Linux CVE-2019-11478).
     /// Calls `f` for each newly SACKed segment; returns newly SACKed bytes.
-    pub fn sack<F: FnMut(&Seg)>(&mut self, left: u32, right: u32, mut f: F) -> u32 {
+    pub fn sack<F: FnMut(&Seg)>(&mut self, left: u32, right: u32, mss: u32, mut f: F) -> u32 {
         if !seq_lt(left, right) || self.is_empty() {
             return 0;
         }
+        let mss = mss.max(1);
         let Some(first) = self.get(0).map(|s| s.start) else {
             return 0;
         };
@@ -514,10 +553,20 @@ impl RtxQueue {
         let Some(mut i) = self.find(l) else {
             return 0;
         };
-        // Partial coverage at the left edge: split so a segment starts at l.
+        // Partial coverage at the left edge: split at the first multiple of
+        // `mss` at or above `l`, if the block reaches past it.
         if let Some(s) = self.get(i).copied() {
-            if seq_lt(s.start, l) && !s.has(SACKED) && self.has_room_for_new() && self.split(i, l) {
-                i += 1;
+            if seq_lt(s.start, l) && !s.has(SACKED) {
+                let at = s
+                    .start
+                    .wrapping_add(l.wrapping_sub(s.start).div_ceil(mss).saturating_mul(mss));
+                if seq_lt(at, s.end)
+                    && seq_lt(at, r)
+                    && self.has_room_for_new()
+                    && self.split(i, at)
+                {
+                    i += 1;
+                }
             }
         }
         let mut newly = 0u32;
@@ -535,19 +584,24 @@ impl RtxQueue {
                     None => break,
                 }
             }
+            if seq_lt(s.start, l) {
+                // Covered only in part, below a multiple of `mss`.
+                i += 1;
+                continue;
+            }
             if seq_lt(r, s.end) {
-                // Block ends inside this segment: split, then SACK the lower part.
-                if !self.has_room_for_new() || !self.split(i, r) {
+                // Block ends inside this segment: SACK the whole multiples
+                // of `mss` it covers, split off; less than one, nothing.
+                let k = r.wrapping_sub(s.start) / mss * mss;
+                if k == 0 || !self.has_room_for_new() || !self.split(i, s.start.wrapping_add(k)) {
                     break;
                 }
                 continue;
             }
-            if seq_le(l, s.start) {
-                let nf = (s.flags | SACKED) & !(LOST | RETRANS);
-                self.set_flags(i, nf);
-                newly = newly.saturating_add(s.seq_len());
-                f(&s);
-            }
+            let nf = (s.flags | SACKED) & !(LOST | RETRANS);
+            self.set_flags(i, nf);
+            newly = newly.saturating_add(s.seq_len());
+            f(&s);
             i += 1;
         }
         newly
@@ -733,11 +787,11 @@ mod tests {
         let out = 1000;
         assert_eq!(q.pipe(out), 1000);
         let mut seen = 0;
-        assert_eq!(q.sack(1200, 1500, |_| seen += 1), 300);
+        assert_eq!(q.sack(1200, 1500, 100, |_| seen += 1), 300);
         assert_eq!(seen, 3);
         assert_eq!(q.pipe(out), 700);
         // Repeated SACK reports nothing new.
-        assert_eq!(q.sack(1200, 1500, |_| ()), 0);
+        assert_eq!(q.sack(1200, 1500, 100, |_| ()), 0);
         q.mark_lost(0);
         q.mark_lost(1);
         assert_eq!(q.pipe(out), 500);
@@ -748,20 +802,60 @@ mod tests {
         q.debug_valid(1000, 2000).unwrap();
     }
 
+    /// Partial coverage splits only at whole multiples of the MSS (Linux
+    /// `tcp_match_skb_to_sack`): a segment of one MSS is never split, so
+    /// blocks of a few bytes cannot shatter the queue.
     #[test]
-    fn partial_sack_splits_segments() {
+    fn partial_sack_splits_only_at_mss_multiples() {
         let mut q = q_with(3, 100);
-        assert_eq!(q.sack(1050, 1250, |_| ()), 200);
-        // [1000,1050) [1050,1100)S [1100,1200)S [1200,1250)S [1250,1300)
-        assert_eq!(q.len(), 5);
-        assert_eq!(q.sacked_bytes(), 200);
+        assert_eq!(q.sack(1050, 1250, 100, |_| ()), 100);
+        // [1000,1100) [1100,1200)S [1200,1300): the edges are ignored.
+        assert_eq!(q.len(), 3);
+        for k in 0..50u32 {
+            q.sack(1201 + 2 * k, 1202 + 2 * k, 100, |_| ());
+        }
+        assert_eq!(q.len(), 3, "one-byte blocks split nothing");
         q.debug_valid(1000, 1300).unwrap();
+        // A 300-byte segment (sent before the MSS shrank to 100): a block
+        // over [1350, 1580) SACKs [1400, 1500), its whole MSS inside.
+        let mut q = q_with(1, 300);
+        q.push(Seg {
+            start: 1300,
+            end: 1600,
+            ..Seg::default()
+        });
+        assert_eq!(q.sack(1350, 1580, 100, |_| ()), 100);
+        // [1000,1300) [1300,1400) [1400,1500)S [1500,1600)
+        assert_eq!(q.len(), 4);
+        assert!(q.get(2).unwrap().has(SACKED));
+        q.debug_valid(1000, 1600).unwrap();
+    }
+
+    /// With SACKed and lost segments alternating, no pair merges as it
+    /// stands: the newest two merge anyway, as one segment to send again, so
+    /// a head that must be split still can be.
+    #[test]
+    fn coalesce_frees_a_record_when_states_alternate() {
+        let mut q = q_with(6, 100);
+        for k in [1u32, 3, 5] {
+            q.sack(1000 + k * 100, 1100 + k * 100, 100, |_| ());
+        }
+        q.mark_all_lost();
+        assert_eq!((q.sacked_bytes(), q.lost_bytes()), (300, 300));
+        assert!(q.coalesce_after(0));
+        assert_eq!(q.len(), 5);
+        let last = *q.last().unwrap();
+        assert_eq!((last.start, last.end), (1400, 1600));
+        assert!(last.has(LOST) && !last.has(SACKED));
+        assert_eq!((q.sacked_bytes(), q.lost_bytes()), (200, 400));
+        assert_eq!(q.next_lost(), Some(0));
+        q.debug_valid(1000, 1600).unwrap();
     }
 
     #[test]
     fn cumulative_ack_removes_and_trims() {
         let mut q = q_with(4, 100);
-        q.sack(1200, 1300, |_| ());
+        q.sack(1200, 1300, 100, |_| ());
         let mut newly = 0;
         assert_eq!(
             q.ack_to(1250, |s, n| {
@@ -780,7 +874,7 @@ mod tests {
     #[test]
     fn rto_marks_everything_not_sacked_lost() {
         let mut q = q_with(5, 100);
-        q.sack(1100, 1200, |_| ());
+        q.sack(1100, 1200, 100, |_| ());
         q.on_retransmit(0, 9);
         q.mark_all_lost();
         assert_eq!(q.lost_bytes(), 400);
@@ -804,7 +898,7 @@ mod tests {
         assert_eq!(q.find(base.wrapping_add(250)), Some(2));
         assert_eq!(q.find(base.wrapping_add(400)), None);
         assert_eq!(
-            q.sack(base.wrapping_add(100), base.wrapping_add(300), |_| ()),
+            q.sack(base.wrapping_add(100), base.wrapping_add(300), 100, |_| ()),
             200
         );
         q.debug_valid(base, base.wrapping_add(400)).unwrap();
@@ -853,16 +947,16 @@ mod tests {
         let first = q.get(0).unwrap().start;
         assert_eq!(q.len(), 1000);
         // SACK everything except logical 0, 130 and 999.
-        q.sack(first + 10, first + 1300, |_| ());
-        q.sack(first + 1310, first + 9990, |_| ());
+        q.sack(first + 10, first + 1300, 10, |_| ());
+        q.sack(first + 1310, first + 9990, 10, |_| ());
         q.debug_valid(first, first + 10_000).unwrap();
         assert_eq!(q.next_unsacked(0), Some(0));
         assert_eq!(q.next_unsacked(1), Some(130));
         assert_eq!(q.next_unsacked(131), Some(999));
         assert_eq!(q.next_unsacked(1000), None);
         // A repeated block over the SACKed runs only adds the hole at 130.
-        assert_eq!(q.sack(first + 10, first + 9990, |_| ()), 10);
-        assert_eq!(q.sack(first + 10, first + 9990, |_| ()), 0);
+        assert_eq!(q.sack(first + 10, first + 9990, 10, |_| ()), 10);
+        assert_eq!(q.sack(first + 10, first + 9990, 10, |_| ()), 0);
         // Splitting keeps the bitmap aligned with the shifted entries.
         assert!(q.split(0, first + 5));
         q.debug_valid(first, first + 10_000).unwrap();

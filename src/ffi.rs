@@ -110,7 +110,7 @@ pub unsafe extern "C" fn tcp_init(
     if storage.is_null() {
         return TcpError::NullPointer.as_code();
     }
-    if storage.cast::<u8>().align_offset(tcp_handle_align()) != 0 {
+    if !storage.addr().is_multiple_of(tcp_handle_align()) {
         return TcpError::InvalidState.as_code();
     }
     // SAFETY: per the contract, the IP pointers are NULL or 4 readable bytes.

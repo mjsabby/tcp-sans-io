@@ -36,7 +36,25 @@ impl<const BUF: usize> Tcb<BUF> {
         }
         self.stats.segs_in = self.stats.segs_in.saturating_add(1);
         match self.state {
-            State::Closed => Err(TcpError::InvalidState),
+            // RFC 9293 §3.10.7.1: the connection is gone, so a segment from
+            // its peer draws a RST (rate limited), as Linux answers one no
+            // socket takes (`tcp_v4_send_reset`). Not a RST, nor a SYN: that
+            // may be for a listener the host runs on this port.
+            State::Closed => {
+                if !seg.has(flags::RST)
+                    && !seg.has(flags::SYN)
+                    && self.remote.port != 0
+                    && self.oow_allowed()
+                {
+                    if seg.has(flags::ACK) {
+                        self.emit_rst_to(seg, seg.ack, 0, flags::RST)?;
+                    } else {
+                        let end = seg.seq.wrapping_add(seg.seq_len());
+                        self.emit_rst_to(seg, 0, end, flags::RST | flags::ACK)?;
+                    }
+                }
+                Err(TcpError::InvalidState)
+            }
             State::Listen => self.on_listen(seg),
             State::SynSent => self.on_syn_sent(seg),
             State::SynRcvd => self.on_syn_rcvd(seg),
@@ -173,7 +191,8 @@ impl<const BUF: usize> Tcb<BUF> {
         self.snd_wnd = u32::from(seg.window);
         self.max_snd_wnd = self.snd_wnd;
         self.snd_wl1 = seg.seq;
-        if let Some(mss) = seg.options.mss {
+        // An MSS of 0 is no option (Linux `tcp_parse_options`): 536 stands.
+        if let Some(mss) = seg.options.mss.filter(|&m| m != 0) {
             self.peer_mss = mss.max(MIN_PEER_MSS);
         }
         if let Some(ws) = seg.options.wscale {
@@ -613,6 +632,14 @@ impl<const BUF: usize> Tcb<BUF> {
             if payload_len > 0 {
                 ack_now |= self.receive_payload(seg, seg_fin);
             }
+            // The FIN goes with its segment's text: text dropped for want of
+            // another out-of-order range takes the FIN along, as Linux drops
+            // the whole skb (so no SACK claims a FIN whose data is missing).
+            let seg_fin = seg_fin.filter(|&f| {
+                payload_len == 0
+                    || seq_ge(self.rcv_nxt, f)
+                    || self.ooo.containing(f.wrapping_sub(1)).is_some()
+            });
             if let Some(f) = seg_fin {
                 ack_now |= self.receive_fin(seg.seq, f);
             } else if fin {
@@ -782,7 +809,7 @@ impl<const BUF: usize> Tcb<BUF> {
     #[inline]
     fn paws_ok(&self, tsval: u32, win: i32) -> bool {
         (self.ts_recent.wrapping_sub(tsval) as i32) <= win
-            || self.now_ms.saturating_sub(self.ts_recent_stamp) > PAWS_IDLE_MS
+            || self.now_ms.saturating_sub(self.ts_recent_stamp) >= PAWS_IDLE_MS
             || self.ts_recent == 0
     }
 
@@ -1012,7 +1039,12 @@ impl<const BUF: usize> Tcb<BUF> {
         {
             match self.ooo_fin {
                 Some(h) if seq_lt(h.seq, fin) => {}
-                Some(h) if h.seq == fin && seq_le(h.start, start) => {}
+                // Again: its block is the newest, reported first (RFC 2018
+                // §4; Linux `tcp_sack_new_ofo_skb` for a duplicate too).
+                Some(h) if h.seq == fin && seq_le(h.start, start) => {
+                    let tag = self.ooo.take_tag();
+                    self.ooo_fin = Some(HeldFin { tag, ..h });
+                }
                 _ => {
                     let tag = self.ooo.take_tag();
                     self.ooo_fin = Some(HeldFin {

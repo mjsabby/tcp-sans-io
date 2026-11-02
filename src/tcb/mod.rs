@@ -132,8 +132,11 @@ const DEFAULT_FIN_WAIT2_TIMEOUT_MS: u32 = 60_000;
 /// ACKs). Per connection, as Linux `tcp_invalid_ratelimit`; prevents ACK
 /// storms and reflection at line rate.
 const OOW_RATELIMIT_MS: u64 = 500;
-/// RFC 7323 §5.5: `TS.Recent` older than 24 days is no longer trusted.
-const PAWS_IDLE_MS: u64 = 24 * 24 * 60 * 60 * 1000;
+/// `TS.Recent` idle this long is no longer trusted (Linux `TCP_PAWS_WRAP`,
+/// `INT_MAX / USEC_PER_SEC` seconds): the peer's clock may tick in
+/// microseconds (Linux `tcp_usec_ts`), lapping half the 32-bit space that
+/// soon.
+const PAWS_IDLE_MS: u64 = (i32::MAX as u64 / 1_000_000) * 1000;
 /// Path-MTU black-hole detection (RFC 4821 spirit, Linux `tcp_mtu_probing`):
 /// after this many consecutive RTOs of an over-sized segment, clamp the MSS.
 const BLACKHOLE_RTO_STEP1: u8 = 3;
@@ -591,9 +594,9 @@ impl<const BUF: usize> Tcb<BUF> {
         // ones written explicitly below: every other field is an integer,
         // bool, byte array, `Deadline` (zero = disarmed) or an all-integer
         // struct, and the `State`/`CaState` enums use 0 for their initial
-        // variant. `Option` fields are written explicitly (their `None`
-        // encoding is not guaranteed to be all-zero). Only then is a
-        // reference created.
+        // variant. `Option` fields, and the structs holding one (`Rack`,
+        // `Reno`), are written explicitly (the `None` encoding is not
+        // guaranteed to be all-zero). Only then is a reference created.
         unsafe {
             core::ptr::write_bytes(p, 0, 1);
             core::ptr::addr_of_mut!((*p).state).write(State::Closed);
@@ -602,6 +605,8 @@ impl<const BUF: usize> Tcb<BUF> {
             core::ptr::addr_of_mut!((*p).rto_span).write(None);
             core::ptr::addr_of_mut!((*p).ooo_fin).write(None);
             core::ptr::addr_of_mut!((*p).dsack).write(None);
+            core::ptr::addr_of_mut!((*p).last_data_recv_ms).write(None);
+            core::ptr::addr_of_mut!((*p).rack).write(Rack::new());
             core::ptr::addr_of_mut!((*p).cc).write(Reno::new(congestion::INITIAL_WINDOW));
             #[cfg(feature = "heap-buffers")]
             {
@@ -1326,12 +1331,15 @@ impl<const BUF: usize> Tcb<BUF> {
     }
 
     /// Copy received in-order data out. Returns `ConnectionClosed` once the
-    /// ring is empty and the peer has FINned, `ConnectionReset` after an
-    /// abort. In `FIN_WAIT_2`, consuming data restarts the FIN_WAIT_2 timeout.
+    /// ring is empty and the peer has FINned, `ConnectionReset` after a
+    /// reset, a timeout or an abort (after a reset or a timeout, only once
+    /// the bytes received before it are read). In `FIN_WAIT_2`, consuming
+    /// data restarts the FIN_WAIT_2 timeout.
     pub fn recv(&mut self, dst: &mut [u8]) -> Result<usize, TcpError> {
         if let Some(e) = self.error {
-            // A reset after the peer's FIN keeps its completed stream
-            // readable; the error follows the last byte (as Linux `recvmsg`).
+            // A reset or a timeout keeps the bytes already received
+            // readable; the error follows the last of them (as Linux
+            // `recvmsg`).
             if self.state == State::Closed && !self.recv_ring.is_empty() {
                 return Ok(self.recv_ring.read(dst));
             }
@@ -1401,7 +1409,8 @@ impl<const BUF: usize> Tcb<BUF> {
     }
 
     /// Abort: queue `RST+ACK` (seq = SND.NXT, ack = RCV.NXT) and drop all
-    /// state. Local-only in `LISTEN` / `SYN_SENT`. Idempotent on `CLOSED`.
+    /// state, received bytes not yet read included. Local-only in `LISTEN` /
+    /// `SYN_SENT`. Idempotent on `CLOSED`.
     pub fn abort(&mut self) -> Result<(), TcpError> {
         match self.state {
             State::Closed => return Ok(()),
@@ -1416,16 +1425,19 @@ impl<const BUF: usize> Tcb<BUF> {
                 )?;
             }
         }
+        self.recv_ring.clear();
         self.abort_local();
         Ok(())
     }
 
     /// Tear the connection down locally (no RST): R2 / USER TIMEOUT /
-    /// keepalive aborts, and the tail of `abort`. Surfaces `ConnectionReset`.
+    /// keepalive aborts, and the tail of `abort`. Surfaces `ConnectionReset`
+    /// once the bytes already received are read: Linux `tcp_done` purges
+    /// only the write queue, and `tcp_recvmsg` returns queued data ahead of
+    /// the error.
     fn abort_local(&mut self) {
         self.state = State::Closed;
         self.error = Some(TcpError::ConnectionReset);
-        self.recv_ring.clear();
         self.release_buffers_and_timers();
     }
 

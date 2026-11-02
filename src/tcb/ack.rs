@@ -143,7 +143,7 @@ impl<const BUF: usize> Tcb<BUF> {
                     // last in-order segment (RFC 7323 §4.3), never that of
                     // the segment it SACKs, so TSecr cannot disambiguate a
                     // SACKed retransmission; RACK falls back to min_rtt.
-                    let n = rtx.sack(l, r, |s| {
+                    let n = rtx.sack(l, r, mss, |s| {
                         rack.on_delivered(s, now, None, true);
                         orig_acked |= frto_orig(s);
                         if !s.has(seg_flags::EVER_RETRANS) {
@@ -179,6 +179,9 @@ impl<const BUF: usize> Tcb<BUF> {
         // ---- Cumulative ACK --------------------------------------------
         let acked = ack.wrapping_sub(prior_una);
         let mut hold_detection = false;
+        // Linux `FLAG_DATA_ACKED`: this ACK acknowledged data (not just our
+        // SYN).
+        let mut data_acked_any = false;
         let sack_rtt = sack_ts.and_then(|(o, n)| {
             let oldest = u32::try_from(now.saturating_sub(o)).ok()?;
             let newest = u32::try_from(now.saturating_sub(n)).ok()?;
@@ -187,6 +190,7 @@ impl<const BUF: usize> Tcb<BUF> {
         if acked > 0 {
             self.rtx_count = 0;
             let syn_acked = self.syn_outstanding();
+            data_acked_any = acked > u32::from(syn_acked);
             if syn_acked {
                 self.complete_closed_handshake(seg);
             }
@@ -261,15 +265,16 @@ impl<const BUF: usize> Tcb<BUF> {
             let sample = match (ack_rtt, sack_rtt) {
                 (Some((r, _)), Some((_, ca))) => Some((r, ca)),
                 (Some(s), None) | (None, Some(s)) => Some(s),
-                (None, None) if retrans_acked => {
-                    let first = self.syn_xmit_ms as u32;
-                    tsecr_ms
-                        .filter(|&t| seq_ge(t, first) && !seq_gt(t, newest_ts as u32))
-                        .map(|t| {
-                            let r = (now as u32).wrapping_sub(t);
-                            (r, r)
-                        })
-                }
+                (None, None) if retrans_acked => tsecr_ms
+                    .filter(|&t| !seq_gt(t, newest_ts as u32))
+                    .map(|t| (now as u32).wrapping_sub(t))
+                    // Echoed no earlier than our first segment, in host
+                    // time: a 32-bit comparison fails after 2^31 ms.
+                    .filter(|&r| {
+                        now.checked_sub(u64::from(r))
+                            .is_some_and(|sent| sent >= self.syn_xmit_ms)
+                    })
+                    .map(|r| (r, r)),
                 (None, None) => None,
             };
             if let Some((r, ca)) = sample {
@@ -333,6 +338,13 @@ impl<const BUF: usize> Tcb<BUF> {
         if self.cc.maybe_exit(self.snd_una) && loss_episode {
             self.rack.on_recovery_exit();
         }
+        // Linux `tcp_reset_reno_sack`: without SACK, duplicate ACKs counted
+        // outside fast recovery are spent once SND.UNA moves, and all of
+        // them when recovery ends (in recovery, each segment a partial ACK
+        // covers beyond the first eats one, above).
+        if acked > 0 && self.cc.state() != CaState::Recovery {
+            self.reno_sacked = 0;
+        }
 
         // ---- ECN-Echo (RFC 3168 §6.1.2): reduce once per window, never
         // retransmit — nothing was lost. As in Linux, also when this ACK
@@ -356,19 +368,22 @@ impl<const BUF: usize> Tcb<BUF> {
             && !hold_detection
             && core::mem::take(&mut self.rack.advanced)
             && self.rack_detect();
+        let mut dup = false;
         if !self.sack_enabled && !hold_detection {
-            let (lost, dup) = self.newreno_detect(seg, acked, wnd_before);
+            let (lost, is_dup) = self.newreno_detect(seg, acked, wnd_before);
             newly_lost |= lost;
-            if dup {
-                let outstanding = self.snd_nxt.wrapping_sub(self.data_una());
-                if self.reno_sacked.saturating_add(mss) <= outstanding {
-                    self.reno_sacked += mss;
-                    delivered = delivered.saturating_add(mss);
-                }
-            }
+            dup = is_dup;
         }
+        // Linux `tcp_add_reno_sack` / `tcp_limit_reno_sacked`: a duplicate
+        // ACK vouches for one more segment received, but never for the
+        // holes (at least one segment) still outstanding.
         let outstanding = self.snd_nxt.wrapping_sub(self.data_una());
-        self.reno_sacked = self.reno_sacked.min(outstanding);
+        let reno_limit = outstanding.saturating_sub(self.rtx.lost_bytes().max(mss));
+        if dup && self.reno_sacked.saturating_add(mss) <= reno_limit {
+            self.reno_sacked += mss;
+            delivered = delivered.saturating_add(mss);
+        }
+        self.reno_sacked = self.reno_sacked.min(reno_limit);
         if self.rtx.lost_bytes() > 0 && !self.cc.in_loss_recovery() {
             self.enter_fast_recovery();
         }
@@ -382,7 +397,12 @@ impl<const BUF: usize> Tcb<BUF> {
             let pipe = self.pipe();
             self.cc
                 .prr_update(delivered, pipe, mss, acked > 0 && !newly_lost);
-        } else {
+        } else if data_acked_any || (self.rack.reordering_seen && newly_sacked) {
+            // RFC 5681 §3.1 / Linux `tcp_may_raise_cwnd`: only an ACK of
+            // new data raises cwnd; SACKs (and duplicate ACKs) alone, only
+            // once reordering has been seen (`FLAG_FORWARD_PROGRESS`). A
+            // window that is overflowing a queue does not keep growing
+            // while RACK waits out its reordering window.
             self.cc.on_ack(delivered, mss, limited);
         }
 

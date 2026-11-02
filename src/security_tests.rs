@@ -6096,3 +6096,502 @@ fn resends_of_a_tick_survive_a_late_originals_sack_in_it() {
     assert_eq!(spurious.iter().filter(|o| o.len > 0).count(), 0);
     assert_eq!(c.stats().segs_retrans, 4);
 }
+
+// ---------------------------------------------------------------------------
+// General sweep (audit iteration 6)
+// ---------------------------------------------------------------------------
+
+/// SACK blocks of a byte or two inside one segment split nothing (Linux
+/// `tcp_match_skb_to_sack` never splits a single-segment skb): splitting
+/// at every block edge let a peer fill the retransmission queue, after
+/// which no new data could be sent, and each fragment would go out again
+/// in a packet of its own.
+#[test]
+fn one_byte_sack_blocks_do_not_shatter_the_retransmission_queue() {
+    let (mut c, sseq, iss) = established(1000, true, false);
+    let now = 1020u64;
+    ts_ack(&mut c, sseq, now, iss + 1, 1000, &[]);
+    let segs = send_burst(&mut c, now, 2 * 1448);
+    assert_eq!(segs.len(), 2);
+    for k in 0..511u32 {
+        let l = segs[1].0 + 1 + 2 * k;
+        ts_ack(&mut c, sseq, now, segs[0].0, now as u32, &[(l, l + 1)]);
+    }
+    c.send(&[0x5a; 1448]).unwrap();
+    c.tick().unwrap();
+    let out: Vec<Out> = drain(&mut c).into_iter().filter(|o| o.len > 0).collect();
+    assert!(!out.is_empty(), "new data blocked by a shattered queue");
+    c.debug_validate_invariants().unwrap();
+}
+
+/// A full queue of segments alternately SACKed and lost has no pair to
+/// merge for the split a path-MTU drop needs at the head; the newest two
+/// merge anyway (to be sent again), or nothing at all would go out until
+/// R2 gave up.
+#[test]
+fn alternating_sacks_and_a_path_mtu_drop_leave_the_head_splittable() {
+    let iss = 1_000_000;
+    let mut c = new_tcb(CLI, SRV, iss);
+    c.set_now(1000);
+    c.connect().unwrap();
+    let syn = drain(&mut c);
+    let opts = TcpOptions {
+        mss: Some(1036),
+        wscale: Some(7),
+        ts: Some((1, tsval(&syn[0]))),
+        sack_permitted: true,
+        sack: SackBlocks::EMPTY,
+    };
+    c.set_now(1010);
+    c.inject_packet(&pkt(
+        SRV,
+        CLI,
+        SRV_ISS,
+        iss + 1,
+        flags::SYN | flags::ACK,
+        8192,
+        &opts,
+        &[],
+    ))
+    .unwrap();
+    drain(&mut c);
+    let sseq = SRV_ISS + 1;
+    let mut now = 1020u64;
+    ts_ack(&mut c, sseq, now, iss + 1, 0, &[]);
+    while c.stats().cwnd < crate::BUF_CAP as u32 {
+        c.send(&vec![0x5a; c.stats().cwnd as usize]).unwrap();
+        send_until_quiet(&mut c);
+        now += 1;
+        let end = c.debug_snapshot().snd_nxt;
+        ts_ack(&mut c, sseq, now, end, 0, &[]);
+    }
+    let start = c.debug_snapshot().snd_una;
+    assert_eq!(c.send(&vec![0x5a; 1023 * 1024]), Ok(1023 * 1024));
+    send_until_quiet(&mut c);
+    for k in (1..1023u32).step_by(2) {
+        let seg = start + k * 1024;
+        ts_ack(&mut c, sseq, now, start, 0, &[(seg, seg + 1024)]);
+    }
+    c.update_pmtu(900);
+    send_until_quiet(&mut c);
+    ts_ack(&mut c, sseq, now, start, 0, &[(start + 848, start + 1024)]);
+    c.update_pmtu(576);
+    let mut out = drain(&mut c);
+    for _ in 0..5 {
+        let d = c.debug_snapshot().rto_deadline;
+        if d == u64::MAX {
+            break;
+        }
+        c.set_now(d);
+        c.tick().unwrap();
+        out.extend(drain(&mut c));
+        c.debug_validate_invariants().unwrap();
+    }
+    assert!(
+        out.iter().any(|o| o.len > 0 && o.total_len <= 576),
+        "nothing small enough for the path went out"
+    );
+}
+
+/// A path-MTU probe that drew nothing back is resent at the size in use
+/// without a window reduction when it is the last segment in flight, not
+/// only when it is the only one: a tail loss probe of its first MSS left
+/// the rest stranded until the RTO.
+#[test]
+fn a_lost_path_mtu_probe_behind_another_segment_is_resent_whole() {
+    let (mut c, sseq, iss) = established(1000, true, false);
+    ts_ack(&mut c, sseq, 1020, iss + 1, 1000, &[]);
+    c.set_now(1020);
+    c.update_pmtu(1064);
+    let mut now = 1020 + 599_999;
+    let pre = send_burst(&mut c, now, 1012);
+    assert_eq!(pre[0].1 - pre[0].0, 1012);
+    now += 1;
+    let probe = send_burst(&mut c, now, 1448);
+    assert_eq!(
+        probe[0].1 - probe[0].0,
+        1448,
+        "a path-MTU probe at the tail"
+    );
+    let before = c.stats();
+    let mut resent = Vec::new();
+    while resent.is_empty() {
+        now += 1;
+        assert!(now < 1020 + 600_100, "nothing was resent");
+        c.set_now(now);
+        c.tick().unwrap();
+        resent = drain(&mut c)
+            .into_iter()
+            .filter(|o| o.len > 0)
+            .collect::<Vec<_>>();
+    }
+    let end = resent.iter().map(|o| o.seq + o.len as u32).max().unwrap();
+    now += 1;
+    let echo = resent.last().unwrap().opts.ts.unwrap().0;
+    ts_ack(&mut c, sseq, now, end, echo, &[]);
+    resent.extend(drain(&mut c).into_iter().filter(|o| o.len > 0));
+    let end = resent.iter().map(|o| o.seq + o.len as u32).max().unwrap();
+    assert_eq!(end, probe[0].1, "the rest of the probe was stranded");
+    let after = c.stats();
+    assert_eq!(after.fast_recoveries, 0, "a lost probe reduced the window");
+    assert!(after.ssthresh >= before.ssthresh && after.cwnd >= before.cwnd);
+}
+
+/// Without SACK, duplicate ACKs credit a segment each to the window's
+/// accounting but raise cwnd no more than an ACK of new data would (Linux
+/// `tcp_may_raise_cwnd`), are spent once SND.UNA moves outside recovery
+/// (`tcp_reset_reno_sack`), and never vouch for the holes
+/// (`tcp_limit_reno_sacked`).
+#[test]
+fn duplicate_acks_without_sack_neither_grow_nor_leak_the_window() {
+    let (mut c, sseq, iss) = established(1000, false, false);
+    let mut now = 1020u64;
+    let ack = |c: &mut Tcb, now: u64, ack: u32| {
+        c.set_now(now);
+        let o = ts(now as u32, now as u32);
+        c.inject_packet(&pkt(SRV, CLI, sseq, ack, flags::ACK, 8192, &o, &[]))
+            .unwrap();
+        drain(c)
+    };
+    ack(&mut c, now, iss + 1);
+    let mss = c.stats().mss;
+    let segs = send_burst(&mut c, now, 10 * mss as usize);
+    let cwnd = c.stats().cwnd;
+    now += 1;
+    ack(&mut c, now, segs[0].0);
+    ack(&mut c, now, segs[0].0);
+    assert_eq!(c.stats().cwnd, cwnd, "duplicate ACKs grew cwnd");
+    for &(_, end) in &segs {
+        now += 1;
+        c.send(&vec![0x5a; mss as usize]).unwrap();
+        ack(&mut c, now, end);
+    }
+    let snap = c.debug_snapshot();
+    assert_eq!(
+        c.stats().pipe,
+        snap.snd_nxt - snap.snd_una,
+        "duplicate ACKs left pipe under-counted"
+    );
+}
+
+/// SACKs alone do not raise cwnd until reordering has been seen (Linux
+/// `tcp_may_raise_cwnd`: `FLAG_DATA_ACKED`): a slow start that overflowed
+/// a queue does not keep doubling while RACK waits out its reordering
+/// window. The ACK of new data that follows raises it.
+#[test]
+fn sacks_alone_do_not_grow_the_window_before_reordering_is_seen() {
+    let (mut c, sseq, iss) = established(1000, true, false);
+    let now = 1020u64;
+    ts_ack(&mut c, sseq, now, iss + 1, 1000, &[]);
+    let n = c.stats().cwnd as usize;
+    let segs = send_burst(&mut c, now, n);
+    let cwnd = c.stats().cwnd;
+    ts_ack(
+        &mut c,
+        sseq,
+        now + 1,
+        segs[0].0,
+        1000,
+        &[(segs[1].0, segs[1].1)],
+    );
+    assert_eq!(c.stats().fast_recoveries, 0);
+    assert_eq!(c.stats().cwnd, cwnd, "a SACK alone grew cwnd");
+    ts_ack(&mut c, sseq, now + 1, segs[2].0, 1000, &[]);
+    assert!(
+        c.stats().cwnd > cwnd,
+        "an ACK of new data did not grow cwnd"
+    );
+}
+
+/// Closed in SYN_RCVD, the FIN that followed a lost SYN-ACK reached a peer
+/// still in SYN-SENT, which drops it: it follows the retransmitted SYN-ACK
+/// (Linux's timeout marks it lost), rather than waiting for a timeout
+/// after the handshake.
+#[test]
+fn a_fin_queued_in_syn_rcvd_follows_the_retransmitted_syn_ack() {
+    let mut s = new_tcb(SRV, ([0; 4], 0), 7);
+    s.set_secret(&[1; 16]);
+    s.set_now(1000);
+    s.listen().unwrap();
+    let syn = TcpOptions {
+        mss: Some(1460),
+        ..TcpOptions::NONE
+    };
+    s.inject_packet(&pkt(CLI, SRV, 500, 0, flags::SYN, 65535, &syn, &[]))
+        .unwrap();
+    assert!(drain(&mut s).iter().any(|o| o.flags & flags::SYN != 0));
+    s.close().unwrap();
+    assert!(drain(&mut s).iter().any(|o| o.flags & flags::FIN != 0));
+    let rto = s.next_deadline().unwrap();
+    s.set_now(rto);
+    s.tick().unwrap();
+    let out = drain(&mut s);
+    let synack = out.iter().position(|o| o.flags & flags::SYN != 0);
+    let fin = out.iter().position(|o| o.flags & flags::FIN != 0);
+    assert!(
+        matches!((synack, fin), (Some(a), Some(b)) if a < b),
+        "the FIN did not follow the SYN-ACK: {:?}",
+        out.iter().map(|o| o.flags).collect::<Vec<_>>()
+    );
+}
+
+/// A timestamp echo names the transmission an ACK covers, also once the
+/// connection is older than 2^31 ms: it was compared, modulo 2^32, with
+/// the time of our first segment, which looked like the future for half
+/// of every 49.7 days, and the RTO stayed backed off.
+#[test]
+fn rtt_samples_from_timestamps_survive_the_32_bit_wrap() {
+    let (mut c, sseq, iss) = established(1000, true, false);
+    let wrapped = 1000u64 + (1u64 << 31) + 50_000;
+    ts_ack(&mut c, sseq, wrapped, iss + 1, 1000, &[]);
+    let segs = send_burst(&mut c, wrapped, 1448);
+    let mut now = wrapped;
+    let mut echo = 0;
+    for _ in 0..3 {
+        now = c.next_deadline().unwrap();
+        c.set_now(now);
+        c.tick().unwrap();
+        if let Some(o) = drain(&mut c).into_iter().find(|o| o.len > 0) {
+            echo = tsval(&o);
+        }
+    }
+    assert!(c.stats().rto_ms >= 800);
+    c.set_now(now + 10);
+    c.inject_packet(&pkt(
+        SRV,
+        CLI,
+        sseq,
+        segs[0].1,
+        flags::ACK,
+        8192,
+        &ts(100, echo),
+        &[],
+    ))
+    .unwrap();
+    drain(&mut c);
+    assert!(
+        c.stats().rto_ms < 400,
+        "the echo gave no RTT sample (RTO {} ms)",
+        c.stats().rto_ms
+    );
+}
+
+/// The FIN of an out-of-order segment whose text is dropped (no room for
+/// another out-of-order range) is dropped with it, as Linux drops the
+/// skb: SACKing the FIN alone claimed the end of a stream whose data was
+/// missing.
+#[test]
+fn the_fin_of_a_dropped_out_of_order_segment_is_not_sacked() {
+    let (mut c, sseq, iss) = established(1000, true, false);
+    ts_ack(&mut c, sseq, 1020, iss + 1, 1000, &[]);
+    for i in 0..crate::ooo::OOO_MAX_RANGES as u32 {
+        c.inject_packet(&pkt(
+            SRV,
+            CLI,
+            sseq + 100 + i * 20,
+            iss + 1,
+            flags::ACK,
+            8192,
+            &ts(10 + i, 1000),
+            &[0x41; 10],
+        ))
+        .unwrap();
+        drain(&mut c);
+    }
+    assert_eq!(c.stats().ooo_drops, 0);
+    let seq = sseq + 100 + (crate::ooo::OOO_MAX_RANGES as u32 + 5) * 20;
+    let fin = seq + 10;
+    c.inject_packet(&pkt(
+        SRV,
+        CLI,
+        seq,
+        iss + 1,
+        flags::ACK | flags::FIN,
+        8192,
+        &ts(9999, 1000),
+        &[0x42; 10],
+    ))
+    .unwrap();
+    assert_eq!(c.stats().ooo_drops, 1);
+    let sacked_fin = drain(&mut c)
+        .iter()
+        .flat_map(|a| a.opts.sack.as_slice().iter().copied())
+        .any(|(_, r)| r == fin + 1);
+    assert!(!sacked_fin, "the FIN of dropped text was SACKed");
+}
+
+/// A held out-of-order FIN sent again is reported in the ACK's first SACK
+/// block (RFC 2018 §4; Linux `tcp_sack_new_ofo_skb` moves a duplicate's
+/// block first too), not left out behind newer blocks.
+#[test]
+fn a_repeated_out_of_order_fin_is_sacked_first() {
+    let (mut c, sseq, iss) = established(1000, true, false);
+    ts_ack(&mut c, sseq, 1020, iss + 1, 1000, &[]);
+    let fin_seq = sseq + 1000;
+    let fin = |v| {
+        pkt(
+            SRV,
+            CLI,
+            fin_seq,
+            iss + 1,
+            flags::ACK | flags::FIN,
+            8192,
+            &ts(v, 1000),
+            &[],
+        )
+    };
+    c.inject_packet(&fin(10)).unwrap();
+    drain(&mut c);
+    for k in 0..3u32 {
+        c.inject_packet(&pkt(
+            SRV,
+            CLI,
+            sseq + 100 + k * 200,
+            iss + 1,
+            flags::ACK,
+            8192,
+            &ts(11 + k, 1000),
+            &[0x41; 10],
+        ))
+        .unwrap();
+        drain(&mut c);
+    }
+    c.inject_packet(&fin(20)).unwrap();
+    let acks = drain(&mut c);
+    let first = acks
+        .last()
+        .and_then(|a| a.opts.sack.as_slice().first().copied());
+    assert_eq!(first, Some((fin_seq, fin_seq + 1)), "{acks:?}");
+}
+
+/// A peer keepalive gives up on is reset, in case it comes back (Linux
+/// `tcp_keepalive_timer`), from CLOSE_WAIT too.
+#[test]
+fn keepalive_resets_the_peer_it_gives_up_on() {
+    for close_wait in [false, true] {
+        let (mut c, sseq, iss) = established(1000, true, false);
+        c.set_now(1020);
+        if close_wait {
+            c.inject_packet(&pkt(
+                SRV,
+                CLI,
+                sseq,
+                iss + 1,
+                flags::ACK | flags::FIN,
+                8192,
+                &ts(3, 0),
+                &[],
+            ))
+            .unwrap();
+            drain(&mut c);
+            assert_eq!(c.state(), State::CloseWait);
+        }
+        c.set_keepalive(10_000, 1_000, 3);
+        let (mut now, mut rst) = (1020u64, false);
+        while c.state() != State::Closed && now < 1020 + 600_000 {
+            now = c.next_deadline().unwrap_or(now + 1000).max(now + 1);
+            c.set_now(now);
+            c.tick().unwrap();
+            rst |= drain(&mut c).iter().any(|o| o.flags & flags::RST != 0);
+        }
+        assert_eq!(c.state(), State::Closed, "close_wait={close_wait}");
+        assert!(rst, "close_wait={close_wait}: no RST");
+    }
+}
+
+/// A segment for a connection that is gone draws a RST (RFC 9293
+/// §3.10.7.1), as from Linux, which no longer has the socket: the peer
+/// otherwise retransmitted into silence until its own timeout. Not a RST
+/// or a SYN (which may be for a listener the host runs), and one per
+/// rate-limit interval.
+#[test]
+fn a_closed_connection_answers_its_peer_with_a_reset() {
+    let (mut c, sseq, iss) = established(1000, true, false);
+    c.set_user_timeout(50);
+    send_burst(&mut c, 1020, 100);
+    c.set_now(1100);
+    c.tick().unwrap();
+    drain(&mut c);
+    assert_eq!(c.state(), State::Closed, "USER TIMEOUT");
+    let data = pkt(
+        SRV,
+        CLI,
+        sseq,
+        iss + 1,
+        flags::ACK,
+        8192,
+        &ts(5, 0),
+        b"late",
+    );
+    assert_eq!(c.inject_packet(&data), Err(TcpError::InvalidState));
+    let rst = drain(&mut c);
+    assert!(
+        matches!(rst.as_slice(), [o] if o.flags == flags::RST && o.seq == iss + 1),
+        "no RST <SEQ=SEG.ACK>"
+    );
+    let _ = c.inject_packet(&data);
+    assert!(drain(&mut c).is_empty(), "not rate limited");
+    c.set_now(2000);
+    let no_ack = pkt(SRV, CLI, sseq, 0, flags::FIN, 8192, &TcpOptions::NONE, &[]);
+    let _ = c.inject_packet(&no_ack);
+    let rst = drain(&mut c);
+    assert!(
+        matches!(rst.as_slice(), [o] if o.flags == flags::RST | flags::ACK && o.ack == sseq + 1),
+        "no RST <SEQ=0><ACK=SEG.SEQ+SEG.LEN>"
+    );
+    c.set_now(3000);
+    for fl in [flags::SYN, flags::RST | flags::ACK] {
+        let _ = c.inject_packet(&pkt(
+            SRV,
+            CLI,
+            sseq,
+            iss + 1,
+            fl,
+            8192,
+            &TcpOptions::NONE,
+            &[],
+        ));
+    }
+    assert!(drain(&mut c).is_empty(), "a SYN or RST drew a RST");
+}
+
+/// PAWS gives up on TS.Recent after 2147 s idle (Linux `TCP_PAWS_WRAP`),
+/// not 24 days: a peer whose clock ticks in microseconds (Linux
+/// `tcp_usec_ts`) laps half the timestamp space that soon, and every
+/// segment it sent after a longer idle was dropped as old.
+#[test]
+fn paws_relaxes_for_a_microsecond_peer_after_a_long_idle() {
+    let (mut c, sseq, iss) = established(1000, true, false);
+    c.set_keepalive(0, 0, 0);
+    c.set_now(1020);
+    c.inject_packet(&pkt(
+        SRV,
+        CLI,
+        sseq,
+        iss + 1,
+        flags::ACK | flags::PSH,
+        8192,
+        &ts(5_000_000, 0),
+        b"a",
+    ))
+    .unwrap();
+    drain(&mut c);
+    let mut buf = [0u8; 16];
+    assert_eq!(c.recv(&mut buf), Ok(1));
+    let idle_s: u64 = 40 * 60;
+    c.set_now(1020 + idle_s * 1000);
+    let tsv = 5_000_000u32.wrapping_add((idle_s * 1_000_000) as u32);
+    c.inject_packet(&pkt(
+        SRV,
+        CLI,
+        sseq + 1,
+        iss + 1,
+        flags::ACK | flags::PSH,
+        8192,
+        &ts(tsv, 0),
+        b"b",
+    ))
+    .unwrap();
+    drain(&mut c);
+    assert_eq!(c.recv(&mut buf), Ok(1), "dropped by PAWS after 40 min idle");
+}

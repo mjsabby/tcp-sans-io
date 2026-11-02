@@ -116,7 +116,7 @@ impl WinMin {
     }
 }
 
-/// RACK state (RFC 8985 §6.1). All-zero is the valid initial state.
+/// RACK state (RFC 8985 §6.1); [`Self::new`] is the initial state.
 #[derive(Copy, Clone, Debug, Default)]
 pub struct Rack {
     /// A delivered segment has been recorded (`RACK.segment` exists).
@@ -394,7 +394,7 @@ mod tests {
         let mut r = Rack::new();
         // Segment 3 (sent t=101) is SACKed at t=120: RTT 19.
         let s3 = *q.get(3).unwrap();
-        q.sack(s3.start, s3.end, |_| ());
+        q.sack(s3.start, s3.end, 1448, |_| ());
         r.on_delivered(&s3, 120, None, false);
         assert_eq!(r.rtt, 19);
         // Not in recovery, 1 segment SACKed: reo_wnd = srtt/4 without a min_rtt sample.
@@ -437,7 +437,9 @@ mod tests {
         let mut r = Rack::new();
         r.on_ack_start();
         let s3 = *q.get(3).unwrap();
-        q.sack(s3.start, s3.end, |s| r.on_delivered(s, 120, None, false));
+        q.sack(s3.start, s3.end, 1448, |s| {
+            r.on_delivered(s, 120, None, false)
+        });
         q.ack_to(1200, |s, newly| {
             if newly {
                 r.on_delivered(s, 120, None, false);
@@ -474,7 +476,7 @@ mod tests {
         let mut r = Rack::new();
         for i in [1, 2, 3] {
             let s = *q.get(i).unwrap();
-            q.sack(s.start, s.end, |_| ());
+            q.sack(s.start, s.end, 1448, |_| ());
             r.on_delivered(&s, 200, None, false);
         }
         let (m, _) = detect_loss(&r, &mut q, 200, 0);
@@ -495,7 +497,7 @@ mod tests {
         // Segment 2 (sent t=100) delivered: segment 0's retransmission was
         // sent *after* it, so it is not a loss candidate.
         let s2 = *q.get(2).unwrap();
-        q.sack(s2.start, s2.end, |_| ());
+        q.sack(s2.start, s2.end, 1448, |_| ());
         r.on_delivered(&s2, 160, None, false);
         let (m, _) = detect_loss(&r, &mut q, 10_000, 0);
         assert!(m);
@@ -518,7 +520,7 @@ mod tests {
         r.sample_rtt(101, 1);
         for i in [1, 3] {
             let s = *q.get(i).unwrap();
-            q.sack(s.start, s.end, |_| ());
+            q.sack(s.start, s.end, 1448, |_| ());
             r.on_delivered(&s, 101, None, true);
         }
         q.mark_lost(0);
@@ -526,7 +528,7 @@ mod tests {
         q.on_retransmit(0, 102);
         q.on_retransmit(2, 102);
         let s2 = *q.get(2).unwrap();
-        q.sack(s2.start, s2.end, |_| ());
+        q.sack(s2.start, s2.end, 1448, |_| ());
         r.on_delivered(&s2, 102, None, true);
         assert!(r.valid && r.ambiguous);
         let (m, t) = detect_loss(&r, &mut q, 102, 0);

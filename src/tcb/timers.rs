@@ -38,6 +38,17 @@ impl<const BUF: usize> Tcb<BUF> {
             State::FinWait1 if self.syn_unacked => self.syn_rcvd_timer()?,
             _ => {}
         }
+        // An ACK owed now goes alone, ahead of data, as on receipt — ahead
+        // of a tail loss probe's or the persist timer's too: a delayed ACK
+        // whose time has come (Linux's timer would have sent it already) or
+        // an immediate one a full or paused egress held back, which a peer
+        // counting duplicate ACKs must see data-less.
+        if self.pending_ack && self.ack_deadline.due(now) {
+            // The reply did not come in time to carry it: not interactive
+            // after all (Linux `tcp_delack_timer_handler`).
+            self.pingpong = false;
+            self.send_pure_ack()?;
+        }
         // A due tail-loss probe goes first: it re-arms the RTO (RFC 8985 §7.3).
         if self.tlp_deadline.due(now) {
             self.fire_tlp()?;
@@ -84,16 +95,6 @@ impl<const BUF: usize> Tcb<BUF> {
         if self.state == State::Closed {
             return Ok(());
         }
-        // An ACK owed now goes alone, ahead of data, as on receipt: a
-        // delayed ACK whose time has come (Linux's timer would have sent it
-        // already) or an immediate one a full or paused egress held back,
-        // which a peer counting duplicate ACKs must see data-less.
-        if self.pending_ack && self.ack_deadline.due(now) {
-            // The reply did not come in time to carry it: not interactive
-            // after all (Linux `tcp_delack_timer_handler`).
-            self.pingpong = false;
-            self.send_pure_ack()?;
-        }
         self.maybe_send_data()
     }
 
@@ -133,6 +134,13 @@ impl<const BUF: usize> Tcb<BUF> {
         self.syn_retransmitted = true;
         self.backoff_rto();
         let _ = self.emit_synack()?;
+        // Closed in SYN-RECEIVED: the FIN that followed the lost SYN-ACK
+        // reached a peer still in SYN-SENT, which drops it (RFC 9293
+        // §3.10.7.3); it follows this one (Linux's timeout marks it lost,
+        // `tcp_enter_loss`).
+        if self.state == State::FinWait1 {
+            self.rtx.mark_all_lost();
+        }
         self.arm_rto();
         Ok(())
     }
@@ -265,17 +273,19 @@ impl<const BUF: usize> Tcb<BUF> {
                 let fin = self.fin_rides(len);
                 (self.emit_new(len, fin)?, false)
             } else if self.pmtu_probe_inflight
-                && self.snd_una == self.pmtu_probe_start
-                && self.rtx.len() == 1
+                && self.snd_nxt == self.pmtu_probe_end
+                && self.rtx.last().is_some_and(|s| {
+                    !s.has(seg_flags::SACKED) && s.payload_len() > self.mss_payload()
+                })
             {
-                // A path-MTU probe alone in flight drew nothing back: too
+                // A path-MTU probe last in flight drew nothing back: too
                 // big, most likely. Resend its data at the size in use
                 // without a congestion response, as Linux does once ACKs
                 // show a probe lost ("MTU probe failure: don't reduce
                 // cwnd"); a probe of its first MSS (Linux: an inconclusive
                 // MTU probe) would leave the rest for RACK to find lost and
-                // halve the window over it. The tick sends it; the RTO
-                // restarts, as for any probe.
+                // halve the window over it, or for the RTO. The tick sends
+                // it; the RTO restarts, as for any probe.
                 self.pmtu_probe_failed();
                 self.simple_retransmit();
                 self.arm_rto();
@@ -363,10 +373,13 @@ impl<const BUF: usize> Tcb<BUF> {
             return Ok(());
         }
         if self.keepalive_probes >= self.keepalive_count {
-            // The peer vanished. In CLOSE_WAIT its stream is complete and
-            // nothing of ours is in flight (we only probe when idle), so
-            // nothing was lost: close, keeping unread bytes readable before
-            // EOF, as Linux delivers them. Anywhere else, abort.
+            // The peer vanished: reset it in case it comes back, as Linux
+            // `tcp_keepalive_timer` does. In CLOSE_WAIT its stream is
+            // complete and nothing of ours is in flight (we only probe when
+            // idle), so nothing was lost: close, keeping unread bytes
+            // readable before EOF, as Linux delivers them. Anywhere else,
+            // abort.
+            let _ = self.emit_ctl(flags::RST | flags::ACK, self.snd_nxt, self.rcv_nxt)?;
             if self.state == State::CloseWait {
                 self.close_clean();
             } else {
