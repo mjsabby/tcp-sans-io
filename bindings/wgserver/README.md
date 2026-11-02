@@ -68,8 +68,8 @@ scale: 10000/10000 ok (100.00%) in 2.55s; p50=63ms p95=68ms p99=79ms
 | ------------------------------------------ | -------- | --------------------------------------------------------------------- |
 | `TestWGServer_SynFlood_NoCookies`          | `STRESS=1` | Without `--cookies`, a forged SYN holds the half-open slot, yet a legit client still gets through at once (cookie key derived from the host secret). |
 | `TestWGServer_SynFlood_Cookies`            | ✅       | 20 K forged SYNs + cookies on → one half-open, the rest answered statelessly; legit succeeds. |
-| `TestWGServer_BareAck_NoReflection`        | ✅       | Bare ACK in LISTEN emits zero packets (no reflection).                |
-| `TestWGServer_Listen_DropsFinSilently`     | ✅       | Bare FIN in LISTEN emits zero packets.                                |
+| `TestWGServer_BareAck_RateLimitedRst`      | ✅       | Bare ACK in LISTEN gets exactly one RST (RFC 9293, as Linux); a repeat within the rate limit gets nothing. |
+| `TestWGServer_Listen_DropsFinSilently`     | ✅       | Bare FIN in LISTEN emits zero packets; FIN+ACK gets one RST (an ACK-bearing segment). |
 | `TestWGServer_Listen_DropsRstSilently`     | ✅       | Bare RST in LISTEN emits zero packets.                                |
 | `TestWGServer_Listen_RstOnSynAck`          | ✅       | SYN+ACK in LISTEN gets exactly one RST (RFC 9293).                    |
 | `TestWGServer_BlindRst_Established`        | ✅       | 200 off-path RSTs do not abort an established connection.             |
@@ -82,12 +82,10 @@ scale: 10000/10000 ok (100.00%) in 2.55s; p50=63ms p95=68ms p99=79ms
 
 ## Notes on observed behaviors
 
-* **`Listen_RstOnSynAck`** — the cdylib addresses the RST emitted in
-  response to a LISTEN-state SYN+ACK to the wildcarded `remote`
-  `(0.0.0.0, 0)`. On a real network this is unroutable; in the
-  integration test we register a "wildcard" inbox to observe the RST
-  byte stream and assert it. The behaviorally critical property is
-  that the server stays in LISTEN and emits exactly one packet.
+* **`Listen_RstOnSynAck`** — the RST goes back to the segment's source
+  with `SEQ = SEG.ACK` (RFC 9293 §3.10.7.2), at most one per rate-limit
+  interval; the server stays in LISTEN. A bare ACK that is not a valid
+  cookie is answered the same way (`BareAck_RateLimitedRst`).
 * **`SynFlood_NoCookies`** — single-Tcb-per-port means the FIRST
   forged SYN takes the listener's only half-open slot (SYN_RCVD).
   Every listener has a host secret (`listen()` requires one), from

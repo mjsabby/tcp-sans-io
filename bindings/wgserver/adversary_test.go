@@ -184,10 +184,13 @@ func TestWGServer_SynFlood_Cookies(t *testing.T) {
 	runOne(t, drv, 31100, 50100, "cookies-post-flood", OptsNone)
 }
 
-// TestWGServer_BareAck_NoReflection sends a bare ACK (not a valid
-// cookie) to LISTEN. The server must emit ZERO packets — otherwise it'd
-// be a reflection / amplification gadget.
-func TestWGServer_BareAck_NoReflection(t *testing.T) {
+// TestWGServer_BareAck_RateLimitedRst sends a bare ACK (not a valid
+// cookie) to LISTEN. As RFC 9293 §3.10.7.2 and Linux, it draws one
+// <SEQ=SEG.ACK><CTL=RST> back to its source, so a peer stranded with a
+// connection the server no longer holds learns of it at once; a repeat
+// within the rate-limit window draws nothing, so the listener cannot be
+// used to reflect packets at line rate.
+func TestWGServer_BareAck_RateLimitedRst(t *testing.T) {
 	drv, h, cleanup := adversarySetup(t, "none", 1, 31200)
 	defer cleanup()
 	_ = h
@@ -211,19 +214,31 @@ func TestWGServer_BareAck_NoReflection(t *testing.T) {
 	if err := drv.SendTo(pkt); err != nil {
 		t.Fatalf("send: %v", err)
 	}
-	// Wait briefly for any reply.
-	got, err := box.Recv(200 * time.Millisecond)
-	if err == nil {
-		// We got *something* back — that's a reflection. Dump and fail.
-		pp, _ := Parse(got)
-		t.Fatalf("expected no reply to bare ACK in LISTEN, got %+v", pp)
+	got, err := box.Recv(500 * time.Millisecond)
+	if err != nil {
+		t.Fatalf("expected a RST to the bare ACK in LISTEN, got timeout")
 	}
-	// Sanity: after the bare-ACK drop the listener still accepts a real connection.
+	pp, err := Parse(got)
+	if err != nil {
+		t.Fatalf("parse RST: %v", err)
+	}
+	if pp.Flags&FlagRST == 0 || pp.Seq != 0x9abc_def0 {
+		t.Fatalf("expected RST with seq = SEG.ACK (0x9abcdef0), got %+v", pp)
+	}
+	// A repeat within the rate-limit window is silent.
+	_ = drv.SendTo(pkt)
+	if g2, err2 := box.Recv(100 * time.Millisecond); err2 == nil {
+		pp2, _ := Parse(g2)
+		t.Fatalf("expected exactly one (rate-limited) RST, got a second packet %+v", pp2)
+	}
+	// Sanity: the listener still accepts a real connection.
 	runOne(t, drv, 31200, 50201, "post-bare-ack", OptsAll)
 }
 
-// TestWGServer_Listen_DropsFinSilently asserts that a bare FIN to
-// LISTEN emits zero packets, then a legit handshake still works.
+// TestWGServer_Listen_DropsFinSilently asserts that a bare FIN (no ACK) to
+// LISTEN emits zero packets, while a FIN+ACK, like any ACK-bearing segment
+// (RFC 9293 §3.10.7.2, as Linux), draws one RST with SEQ = SEG.ACK; then a
+// legit handshake still works.
 func TestWGServer_Listen_DropsFinSilently(t *testing.T) {
 	drv, h, cleanup := adversarySetup(t, "none", 1, 31300)
 	defer cleanup()
@@ -240,7 +255,7 @@ func TestWGServer_Listen_DropsFinSilently(t *testing.T) {
 		SrcPort: 50300,
 		DstPort: 31300,
 		Seq:     0x1,
-		Flags:   FlagFIN | FlagACK,
+		Flags:   FlagFIN,
 		Window:  65535,
 	}
 	pkt, _ := Encode(spec)
@@ -248,6 +263,17 @@ func TestWGServer_Listen_DropsFinSilently(t *testing.T) {
 	if got, err := box.Recv(200 * time.Millisecond); err == nil {
 		pp, _ := Parse(got)
 		t.Fatalf("expected no reply to bare FIN in LISTEN, got %+v", pp)
+	}
+	spec.Flags = FlagFIN | FlagACK
+	spec.Ack = 0x77
+	pkt, _ = Encode(spec)
+	_ = drv.SendTo(pkt)
+	got, err := box.Recv(500 * time.Millisecond)
+	if err != nil {
+		t.Fatalf("expected a RST to FIN+ACK in LISTEN, got timeout")
+	}
+	if pp, _ := Parse(got); pp.Flags&FlagRST == 0 || pp.Seq != 0x77 {
+		t.Fatalf("expected RST with seq = SEG.ACK (0x77), got %+v", pp)
 	}
 	runOne(t, drv, 31300, 50301, "post-bare-fin", OptsAll)
 }

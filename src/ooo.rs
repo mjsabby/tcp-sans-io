@@ -40,11 +40,24 @@ struct Range {
 /// Outcome of [`OooList::insert`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Insert {
-    /// The range was recorded (possibly merged). `dup` is true when every
-    /// byte of it was already held (a duplicate, reported via D-SACK).
-    Stored { dup: bool },
+    /// The range was recorded (possibly merged). `dup`: the lowest run of
+    /// it that was already held, which a D-SACK reports (Linux
+    /// `tcp_data_queue_ofo` sets one for a partial overlap too);
+    /// `dup_bytes`: how many of its bytes were already held in all.
+    Stored {
+        dup: Option<(u32, u32)>,
+        dup_bytes: u32,
+    },
     /// No room for another disjoint range; the segment must be dropped.
     Full,
+}
+
+impl Insert {
+    /// Recorded, and nothing of it was held before.
+    pub const NEW: Self = Self::Stored {
+        dup: None,
+        dup_bytes: 0,
+    };
 }
 
 /// Sorted set of out-of-order sequence ranges above `RCV.NXT`.
@@ -116,7 +129,7 @@ impl OooList {
     pub fn insert(&mut self, start: u32, end: u32, rcv_nxt: u32) -> Insert {
         let (s, e) = (off(start, rcv_nxt), off(end, rcv_nxt));
         if s == 0 || e <= s {
-            return Insert::Stored { dup: true };
+            return Insert::NEW;
         }
         // Offsets from RCV.NXT are monotonic across the sorted list.
         // `lo`: first range ending at/after `s` (could merge or follow);
@@ -143,7 +156,7 @@ impl OooList {
                 }
             }
             self.len += 1;
-            return Insert::Stored { dup: false };
+            return Insert::NEW;
         }
         // Merge ranges lo..hi with the new one.
         let (first, last) = match (
@@ -153,7 +166,16 @@ impl OooList {
             (Some(f), Some(l)) => (f, l),
             _ => return Insert::Full,
         };
-        let dup = hi - lo == 1 && off(first.start, rcv_nxt) <= s && e <= off(first.end, rcv_nxt);
+        let mut dup = None;
+        let mut dup_bytes = 0u32;
+        for r in self.slice().get(lo..hi).unwrap_or(&[]) {
+            let is = off(r.start, rcv_nxt).max(s);
+            let ie = off(r.end, rcv_nxt).min(e);
+            if is < ie {
+                dup.get_or_insert((rcv_nxt.wrapping_add(is), rcv_nxt.wrapping_add(ie)));
+                dup_bytes += ie - is;
+            }
+        }
         let m_start = if off(first.start, rcv_nxt) < s {
             first.start
         } else {
@@ -178,7 +200,7 @@ impl OooList {
             }
             self.len -= removed;
         }
-        Insert::Stored { dup }
+        Insert::Stored { dup, dup_bytes }
     }
 
     /// Forget everything held at or beyond `limit` (> `rcv_nxt`), trimming a
@@ -225,25 +247,57 @@ impl OooList {
         nxt
     }
 
+    /// A fresh recency stamp, for an out-of-order FIN reported alongside
+    /// the ranges (see [`Self::fill_sack_blocks`]).
+    pub fn take_tag(&mut self) -> u32 {
+        let tag = self.next_tag;
+        self.next_tag = self.next_tag.wrapping_add(1);
+        tag
+    }
+
+    /// Whether a held range ends exactly at `seq`.
+    pub fn ends_at(&self, seq: u32) -> bool {
+        self.slice().iter().any(|r| r.end == seq)
+    }
+
     /// Append up to `max` (≤ 4) SACK blocks, most recently changed first.
-    pub fn fill_sack_blocks(&self, sack: &mut SackBlocks, max: usize) {
+    /// `fin`: an out-of-order FIN `(seq, tag)` held beyond `RCV.NXT`. Its
+    /// sequence number is SACKed too, as Linux reports a FIN segment's
+    /// `end_seq`: it extends the block of the data that ends at it, or is
+    /// a block of its own (a bare FIN).
+    pub fn fill_sack_blocks(&self, sack: &mut SackBlocks, max: usize, fin: Option<(u32, u32)>) {
         // Single pass keeping the `k` youngest ranges. Ages are measured
         // back from `next_tag`, so tag wrap-around is harmless.
         let k = max.min(4);
-        let age = |r: &Range| self.next_tag.wrapping_sub(r.tag);
-        let mut top: [Option<Range>; 4] = [None; 4];
-        for &r in self.slice() {
-            let mut cand = r;
+        let age = |tag: u32| self.next_tag.wrapping_sub(tag);
+        let keep = |top: &mut [Option<Range>; 4], mut cand: Range| {
             for slot in top.iter_mut().take(k) {
                 match slot {
                     None => {
                         *slot = Some(cand);
                         break;
                     }
-                    Some(held) if age(&cand) < age(held) => core::mem::swap(held, &mut cand),
+                    Some(held) if age(cand.tag) < age(held.tag) => core::mem::swap(held, &mut cand),
                     Some(_) => {}
                 }
             }
+        };
+        let mut top: [Option<Range>; 4] = [None; 4];
+        let mut fin_merged = false;
+        for &r in self.slice() {
+            let mut r = r;
+            if let Some((f, tag)) = fin.filter(|&(f, _)| f == r.end) {
+                r.end = f.wrapping_add(1);
+                if age(tag) < age(r.tag) {
+                    r.tag = tag;
+                }
+                fin_merged = true;
+            }
+            keep(&mut top, r);
+        }
+        if let Some((f, tag)) = fin.filter(|_| !fin_merged) {
+            let end = f.wrapping_add(1);
+            keep(&mut top, Range { start: f, end, tag });
         }
         for r in top.iter().take(k).flatten() {
             sack.push(r.start, r.end);
@@ -308,19 +362,25 @@ mod tests {
 
     fn blocks(l: &OooList, max: usize) -> std::vec::Vec<(u32, u32)> {
         let mut s = SackBlocks::EMPTY;
-        l.fill_sack_blocks(&mut s, max);
+        l.fill_sack_blocks(&mut s, max, None);
         s.as_slice().to_vec()
     }
 
     #[test]
     fn merges_overlapping_and_adjacent_ranges() {
         let mut l = OooList::new();
-        assert_eq!(l.insert(200, 300, 100), Insert::Stored { dup: false });
-        assert_eq!(l.insert(400, 500, 100), Insert::Stored { dup: false });
-        assert_eq!(l.insert(300, 400, 100), Insert::Stored { dup: false }); // bridges both
+        assert_eq!(l.insert(200, 300, 100), Insert::NEW);
+        assert_eq!(l.insert(400, 500, 100), Insert::NEW);
+        assert_eq!(l.insert(300, 400, 100), Insert::NEW); // bridges both
         assert_eq!(l.len(), 1);
         assert_eq!(l.held_bytes(), 300);
-        assert_eq!(l.insert(250, 450, 100), Insert::Stored { dup: true });
+        assert_eq!(
+            l.insert(250, 450, 100),
+            Insert::Stored {
+                dup: Some((250, 450)),
+                dup_bytes: 200
+            }
+        );
         assert!(l.debug_valid(100));
     }
 
@@ -351,11 +411,11 @@ mod tests {
         let mut l = OooList::new();
         for i in 0..OOO_MAX_RANGES as u32 {
             let s = 1000 + i * 100;
-            assert_eq!(l.insert(s, s + 10, 0), Insert::Stored { dup: false });
+            assert_eq!(l.insert(s, s + 10, 0), Insert::NEW);
         }
         let beyond = 1000 + OOO_MAX_RANGES as u32 * 100 + 1000;
         assert_eq!(l.insert(beyond, beyond + 10, 0), Insert::Full);
-        assert_eq!(l.insert(1010, 1020, 0), Insert::Stored { dup: false });
+        assert_eq!(l.insert(1010, 1020, 0), Insert::NEW);
         assert_eq!(l.len(), OOO_MAX_RANGES);
         assert!(l.debug_valid(0));
     }
@@ -370,11 +430,7 @@ mod tests {
         let mut k = 1;
         while (2 * k + 1) * mss <= window && (k as usize) <= OOO_MAX_RANGES {
             let s = 2 * k * mss;
-            assert_eq!(
-                l.insert(s, s + mss, 0),
-                Insert::Stored { dup: false },
-                "range {k}"
-            );
+            assert_eq!(l.insert(s, s + mss, 0), Insert::NEW, "range {k}");
             k += 1;
         }
         assert!(
@@ -403,7 +459,14 @@ mod tests {
             l.insert(s, s + 50, 100);
         }
         assert_eq!(l.len(), 4);
-        assert_eq!(l.insert(320, 920, 100), Insert::Stored { dup: false });
+        // Partly held: the lowest held run is the D-SACK, all of it duplicates.
+        assert_eq!(
+            l.insert(320, 920, 100),
+            Insert::Stored {
+                dup: Some((320, 350)),
+                dup_bytes: 30 + 50 + 50 + 20
+            }
+        );
         assert_eq!(l.len(), 1);
         assert_eq!(l.containing(600), Some((300, 950)));
         assert!(l.debug_valid(100));

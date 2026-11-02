@@ -47,6 +47,10 @@ pub mod seg_flags {
     /// Sent with PSH: it ended the queued data (a write), as Linux marks
     /// the tail of a write; a retransmission repeats it.
     pub const PSH: u8 = 1 << 5;
+    /// The latest transmission left in a later millisecond than the one
+    /// before it, so a TSecr at or after its send time can only echo it
+    /// (or a later one): TSecr then tells which transmission arrived.
+    pub const DISTINCT_TS: u8 = 1 << 6;
 }
 use seg_flags::*;
 
@@ -389,6 +393,60 @@ impl RtxQueue {
         true
     }
 
+    /// Make room for a split when the queue is full: merge the newest
+    /// adjacent pair of segments after `i` that are in the same state and
+    /// were sent once (neither SACKed nor retransmitted), so the counters
+    /// stay exact. One spare record serves one split, but a path MTU that
+    /// shrinks again before anything is acknowledged needs another for
+    /// every retransmission, and nothing could be acknowledged without
+    /// them. The merged segment keeps the later send time and is split
+    /// again when it is retransmitted. Returns whether a record was freed.
+    pub fn coalesce_after(&mut self, i: usize) -> bool {
+        const STATE: u8 = SACKED | LOST | RETRANS | EVER_RETRANS;
+        let mut j = match self.len.checked_sub(2) {
+            Some(j) => j,
+            None => return false,
+        };
+        while j > i {
+            let (Some(a), Some(b)) = (self.get(j).copied(), self.get(j + 1).copied()) else {
+                return false;
+            };
+            if a.flags & STATE == b.flags & STATE
+                && a.flags & (SACKED | RETRANS | EVER_RETRANS | FIN) == 0
+                && a.end == b.start
+            {
+                let merged = Seg {
+                    start: a.start,
+                    flags: (a.flags & !PSH) | (b.flags & (FIN | PSH)),
+                    ..b
+                };
+                if let Some(d) = self.get_mut(j) {
+                    *d = merged;
+                }
+                // Shift j+2.. down one; none of the moved bits change, but
+                // each moves to its new slot.
+                for k in j + 1..self.len - 1 {
+                    let dst = self.phys(k);
+                    if let Some(v) = self.segs.get(self.phys(k + 1)).copied() {
+                        if let Some(d) = self.segs.get_mut(dst) {
+                            *d = v;
+                        }
+                        self.set_sacked_bit(dst, v.has(SACKED));
+                    }
+                }
+                let last = self.phys(self.len - 1);
+                self.set_sacked_bit(last, false);
+                self.len -= 1;
+                if self.lost_hint > j {
+                    self.lost_hint -= 1;
+                }
+                return true;
+            }
+            j -= 1;
+        }
+        false
+    }
+
     /// Cumulative ACK up to `una`: remove (or trim) covered segments,
     /// calling `f` with each segment's pre-removal state (`newly_acked` =
     /// whether it had not been SACKed). Returns the sequence bytes removed.
@@ -565,6 +623,11 @@ impl RtxQueue {
     fn stamp_transmission(&mut self, i: usize, now: u64) {
         let xmit_seq = self.next_xmit;
         if let Some(d) = self.get_mut(i) {
+            if now > d.xmit_ts {
+                d.flags |= DISTINCT_TS;
+            } else {
+                d.flags &= !DISTINCT_TS;
+            }
             d.xmit_ts = now;
             d.xmit_seq = xmit_seq;
             self.next_xmit = xmit_seq.wrapping_add(1);

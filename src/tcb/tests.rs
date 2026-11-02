@@ -1152,3 +1152,134 @@ fn every_byte_up_to_the_advertised_edge_is_accepted() {
     }
     t.debug_validate_invariants().unwrap();
 }
+
+/// The FIN occupies a sequence number the peer's window must admit (Linux
+/// `tcp_snd_wnd_test` counts it in `end_seq`): when the data fills the
+/// window exactly, it goes alone and the FIN waits for the window.
+#[test]
+fn fin_does_not_ride_past_the_peer_window() {
+    let mut t = established();
+    ack(&mut t, 1001, 0);
+    ack(&mut t, 1001, 1000);
+    t.send(&[0x5a; 1000]).unwrap();
+    t.close().unwrap();
+    let out = drain(&mut t);
+    assert_eq!(out.len(), 1);
+    assert_eq!((out[0].3, out[0].2 & flags::FIN), (1000, 0));
+    ack(&mut t, 2001, 0);
+    assert!(!t.fin_sent);
+    assert!(t.persist_deadline.is_armed());
+    ack(&mut t, 2001, 1);
+    assert!(drain(&mut t).iter().any(|p| p.2 & flags::FIN != 0));
+}
+
+/// A read that reopens a zero window announces it at once (Linux
+/// `__tcp_cleanup_rbuf`: a nonzero window at least twice the old one), so
+/// the sender need not wait for its next, backed-off, probe.
+#[test]
+fn read_that_reopens_a_zero_window_announces_it() {
+    let mut t = Box::new(Tcb::new(cfg(1000)).unwrap());
+    let windows = |t: &mut Tcb| {
+        let mut out = Vec::new();
+        let mut buf = [0u8; MAX_PACKET];
+        while let Ok(n) = t.extract_packet(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            let s = wire::parse(&buf[..n]).unwrap();
+            out.push((s.ack, s.window));
+        }
+        out
+    };
+    t.connect().unwrap();
+    windows(&mut t);
+    t.set_now(1);
+    let o = TcpOptions {
+        mss: Some(1460),
+        wscale: Some(7),
+        ..TcpOptions::NONE
+    };
+    t.inject_packet(&peer_pkt(
+        PEER_ISS,
+        1001,
+        flags::SYN | flags::ACK,
+        65535,
+        &o,
+        &[],
+    ))
+    .unwrap();
+    windows(&mut t);
+    let mut seq = PEER_ISS + 1;
+    let mut last = 65535;
+    for off in (0..crate::BUF_CAP).step_by(1460) {
+        let len = 1460.min(crate::BUF_CAP - off);
+        let p = peer_pkt(
+            seq,
+            1001,
+            flags::ACK,
+            65535,
+            &TcpOptions::NONE,
+            &std::vec![0x55; len],
+        );
+        t.inject_packet(&p).unwrap();
+        seq += len as u32;
+        for (_, w) in windows(&mut t) {
+            last = w;
+        }
+    }
+    t.set_now(50);
+    t.tick().unwrap();
+    for (_, w) in windows(&mut t) {
+        last = w;
+    }
+    assert_eq!(last, 0, "the ring is full");
+    assert_eq!(t.recv(&mut [0u8; 2048]).unwrap(), 2048);
+    t.tick().unwrap();
+    let reopened = windows(&mut t);
+    assert!(
+        reopened.iter().any(|&(a, w)| a == seq && w > 0),
+        "no window update: {reopened:?}"
+    );
+}
+
+/// A D-SACK for data the retransmission timer resent shows a delayed ACK
+/// path, not reordering: like a tail loss probe's, it leaves RACK's
+/// reordering state alone, or every later loss would wait out a 2 ms
+/// reordering window instead of being declared at once.
+#[test]
+fn dsack_of_a_timeout_retransmission_is_not_reordering() {
+    let mut t = Box::new(Tcb::new(cfg(1000)).unwrap());
+    t.set_now(0);
+    t.connect().unwrap();
+    drain(&mut t);
+    let o = TcpOptions {
+        mss: Some(1460),
+        sack_permitted: true,
+        ..TcpOptions::NONE
+    };
+    t.set_now(10);
+    t.inject_packet(&peer_pkt(
+        PEER_ISS,
+        1001,
+        flags::SYN | flags::ACK,
+        65535,
+        &o,
+        &[],
+    ))
+    .unwrap();
+    drain(&mut t);
+    t.send(&[0xAB; 1000]).unwrap();
+    t.tick().unwrap();
+    drain(&mut t);
+    run_timers(&mut t, 10, |t| t.stats.rto_count > 0);
+    assert_eq!(t.stats.rto_count, 1);
+    // The original had arrived: the ACK covers it and D-SACKs a resend.
+    let d = TcpOptions {
+        sack: SackBlocks::from_slice(&[(1001, 2001)]),
+        ..TcpOptions::NONE
+    };
+    t.inject_packet(&peer_pkt(PEER_ISS + 1, 2001, flags::ACK, 65535, &d, &[]))
+        .unwrap();
+    assert_eq!(t.stats.dsacks_received, 1);
+    assert!(!t.rack.reordering_seen);
+}

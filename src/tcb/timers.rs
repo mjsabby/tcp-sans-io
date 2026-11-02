@@ -1,8 +1,9 @@
 //! `tick()`: every timer-driven action.
 
 use super::{
-    Deadline, Tcb, BLACKHOLE_MSS1, BLACKHOLE_MSS2, BLACKHOLE_RTO_STEP1, BLACKHOLE_RTO_STEP2,
-    MAX_RETRANSMITS, MAX_SYN_RCVD_RETRIES, MAX_SYN_RETRIES, PMTU_PROBE_MIN_MS, RTO_MAX_MS,
+    seq_ge, seq_gt, Deadline, Tcb, BLACKHOLE_MSS1, BLACKHOLE_MSS2, BLACKHOLE_RTO_STEP1,
+    BLACKHOLE_RTO_STEP2, MAX_RETRANSMITS, MAX_SYN_RCVD_RETRIES, MAX_SYN_RETRIES, PMTU_PROBE_MIN_MS,
+    RTO_MAX_MS,
 };
 use crate::error::TcpError;
 use crate::rtx_queue::seg_flags;
@@ -152,6 +153,19 @@ impl<const BUF: usize> Tcb<BUF> {
         // undo state, so of earlier retransmissions only a tail loss probe
         // still needs a D-SACK.
         let seed = self.undo_seed(0);
+        // What the timer is about to resend: a D-SACK for it later shows a
+        // delayed ACK path, not reordering (see `process_ack`).
+        self.rto_span = Some(match self.rto_span {
+            Some((lo, hi)) if seq_ge(hi, self.snd_una) => (
+                lo,
+                if seq_gt(self.snd_nxt, hi) {
+                    self.snd_nxt
+                } else {
+                    hi
+                },
+            ),
+            _ => (self.snd_una, self.snd_nxt),
+        });
         self.cc.on_rto(
             self.snd_una,
             self.snd_nxt,
@@ -160,6 +174,13 @@ impl<const BUF: usize> Tcb<BUF> {
             self.max_snd_wnd,
             repeat,
         );
+        // Linux `tcp_enter_loss`: no F-RTO while a path-MTU probe is out —
+        // its loss is the size's, and later data getting through says
+        // nothing about it.
+        if self.pmtu_probe_inflight {
+            self.cc.frto_off();
+        }
+        self.frto_new = false;
         self.queue_cwr();
         self.rtx.mark_all_lost();
         self.reno_sacked = 0;
@@ -223,7 +244,7 @@ impl<const BUF: usize> Tcb<BUF> {
         let (sent, is_retrans) =
             if unsent > 0 && usable >= unsent.min(mss) && self.rtx.has_room_for_new() {
                 let len = unsent.min(mss);
-                let fin = self.fin_owed() && len == unsent;
+                let fin = self.fin_rides(len);
                 (self.emit_new(len, fin)?, false)
             } else {
                 match self.rtx.len().checked_sub(1) {
@@ -262,7 +283,7 @@ impl<const BUF: usize> Tcb<BUF> {
         let usable = self.usable_window();
         if usable > 0 && self.rtx.has_room_for_new() {
             let len = usable.min(unsent).min(self.data_mss());
-            let fin = self.fin_owed() && len == unsent;
+            let fin = self.fin_rides(len);
             let _ = self.emit_new(len, fin)?;
         } else {
             let _ = self.emit_probe(self.snd_una.wrapping_sub(1))?;

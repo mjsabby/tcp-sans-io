@@ -186,6 +186,7 @@ impl Rack {
     /// segment. `tsecr_ms` is the ACK's TSecr mapped back onto the host
     /// clock (TSecr − TS offset), if timestamps are in use; `sacked`: the
     /// delivery was reported by a SACK block.
+    #[inline]
     pub fn on_delivered(&mut self, seg: &Seg, now: u64, tsecr_ms: Option<u32>, sacked: bool) {
         // Step 3: reordering — a never-retransmitted segment delivered below
         // the highest sequence delivered by *earlier* ACKs arrived out of
@@ -203,22 +204,31 @@ impl Rack {
         // Step 2: retransmission ambiguity filter.
         let rtt = u32::try_from(now.saturating_sub(seg.xmit_ts)).unwrap_or(u32::MAX);
         if seg.has(seg_flags::EVER_RETRANS) {
+            // The ACK echoes this transmission or a later one, and no
+            // earlier one shares its millisecond: TSecr names what arrived.
+            let mut echoed = false;
             if let Some(t) = tsecr_ms {
                 if (t.wrapping_sub(seg.xmit_ts as u32) as i32) < 0 {
                     return; // the ACK echoes an earlier transmission
                 }
+                echoed = !sacked && seg.has(seg_flags::DISTINCT_TS);
             }
             // A tail loss probe leaves at least a PTO after the original,
             // so a fast delivery of it is the probe itself. Below 1 ms the
             // clock reads its RTT as 0 against a `min_rtt` floored at 1,
             // and filtering it would leave the rest of a lost tail to the
             // RTO. So it would any SACKed retransmission there, and a lost
-            // retransmission before it would wait for the RTO: until the
-            // path has shown reordering (an original arriving late could
-            // then pass for the retransmission), a tick of slack. Linux,
-            // timing in microseconds, needs none.
+            // retransmission before it would wait for the RTO: while the
+            // path delivers within the clock's tick (RACK's latest RTT is
+            // at most 1 ms), a tick of slack. With a queue in the path a
+            // retransmission cannot be delivered in the millisecond it
+            // left, so a 0 ms sample is the original arriving late, as
+            // Linux's filter (timing in microseconds) assumes. A
+            // cumulatively ACKed one gets the slack only when the echo
+            // shows it arrived: a late original ACKed in the same tick is
+            // indistinguishable from it.
             if let Some(m) = self.min_rtt.get() {
-                let slack = u32::from(sacked && m <= 1 && !self.reordering_seen);
+                let slack = u32::from(m <= 1 && (echoed || (sacked && self.rtt <= 1)));
                 if rtt.saturating_add(slack) < m && self.tlp_probe_end != Some(seg.end) {
                     return; // implausibly fast: acks the original
                 }

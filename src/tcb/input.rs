@@ -110,15 +110,15 @@ impl<const BUF: usize> Tcb<BUF> {
             return Ok(());
         }
         if seg.has(flags::ACK) {
-            if !seg.has(flags::SYN) {
-                // Possibly the third leg of a cookie handshake; otherwise a
-                // stray ACK is dropped silently (no reflection target).
-                if self.cookie_secret_set {
-                    let _ = self.try_promote_via_cookie(seg)?;
-                }
+            // Possibly the third leg of a cookie handshake.
+            if !seg.has(flags::SYN) && self.cookie_secret_set && self.try_promote_via_cookie(seg)? {
                 return Ok(());
             }
-            // RFC 9293 §3.10.7.2: an ACK in LISTEN draws <SEQ=SEG.ACK><RST>.
+            // RFC 9293 §3.10.7.2, as Linux: any other ACK in LISTEN draws
+            // <SEQ=SEG.ACK><CTL=RST>, so a peer stranded with a connection
+            // the host no longer holds learns of it at once instead of
+            // retrying until it times out. Rate limited, so spoofed ACKs
+            // cannot turn the listener into a reflector.
             if self.oow_allowed() {
                 self.emit_rst_to(seg, seg.ack, 0, flags::RST)?;
             }
@@ -312,9 +312,26 @@ impl<const BUF: usize> Tcb<BUF> {
                 return Ok(());
             }
             // Retransmitted SYN: our SYN-ACK was lost.
-            if seg.seq == self.irs && self.oow_allowed() {
-                let _ = self.emit_synack()?;
+            if seg.seq == self.irs {
+                if self.oow_allowed() {
+                    let _ = self.emit_synack()?;
+                }
+                return Ok(());
             }
+            // A SYN with a new ISN: the peer gave up on this handshake (its
+            // RST lost, or none sent) and opens again from the same port.
+            // As Linux `tcp_check_req`: outside the window it draws a
+            // (rate-limited) ACK, which the peer finds unacceptable and
+            // answers with a RST that frees this half-open, instead of
+            // waiting out our SYN-ACK retries. Inside the window a
+            // listener's half-open returns to LISTEN (RFC 9293
+            // §3.10.7.4; Linux resets it with a RST, which would refuse
+            // the new attempt), so the peer's next SYN starts afresh; an
+            // active open's is challenged (RFC 5961 §4).
+            if !self.acceptable(seg.seq, 1) || !self.is_listener {
+                return self.send_oow_ack();
+            }
+            self.reset_to_listen_or_closed();
             return Ok(());
         }
         if !seg.has(flags::ACK) {
@@ -474,10 +491,15 @@ impl<const BUF: usize> Tcb<BUF> {
                 self.send_oow_ack()
             };
         }
-        // RFC 5961 §3.2: only an exact-match RST resets; any other
-        // in-window RST draws a (rate-limited) challenge ACK.
+        // RFC 5961 §3.2, as Linux `tcp_validate_incoming` extends it: a RST
+        // resets at RCV.NXT, at RCV.NXT − 1 after the peer's FIN, or at the
+        // right edge of the SACK blocks we report; any other in-window RST
+        // draws a (rate-limited) challenge ACK.
         if seg.has(flags::RST) {
-            if seg.seq == self.rcv_nxt {
+            if seg.seq == self.rcv_nxt
+                || self.reset_after_fin(seg.seq)
+                || self.sack_right_edge() == Some(seg.seq)
+            {
                 self.on_reset_received();
                 return Ok(());
             }
@@ -534,6 +556,7 @@ impl<const BUF: usize> Tcb<BUF> {
         if self.state == State::Closed {
             return Ok(()); // our FIN was ACKed in LAST-ACK
         }
+        self.send_recovery()?;
         if zero_window_probe {
             // Linux `tcp_data_queue`: data into a zero window is out of
             // window; ACK it at once, and the next data too.
@@ -572,14 +595,26 @@ impl<const BUF: usize> Tcb<BUF> {
             self.note_data_received(payload_len, seg.has(flags::PSH));
         }
 
-        if ack_now {
+        let ack_due = if ack_now {
             self.pending_ack = true; // owed for this segment
-            self.send_pure_ack()?;
+            true
         } else if advanced {
-            self.schedule_delayed_ack(payload_len);
-        } else if payload_len > 0 || fin {
-            // Text or a FIN after the peer's FIN: nothing was taken.
-            self.send_oow_ack()?;
+            self.schedule_delayed_ack(payload_len)
+        } else {
+            if payload_len > 0 || fin {
+                // Text or a FIN after the peer's FIN: nothing was taken.
+                self.send_oow_ack()?;
+            }
+            false
+        };
+        // An ACK due now goes on its own, ahead of any data (Linux lets the
+        // data carry it: `tcp_data_snd_check` before `tcp_ack_snd_check`).
+        // Only a data-less ACK counts as a duplicate (RFC 5681 §2), so a
+        // sender recovering by duplicate ACKs alone (no SACK — smoltcp,
+        // for one) would see them ride on our data and stall until its
+        // timeout in a two-way transfer.
+        if ack_due && self.pending_ack {
+            self.send_pure_ack()?;
         }
         self.maybe_send_data()
     }
@@ -601,6 +636,9 @@ impl<const BUF: usize> Tcb<BUF> {
         fin: bool,
     ) -> Result<(), TcpError> {
         if seg.has(flags::RST) {
+            if self.reset_after_fin(seg.seq) {
+                self.on_reset_received();
+            }
             return Ok(());
         }
         if seg.has(flags::SYN) || !seg.has(flags::ACK) || !self.ack_acceptable(seg.ack) {
@@ -620,13 +658,19 @@ impl<const BUF: usize> Tcb<BUF> {
             }
         }
         let at_once = self.may_answer_at_once(seg);
-        if at_once && self.state == State::TimeWait && fin && end.wrapping_add(1) == self.rcv_nxt {
+        if at_once && fin && end.wrapping_add(1) == self.rcv_nxt && !self.state.can_recv() {
             // RFC 9293 §3.10.7.4: a retransmitted FIN means our last ACK was
-            // lost; re-ACK it and restart 2·MSL — but never beyond
-            // TIME_WAIT_MAX_MS after entry, so FINs cannot pin the TCB.
-            let restart = self.now_ms.saturating_add(TIME_WAIT_MS);
-            let cap = self.time_wait_since_ms.saturating_add(TIME_WAIT_MAX_MS);
-            self.time_wait_deadline = Deadline::at(restart.min(cap));
+            // lost. Re-ACK it at once in every state that has consumed it,
+            // as Linux does (`tcp_data_queue` for a retransmission), not
+            // through the out-of-window limiter: the peer backs off each
+            // time it goes unanswered.
+            if self.state == State::TimeWait {
+                // Restart 2·MSL, but never beyond TIME_WAIT_MAX_MS after
+                // entry, so FINs cannot pin the TCB.
+                let restart = self.now_ms.saturating_add(TIME_WAIT_MS);
+                let cap = self.time_wait_since_ms.saturating_add(TIME_WAIT_MAX_MS);
+                self.time_wait_deadline = Deadline::at(restart.min(cap));
+            }
             if payload_len > 0 {
                 // Data came back with it: D-SACK it like any duplicate.
                 self.stats.dup_bytes_received = self
@@ -743,10 +787,41 @@ impl<const BUF: usize> Tcb<BUF> {
         }
     }
 
+    /// Linux `tcp_reset_check`: after the peer's FIN, a RST at the FIN's
+    /// own sequence number (RCV.NXT − 1), which stacks send when the
+    /// application aborts right after closing, resets wherever it falls.
+    /// Its challenge ACK could be lost or rate-limited by a peer that has
+    /// already closed.
+    fn reset_after_fin(&self, seq: u32) -> bool {
+        seq == self.rcv_nxt.wrapping_sub(1)
+            && matches!(
+                self.state,
+                State::CloseWait | State::LastAck | State::Closing
+            )
+    }
+
+    /// The right edge of the SACK blocks we report, if any (a held FIN
+    /// included): the peer's SND.NXT when the data before a hole was lost,
+    /// so Linux accepts a RST there too.
+    fn sack_right_edge(&self) -> Option<u32> {
+        if !self.sack_enabled {
+            return None;
+        }
+        let fin = self.ooo_fin.map(|h| h.seq.wrapping_add(1));
+        match (self.ooo.last_end(), fin) {
+            (Some(e), Some(f)) => Some(if seq_gt(f, e) { f } else { e }),
+            (e, f) => e.or(f),
+        }
+    }
+
     fn on_reset_received(&mut self) {
         match self.state {
+            // Linux `tcp_reset` purges only the write queue: bytes already
+            // received stay readable, and the error follows the last of
+            // them (`tcp_recvmsg`).
             State::Established | State::FinWait1 | State::FinWait2 | State::CloseWait => {
-                self.abort_local();
+                self.close_clean();
+                self.error = Some(TcpError::ConnectionReset);
             }
             // The peer's stream is complete (its FIN arrived), but ours may
             // not be: a reset that discards data of ours not yet
@@ -824,12 +899,17 @@ impl<const BUF: usize> Tcb<BUF> {
         }
         let end = seq.wrapping_add(take as u32);
         match self.ooo.insert(seq, end, self.rcv_nxt) {
-            Insert::Stored { dup } => {
+            Insert::Stored { dup, dup_bytes } => {
                 let _ = self.recv_ring.write_at(off, data);
-                if dup {
-                    self.stats.dup_bytes_received =
-                        self.stats.dup_bytes_received.saturating_add(take as u64);
-                    self.note_dsack(seq, end);
+                // Bytes already held arrived again: D-SACK the lowest run
+                // of them, also when the segment brought new bytes too
+                // (Linux `tcp_data_queue_ofo`).
+                if let Some((l, r)) = dup {
+                    self.stats.dup_bytes_received = self
+                        .stats
+                        .dup_bytes_received
+                        .saturating_add(u64::from(dup_bytes));
+                    self.note_dsack(l, r);
                 }
                 // So does parked text from a segment that starts no later
                 // than the held FIN's: it comes first in SEG.SEQ order.
@@ -902,7 +982,14 @@ impl<const BUF: usize> Tcb<BUF> {
             match self.ooo_fin {
                 Some(h) if seq_lt(h.seq, fin) => {}
                 Some(h) if h.seq == fin && seq_le(h.start, start) => {}
-                _ => self.ooo_fin = Some(HeldFin { start, seq: fin }),
+                _ => {
+                    let tag = self.ooo.take_tag();
+                    self.ooo_fin = Some(HeldFin {
+                        start,
+                        seq: fin,
+                        tag,
+                    });
+                }
             }
         }
         true
@@ -1016,8 +1103,9 @@ impl<const BUF: usize> Tcb<BUF> {
     /// segment counts as the number of MSS-sized segments it spans, and,
     /// as in Linux (`__tcp_ack_snd_check`), more than one receive MSS of
     /// unacknowledged data is ACKed at once whatever the segment sizes, as
-    /// is every segment in quickack mode.
-    fn schedule_delayed_ack(&mut self, payload_len: u32) {
+    /// is every segment in quickack mode. Returns whether the ACK is due
+    /// now (the caller sends it, ahead of any data).
+    fn schedule_delayed_ack(&mut self, payload_len: u32) -> bool {
         let full = payload_len / u32::from(self.local_mss.max(1));
         let units = full.clamp(1, u32::from(u8::MAX)) as u8;
         self.delayed_ack_count = self.delayed_ack_count.saturating_add(units);
@@ -1027,10 +1115,12 @@ impl<const BUF: usize> Tcb<BUF> {
             || unacked > u32::from(self.rcv_mss.max(1))
             || self.in_quickack_mode()
         {
-            let _ = self.send_pure_ack();
-        } else if !self.ack_deadline.is_armed() {
+            return true;
+        }
+        if !self.ack_deadline.is_armed() {
             self.ack_deadline = Deadline::at(self.now_ms.saturating_add(DELAYED_ACK_MS));
         }
+        false
     }
 
     /// Linux `tcp_incr_quickack`: ACK the next segments at once — as many

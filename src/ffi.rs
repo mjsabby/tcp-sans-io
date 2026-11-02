@@ -266,8 +266,9 @@ pub unsafe extern "C" fn tcp_set_mtu(handle: *mut TcpStreamHandle, mtu: u16) -> 
 }
 
 /// Report a reduced path MTU mid-connection (e.g. from an ICMP
-/// "fragmentation needed" the host received). Shrinks the segment size and
-/// retransmits in-flight segments that no longer fit.
+/// "fragmentation needed" quoting this connection's 4-tuple). Shrinks the
+/// segment size and retransmits in-flight segments that no longer fit; the
+/// report holds for 10 minutes, then one segment probes the old size.
 ///
 /// # Safety
 /// `handle` must be NULL or a live handle from [`tcp_init`].

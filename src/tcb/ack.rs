@@ -3,9 +3,9 @@
 //! Per ACK: validate (RFC 9293 + RFC 5961 §5), absorb SACK blocks (D-SACK
 //! per RFC 2883 is detected, validated, and *never* treated as loss), apply
 //! the cumulative ACK, take an RTT sample (our send times; TSecr only when
-//! retransmitted data is acknowledged), undo a loss episode the D-SACKs or
-//! the timestamp echo show was spurious, update the send window, run loss
-//! detection (RACK with SACK, RFC 6582 NewReno without), then let
+//! retransmitted data is acknowledged), undo a loss episode the D-SACKs,
+//! the timestamp echo or F-RTO show was spurious, update the send window,
+//! run loss detection (RACK with SACK, RFC 6582 NewReno without), then let
 //! congestion control react: PRR during a reduction, slow start /
 //! congestion avoidance otherwise.
 
@@ -27,6 +27,12 @@ impl<const BUF: usize> Tcb<BUF> {
     /// a rate-limited ACK, so callers check this before the segment may
     /// touch any state (TS.Recent, the ECN echo, the keepalive clock, …).
     pub(super) fn ack_acceptable(&self, ack: u32) -> bool {
+        // Closed in SYN-RECEIVED, our SYN unacknowledged: as in SYN-RECEIVED
+        // itself (Linux `tcp_check_req`), an ACK must cover the SYN; one
+        // at ISS acknowledges nothing the peer can have seen.
+        if self.syn_unacked {
+            return seq_gt(ack, self.iss) && !seq_gt(ack, self.snd_nxt);
+        }
         let max_wnd = self.max_snd_wnd.max(u32::from(self.local_mss));
         let back = u32::try_from(self.snd_acked).map_or(max_wnd, |a| a.min(max_wnd));
         !seq_gt(ack, self.snd_nxt) && !seq_lt(ack, self.snd_una.wrapping_sub(back))
@@ -35,6 +41,7 @@ impl<const BUF: usize> Tcb<BUF> {
     /// Process the ACK field of a segment that passed [`Self::ack_acceptable`].
     pub(super) fn process_ack(&mut self, seg: &Segment<'_>) -> Result<(), TcpError> {
         let ack = seg.ack;
+        self.frto_new = false;
         // An ACK older than SND.UNA (reordered behind a newer one) is news
         // only for its SACK and D-SACK blocks (Linux `tcp_ack` old_ack).
         let old_ack = seq_lt(ack, self.snd_una);
@@ -62,6 +69,16 @@ impl<const BUF: usize> Tcb<BUF> {
         let mut delivered: u32 = 0;
         self.rack.on_ack_start();
         self.rack.tlp_probe_end = self.tlp_end_seq.filter(|_| self.tlp_is_retrans);
+        // F-RTO's test (Linux `FLAG_ORIG_SACK_ACKED`): data sent before the
+        // timeout and never retransmitted is (S)ACKed by this ACK.
+        let frto_hi = self
+            .cc
+            .frto_undo_possible()
+            .then(|| self.cc.recovery_point());
+        let frto_orig = |s: &crate::rtx_queue::Seg| {
+            frto_hi.is_some_and(|hi| !s.has(seg_flags::EVER_RETRANS) && seq_le(s.end, hi))
+        };
+        let mut orig_acked = false;
         // ECN-Echo during a loss episode: the reduction stands, whatever
         // undo may follow (Linux `tcp_fastretrans_alert`).
         let ece = !old_ack && self.ecn_enabled && seg.has(flags::ECE);
@@ -85,9 +102,17 @@ impl<const BUF: usize> Tcb<BUF> {
                     self.stats.dsacks_received = self.stats.dsacks_received.saturating_add(1);
                     // A duplicate tail loss probe says nothing about
                     // reordering: the timer, not RACK, sent it (Linux
-                    // `FLAG_DSACK_TLP`).
+                    // `FLAG_DSACK_TLP`). Nor does a duplicate of what the
+                    // retransmission timer resent: a spurious timeout shows
+                    // a delay, and must not leave RACK waiting out a
+                    // reordering window for every later loss (Linux, which
+                    // learns reordering from SACKs alone, never lets such a
+                    // D-SACK widen it before reordering is seen).
                     let tlp_dsack = self.tlp_end_seq == Some(r0) && r0.wrapping_sub(l0) <= mss;
-                    if !tlp_dsack {
+                    let rto_dsack = self
+                        .rto_span
+                        .is_some_and(|(lo, hi)| seq_ge(l0, lo) && seq_le(r0, hi));
+                    if !tlp_dsack && !rto_dsack {
                         self.rack.on_dsack(self.snd_una, self.snd_nxt);
                     }
                     let before = self.cc.ssthresh;
@@ -114,14 +139,22 @@ impl<const BUF: usize> Tcb<BUF> {
                     // last in-order segment (RFC 7323 §4.3), never that of
                     // the segment it SACKs, so TSecr cannot disambiguate a
                     // SACKed retransmission; RACK falls back to min_rtt.
-                    let n = rtx.sack(l, r, |s| rack.on_delivered(s, now, None, true));
+                    let n = rtx.sack(l, r, |s| {
+                        rack.on_delivered(s, now, None, true);
+                        orig_acked |= frto_orig(s);
+                    });
                     delivered = delivered.saturating_add(n);
                 }
             }
         }
+        // Linux `FLAG_DATA_SACKED`: this ACK SACKed data not SACKed before.
+        let newly_sacked = delivered > 0;
         if old_ack {
             // Linux `tcp_fastretrans_alert` for an old ACK: loss detection
             // and recovery on what it SACKed; nothing else in it is current.
+            if self.cc.frto_undo_possible() {
+                self.frto_on_ack(orig_acked, newly_sacked, false, false);
+            }
             self.rack_detect();
             if self.rtx.lost_bytes() > 0 && !self.cc.in_loss_recovery() {
                 self.enter_fast_recovery();
@@ -157,6 +190,7 @@ impl<const BUF: usize> Tcb<BUF> {
                         rack.on_delivered(s, now, tsecr_ms, false);
                         newest_ts = newest_ts.max(s.xmit_ts);
                         segs_acked += 1;
+                        orig_acked |= frto_orig(s);
                         if s.has(seg_flags::EVER_RETRANS) {
                             retrans_acked = true;
                         } else {
@@ -191,13 +225,18 @@ impl<const BUF: usize> Tcb<BUF> {
             // reports) and `min_rtt` the newest (Linux `ca_rtt_us`), which
             // the receiver did not hold back waiting for more. Otherwise
             // Karn's rule rules out send times and TSecr (RTTM) names the
-            // transmission that arrived; it is believed only if not later
-            // than the newest transmission this ACK covers.
+            // transmission that arrived; it is believed only if neither
+            // later than the newest transmission this ACK covers nor earlier
+            // than the connection's first segment (as the handshake checks):
+            // the peer controls TSecr.
             let sample = if retrans_acked {
-                tsecr_ms.filter(|&t| !seq_gt(t, newest_ts as u32)).map(|t| {
-                    let r = (now as u32).wrapping_sub(t);
-                    (r, r)
-                })
+                let first = self.syn_xmit_ms as u32;
+                tsecr_ms
+                    .filter(|&t| seq_ge(t, first) && !seq_gt(t, newest_ts as u32))
+                    .map(|t| {
+                        let r = (now as u32).wrapping_sub(t);
+                        (r, r)
+                    })
             } else {
                 oldest_ts.and_then(|x| {
                     let oldest = u32::try_from(now.saturating_sub(x)).ok()?;
@@ -230,6 +269,30 @@ impl<const BUF: usize> Tcb<BUF> {
         // ---- Send window (RFC 9293 §3.10.7.4, hardened) -----------------
         let wnd_before = self.snd_wnd;
         self.update_send_window(seg, prior_una);
+
+        // ---- F-RTO, with the window this ACK opened (Linux
+        // `tcp_process_loss` runs after `tcp_ack_update_window`).
+        if self.cc.frto_undo_possible() {
+            let dupack = acked == 0
+                && seg.payload.is_empty()
+                && !seg.has(flags::FIN)
+                && self.snd_wnd == wnd_before
+                && dsack.is_none();
+            self.frto_on_ack(orig_acked, newly_sacked, dupack, acked > 0);
+        }
+
+        // ---- Tail loss probe outcome (RFC 8985 §7.4.2), before this ACK's
+        // loss detection (Linux `tcp_process_tlp_ack` precedes
+        // `tcp_fastretrans_alert`): a probe it shows delivered must not
+        // count among the retransmissions a recovery it starts waits on to
+        // be undone. Linux's "pure dupack": nothing acknowledged or newly
+        // SACKed, no data, no FIN, no window change.
+        let pure_dupack = acked == 0
+            && delivered == 0
+            && seg.payload.is_empty()
+            && !seg.has(flags::FIN)
+            && self.snd_wnd == wnd_before;
+        self.tlp_on_ack(ack, dsack, pure_dupack);
 
         // ---- End of a reduction episode, before this ACK's loss detection
         // (Linux `tcp_fastretrans_alert` checks exit before it processes
@@ -273,16 +336,6 @@ impl<const BUF: usize> Tcb<BUF> {
         if self.rtx.lost_bytes() > 0 && !self.cc.in_loss_recovery() {
             self.enter_fast_recovery();
         }
-
-        // ---- Tail loss probe outcome (RFC 8985 §7.4.2) -----------------
-        // Linux's "pure dupack": nothing acknowledged or newly SACKed, no
-        // data, no FIN, no window change.
-        let pure_dupack = acked == 0
-            && delivered == 0
-            && seg.payload.is_empty()
-            && !seg.has(flags::FIN)
-            && self.snd_wnd == wnd_before;
-        self.tlp_on_ack(ack, dsack, pure_dupack);
 
         // ---- Congestion control ----------------------------------------
         if !self.retx_outstanding() {
@@ -419,6 +472,13 @@ impl<const BUF: usize> Tcb<BUF> {
         if !seq_lt(l, r) || seq_gt(r, self.snd_nxt) || len > max_wnd {
             return false;
         }
+        // Nor below what was sent and acknowledged (the bound an ACK has,
+        // see `ack_acceptable`): data never sent cannot arrive twice.
+        let back =
+            u32::try_from(self.snd_acked.saturating_sub(1)).map_or(max_wnd, |a| a.min(max_wnd));
+        if seq_lt(l, self.snd_una.wrapping_sub(back)) {
+            return false;
+        }
         let segs = u64::from(len.div_ceil(mss.max(1)));
         let total = self.dsack_segs.saturating_add(segs);
         if total > self.stats.segs_retrans {
@@ -477,6 +537,58 @@ impl<const BUF: usize> Tcb<BUF> {
     fn withdraw_cwr(&mut self, before: u32) {
         if self.cc.ssthresh > before {
             self.send_cwr_pending = false;
+        }
+    }
+
+    /// F-RTO (RFC 5682 §3.1, the SACK-enhanced algorithm, which Linux
+    /// `tcp_process_loss` runs for every connection) on an ACK in a
+    /// timeout's Loss state. `orig_acked`: data sent before the timeout and
+    /// never resent was (S)ACKed (Linux `FLAG_ORIG_SACK_ACKED`);
+    /// `newly_sacked`, `dupack`, `una_advanced`: Linux `FLAG_DATA_SACKED`,
+    /// `num_dupack`, `FLAG_SND_UNA_ADVANCED`. Only after a timeout, so out
+    /// of the per-ACK path.
+    #[cold]
+    fn frto_on_ack(
+        &mut self,
+        orig_acked: bool,
+        newly_sacked: bool,
+        dupack: bool,
+        una_advanced: bool,
+    ) {
+        if !self.cc.frto_undo_possible() {
+            return;
+        }
+        // Step 3.b: not everything was lost, so the timeout was spurious
+        // (`tcp_try_undo_loss(sk, true)`: no D-SACK or timestamp needed).
+        // Timestamps catch most spurious timeouts, but not an ACK outage:
+        // the D-SACKs for the resends were lost with the ACKs, and the
+        // first ACK through echoes a resend.
+        if orig_acked {
+            let before = self.cc.ssthresh;
+            self.cc.undo();
+            self.withdraw_cwr(before);
+            self.rtx.unmark_lost();
+            self.rtx_count = 0;
+            return;
+        }
+        let hi = self.cc.recovery_point();
+        if seq_gt(self.snd_nxt, hi) {
+            // Step 3.a: the receiver reported the new data step 2.b sent
+            // out of order, or a duplicate ACK came: the loss was real.
+            if newly_sacked || dupack {
+                self.cc.frto_off();
+            }
+        } else if una_advanced && seq_lt(self.snd_una, hi) {
+            // Step 2.b: the resend got through, not everything after it.
+            // Send new data instead of the next presumed-lost segment, so
+            // the next ACK tells: an original (S)ACKed means spurious, the
+            // new data reported out of order means real. Nothing new to
+            // send: conventional recovery.
+            if (self.unsent_bytes() > 0 || self.fin_owed()) && self.usable_window() > 0 {
+                self.frto_new = true;
+            } else {
+                self.cc.frto_off();
+            }
         }
     }
 
@@ -593,7 +705,7 @@ impl<const BUF: usize> Tcb<BUF> {
         }
         let mss = self.mss_payload();
         if self.cc.state() == CaState::Cwr {
-            self.cc.cwr_to_recovery();
+            self.cc.cwr_to_recovery(self.snd_nxt);
         } else {
             let seed = self.undo_seed(self.rtx.retrans_segs());
             self.cc

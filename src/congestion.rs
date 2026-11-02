@@ -90,6 +90,10 @@ pub struct Reno {
     /// retransmission that may still fill a hole (Linux `retrans_stamp`):
     /// an ACK echoing an earlier TSval was triggered by an original.
     first_retx_ms: Option<u32>,
+    /// The current Loss episode may be shown spurious by F-RTO's test
+    /// (Linux `tp->frto`): it began with a timeout from the Open or CWR
+    /// state, or repeats one no ACK of new data has answered.
+    frto: bool,
 }
 
 impl Reno {
@@ -109,6 +113,7 @@ impl Reno {
             undo_marker: 0,
             undo_retrans: 0,
             first_retx_ms: None,
+            frto: false,
         }
     }
 
@@ -249,6 +254,7 @@ impl Reno {
         self.prior_cwnd = 0;
         self.prior_ssthresh = 0;
         self.undo_valid = false;
+        self.frto = false;
         self.state = CaState::Loss;
         self.recovery_point = snd_nxt;
     }
@@ -263,10 +269,14 @@ impl Reno {
     }
 
     /// Upgrade a CWR episode to fast recovery when loss is found during it
-    /// (the window was already reduced once for this round trip).
-    pub fn cwr_to_recovery(&mut self) {
+    /// (the window was already reduced once for this round trip). The
+    /// recovery point moves to `snd_nxt` (RFC 6675 `RecoveryPoint =
+    /// HighData`); Linux keeps the CWR's, which, while CWR is held at it,
+    /// ends recovery on the next ACK and reduces again for the same loss.
+    pub fn cwr_to_recovery(&mut self, snd_nxt: u32) {
         if self.state == CaState::Cwr {
             self.state = CaState::Recovery;
+            self.recovery_point = snd_nxt;
         }
     }
 
@@ -297,6 +307,18 @@ impl Reno {
             Some(t) => tsecr_ms.is_some_and(|e| (e.wrapping_sub(t) as i32) < 0),
             None => sack || !seq_ge(snd_una, self.recovery_point),
         }
+    }
+
+    /// F-RTO's test may still show the current timeout spurious (see
+    /// [`Self::on_rto`]); the caller checks for acknowledged originals.
+    pub fn frto_undo_possible(&self) -> bool {
+        self.frto && self.undo_valid && self.state == CaState::Loss
+    }
+
+    /// F-RTO is over for this timeout: the loss was real, or its test
+    /// cannot run (Linux `tp->frto = 0`).
+    pub fn frto_off(&mut self) {
+        self.frto = false;
     }
 
     /// ECN-Echo during a loss episode: the reduction is required, so an
@@ -415,6 +437,9 @@ impl Reno {
             CaState::Loss => episode_over || !repeat,
             CaState::Recovery | CaState::Cwr => episode_over,
         };
+        // Linux `tcp_enter_loss`: F-RTO for a timeout from a calm state, or
+        // a repeated one (a timeout in fast recovery has resent data already).
+        self.frto = matches!(self.state, CaState::Open | CaState::Cwr) || repeat;
         if reduce {
             self.arm_undo(snd_una, seed);
             self.ssthresh = (self.reduction_window(peer_wnd) / 2).max(mss.saturating_mul(2));
@@ -592,7 +617,12 @@ mod tests {
     fn ecn_reductions_are_never_undone() {
         let mut r = Reno::new(20 * M);
         r.enter_cwr(21_000, M, u32::MAX);
-        r.cwr_to_recovery();
+        r.cwr_to_recovery(22_000);
+        assert_eq!(
+            r.recovery_point(),
+            22_000,
+            "RFC 6675: RecoveryPoint = HighData"
+        );
         r.on_retransmit(50);
         assert!(!r.on_dsack(0, 1000, M));
         assert!(!r.packet_delayed(Some(10), 0, true));

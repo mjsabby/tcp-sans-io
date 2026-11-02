@@ -1476,7 +1476,9 @@ fn timestamp_echo_undoes_only_a_spurious_fast_recovery() {
 
 /// The same detection after a timeout (Linux `tcp_try_undo_loss`): an ACK
 /// echoing the original transmission's TSval shows the RTO was spurious (a
-/// delay spike, not loss), so the collapsed window is restored at once.
+/// delay spike, not loss), so the collapsed window is restored at once. The
+/// ACK covers only the resent segment, so F-RTO has no original to judge
+/// by: the echo alone decides.
 #[test]
 fn timestamp_echo_undoes_only_a_spurious_timeout() {
     for spurious in [true, false] {
@@ -1495,8 +1497,8 @@ fn timestamp_echo_undoes_only_a_spurious_timeout() {
         };
         assert_eq!((c.stats().rto_count, retx.seq), (1, burst[0].seq));
         let echo = tsval(if spurious { &burst[0] } else { &retx });
-        let all = burst[3].seq + burst[3].len as u32;
-        ts_ack(&mut c, sseq, now + 10, all, echo, &[]);
+        let head = burst[0].seq + burst[0].len as u32;
+        ts_ack(&mut c, sseq, now + 10, head, echo, &[]);
         let s = c.stats();
         if spurious {
             assert_eq!(s.ca_state, CaState::Open as u8);
@@ -1547,15 +1549,123 @@ fn timestamp_undo_restarts_its_clock_after_each_episode() {
             }
         };
         assert_eq!(c.stats().tlp_count, 1);
+        // Only the resent head is ACKed: F-RTO has no original to judge by.
         let echo = tsval(if spurious { &tail[0] } else { &rto_retx });
-        let all = tail[3].seq + tail[3].len as u32;
-        ts_ack(&mut c, sseq, now + 10, all, echo, &[]);
+        let head = tail[0].seq + tail[0].len as u32;
+        ts_ack(&mut c, sseq, now + 10, head, echo, &[]);
         let s = c.stats();
         if spurious {
             assert_eq!(s.ca_state, CaState::Open as u8);
             assert_eq!(s.ssthresh, before.ssthresh, "spurious timeout kept");
         } else {
             assert!(s.ssthresh < before.ssthresh, "genuine timeout undone");
+        }
+    }
+}
+
+/// Tick `c` from `now` until its first retransmission timeout; returns the
+/// resend of `head` and the time.
+fn until_rto(c: &mut Tcb, mut now: u64, head: u32) -> (Out, u64) {
+    loop {
+        now += 1;
+        assert!(now < 10_000, "no retransmission timeout");
+        c.set_now(now);
+        c.tick().unwrap();
+        let out = drain(c);
+        if c.stats().rto_count == 1 {
+            let retx = out.into_iter().find(|o| o.len > 0 && o.seq == head);
+            return (retx.expect("the timeout resent the head"), now);
+        }
+    }
+}
+
+/// F-RTO (RFC 5682 §3.1; Linux `tcp_process_loss` step 3.b): after a
+/// timeout, an ACK of data sent before it and never resent shows that not
+/// everything was lost, so the timeout was spurious — even though the ACK
+/// echoes the resend and carries no D-SACK, as after an outage of the ACK
+/// path took the D-SACKs with it. With SACK, a SACK block is evidence too.
+#[test]
+fn frto_undoes_a_timeout_once_never_resent_data_is_acknowledged() {
+    for sack in [false, true] {
+        let (mut c, sseq, iss) = established(1000, sack, false);
+        let burst = ts_burst(&mut c, sseq, iss, 4);
+        let end = |k: usize| burst[k].seq + burst[k].len as u32;
+        let before = c.stats();
+        let (retx, now) = until_rto(&mut c, 1020, burst[0].seq);
+        if sack {
+            let blocks = [(burst[1].seq, end(3))];
+            ts_ack(&mut c, sseq, now + 1, end(0), tsval(&retx), &blocks);
+        } else {
+            ts_ack(&mut c, sseq, now + 1, end(3), tsval(&retx), &[]);
+        }
+        let s = c.stats();
+        assert_eq!(s.dsacks_received, 0);
+        assert_eq!(s.ca_state, CaState::Open as u8, "sack {sack}: timeout kept");
+        assert_eq!(s.ssthresh, before.ssthresh, "sack {sack}");
+        assert!(
+            s.cwnd >= before.cwnd,
+            "sack {sack}: cwnd {} < {}",
+            s.cwnd,
+            before.cwnd
+        );
+    }
+}
+
+/// F-RTO steps 2.b and 3 (Linux `tcp_process_loss`, `REXMIT_NEW`): the
+/// first ACK after a timeout covers the resend alone, so new data goes out
+/// instead of the next presumed-lost segment. If the next ACK reports that
+/// data out of order, the loss was real: the lost segments are resent and
+/// the timeout stands, even when a later ACK covers originals never resent.
+/// If it acknowledges an original instead, the timeout was spurious.
+#[test]
+fn frto_probes_with_new_data_after_a_partial_ack() {
+    for (sack, real) in [(false, true), (true, true), (false, false), (true, false)] {
+        let (mut c, sseq, iss) = established(1000, sack, false);
+        let burst = ts_burst(&mut c, sseq, iss, 10);
+        let end = |k: usize| burst[k].seq + burst[k].len as u32;
+        c.send(&vec![0x5b; 4 * 1448]).unwrap();
+        c.tick().unwrap();
+        assert!(
+            drain(&mut c).iter().all(|o| o.len == 0),
+            "cwnd was not full"
+        );
+        let before = c.stats();
+        let (retx, now) = until_rto(&mut c, 1020, burst[0].seq);
+        // With SACK a tail loss probe sent new data before the timeout.
+        let rto_nxt = c.debug_snapshot().snd_nxt;
+        let out = ts_ack(&mut c, sseq, now + 1, end(0), tsval(&retx), &[]);
+        let new: Vec<&Out> = out.iter().filter(|o| o.len > 0).collect();
+        let seqs: Vec<u32> = new.iter().map(|o| o.seq).collect();
+        assert!(
+            !new.is_empty() && new.iter().all(|o| o.seq.wrapping_sub(rto_nxt) < 1 << 30),
+            "case {sack}/{real}: step 2.b sent {seqs:?}, not new data from {rto_nxt}"
+        );
+        let new_end = new.iter().map(|o| o.seq + o.len as u32).max().unwrap();
+        if real {
+            // Segment 1 was lost: the new data arrives above the hole.
+            let blocks = [(rto_nxt, new_end)];
+            let blocks: &[(u32, u32)] = if sack { &blocks } else { &[] };
+            let out = ts_ack(&mut c, sseq, now + 2, end(0), tsval(&retx), blocks);
+            assert!(
+                out.iter().any(|o| o.len > 0 && o.seq == burst[1].seq),
+                "case {sack}/{real}: lost segment not resent"
+            );
+            // Its resend fills the hole; segments 2..9 had arrived.
+            ts_ack(&mut c, sseq, now + 3, new_end, tsval(&retx), &[]);
+            let s = c.stats();
+            assert!(
+                s.ssthresh < before.ssthresh,
+                "case {sack}/{real}: real timeout undone"
+            );
+        } else {
+            // Segment 1 was only late: an ACK covers originals never resent.
+            ts_ack(&mut c, sseq, now + 2, end(9), tsval(&retx), &[]);
+            let s = c.stats();
+            assert_eq!(s.ca_state, CaState::Open as u8, "case {sack}/{real}");
+            assert_eq!(
+                s.ssthresh, before.ssthresh,
+                "case {sack}/{real}: spurious timeout kept"
+            );
         }
     }
 }
@@ -2627,6 +2737,67 @@ fn reported_pmtu_resegments_in_flight_data() {
     );
     assert!(out.iter().all(|p| p.total_len <= 1280));
     assert_eq!(out[0].seq, segs[0].0);
+}
+
+/// A reported path MTU holds for 10 minutes, as a route's learned PMTU
+/// (Linux `ip_rt_mtu_expires`); then one segment probes the size before
+/// it. It used to cap the segment size for the rest of the connection, so
+/// a path that grew back, or a forged report, did so for good. A report
+/// of the size in use (a probe that did not fit) holds it 10 more minutes.
+#[test]
+fn reported_pmtu_expires_after_ten_minutes() {
+    let (mut c, sseq, iss) = established(1000, true, false);
+    ts_ack(&mut c, sseq, 1020, iss + 1, 1000, &[]);
+    // One write, ACKed: the largest payload it went out in.
+    let write = |c: &mut Tcb, now: u64| {
+        c.set_now(now);
+        c.send(&vec![0x5a; 4 * 1448]).unwrap();
+        c.tick().unwrap();
+        let data: Vec<Out> = drain(c).into_iter().filter(|o| o.len > 0).collect();
+        let end = data.iter().map(|o| o.seq + o.len as u32).max().unwrap();
+        ts_ack(c, sseq, now + 1, end, now as u32, &[]);
+        data.iter().map(|o| o.len).max().unwrap()
+    };
+    let reduced = 1020;
+    c.update_pmtu(1280);
+    let mut now = reduced;
+    for _ in 0..9 {
+        now += 60_000;
+        assert_eq!(write(&mut c, now), 1228, "at {now} ms");
+    }
+    now = reduced + 600_000;
+    assert_eq!(write(&mut c, now), 1448, "the old size probed after 10 min");
+    now += 60_000;
+    assert_eq!(write(&mut c, now), 1448, "and restored once it got through");
+    // Reduced again; 10 minutes on, the probe does not fit and is reported.
+    c.update_pmtu(1280);
+    let reduced = now + 1;
+    for _ in 0..9 {
+        now += 60_000;
+        assert_eq!(write(&mut c, now), 1228, "at {now} ms");
+    }
+    now = reduced + 600_000;
+    c.set_now(now);
+    c.send(&vec![0x5a; 1448]).unwrap();
+    c.tick().unwrap();
+    assert!(drain(&mut c).iter().any(|o| o.len == 1448), "probe sent");
+    c.update_pmtu(1280);
+    let (resend, t) = first_data(&mut c, now, now + 5_000);
+    assert!(
+        resend.len <= 1228,
+        "the dropped probe resent at the size in use"
+    );
+    now = t;
+    let nxt = c.debug_snapshot().snd_nxt;
+    ts_ack(&mut c, sseq, now, nxt, now as u32, &[]);
+    for _ in 0..9 {
+        now += 60_000;
+        assert_eq!(
+            write(&mut c, now),
+            1228,
+            "held 10 more minutes: at {now} ms"
+        );
+    }
 }
 
 #[test]
@@ -4225,37 +4396,762 @@ fn partial_sack_of_a_path_mtu_probe_is_not_its_delivery() {
 }
 
 /// A SYN-cookie handshake turns timestamps on only if our SYN-ACK carried
-/// them, which its echo shows (RFC 7323 §3.2).
+/// them (RFC 7323 §3.2): the cookie's MAC records whether it did, so a
+/// TSopt on the third ACK, zero or not, cannot switch on timestamps or the
+/// window scaling, SACK and ECN bits a TSecr would carry.
 #[test]
 fn cookie_handshake_ignores_timestamps_the_syn_ack_lacked() {
-    let mut s = new_tcb(SRV, ([0; 4], 0), 1);
-    s.set_secret(&[1; 16]);
-    s.set_now(10_000);
+    for tsecr in [0, 0x3e] {
+        let mut s = new_tcb(SRV, ([0; 4], 0), 1);
+        s.set_secret(&[1; 16]);
+        s.set_now(10_000);
+        s.listen().unwrap();
+        let no_ts = TcpOptions {
+            mss: Some(1460),
+            ..TcpOptions::NONE
+        };
+        s.inject_packet(&pkt(ATTACKER, SRV, 9, 0, flags::SYN, 65535, &no_ts, &[]))
+            .unwrap();
+        drain(&mut s);
+        s.inject_packet(&pkt(CLI, SRV, 500, 0, flags::SYN, 65535, &no_ts, &[]))
+            .unwrap();
+        let synack = drain(&mut s).remove(0);
+        assert!(synack.opts.ts.is_none());
+        s.set_now(10_020);
+        let ack = pkt(
+            CLI,
+            SRV,
+            501,
+            synack.seq + 1,
+            flags::ACK | flags::PSH,
+            65535,
+            &ts(123, tsecr),
+            b"hi",
+        );
+        s.inject_packet(&ack).unwrap();
+        assert_eq!(s.state(), State::Established, "tsecr {tsecr:#x}");
+        drain(&mut s);
+        let snap = s.debug_snapshot();
+        assert_eq!(
+            s.stats().mss,
+            1460,
+            "tsecr {tsecr:#x}: timestamps turned on"
+        );
+        assert_eq!(
+            snap.snd_wnd, 65535,
+            "tsecr {tsecr:#x}: window scaling turned on"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Receive path, resets and retransmission-queue limits (audit iteration 3)
+// ---------------------------------------------------------------------------
+
+/// A FIN held out of order is SACKed with the data (Linux reports a
+/// segment's `end_seq`, FIN included), so the sender's RACK can see what
+/// is missing before it.
+#[test]
+fn out_of_order_fin_is_sacked() {
+    for len in [0usize, 100] {
+        let (mut c, seq, iss) = established_rtt(1000, 1, true, false);
+        c.set_now(1002);
+        let fin = pkt(
+            SRV,
+            CLI,
+            seq + 1448,
+            iss + 1,
+            flags::ACK | flags::FIN,
+            8192,
+            &ts(2, 0),
+            &vec![0x5a; len],
+        );
+        c.inject_packet(&fin).unwrap();
+        let out = drain(&mut c);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].ack, seq);
+        assert_eq!(
+            out[0].opts.sack.as_slice(),
+            &[(seq + 1448, seq + 1449 + len as u32)],
+            "{len} bytes + FIN"
+        );
+    }
+}
+
+/// Out-of-order data partly overlapping data already held gets a D-SACK
+/// for the overlap, ahead of the block it joins (Linux
+/// `tcp_data_queue_ofo`).
+#[test]
+fn partial_out_of_order_overlap_is_dsacked() {
+    let (mut c, sseq, iss) = established_rtt(1000, 0, true, false);
+    for (seq, len) in [(sseq + 500, 1000), (sseq + 1000, 1000)] {
+        let p = pkt(
+            SRV,
+            CLI,
+            seq,
+            iss + 1,
+            flags::ACK,
+            8192,
+            &ts(2, 1000),
+            &vec![0x55; len],
+        );
+        c.inject_packet(&p).unwrap();
+        let out = drain(&mut c);
+        if seq == sseq + 1000 {
+            assert_eq!(
+                out[0].opts.sack.as_slice(),
+                &[(sseq + 1000, sseq + 1500), (sseq + 500, sseq + 2000)]
+            );
+            assert_eq!(c.stats().dup_bytes_received, 500);
+        }
+    }
+}
+
+/// A peer's RST purges what we had to send, not what we received (Linux
+/// `tcp_reset`): bytes that already arrived stay readable, with or without
+/// the peer's FIN, and the reset is reported after the last of them.
+#[test]
+fn peer_reset_keeps_received_data_readable() {
+    for fin in [false, true] {
+        let (mut c, sseq, iss) = established(1000, true, false);
+        let body = b"response already delivered to TCP";
+        let fl = flags::ACK | flags::PSH | if fin { flags::FIN } else { 0 };
+        c.set_now(1002);
+        c.inject_packet(&pkt(SRV, CLI, sseq, iss + 1, fl, 8192, &ts(2, 0), body))
+            .unwrap();
+        drain(&mut c);
+        let rst = sseq + body.len() as u32 + u32::from(fin);
+        c.inject_packet(&pkt(
+            SRV,
+            CLI,
+            rst,
+            0,
+            flags::RST,
+            0,
+            &TcpOptions::NONE,
+            &[],
+        ))
+        .unwrap();
+        assert_eq!(c.state(), State::Closed);
+        let mut buf = [0u8; 64];
+        assert_eq!(c.recv(&mut buf), Ok(body.len()), "fin={fin}");
+        assert_eq!(&buf[..body.len()], body);
+        assert_eq!(c.recv(&mut buf), Err(TcpError::ConnectionReset));
+    }
+}
+
+/// RACK's tick of slack for a retransmission SACKed within the millisecond
+/// it left holds after the path has shown reordering too: a lost
+/// retransmission ahead of it is repaired by RACK, not the RTO, whichever
+/// side of a millisecond boundary the ACK falls.
+#[test]
+fn sub_millisecond_lost_retransmission_after_reordering_is_repaired_by_rack() {
+    for (reordered, ack_at) in [(false, 1013), (true, 1014), (true, 1013)] {
+        let (mut c, sseq, iss) = established_rtt(1000, 0, true, false);
+        ts_ack(&mut c, sseq, 1000, iss + 1, 1000, &[]);
+        let warmup = send_burst(&mut c, 1000, 3 * 1448);
+        if reordered {
+            ts_ack(&mut c, sseq, 1000, iss + 1, 1000, &[warmup[1]]);
+        }
+        ts_ack(&mut c, sseq, 1000, warmup[2].1, 1000, &[]);
+        let lost = send_burst(&mut c, 1010, 3 * 1448);
+        let tail = send_burst(&mut c, 1013, 7 * 1448);
+        assert_eq!((lost.len(), tail.len()), (3, 7));
+        let sack = [(tail[0].0, tail[6].1)];
+        let retx = ts_ack(&mut c, sseq, 1013, lost[0].0, 1000, &sack);
+        assert_eq!(retx.iter().filter(|o| o.len > 0).count(), 3);
+        // The first retransmission is lost again; the other two arrive.
+        let sack = [(lost[1].0, tail[6].1)];
+        let out = ts_ack(&mut c, sseq, ack_at, lost[0].0, 1000, &sack);
+        let repair = match out.into_iter().find(|o| o.len > 0) {
+            Some(o) => o,
+            None => first_data(&mut c, ack_at, 2000).0,
+        };
+        assert_eq!(repair.seq, lost[0].0);
+        assert_eq!(
+            c.stats().rto_count,
+            0,
+            "reordered={reordered}, ACK at {ack_at}"
+        );
+    }
+}
+
+/// A path MTU that shrinks again before anything is acknowledged needs a
+/// split for every retransmission. With the queue full and its spare
+/// record spent, merging two newer records frees one, rather than leaving
+/// the head unsendable at every timeout.
+#[cfg(not(feature = "small-buffers"))]
+#[test]
+fn repeated_path_mtu_drops_with_a_full_queue_keep_retransmitting() {
+    let iss = 1_000_000;
+    let mut c = new_tcb(CLI, SRV, iss);
+    c.set_now(1000);
+    c.connect().unwrap();
+    let syn = drain(&mut c);
+    let opts = TcpOptions {
+        mss: Some(1036),
+        wscale: Some(7),
+        ts: Some((1, tsval(&syn[0]))),
+        sack_permitted: true,
+        sack: SackBlocks::EMPTY,
+    };
+    c.set_now(1010);
+    c.inject_packet(&pkt(
+        SRV,
+        CLI,
+        SRV_ISS,
+        iss + 1,
+        flags::SYN | flags::ACK,
+        8192,
+        &opts,
+        &[],
+    ))
+    .unwrap();
+    drain(&mut c);
+    let sseq = SRV_ISS + 1;
+    let mut now = 1020;
+    ts_ack(&mut c, sseq, now, iss + 1, 0, &[]);
+    while c.stats().cwnd < crate::BUF_CAP as u32 {
+        assert!(now < 1050, "failed to grow the test flight");
+        c.send(&vec![0x5a; c.stats().cwnd as usize]).unwrap();
+        loop {
+            c.tick().unwrap();
+            if drain(&mut c).is_empty() {
+                break;
+            }
+        }
+        now += 1;
+        let end = c.debug_snapshot().snd_nxt;
+        ts_ack(&mut c, sseq, now, end, 0, &[]);
+    }
+    assert_eq!(c.send(&vec![0x5a; 1023 * 1024]), Ok(1023 * 1024));
+    let mut flight = 0;
+    loop {
+        c.tick().unwrap();
+        let out = drain(&mut c);
+        if out.is_empty() {
+            break;
+        }
+        flight += out.iter().filter(|o| o.len > 0).count();
+    }
+    assert_eq!(flight, 1023);
+    c.update_pmtu(900);
+    drain(&mut c);
+    c.update_pmtu(576);
+    let mut out = drain(&mut c);
+    for _ in 0..3 {
+        c.set_now(c.debug_snapshot().rto_deadline);
+        c.tick().unwrap();
+        out.extend(drain(&mut c));
+        c.debug_validate_invariants().unwrap();
+    }
+    assert!(
+        out.iter().any(|o| o.len > 0 && o.total_len <= 576),
+        "nothing fit the path: {:?}",
+        c.stats()
+    );
+}
+
+/// A FIN whose ACK was lost is retransmitted with backoff; each copy is
+/// answered at once in every state that has consumed it (Linux
+/// `tcp_data_queue`), not only in TIME_WAIT, so it is not left to the
+/// out-of-window limiter (one ACK per 500 ms) while the peer backs off.
+#[test]
+fn retransmitted_fin_is_acked_at_once_in_every_state_that_consumed_it() {
+    for state in [State::CloseWait, State::LastAck, State::Closing] {
+        let (mut c, sseq, iss) = established(1000, true, false);
+        let fin = |c: &mut Tcb, now: u64, tsv: u32| {
+            c.set_now(now);
+            let p = pkt(
+                SRV,
+                CLI,
+                sseq,
+                iss + 1,
+                flags::ACK | flags::FIN,
+                8192,
+                &ts(tsv, 0),
+                &[],
+            );
+            c.inject_packet(&p).unwrap();
+            drain(c)
+        };
+        if state == State::Closing {
+            c.close().unwrap();
+            drain(&mut c);
+        }
+        assert_eq!(fin(&mut c, 1100, 10).len(), 1);
+        if state == State::LastAck {
+            c.close().unwrap();
+            drain(&mut c);
+        }
+        assert_eq!(c.state(), state);
+        // Our ACKs are lost; the peer retransmits 200 ms, then 400 ms later.
+        for (now, tsv) in [(1300, 11), (1700, 12)] {
+            let out = fin(&mut c, now, tsv);
+            assert_eq!(c.state(), state);
+            assert_eq!(
+                out.len(),
+                1,
+                "{state:?}: retransmitted FIN at {now} ms not ACKed"
+            );
+            assert_eq!(out[0].ack, sseq + 1);
+        }
+    }
+}
+
+/// Linux `tcp_reset_check`: after the peer's FIN, a RST carrying the FIN's
+/// own sequence number (RCV.NXT − 1), as a stack that aborts right after
+/// closing sends, resets in CLOSE_WAIT, LAST_ACK and CLOSING. It was
+/// dropped as out of window, leaving the connection to the application's
+/// close or to keepalive.
+#[test]
+fn reset_at_the_peer_fin_sequence_resets_after_its_fin() {
+    for state in [State::CloseWait, State::LastAck, State::Closing] {
+        let (mut c, sseq, iss) = established(1000, true, false);
+        if state == State::Closing {
+            c.close().unwrap();
+        }
+        c.set_now(1100);
+        let fin = pkt(
+            SRV,
+            CLI,
+            sseq,
+            iss + 1,
+            flags::ACK | flags::FIN,
+            8192,
+            &ts(10, 0),
+            &[],
+        );
+        c.inject_packet(&fin).unwrap();
+        if state == State::LastAck {
+            c.close().unwrap();
+        }
+        assert_eq!(c.state(), state);
+        drain(&mut c);
+        let rst = |c: &mut Tcb, seq: u32| {
+            let p = pkt(SRV, CLI, seq, 0, flags::RST, 0, &TcpOptions::NONE, &[]);
+            c.inject_packet(&p).unwrap();
+        };
+        c.set_now(1105);
+        rst(&mut c, sseq - 1);
+        assert_eq!(
+            c.state(),
+            state,
+            "a RST below the FIN's sequence number reset"
+        );
+        rst(&mut c, sseq);
+        assert_eq!(c.state(), State::Closed, "{state:?}");
+    }
+}
+
+/// RFC 5961 §3.2 as Linux extends it (`tcp_validate_incoming`): with
+/// out-of-order data held, a RST at the right edge of the SACK blocks we
+/// report resets too — the peer's SND.NXT when what preceded a hole was
+/// lost — a held FIN included; elsewhere in the window it draws a
+/// challenge ACK.
+#[test]
+fn reset_at_the_right_edge_of_our_sack_blocks_resets() {
+    for fin in [false, true] {
+        let (mut c, sseq, iss) = established(1000, true, false);
+        c.set_now(1100);
+        let fl = flags::ACK | if fin { flags::FIN } else { 0 };
+        let ooo = pkt(
+            SRV,
+            CLI,
+            sseq + 100,
+            iss + 1,
+            fl,
+            8192,
+            &ts(10, 0),
+            &[7; 200],
+        );
+        c.inject_packet(&ooo).unwrap();
+        let edge = sseq + 300 + u32::from(fin);
+        let out = drain(&mut c);
+        assert_eq!(
+            out.last().unwrap().opts.sack.as_slice(),
+            &[(sseq + 100, edge)]
+        );
+        let rst = |c: &mut Tcb, seq: u32| {
+            let p = pkt(SRV, CLI, seq, 0, flags::RST, 0, &TcpOptions::NONE, &[]);
+            c.inject_packet(&p).unwrap();
+            drain(c)
+        };
+        c.set_now(1105);
+        assert_eq!(rst(&mut c, edge - 1).len(), 1, "fin={fin}: challenge ACK");
+        assert_eq!(c.state(), State::Established);
+        rst(&mut c, edge);
+        assert_eq!(c.state(), State::Closed, "fin={fin}");
+    }
+}
+
+/// An ACK due now goes on its own, ahead of the data its segment releases;
+/// Linux lets the data carry it (`tcp_data_snd_check` before
+/// `tcp_ack_snd_check`). Only a data-less ACK counts as a duplicate (RFC
+/// 5681 §2): a sender that recovers by duplicate ACKs alone (smoltcp
+/// resets its count on any segment with data) saw them ride on our data and
+/// stalled on its timeout in two-way lossy transfers (the shootout's
+/// kitchen sink: 0.87 s → 1.89 s).
+#[test]
+fn an_ack_due_now_goes_alone_ahead_of_data() {
+    let (mut c, sseq, iss) = established(1000, true, false);
+    ts_ack(&mut c, sseq, 1020, iss + 1, 1010, &[]);
+    c.send(&vec![0x5a; 40 * 1448]).unwrap();
+    c.tick().unwrap();
+    let burst: Vec<Out> = drain(&mut c).into_iter().filter(|o| o.len > 0).collect();
+    assert_eq!(burst.len(), 10);
+    c.set_now(1030);
+    let acked = burst[1].seq + burst[1].len as u32;
+    let o = ts(8, tsval(&burst[1]));
+    let data = pkt(SRV, CLI, sseq, acked, flags::ACK, 0xffff, &o, &[7u8; 1448]);
+    c.inject_packet(&data).unwrap();
+    let out = drain(&mut c);
+    let summary: Vec<(usize, u32)> = out.iter().map(|o| (o.len, o.ack)).collect();
+    assert_eq!(summary.first(), Some(&(0, sseq + 1448)), "{summary:?}");
+    assert!(out.iter().skip(1).any(|o| o.len > 0), "{summary:?}");
+}
+
+/// RACK's ambiguity filter (Linux `tcp_rack_advance`) on a millisecond
+/// clock: a retransmission cumulatively ACKed within the millisecond it
+/// left reads 0 ms against a `min_rtt` floored at 1. When it left in a
+/// later millisecond than the original, an echo of its TSval proves it is
+/// what arrived, so RACK advances and finds the tail lost behind it at
+/// once, not at the RTO.
+#[test]
+fn sub_millisecond_cumulative_ack_of_a_retransmission_advances_rack() {
+    let (mut c, sseq, iss) = established_rtt(1000, 0, true, false);
+    let b = ts_burst(&mut c, sseq, iss, 10);
+    let end = |i: usize| b[i].seq + b[i].len as u32;
+    // Segments 0 and 9 are lost; 1..=8 are SACKed a millisecond later.
+    let out = ts_ack(
+        &mut c,
+        sseq,
+        1021,
+        b[0].seq,
+        tsval(&b[0]),
+        &[(b[1].seq, end(8))],
+    );
+    let retx = out.iter().find(|o| o.len > 0 && o.seq == b[0].seq);
+    let retx = retx.expect("segment 0 fast-retransmitted");
+    let out = ts_ack(&mut c, sseq, 1021, end(8), tsval(retx), &[]);
+    assert!(
+        out.iter().any(|o| o.len > 0 && o.seq == b[9].seq),
+        "the tail behind the retransmission was not found lost"
+    );
+    assert_eq!(c.stats().rto_count, 0);
+}
+
+/// Loss recovery's resends go out before the segment's text is taken
+/// (Linux `tcp_xmit_recovery` at the end of `tcp_ack`), carrying the ACK
+/// as it stood; the ACK the text earns follows on new data or a pure ACK.
+/// A spurious resend the peer discards as old used to carry it away, and
+/// the peer's data waited for its tail loss probe.
+#[test]
+fn recovery_resends_do_not_carry_away_the_ack_their_segment_earned() {
+    let (mut c, sseq, iss) = established(1000, true, false);
+    let (seq, now) = spend_quick_acks(&mut c, sseq, iss + 1, 1020);
+    let b = send_burst(&mut c, now + 10, 4 * 1448);
+    // The peer's data arrives with SACKs that make segment 0 look lost.
+    let o = TcpOptions {
+        ts: Some((6, (now + 10) as u32)),
+        sack: SackBlocks::from_slice(&[(b[1].0, b[3].1)]),
+        ..TcpOptions::NONE
+    };
+    c.set_now(now + 20);
+    let data = pkt(
+        SRV,
+        CLI,
+        seq,
+        b[0].0,
+        flags::ACK | flags::PSH,
+        0xffff,
+        &o,
+        &[0xab; 100],
+    );
+    c.inject_packet(&data).unwrap();
+    let out = drain(&mut c);
+    let resend = out.iter().find(|p| p.len > 0 && p.seq == b[0].0);
+    assert_eq!(
+        resend.map(|p| p.ack),
+        Some(seq),
+        "the resend carries the ACK as it stood"
+    );
+    // The resend was spurious: the peer had segment 0 and drops it.
+    ts_ack(
+        &mut c,
+        seq + 100,
+        now + 25,
+        b[3].1,
+        (now + 10) as u32,
+        &[b[0]],
+    );
+    let mut acked = out.iter().any(|p| p.ack == seq + 100);
+    for t in (now + 26)..=(now + 70) {
+        c.set_now(t);
+        c.tick().unwrap();
+        acked |= drain(&mut c).iter().any(|p| p.ack == seq + 100);
+    }
+    assert!(acked, "the peer's 100 bytes were never acknowledged");
+}
+
+/// A burst stopped by a full egress ring, not by the windows, is not
+/// application limited: after an RTO of light use, a write of a full
+/// window used to decay cwnd (Linux `tcp_cwnd_application_limited`) on
+/// its first ring-full of segments, before the host could drain the rest.
+#[test]
+fn a_full_egress_ring_mid_burst_is_not_application_limited() {
+    let (mut c, sseq, iss) = established(1000, true, false);
+    let mut now = 1020u64;
+    ts_ack(&mut c, sseq, now, iss + 1, 1000, &[]);
+    for _ in 0..3 {
+        let w = c.stats().cwnd as usize;
+        c.send(&vec![0x5a; w]).unwrap();
+        while !{
+            c.tick().unwrap();
+            drain(&mut c).is_empty()
+        } {}
+        now += 10;
+        let nxt = c.debug_snapshot().snd_nxt;
+        ts_ack(&mut c, sseq, now, nxt, (now - 10) as u32, &[]);
+    }
+    let cwnd = c.stats().cwnd;
+    assert!(cwnd >= 64 * 1448, "cwnd {cwnd} fits the egress ring");
+    let rto = u64::from(c.stats().rto_ms);
+    now += rto / 2;
+    let seg = send_burst(&mut c, now, 1448);
+    now += 10;
+    ts_ack(&mut c, sseq, now, seg[0].1, (now - 10) as u32, &[]);
+    now += rto / 2 + 10;
+    c.set_now(now);
+    c.send(&vec![0x5a; cwnd as usize]).unwrap();
+    let mut sent = 0usize;
+    loop {
+        c.tick().unwrap();
+        let batch = drain(&mut c);
+        if batch.is_empty() {
+            break;
+        }
+        sent += batch.iter().map(|o| o.len).sum::<usize>();
+    }
+    assert_eq!(c.stats().cwnd, cwnd, "a ring-full mid-burst decayed cwnd");
+    assert_eq!(sent as u32, cwnd);
+}
+
+/// Closed in SYN-RECEIVED (our FIN out, our SYN unacknowledged), an ACK
+/// must still cover the SYN, as in SYN-RECEIVED itself (Linux
+/// `tcp_check_req`): one at our ISS acknowledges nothing the peer could
+/// have seen, and its text and FIN used to be taken.
+#[test]
+fn ack_of_nothing_after_close_in_syn_rcvd_is_rejected() {
+    let mut s = new_tcb(SRV, ([0; 4], 0), 4242);
+    s.set_secret(&[3u8; 16]);
+    s.set_now(1000);
     s.listen().unwrap();
-    let no_ts = TcpOptions {
+    let syn = TcpOptions {
         mss: Some(1460),
         ..TcpOptions::NONE
     };
-    s.inject_packet(&pkt(ATTACKER, SRV, 9, 0, flags::SYN, 65535, &no_ts, &[]))
-        .unwrap();
-    drain(&mut s);
-    s.inject_packet(&pkt(CLI, SRV, 500, 0, flags::SYN, 65535, &no_ts, &[]))
+    s.inject_packet(&pkt(CLI, SRV, 77, 0, flags::SYN, 65535, &syn, &[]))
         .unwrap();
     let synack = drain(&mut s).remove(0);
-    assert!(synack.opts.ts.is_none());
-    s.set_now(10_020);
+    s.close().unwrap();
+    drain(&mut s);
+    assert_eq!(s.state(), State::FinWait1);
+    let fl = flags::ACK | flags::FIN;
+    let bogus = pkt(
+        CLI,
+        SRV,
+        78,
+        synack.seq,
+        fl,
+        65535,
+        &TcpOptions::NONE,
+        b"spoof",
+    );
+    s.inject_packet(&bogus).unwrap();
+    let mut buf = [0u8; 16];
+    assert_eq!(
+        s.recv(&mut buf),
+        Ok(0),
+        "text taken before the SYN was acknowledged"
+    );
+    assert_eq!(s.state(), State::FinWait1);
+    // The real third ACK still completes the handshake (and ACKs our FIN).
     let ack = pkt(
         CLI,
         SRV,
-        501,
-        synack.seq + 1,
-        flags::ACK | flags::PSH,
+        78,
+        synack.seq + 2,
+        flags::ACK,
         65535,
-        &ts(123, 0),
-        b"hi",
+        &TcpOptions::NONE,
+        &[],
     );
     s.inject_packet(&ack).unwrap();
-    assert_eq!(s.state(), State::Established);
-    drain(&mut s);
-    assert_eq!(s.stats().mss, 1460, "timestamps turned on");
+    assert_eq!(s.state(), State::FinWait2);
+}
+
+/// A SYN with a new ISN in SYN-RECEIVED, from the half-open's own peer
+/// (it gave up and opened again from the same port), was ignored, leaving
+/// the peer to wait out our SYN-ACK retries. Outside the window it now
+/// draws a (rate-limited) ACK, as Linux `tcp_check_req` sends, which the
+/// peer answers with a RST that frees the half-open; inside the window the
+/// half-open returns to LISTEN (RFC 9293 §3.10.7.4).
+#[test]
+fn new_isn_syn_in_syn_rcvd_is_answered() {
+    for (isn, in_window) in [(0x4000_0000u32, false), (5_000, true)] {
+        let syn = TcpOptions {
+            mss: Some(1460),
+            ..TcpOptions::NONE
+        };
+        let mut s = new_tcb(SRV, ([0; 4], 0), 4242);
+        s.set_secret(&[3u8; 16]);
+        s.set_now(2000);
+        s.listen().unwrap();
+        s.inject_packet(&pkt(CLI, SRV, 100, 0, flags::SYN, 65535, &syn, &[]))
+            .unwrap();
+        drain(&mut s);
+        assert_eq!(s.state(), State::SynRcvd);
+        s.set_now(2600);
+        s.inject_packet(&pkt(CLI, SRV, isn, 0, flags::SYN, 65535, &syn, &[]))
+            .unwrap();
+        let out = drain(&mut s);
+        if in_window {
+            assert!(out.is_empty(), "{out:?}");
+            assert_eq!(s.state(), State::Listen);
+        } else {
+            assert!(
+                out.iter().any(|o| o.flags == flags::ACK && o.ack == 101),
+                "new-ISN SYN not challenged: {out:?}"
+            );
+            assert_eq!(s.state(), State::SynRcvd);
+        }
+    }
+}
+
+/// An ACK that both shows a tail loss probe needless (its D-SACK) and
+/// starts fast recovery: the probe is settled first, as Linux runs
+/// `tcp_process_tlp_ack` before `tcp_fastretrans_alert`, so the recovery's
+/// undo does not wait on a D-SACK for the probe that already came.
+#[test]
+fn a_probe_settled_by_the_ack_that_starts_recovery_does_not_block_its_undo() {
+    let (mut c, sseq, iss) = established(1000, true, false);
+    let b = ts_burst(&mut c, sseq, iss, 2);
+    let end = |v: &[Out], i: usize| v[i].seq + v[i].len as u32;
+    let (probe, t) = first_data(&mut c, 1020, 1500);
+    assert_eq!((c.stats().tlp_count, probe.seq), (1, b[1].seq));
+    c.send(&vec![0x44; 4 * 1448]).unwrap();
+    let m: Vec<Out> = ts_ack(&mut c, sseq, t + 5, end(&b, 1), tsval(&b[1]), &[])
+        .into_iter()
+        .filter(|o| o.len > 0)
+        .collect();
+    assert_eq!(m.len(), 4);
+    let before = c.stats().ssthresh;
+    let blocks = [(b[1].seq, end(&b, 1)), (m[1].seq, end(&m, 3))];
+    let retx: Vec<Out> = ts_ack(&mut c, sseq, t + 15, end(&b, 1), tsval(&probe), &blocks)
+        .into_iter()
+        .filter(|o| o.len > 0)
+        .collect();
+    assert!(retx.iter().any(|o| o.seq == m[0].seq));
+    assert_eq!(c.stats().ca_state, CaState::Recovery as u8);
+    // Segment m[0] was only late: its resend is D-SACKed.
+    let dsack = [(m[0].seq, end(&m, 0))];
+    ts_ack(&mut c, sseq, t + 25, end(&m, 3), tsval(&retx[0]), &dsack);
+    assert_eq!(c.stats().ssthresh, before, "spurious recovery kept");
+}
+
+/// Loss found during an ECN reduction while CWR is held exactly at its
+/// recovery point: fast recovery covers what was sent up to the loss (RFC
+/// 6675 `RecoveryPoint = HighData`). Keeping CWR's point, as Linux does,
+/// ended recovery on the next duplicate ACK and reduced again for the same
+/// loss.
+#[test]
+fn loss_during_an_ecn_reduction_reduces_once() {
+    let (mut c, sseq, iss) = established(1000, true, true);
+    let b = ts_burst(&mut c, sseq, iss, 10);
+    let end = |v: &[Out], i: usize| v[i].seq + v[i].len as u32;
+    let cwr_point = end(&b, 9);
+    c.set_now(1030);
+    let ece = pkt(
+        SRV,
+        CLI,
+        sseq,
+        end(&b, 5),
+        flags::ACK | flags::ECE,
+        0xffff,
+        &ts(8, 1020),
+        &[],
+    );
+    c.inject_packet(&ece).unwrap();
+    drain(&mut c);
+    assert_eq!(c.stats().ca_state, CaState::Cwr as u8);
+    let ssthresh = c.stats().ssthresh;
+    c.send(&vec![0x55; 6 * 1448]).unwrap();
+    let m: Vec<Out> = ts_ack(&mut c, sseq, 1035, cwr_point, 1020, &[])
+        .into_iter()
+        .filter(|o| o.len > 0)
+        .collect();
+    assert!(m.len() >= 4);
+    assert_eq!(c.stats().ca_state, CaState::Cwr as u8, "held at its point");
+    for now in [1045, 1046] {
+        ts_ack(
+            &mut c,
+            sseq,
+            now,
+            cwr_point,
+            1035,
+            &[(m[1].seq, end(&m, 3))],
+        );
+        let s = c.stats();
+        assert_eq!(s.ca_state, CaState::Recovery as u8, "at {now}");
+        assert_eq!((s.fast_recoveries, s.ssthresh), (1, ssthresh), "at {now}");
+    }
+}
+
+/// TSecr times a retransmission only if it echoes a time since the
+/// connection began, as the handshake requires: the peer controls it, and
+/// an echo from before the connection pinned the RTO near its 60 s cap.
+#[test]
+fn timestamp_echo_before_the_connection_gives_no_rtt_sample() {
+    let (mut c, sseq, _) = established(1000, true, false);
+    let segs = send_burst(&mut c, 3000, 1448);
+    let mut now = 3000u64;
+    while !drain(&mut c).iter().any(|o| o.len > 0) {
+        now += 5;
+        c.set_now(now);
+        c.tick().unwrap();
+    }
+    c.set_now(now + 30);
+    let forged = (now as u32 + 30).wrapping_sub(59_000);
+    let ack = pkt(
+        SRV,
+        CLI,
+        sseq,
+        segs[0].1,
+        flags::ACK,
+        8192,
+        &ts(10, forged),
+        &[],
+    );
+    c.inject_packet(&ack).unwrap();
+    drain(&mut c);
+    assert!(c.stats().rto_ms < 2_000, "RTO {} ms", c.stats().rto_ms);
+}
+
+/// A D-SACK can only name data that was sent: one below what has been
+/// sent and acknowledged (here, below our ISS) is ignored, like an ACK of
+/// it (see `ack_of_bytes_never_sent_is_rejected`).
+#[test]
+fn dsack_below_the_data_ever_sent_is_ignored() {
+    let (mut c, sseq, iss) = established(1000, true, false);
+    let segs = send_burst(&mut c, 3000, 1448);
+    let mut now = 3000u64;
+    while !drain(&mut c).iter().any(|o| o.len > 0) {
+        now += 5;
+        c.set_now(now);
+        c.tick().unwrap();
+    }
+    let never_sent = (iss.wrapping_sub(100_000), iss.wrapping_sub(99_000));
+    ts_ack(&mut c, sseq, now + 40, segs[0].1, now as u32, &[never_sent]);
+    assert_eq!(c.stats().dsacks_received, 0);
 }

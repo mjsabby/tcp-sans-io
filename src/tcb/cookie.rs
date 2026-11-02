@@ -40,6 +40,8 @@ pub(super) struct CookieOpts {
     pub ecn: bool,
     /// Validated with the key in force before the last rotation.
     pub prev_key: bool,
+    /// The cookie SYN-ACK carried timestamps (the SYN offered them).
+    pub ts: bool,
 }
 
 impl<const BUF: usize> Tcb<BUF> {
@@ -111,7 +113,9 @@ impl<const BUF: usize> Tcb<BUF> {
         }
     }
 
-    /// 32-bit cookie: top 3 bits = MSS index, low 29 bits = MAC.
+    /// 32-bit cookie: top 3 bits = MSS index, low 29 bits = MAC. The MAC
+    /// also covers whether the SYN-ACK carried timestamps (`has_ts`), so
+    /// option bits are read back from a TSecr only if it can echo them.
     fn compute_cookie(
         &self,
         key: &[u8; 16],
@@ -119,6 +123,7 @@ impl<const BUF: usize> Tcb<BUF> {
         remote: Endpoint,
         mss_idx: u8,
         peer_seq: u32,
+        has_ts: bool,
     ) -> u32 {
         let mut buf = [0u8; 25];
         let fields: [&[u8]; 7] = [
@@ -128,7 +133,7 @@ impl<const BUF: usize> Tcb<BUF> {
             &self.local.ip,
             &self.local.port.to_be_bytes(),
             &peer_seq.to_be_bytes(),
-            &[mss_idx],
+            &[(mss_idx & 0x7) | (u8::from(has_ts) << 7)],
         ];
         let mut at = 0usize;
         for f in fields {
@@ -159,7 +164,15 @@ impl<const BUF: usize> Tcb<BUF> {
             .max(MIN_PEER_MSS);
         let mss_idx = cookie_mss_index(peer_mss);
         let bucket = self.now_ms / COOKIE_TIME_BUCKET_MS;
-        let cookie = self.compute_cookie(&self.cookie_secret, bucket, remote, mss_idx, seg.seq);
+        let has_ts = seg.options.ts.is_some();
+        let cookie = self.compute_cookie(
+            &self.cookie_secret,
+            bucket,
+            remote,
+            mss_idx,
+            seg.seq,
+            has_ts,
+        );
 
         // Options can only be preserved through the cookie via TSval bits.
         let ts_off = self.ts_offset_for(remote);
@@ -245,24 +258,32 @@ impl<const BUF: usize> Tcb<BUF> {
         let mss_idx = ((cookie >> 29) & 0x7) as u8;
         let peer_seq = seg.seq.wrapping_sub(1);
         let now_bucket = self.now_ms / COOKIE_TIME_BUCKET_MS;
-        let issued_with = |key: &[u8; 16]| {
+        let issued_with = |key: &[u8; 16], has_ts: bool| {
             [now_bucket, now_bucket.wrapping_sub(1)]
                 .iter()
-                .any(|&b| self.compute_cookie(key, b, remote, mss_idx, peer_seq) == cookie)
+                .any(|&b| self.compute_cookie(key, b, remote, mss_idx, peer_seq, has_ts) == cookie)
         };
         let prev_valid = self.prev_cookie_secret_set && self.now_ms < self.prev_cookie_until_ms;
-        let prev_key = if issued_with(&self.cookie_secret) {
-            false
-        } else if prev_valid && issued_with(&self.prev_cookie_secret) {
-            true
-        } else {
-            return None;
-        };
+        // Whether the SYN-ACK carried timestamps is in the MAC; try what
+        // the ACK suggests first.
+        let echo = seg.options.ts.is_some_and(|(_, e)| e != 0);
+        let (prev_key, ts) = [echo, !echo].into_iter().find_map(|has_ts| {
+            if issued_with(&self.cookie_secret, has_ts) {
+                Some((false, has_ts))
+            } else if prev_valid && issued_with(&self.prev_cookie_secret, has_ts) {
+                Some((true, has_ts))
+            } else {
+                None
+            }
+        })?;
         // Malformed option bits in the echoed TSval: not a cookie we issued.
-        let opts = decode_ts_opts(seg.options.ts)?;
+        // A TSopt on the ACK when the SYN-ACK carried none is ignored (RFC
+        // 7323 §3.2): its TSecr echoes nothing of ours.
+        let opts = decode_ts_opts(seg.options.ts.filter(|_| ts))?;
         Some(CookieOpts {
             mss: cookie_mss_from_index(mss_idx),
             prev_key,
+            ts,
             ..opts
         })
     }
@@ -312,15 +333,17 @@ impl<const BUF: usize> Tcb<BUF> {
             self.snd_wscale = ws;
             self.rcv_wscale = Self::WS;
         }
-        // Timestamps only if our SYN-ACK carried them: its TSval comes back
-        // as a nonzero TSecr (RFC 7323 §3.2: no TSopt unless negotiated).
-        if let Some((tsval, _)) = seg.options.ts.filter(|&(_, e)| e != 0) {
+        // Timestamps only if our SYN-ACK carried them (the cookie says so)
+        // and its TSval comes back as a nonzero TSecr (RFC 7323 §3.2).
+        if let Some((tsval, _)) = seg.options.ts.filter(|&(_, e)| opts.ts && e != 0) {
             self.ts_enabled = true;
             self.ts_recent = tsval;
             self.ts_recent_stamp = self.now_ms;
             self.sack_enabled = opts.sack;
             self.ecn_enabled = opts.ecn;
         }
+        // The earliest our SYN-ACK can have left: no TSecr predates it.
+        self.syn_xmit_ms = self.now_ms.saturating_sub(2 * COOKIE_TIME_BUCKET_MS);
         self.snd_wnd = self.scale_peer_window(seg.window);
         self.max_snd_wnd = self.snd_wnd;
         self.snd_wl1 = seg.seq;
@@ -358,6 +381,7 @@ fn decode_ts_opts(ts: Option<(u32, u32)>) -> Option<CookieOpts> {
         sack: false,
         ecn: false,
         prev_key: false,
+        ts: false,
     };
     // No timestamps, or a zero TSecr (nothing echoed): no preserved options.
     let Some((_, tsecr)) = ts.filter(|&(_, e)| e != 0) else {
@@ -472,6 +496,7 @@ mod tests {
             sack: false,
             ecn: false,
             prev_key: false,
+            ts: false,
         });
         assert_eq!((o.wscale, o.sack, o.ecn), (Some(7), true, false));
         let none = decode_ts_opts(Some((1, TS_OPT_WS_MASK)));

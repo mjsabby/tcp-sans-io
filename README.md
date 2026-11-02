@@ -39,12 +39,12 @@ that costs against Linux CUBIC on lossy long paths.
 | Half-open replacement (a new SYN recycles a stalled `SYN_RCVD` slot) | — (single-slot listener policy) | ✅ |
 | SYN cookies while the half-open slot is busy (a valid cookie ACK takes the slot over); WS / SACK / ECN kept via timestamp bits; key derived from the host secret or set explicitly, surviving one rotation | RFC 4987 | ✅ |
 | ISN selection | RFC 6528 | ✅ keyed by `tcp_set_secret` on passive opens (`tcp_listen` requires a secret); host-supplied `iss` on active |
-| MSS; MTU / PMTU (`tcp_set_mtu`, `tcp_update_pmtu`, black-hole clamp, probing back up); what a smaller path MTU, or a probe that did not get through, lost is resent without reducing the window | RFC 9293, RFC 1191, RFC 4821 (spirit) | ✅ Linux `tcp_simple_retransmit` |
+| MSS; MTU / PMTU (`tcp_set_mtu`, `tcp_update_pmtu`, black-hole clamp, probing back up); a reported MTU holds for 10 minutes, then the old size is probed; what a smaller path MTU, or a probe that did not get through, lost is resent without reducing the window | RFC 9293, RFC 1191, RFC 4821 (spirit) | ✅ Linux `tcp_simple_retransmit` / `ip_rt_mtu_expires` |
 | Timestamps: RTTM, PAWS (pure ACKs included, but for Linux's exemption of a reordered old ACK), keyed per-connection offset | RFC 7323 §3–5 | ✅ Linux `tcp_paws_discard` / `tcp_disordered_ack` |
 | Window Scale | RFC 7323 §2 | ✅ |
-| SACK, both directions; receiver holds the whole window out of order; blocks beyond `SND.NXT` or not above `SND.UNA` ignored; blocks on an ACK reordered behind a newer one still count; a receiver that reneges gets max(SRTT/2, 10 ms) before the timeout resends | RFC 2018 | ✅ Linux `tcp_is_sackblock_valid` / `tcp_check_sack_reneging` |
-| D-SACK, both directions (drives RACK's reordering window) | RFC 2883, RFC 3708 | ✅ |
-| Spurious fast recovery / RTO undone: D-SACKs for every retransmission (an unresolved tail loss probe included), an ACK whose timestamp echo predates the first one (receivers without D-SACK too), or a hole filled before anything was resent; never past an ECN-Echo | RFC 3708, RFC 3522 | ✅ Linux-style (`tcp_try_undo_*`, `tcp_packet_delayed`) |
+| SACK, both directions; receiver holds the whole window out of order, a FIN held out of order included; blocks beyond `SND.NXT` or not above `SND.UNA` ignored; blocks on an ACK reordered behind a newer one still count; a receiver that reneges gets max(SRTT/2, 10 ms) before the timeout resends | RFC 2018 | ✅ Linux `tcp_is_sackblock_valid` / `tcp_check_sack_reneging` |
+| D-SACK, both directions, for wholly or partly duplicated segments (drives RACK's reordering window) | RFC 2883, RFC 3708 | ✅ Linux `tcp_data_queue_ofo` |
+| Spurious fast recovery / RTO undone: D-SACKs for every retransmission (an unresolved tail loss probe included), an ACK whose timestamp echo predates the first one (receivers without D-SACK too), or a hole filled before anything was resent; after a timeout also F-RTO: data sent before it and never resent is (S)ACKed, with new data sent after the first partial ACK to find out; never past an ECN-Echo | RFC 3708, RFC 3522, RFC 5682 | ✅ Linux-style (`tcp_try_undo_*`, `tcp_packet_delayed`, `tcp_process_loss`) |
 | RTO with Karn's algorithm; RTO = SRTT + max(4·RTTVAR, 200 ms), SRTT / RTTVAR in fixed point | RFC 6298 | ✅ Linux `tcp_rtt_estimator` / `tcp_set_rto` |
 | Slow start / congestion avoidance (byte counting, growth only while cwnd-limited, per round of data); restart after idle halves cwnd per idle RTO; a window left unused for an RTO decays | RFC 5681, RFC 3465, RFC 7661 (spirit) | ✅ Linux `tcp_cwnd_validate` / `tcp_cwnd_restart` |
 | Proportional Rate Reduction; each reduction halves `cwnd` (capped by the peer's window), not FlightSize | RFC 6937 | ✅ Linux `tcp_init_cwnd_reduction` / `tcp_cwnd_reduction` |
@@ -52,8 +52,8 @@ that costs against Linux CUBIC on lossy long paths.
 | RACK-TLP: time-based loss detection, tail loss probe (also during an ECN reduction) | RFC 8985 | ✅ primary loss detection |
 | Duplicate-ACK fast retransmit (peers without SACK) | RFC 5681 §3.2 | ✅ fallback |
 | ECN (ECT(0) on new data; CE echoed only from data segments; ECE → one CWR reduction per window; CWR sent after every reduction, withdrawn if it is undone first) | RFC 3168 | ✅ Linux `tcp_ecn_queue_cwr` / `tcp_ecn_withdraw_cwr` |
-| Blind-attack hardening: RST, SYN and ACK checks, rate-limited challenge ACKs | RFC 5961 §3–5, §7 | ✅ |
-| Silly-window avoidance, sender and receiver | RFC 9293 §3.8.6.2 | ✅ |
+| Blind-attack hardening: RST (at RCV.NXT, or as Linux at RCV.NXT − 1 after the peer's FIN and at the right edge of our SACK blocks), SYN and ACK checks, rate-limited challenge ACKs | RFC 5961 §3–5, §7 | ✅ Linux `tcp_validate_incoming` / `tcp_reset_check` |
+| Silly-window avoidance, sender and receiver; a read that reopens or doubles the window announces it at once | RFC 9293 §3.8.6.2 | ✅ Linux `__tcp_cleanup_rbuf` |
 | Nagle in Minshall's variant (a short segment waits only behind an unacknowledged short one); `tcp_set_nodelay` turns it off | RFC 9293 §3.7.4 | ✅ on by default, as Linux |
 | PSH on the segment that ends the queued data (and every half window), not on every segment | RFC 9293 §3.9.1 | ✅ as Linux `tcp_mark_push` |
 | Window-update rule (SND.WL1 / WL2) | RFC 9293 §3.10.7.4 | ✅ Linux `tcp_may_update_window`: a reordered ACK cannot shrink the window; a forged future WL1 cannot freeze it (nor at the handshake) |
@@ -89,18 +89,20 @@ known differences:
 
 | Area | tcp-sans-io | Linux | Why |
 |---|---|---|---|
-| Clock | Milliseconds, from the host | Microseconds (`tcp_mstamp`) | No clock of its own. RACK's reordering window is at least 2 ms and the TLP timeout `max(2·SRTT, 10 ms)` (Linux: `min_RTT/4` in µs and `2·SRTT + 2 ms`), so on sub-millisecond paths loss is declared a little later; and a SACKed retransmission timed at 0 ms against a 1 ms minimum RTT still counts as delivered until the path has shown reordering, where Linux needs no such slack. See *Clock model*. |
+| Clock | Milliseconds, from the host | Microseconds (`tcp_mstamp`) | No clock of its own. RACK's reordering window is at least 2 ms and the TLP timeout `max(2·SRTT, 10 ms)` (Linux: `min_RTT/4` in µs and `2·SRTT + 2 ms`), so on sub-millisecond paths loss is declared a little later; and a retransmission timed at 0 ms against a 1 ms minimum RTT still counts as delivered when SACKed while RACK's latest RTT is within that tick (no queue in the path), or when cumulatively ACKed with a timestamp echo that shows it arrived, where Linux needs no such slack. A retransmission sent and ACKed within the original's millisecond stays ambiguous. See *Clock model*. |
 | Congestion control | Reno | CUBIC (+ HyStart) | See *Deliberately deferred*. |
 | Loss reduction | Halves `min(cwnd, peer window)` | Halves `cwnd` | Slow start may grow `cwnd` to twice a flight the peer's window caps (as in Linux), and halving that would not slow the sender: with a 1 MiB window the first reduction after a slow-start overshoot would be a no-op. |
 | Send buffer | Fixed `BUF_CAP` ring, the same size as the largest window it can fill | Autotuned to about twice `cwnd` | Allocation-free. A bulk sender that keeps the peer's window full can drain the ring and send a short segment mid-stream; Nagle then holds the transfer's last short segment behind it for up to an RTT. `close()` (the FIN rides on it) or `set_nodelay(true)` ends a transfer without the wait. |
 | SACK on retransmissions | A retransmission keeps its size and carries the blocks only if they fit | Splits the segment to fit them (`__tcp_retransmit_skb`) | No re-segmentation of the retransmission queue. New data segments shrink to carry them, as in Linux, and pure ACKs always do. |
+| Immediate ACKs | Go on their own, ahead of data leaving at the same time | Ride on that data (`tcp_data_snd_check` before `tcp_ack_snd_check`) | Only a data-less ACK counts as a duplicate (RFC 5681 §2): a sender that recovers by duplicate ACKs alone, such as smoltcp, otherwise stalls on its timeout in two-way lossy transfers. One extra packet when it happens. |
 | RST in `CLOSING` / `LAST_ACK` | Reports `ConnectionReset` only if data of ours (beyond the FIN) was undelivered | Always `ECONNRESET` | Everything the application sent arrived, so the stream completed. |
 | PAWS reference expiry | 24 days idle (RFC 7323 §5.5) | About 36 minutes (`TCP_PAWS_WRAP`, sized for microsecond timestamps) | Our timestamps are milliseconds, which take 24 days to wrap. |
 | Late D-SACK undo | Once an episode has ended, only D-SACKs below its recovery point can undo it | Any D-SACK above `undo_marker` counts | A D-SACK for a later tail loss probe would otherwise undo an earlier, real loss's reduction. |
+| Loss during an ECN reduction | Fast recovery's recovery point moves to `SND.NXT` (RFC 6675 `RecoveryPoint = HighData`) | Keeps the CWR episode's `high_seq` (`tcp_enter_recovery` skips `tcp_init_cwnd_reduction`) | While CWR is held at its recovery point, Linux leaves recovery on the next ACK and reduces again for the same loss. |
 | Timestamp undo reference | An unresolved tail loss probe keeps it, as a retransmission still in flight | `tcp_any_retrans_done` does not count the probe | The probe's own ACK would otherwise pass for a delayed original's and undo a real loss. |
-| Spurious timeout detection | D-SACK and timestamps (Eifel) | Also F-RTO (RFC 5682, on by default) | Timestamps cover it whenever they are negotiated; F-RTO for peers without them is deferred. |
 | Timeouts into a zero window | Count toward R2 only while unanswered | Given up once the peer has been silent for 2·`TCP_RTO_MAX` (240 s) | Counted like persist probes; the USER TIMEOUT bounds both. |
-| SYN-cookie timestamps | On only if the ACK echoes our SYN-ACK's TSval | On whenever the ACK carries the option | RFC 7323 §3.2: otherwise they were never negotiated. |
+| SYN-cookie timestamps | On only if our SYN-ACK carried them (the cookie's MAC records it) and the ACK echoes its TSval | On whenever the ACK carries the option | RFC 7323 §3.2: otherwise they were never negotiated, and the option bits a TSecr would carry (window scaling, SACK, ECN) were never offered. |
+| Path-MTU reports | `tcp_update_pmtu` takes the MTU alone; the ICMP's quoted sequence number is not checked | Accepts an ICMP only if the sequence number it quotes lies in `[SND.UNA, SND.NXT]` (`tcp_v4_err`, RFC 5927) | The host parses the ICMP; it should pass only those quoting the connection's 4-tuple. A report holds for 10 minutes, so a forged one cannot shrink segments for good. |
 | ECN on active opens | Always requested | Requested only with `tcp_ecn=1` (the default, 2, accepts it but does not ask) | Virtual links and modern queues mark rather than drop; a retransmitted SYN falls back without it. |
 | USER TIMEOUT, keepalive | On by default (5 min; keepalive after 10 min idle, 4 probes 60 s apart) | Off unless set (`TCP_USER_TIMEOUT`, `SO_KEEPALIVE` with 2 h idle) | A library connection has no process exit to reap it; both can be turned off. |
 | FIN_WAIT_2 timeout | 60 s even while the application holds the TCB (restarted by reads; 0 turns it off) | Only for orphaned sockets (`tcp_fin_timeout`) | A sans-I/O TCB cannot tell whether its owner still cares; the host decides. |
@@ -119,8 +121,8 @@ known differences:
 
 ### Memory footprint
 
-Per connection, `tcp_handle_size()` is **2,176,976 bytes (≈ 2.08 MiB)** with
-default features, or **139,600 bytes (136 KiB)** with `small-buffers`:
+Per connection, `tcp_handle_size()` is **2,176,992 bytes (≈ 2.08 MiB)** with
+default features, or **139,616 bytes (136 KiB)** with `small-buffers`:
 
 - `BUF_CAP` send ring + receive ring (2 × 1 MiB; 2 × 32 KiB with
   `small-buffers`). Out-of-order data is parked inside the receive ring at
@@ -537,12 +539,12 @@ tracker and no timestamps.
 
 | | tcp-sans-io | smoltcp 0.14 |
 |---|---|---|
-| RFC probes (33) | 32 pass, 1 informational | 20 pass, 6 warnings, 4 failures, 3 informational |
+| RFC probes (33) | 33 pass | 21 pass, 6 warnings, 4 failures, 2 informational |
 | Interop: 16 cases × 4 client/server pairings | 48 / 48 runs involving it pass | 48 / 48 runs involving it pass |
 | 1 M fuzzed segments | no panics, no invariant violations | no panics |
 | Goodput as a sender | 1.6–19× smoltcp's with tcp-sans-io receiving, 1.4–19× with smoltcp receiving; near line rate on clean paths, 10 Gbit/s virtual links included | every loss its single fast retransmit cannot repair costs a ≥ 1 s RTO and a go-back-N resend |
-| CPU, bulk transfer, one packet per call (Gbit/s per core) | 33.8 sending, 41.3 receiving | 35.8 sending, 36.9 receiving |
-| CPU, 64 B request/response (transactions per core-second) | 1.58 M | 1.56 M |
+| CPU, bulk transfer, one packet per call (Gbit/s per core) | 33.6 sending, 40.7 receiving | 35.5 sending, 36.5 receiving |
+| CPU, 64 B request/response (transactions per core-second) | 1.47 M | 1.56 M |
 | State per connection besides the data buffers | 78 KiB | 960 B (+ 184 B per interface) |
 
 ### RFC probes
@@ -587,7 +589,7 @@ loss-recovery probes model a 10 ms RTT after a 64 KiB warm-up.
 | **FIN retransmitted**: unacknowledged FIN | 9293 §3.10.4 | ✅ after 201 ms | ✅ after 1000 ms |
 | **send in CLOSE_WAIT**: half-close: data after peer's FIN | 9293 §3.10.4 | ✅ | ✅ |
 | **one spoofed SYN**: can a legitimate client still connect? | 4987 | ✅ legitimate client served | ❌ legitimate client refused (no SYN-ACK); still refused 2 min later |
-| **ACK to a listener**: RST or silence | 9293 §3.10.7.2 | ℹ️ dropped silently | ℹ️ RST |
+| **ACK to a listener**: RST or silence | 9293 §3.10.7.2 | ✅ RST | ✅ RST |
 
 smoltcp's failures, each confirmed against its source:
 
@@ -602,9 +604,6 @@ smoltcp's failures, each confirmed against its source:
   and never times it out, so one SYN from an address that never answers
   pins it; other clients get an RST. tcp-sans-io answers with SYN cookies
   while its half-open slot is busy.
-
-tcp-sans-io's silence towards an ACK sent to a listener is deliberate (no
-reflection; see *Threat model*).
 
 ### Interop matrix
 
@@ -622,7 +621,7 @@ resent sequence space, both directions.
 | **reorder 3%**: 3% of packets held back 3 ms, both ways | ✅ 544 ms · 29 rtx | ✅ 696 ms · 24 rtx | ✅ 131 ms · 9 rtx | ✅ 1.99 s · 28 rtx |
 | **duplicate 2%**: 2% of packets delivered twice | ✅ 203 ms · 0 rtx | ✅ 206 ms · 0 rtx | ✅ 134 ms · 0 rtx | ✅ 172 ms · 0 rtx |
 | **corrupt 1%**: 1% of packets get a flipped byte (checksums must catch it) | ✅ 678 ms · 24 rtx | ✅ 685 ms · 21 rtx | ✅ 599 ms · 11 rtx | ✅ 1.70 s · 26 rtx |
-| **kitchen sink**: 1% loss, 1% reorder, 1% duplicate, 0.5% corrupt, both ways | ✅ 1.95 s · 41 rtx | ✅ 869 ms · 32 rtx | ✅ 701 ms · 27 rtx | ✅ 5.28 s · 30 rtx |
+| **kitchen sink**: 1% loss, 1% reorder, 1% duplicate, 0.5% corrupt, both ways | ✅ 1.95 s · 41 rtx | ✅ 869 ms · 32 rtx | ✅ 621 ms · 21 rtx | ✅ 5.28 s · 30 rtx |
 | **ACK loss 20%**: 2 MiB upload; 20% of the reverse path lost | ✅ 202 ms · 0 rtx | ✅ 1.87 s · 1 rtx | ✅ 203 ms · 0 rtx | ✅ 3.94 s · 2 rtx |
 | **SYN, SYN-ACK lost**: first SYN and first SYN-ACK dropped | ✅ 122 ms · 0 rtx | ✅ 128 ms · 0 rtx | ✅ 32 ms · 0 rtx | ✅ 138 ms · 0 rtx |
 | **server MTU 576**: server MSS 536: both directions must honour it | ✅ 84 ms · 0 rtx | ✅ 107 ms · 0 rtx | ✅ 72 ms · 0 rtx | ✅ 99 ms · 0 rtx |
@@ -690,7 +689,7 @@ senders meet the same random losses.
 | **reorder-2**: 20 ms, 50 Mbit/s, 1000-pkt queue, 2% +4 ms reorder; 8 MiB | 46.1 (45.4–46.4) | 6.9 (6.2–7.9) | 6.6 (6.1–6.9) | 7.3 (6.1–7.9) | 45.8 (45.5–46.1) |
 | **burst-40**: 20 ms, 100 Mbit/s, 1000-pkt queue, 40 consecutive drops; 4 MiB | 76.7 | 12.0 | 11.9 | 12.3 | 76.6 |
 | **virt**: 0.1 ms, 10000 Mbit/s, 256-pkt queue; 64 MiB | 9596.2 | 499.6 | 499.7 | 500.4 | 9531.5 |
-| **virt-reorder**: 0.1 ms, 10000 Mbit/s, 256-pkt queue, 1% +0.1 ms reorder; 32 MiB | 8315.3 (8161.1–8644.2) | 953.7 (884.4–987.3) | 927.8 (879.2–946.2) | 1068.0 (885.9–1095.8) | 7729.0 (6446.3–9542.0) |
+| **virt-reorder**: 0.1 ms, 10000 Mbit/s, 256-pkt queue, 1% +0.1 ms reorder; 32 MiB | 8315.3 (8161.1–8653.1) | 953.7 (884.4–987.3) | 927.8 (879.2–946.2) | 1068.0 (885.9–1095.8) | 7729.0 (6446.3–9542.0) |
 
 Retransmitted segments / data segments the link dropped / retransmissions
 of data the link had already delivered (medians; a receiver may have
@@ -756,21 +755,21 @@ interleaved runs, ± half the range.
 
 | Bulk transfer, 1 GiB (sender → receiver) | Sender Gbit/s, per packet | Receiver Gbit/s, per packet | ACKs / 100 segments, per packet | Sender Gbit/s, batched | Receiver Gbit/s, batched | ACKs / 100 segments, batched |
 |---|---|---|---|---|---|---|
-| tcp-sans-io → tcp-sans-io | 35.7 ±3% | 43.6 ±5% | 51 | 35.3 ±3% | 42.9 ±4% | 51 |
-| smoltcp → smoltcp | 37.4 ±3% | 38.5 ±3% | 50 | 50.3 ±4% | 53.1 ±4% | 0 |
+| tcp-sans-io → tcp-sans-io | 33.6 ±2% | 40.7 ±1% | 51 | 33.8 ±2% | 41.2 ±2% | 51 |
+| smoltcp → smoltcp | 35.5 ±2% | 36.5 ±3% | 50 | 49.0 ±3% | 51.9 ±2% | 0 |
 
 | 64 B request / 64 B response (client ⇄ server) | Client µs / transaction | Server µs / transaction | Packets / transaction | Transactions per core-second (both ends) |
 |---|---|---|---|---|
-| tcp-sans-io ⇄ tcp-sans-io | 0.35 ±3% | 0.31 ±4% | 2.00 | 1519603 |
-| smoltcp (Nagle off) ⇄ smoltcp (Nagle off) | 0.35 ±2% | 0.28 ±2% | 2.00 | 1587469 |
+| tcp-sans-io ⇄ tcp-sans-io | 0.36 ±2% | 0.32 ±2% | 2.00 | 1468687 |
+| smoltcp (Nagle off) ⇄ smoltcp (Nagle off) | 0.35 ±3% | 0.29 ±3% | 2.00 | 1563410 |
 
 *Per packet* hands each datagram over and lets the stack act on it before
 the next (one read per packet, as from a TUN or WireGuard device);
 *batched* hands a side the whole flight and lets it act once. Per packet
-both stacks ACK about every second segment; tcp-sans-io costs 5 % more to
+both stacks ACK about every second segment; tcp-sans-io costs 6 % more to
 send with (its Linux-style loss recovery, RTT estimator and window
-validation run on every ACK) and receives 12 % cheaper; a request and
-response cost it 4 % more. Batched, smoltcp
+validation run on every ACK) and receives 10 % cheaper; a request and
+response cost it 6 % more. Batched, smoltcp
 answers a whole flight
 (up to 1 MiB) with a single ACK: cheaper, but a stretch ACK that would
 make the sender burst on a real path. The cross pairs are left out on
@@ -781,8 +780,8 @@ misses.
 
 | Per-connection state | Bytes | Of which data buffers |
 |---|---|---|
-| tcp-sans-io (1 MiB rings) | 2176968 | 2097152 |
-| tcp-sans-io (64 KiB rings, `Tcb<65536>`) | 210888 | 131072 |
+| tcp-sans-io (1 MiB rings) | 2176984 | 2097152 |
+| tcp-sans-io (64 KiB rings, `Tcb<65536>`) | 210904 | 131072 |
 | smoltcp socket | 960 | caller-supplied |
 | smoltcp `Interface` (per interface) | 184 | — |
 
@@ -804,8 +803,8 @@ cargo run --release -- --profile reorder-2 --pair ours,smol        # one goodput
 PROBE_TRACE=1 cargo run --release -- --probe PAWS --stack smol     # one probe, every segment
 ```
 
-`--check` exits non-zero if any tcp-sans-io probe result is not ✅ (the
-informational *ACK to a listener* aside), an interop case involving it
+`--check` exits non-zero if any tcp-sans-io probe result is not ✅, an
+interop case involving it
 fails, or the fuzzer finds a panic or an invariant violation; smoltcp's
 results are reported only. CI runs it on every push, and the
 `perf-bench` workflow adds the full report to its summary.
@@ -878,7 +877,9 @@ to put on the wire and hands you back the bytes the peer sent.
    an explicit, rotatable cookie key (cookies survive one rotation).
 6. **The path MTU** — `tcp_set_mtu` before the handshake when the tunnel
    MTU is below 1500 (1420 for a default WireGuard interface), and
-   `tcp_update_pmtu` if you receive ICMP "fragmentation needed".
+   `tcp_update_pmtu` if you receive ICMP "fragmentation needed" quoting the
+   connection's 4-tuple (the report holds for 10 minutes, then the old size
+   is probed again).
 7. **5-tuple demux** — route each inbound datagram to the TCB that owns
    its 4-tuple. The stack rejects mismatches with `NOT_FOR_US`, but you
    shouldn't rely on that for routing N connections. A listener may also
@@ -993,7 +994,8 @@ free(mem);                             // you own the memory
   or mis-routed wire, not fatal.
 - Treat `WOULD_BLOCK` from `send` as backpressure (the send ring is full);
   retry after a later turn drains it. Treat `CONNECTION_CLOSED` from `recv`
-  as EOF and `CONNECTION_RESET` as an aborted peer.
+  as EOF and `CONNECTION_RESET` as an aborted peer (after a peer's RST,
+  `recv` first returns the bytes that had already arrived, as Linux).
 - Drive `tick()` *event-driven*: right after a batch of injects or sends,
   and when `tcp_next_deadline()` comes due.
 - **Mind Nagle** — on by default, as in Linux: a segment shorter than the
@@ -1147,7 +1149,7 @@ proof.
 | Layer | What it covers | Files |
 |---|---|---|
 | **Property tests** | Wire codec round-trips; checksum integrity; serial-arithmetic; out-of-order reassembly vs a model | `src/property_tests.rs` (proptest, 4096 cases each) |
-| **Security regressions** | One test per finding of the public-deployment review: blind injection, RFC 5961 challenge/rate limits, forged zero window, PAWS, timestamp poisoning by a rejected ACK, ACK storms, old-data reflection, listener RSTs, SYN-SENT RST, simultaneous open, half-open replacement, cookie options, keyed timestamps, FIN_WAIT_2, slow-reader / zero-window stalls, no SACKed retransmits, ECE handling, no sequence rewinds, full-window out-of-order, D-SACK (reported and believed), timestamp undo (only of a spurious fast recovery or RTO), forged TSecr, reply gating for unacceptable segments, MTU / PMTU / black-hole, FFI stack use, NULL / zero-length / misaligned FFI arguments. Second review: TS.Recent only after ACK validation, CE on a CWR segment, FIN after the peer's FIN, zero-window probe ACKs, out-of-order data beyond a FIN, FIN_WAIT_2 trickle and TIME_WAIT pinning, keyed listener ISNs, hybrid cookies (option preservation, spoofed-SYN lockout, rotation), black-hole probing. Multi-model audit: tail loss probes (not counted in pipe, answered by a plain duplicate ACK, not postponed by peer data, also during CWR), undo (after a probe, past an ECN-Echo, with nothing resent), RACK's timer in recovery, ACK on read and interactive mode, partial hole fills and overlaps D-SACKed, cwnd growth and validation, the Linux RTT estimator, the RTO after a head retransmission, Nagle and PSH, the handshake's third ACK (window and PAWS), close in SYN_RCVD, RST in CLOSING / LAST_ACK, PAWS on pure ACKs, SACK block validation, reneging, the deadline with a full egress ring | `src/security_tests.rs` |
+| **Security regressions** | One test per finding of the public-deployment review: blind injection, RFC 5961 challenge/rate limits, forged zero window, PAWS, timestamp poisoning by a rejected ACK, ACK storms, old-data reflection, listener RSTs, SYN-SENT RST, simultaneous open, half-open replacement, cookie options, keyed timestamps, FIN_WAIT_2, slow-reader / zero-window stalls, no SACKed retransmits, ECE handling, no sequence rewinds, full-window out-of-order, D-SACK (reported and believed), timestamp undo (only of a spurious fast recovery or RTO), forged TSecr, reply gating for unacceptable segments, MTU / PMTU / black-hole, FFI stack use, NULL / zero-length / misaligned FFI arguments. Second review: TS.Recent only after ACK validation, CE on a CWR segment, FIN after the peer's FIN, zero-window probe ACKs, out-of-order data beyond a FIN, FIN_WAIT_2 trickle and TIME_WAIT pinning, keyed listener ISNs, hybrid cookies (option preservation, spoofed-SYN lockout, rotation), black-hole probing. Multi-model audit: tail loss probes (not counted in pipe, answered by a plain duplicate ACK, not postponed by peer data, also during CWR), undo (after a probe, past an ECN-Echo, with nothing resent), RACK's timer in recovery, ACK on read and interactive mode, partial hole fills and overlaps D-SACKed, cwnd growth and validation, the Linux RTT estimator, the RTO after a head retransmission, Nagle and PSH, the handshake's third ACK (window and PAWS), close in SYN_RCVD, RST in CLOSING / LAST_ACK, PAWS on pure ACKs, SACK block validation, reneging, the deadline with a full egress ring. Third audit: out-of-order FINs SACKed, partial overlaps D-SACKed, received data readable after a RST, RSTs at RCV.NXT − 1 after a FIN and at the SACK edge, RSTs to stray ACKs at a listener, retransmitted FINs ACKed at once, F-RTO, resends ahead of the text they would carry an ACK for, RACK on a millisecond clock, CWR turning into recovery, cookie timestamps, path-MTU expiry, a full queue across repeated path-MTU drops | `src/security_tests.rs` |
 | **Link simulation** | Two real TCBs over a seeded discrete-event link (bottleneck queue, delay, loss, reordering with and without D-SACK, ACK loss, burst and tail loss, slow reader, chaos with sequence wrap, and 10 Gbit/s virtual links with sub-millisecond RTT, reordering and tail loss). Asserts retransmissions equal drops, goodput vs the Mathis bound, TLP before RTO, one window halving per queue overflow, clean closes, that request/response never waits on a delayed ACK, and that `next_deadline()` never leaves a host spinning | `src/sim_tests.rs` |
 | **TCB internals** | R2 / SYN retry limits, keepalive, USER TIMEOUT, lost FIN, TIME_WAIT restart (and no restart by a forged FIN), FIN edge cases (FIN after FIN, out-of-order FIN consumed with one ACK and processed in SEG.SEQ order, ACK carried by a retransmitted FIN), unread data across the final close, byte-exact data after SND.UNA laps back to ISS (4 GiB; release builds), in-place init, liveness oracles, deadline reporting | `src/tcb/tests.rs` |
 | **C ABI ownership** | `tcp_destroy` releases the `heap-buffers` rings (counting allocator, own binary): `cargo test --release --features std,heap-buffers --test ffi_heap_buffers` | `tests/ffi_heap_buffers.rs` |
@@ -1167,7 +1169,7 @@ proof.
 | **Real TLS over the cdylib** | Go's `crypto/tls.Server` wraps a custom `net.Conn` backed by the cdylib + TUN pair; real `curl --insecure` does HTTPS round-trips. Validates TCP behaviour under handshake-sensitive workloads (small writes, half-close timing, MAC-validated bulk transfer) — anything our stack mis-orders or corrupts surfaces as a TLS alert, not silent corruption. | `bindings/realworld/tls_test.go` |
 | **h2spec HTTP/2 conformance** | `h2spec` (nghttp2's official HTTP/2 conformance suite) runs all 44 generic tests against an HTTP/2 server hosted on our TCP stack via TLS + ALPN. Each test case is a fresh TCP+TLS+HTTP/2 connection — exercises the LISTEN re-arm cycle at scale plus framing-sensitive H2 traffic. All 44/44 generic tests pass. | `bindings/realworld/h2spec_test.go` |
 | **git clone over HTTPS** | Real `git clone https://…/repo.git` against a bare repository served by `http.FileServer` over the cdylib's TLS listener. Exercises chatty HTTP/1.1 traffic (many small pkt-line writes interleaved with variable-length pack/object body reads). End-to-end signal: the cloned working tree's bytes must match the source repo exactly. | `bindings/realworld/git_test.go` |
-| **Userspace UDP server stress** | A standalone Rust harness (`bindings/wgserver-rs/`) hosts N TCBs in LISTEN on a single UDP socket. A pure-Go driver (`bindings/wgserver/`) — no cgo, no kernel TUN, no root — runs adversarial scenarios (SYN flood ±cookies, blind RST/ACK, cookie forgery, bare-ACK reflection check, malformed-packet spray, wrong-IP rejection, in-window RST in SYN_RCVD, …) and a 10 000-connection functional scale test (≈ 1.3 GiB with `--features small-buffers`, 100 % success, p99 ≈ 18 ms loopback). | `bindings/wgserver-rs/src/server.rs`, `bindings/wgserver/{scale,adversary}_test.go` |
+| **Userspace UDP server stress** | A standalone Rust harness (`bindings/wgserver-rs/`) hosts N TCBs in LISTEN on a single UDP socket. A pure-Go driver (`bindings/wgserver/`) — no cgo, no kernel TUN, no root — runs adversarial scenarios (SYN flood ±cookies, blind RST/ACK, cookie forgery, rate-limited RST to a bare ACK, malformed-packet spray, wrong-IP rejection, in-window RST in SYN_RCVD, …) and a 10 000-connection functional scale test (≈ 1.3 GiB with `--features small-buffers`, 100 % success, p99 ≈ 18 ms loopback). | `bindings/wgserver-rs/src/server.rs`, `bindings/wgserver/{scale,adversary}_test.go` |
 
 ### packetdrill scripts
 
@@ -1364,9 +1366,11 @@ put packets on the path — is hostile.
   are dropped unanswered. Replies to unacceptable segments (challenge ACKs,
   dup ACKs for out-of-window data, RSTs to stray ACKs or SYN-ACKs) are
   limited to one per 500 ms per connection, each a single header-only packet
-  of at most 80 bytes; a SYN-ACK to a listener draws at most one such RST,
-  addressed to the segment's source, and a bare ACK that is not a valid
-  cookie draws nothing. Only data or a FIN that could be the peer's own
+  of at most 80 bytes; an ACK to a listener that is not a valid cookie (a
+  SYN-ACK included) draws at most one such RST, addressed to the segment's
+  source, as RFC 9293 §3.10.7.2 and Linux answer it, so a peer stranded with
+  a connection the host no longer holds learns of it at once. Only data or a
+  FIN that could be the peer's own
   retransmission — an acceptable ACK and, when negotiated, a timestamp — is
   answered outside that budget (one ACK per segment, with a D-SACK that never
   names sequence space the connection cannot have received), because the

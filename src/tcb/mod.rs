@@ -331,6 +331,13 @@ pub struct Tcb<const BUF: usize = BUF_CAP> {
     tlp_deadline: Deadline,
     tlp_end_seq: Option<u32>,
     tlp_is_retrans: bool,
+    /// Sequence space the retransmission timer marked lost (`[SND.UNA,
+    /// SND.NXT)` at the timeout, extended by repeated ones): its resends
+    /// are the timer's, so their D-SACKs show a delay, not reordering.
+    rto_span: Option<(u32, u32)>,
+    /// F-RTO step 2.b (Linux `REXMIT_NEW`): the ACK just processed asks the
+    /// next send to put out new data rather than presumed-lost segments.
+    frto_new: bool,
     /// Duplicate-ACK counter (RFC 6582 NewReno; RFC 6675 DupThresh fallback
     /// when a SACK connection receives block-less duplicate ACKs).
     dup_acks: u8,
@@ -538,11 +545,13 @@ pub(crate) fn seq_in_range(x: u32, lo: u32, hi_exclusive: u32) -> bool {
 
 /// A FIN that arrived beyond `RCV.NXT`, with the first sequence number of
 /// the segment that carried it (the FIN itself for a bare FIN), which is
-/// its place in SEG.SEQ processing order.
+/// its place in SEG.SEQ processing order, and its recency among the
+/// out-of-order ranges for SACK reporting.
 #[derive(Clone, Copy, Debug)]
 struct HeldFin {
     start: u32,
     seq: u32,
+    tag: u32,
 }
 
 impl<const BUF: usize> Tcb<BUF> {
@@ -585,6 +594,7 @@ impl<const BUF: usize> Tcb<BUF> {
             core::ptr::addr_of_mut!((*p).state).write(State::Closed);
             core::ptr::addr_of_mut!((*p).error).write(None);
             core::ptr::addr_of_mut!((*p).tlp_end_seq).write(None);
+            core::ptr::addr_of_mut!((*p).rto_span).write(None);
             core::ptr::addr_of_mut!((*p).ooo_fin).write(None);
             core::ptr::addr_of_mut!((*p).dsack).write(None);
             core::ptr::addr_of_mut!((*p).cc).write(Reno::new(congestion::INITIAL_WINDOW));
@@ -689,6 +699,8 @@ impl<const BUF: usize> Tcb<BUF> {
         self.tlp_deadline = Deadline::OFF;
         self.tlp_end_seq = None;
         self.tlp_is_retrans = false;
+        self.rto_span = None;
+        self.frto_new = false;
         self.dup_acks = 0;
         self.reno_sacked = 0;
         self.dsack_segs = 0;
@@ -1093,26 +1105,44 @@ impl<const BUF: usize> Tcb<BUF> {
     }
 
     /// Report a smaller path MTU (e.g. from an ICMP "fragmentation needed"
-    /// the host received, or out-of-band knowledge). Lowers the segment
-    /// size for the rest of the connection and retransmits in-flight
+    /// the host received). Lowers the segment size and retransmits in-flight
     /// segments that no longer fit (they were most likely dropped) without
     /// reducing the congestion window: a smaller MTU is not congestion
-    /// (Linux `tcp_simple_retransmit`).
+    /// (Linux `tcp_simple_retransmit`). Like a route's learned PMTU (Linux
+    /// `ip_rt_mtu_expires`), a reduction holds for 10 minutes; then one
+    /// segment probes the size before it, so a path that grew back, or a
+    /// forged report, does not cap the segment size for good. A link MTU
+    /// that never changes belongs in [`Tcb::set_mtu`].
     pub fn update_pmtu(&mut self, mtu: u16) {
         let mss = mtu.clamp(MIN_MTU, MAX_MTU) - HDR_LEN;
-        // A reported MTU also bounds black-hole recovery: never probe above it.
-        self.pmtu_restore_mss = self.pmtu_restore_mss.min(mss);
-        if self.pmtu_restore_mss <= self.pmtu_mss.min(mss) {
-            self.pmtu_restore_mss = 0;
+        let expires = self.now_ms.saturating_add(u64::from(PMTU_PROBE_MAX_MS));
+        if mss < self.pmtu_mss {
+            self.pmtu_restore_mss = self.pmtu_restore_mss.max(self.pmtu_mss);
+            self.pmtu_mss = mss;
             self.pmtu_probe_inflight = false;
-        }
-        if mss >= self.pmtu_mss {
+            self.pmtu_probe_backoff_ms = PMTU_PROBE_MAX_MS;
+            self.pmtu_probe_at = expires;
+            if self.state.is_synchronized() {
+                self.simple_retransmit();
+                let _ = self.maybe_send_data();
+            }
             return;
         }
-        self.pmtu_mss = mss;
-        if self.state.is_synchronized() {
-            self.simple_retransmit();
-            let _ = self.maybe_send_data();
+        if mss == self.pmtu_mss {
+            // The size in use, reported again (a probe above it did not
+            // fit): it holds for another 10 minutes.
+            if self.pmtu_restore_mss != 0 {
+                self.pmtu_probe_inflight = false;
+                self.pmtu_probe_backoff_ms = PMTU_PROBE_MAX_MS;
+                self.pmtu_probe_at = expires;
+            }
+            return;
+        }
+        // Above the size in use: never probe beyond it.
+        self.pmtu_restore_mss = self.pmtu_restore_mss.min(mss);
+        if self.pmtu_restore_mss <= self.pmtu_mss {
+            self.pmtu_restore_mss = 0;
+            self.pmtu_probe_inflight = false;
         }
     }
 
@@ -1565,7 +1595,9 @@ impl<const BUF: usize> Tcb<BUF> {
     fn data_mss(&self) -> u32 {
         let mss = self.mss_payload();
         let owed = if self.sack_enabled {
-            usize::from(self.dsack.is_some()) + self.ooo.len()
+            usize::from(self.dsack.is_some())
+                + self.ooo.len()
+                + usize::from(self.ooo_fin.is_some_and(|h| !self.ooo.ends_at(h.seq)))
         } else {
             0
         };

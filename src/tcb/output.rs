@@ -28,18 +28,47 @@ struct RingSlice {
 const NO_PAYLOAD: RingSlice = RingSlice { off: 0, len: 0 };
 
 impl<const BUF: usize> Tcb<BUF> {
-    /// Emit as many segments as the congestion window, the peer's window
-    /// and the egress ring allow; then (re)arm the persist timer if data is
-    /// stuck with nothing in flight.
-    pub(super) fn maybe_send_data(&mut self) -> Result<(), TcpError> {
-        if !matches!(
+    /// States that (re)transmit data: established, or our FIN not yet
+    /// acknowledged.
+    #[inline]
+    fn transmits_data(&self) -> bool {
+        matches!(
             self.state,
             State::Established
                 | State::CloseWait
                 | State::FinWait1
                 | State::Closing
                 | State::LastAck
-        ) {
+        )
+    }
+
+    /// Emit as many segments as the congestion window, the peer's window
+    /// and the egress ring allow; then (re)arm the persist timer if data is
+    /// stuck with nothing in flight.
+    #[inline]
+    pub(super) fn maybe_send_data(&mut self) -> Result<(), TcpError> {
+        self.send_data(false)
+    }
+
+    /// What loss recovery sends on an ACK before the segment's text is
+    /// taken (Linux `tcp_xmit_recovery`, at the end of `tcp_ack`): F-RTO's
+    /// new data, else presumed-lost segments. They carry the ACK as it
+    /// stood; the one the text earns follows on new data or a pure ACK,
+    /// which the peer cannot discard as old. On a spurious resend the peer
+    /// discards, it would have been lost.
+    #[inline]
+    pub(super) fn send_recovery(&mut self) -> Result<(), TcpError> {
+        if self.frto_new || self.rtx.lost_bytes() > 0 {
+            self.send_data(true)?;
+        }
+        Ok(())
+    }
+
+    /// The send loop of [`Self::maybe_send_data`], presumed-lost segments
+    /// first, then new data; with `recovery_only`, that of
+    /// [`Self::send_recovery`], which stops short of new data.
+    fn send_data(&mut self, recovery_only: bool) -> Result<(), TcpError> {
+        if !self.transmits_data() {
             return Ok(());
         }
         // Nothing queued, lost or owed (Linux runs `tcp_write_xmit` only with
@@ -51,17 +80,49 @@ impl<const BUF: usize> Tcb<BUF> {
         }
         let mut guard = 0u32;
         let mut sent = false;
-        while !self.egress_full() {
-            if crate::loop_budget_exhausted(&mut guard, TX_RING_CAP as u32 + 2, "maybe_send_data") {
-                break;
+        let mut stalled;
+        loop {
+            stalled = true;
+            while !self.egress_full() {
+                if crate::loop_budget_exhausted(
+                    &mut guard,
+                    TX_RING_CAP as u32 + 2,
+                    "maybe_send_data",
+                ) {
+                    break;
+                }
+                if recovery_only && !self.frto_new && self.rtx.next_lost().is_none() {
+                    stalled = false;
+                    break;
+                }
+                if !self.send_one()? {
+                    stalled = false;
+                    break;
+                }
+                sent = true;
             }
-            if !self.send_one()? {
-                break;
+            // F-RTO step 2.b (Linux `tcp_xmit_recovery`, `REXMIT_NEW`): new
+            // data only (see `send_one`), and no resend on this ACK if any
+            // went out; if none could go, F-RTO is over: resend as usual.
+            if core::mem::take(&mut self.frto_new) && !sent {
+                self.cc.frto_off();
+                continue;
             }
-            sent = true;
+            break;
+        }
+        if recovery_only {
+            // A full cwnd is found again by the send that follows.
+            self.cwnd_hit = false;
+            return Ok(());
         }
         let is_limited = core::mem::take(&mut self.cwnd_hit) || self.pipe() >= self.cc.cwnd;
-        if sent || is_limited {
+        // Stopped by a full egress ring with data still queued, not by the
+        // windows: the burst goes on once the host drains the ring, so its
+        // use of cwnd is judged then (Linux sends a whole window in one
+        // `tcp_write_xmit`). Judged now, a sender idle for an RTO before
+        // writing a full window would decay cwnd as application limited.
+        let mid_burst = stalled && !is_limited && self.unsent_bytes() > 0;
+        if (sent || is_limited) && !mid_burst {
             self.cwnd_validate(is_limited);
         }
         self.update_persist();
@@ -112,12 +173,16 @@ impl<const BUF: usize> Tcb<BUF> {
     }
 
     fn send_one(&mut self) -> Result<bool, TcpError> {
-        if let Some(i) = self.rtx.next_lost() {
-            if self.pipe() >= self.cc.cwnd {
-                self.cwnd_hit = true;
-                return Ok(false);
+        // F-RTO step 2.b puts out new data in place of resends (see
+        // `send_data`).
+        if !self.frto_new {
+            if let Some(i) = self.rtx.next_lost() {
+                if self.pipe() >= self.cc.cwnd {
+                    self.cwnd_hit = true;
+                    return Ok(false);
+                }
+                return self.retransmit(i, false);
             }
-            return self.retransmit(i, false);
         }
         self.send_new()
     }
@@ -129,6 +194,15 @@ impl<const BUF: usize> Tcb<BUF> {
             self.state,
             State::FinWait1 | State::Closing | State::LastAck
         ) && !self.fin_sent
+    }
+
+    /// The owed FIN rides on a segment of `len` new bytes if that segment
+    /// ends the queued data and the peer's window admits the FIN's sequence
+    /// number too (Linux `tcp_snd_wnd_test` counts it in `end_seq`);
+    /// otherwise the data goes alone and the FIN waits for the window.
+    #[inline]
+    pub(super) fn fin_rides(&self, len: u32) -> bool {
+        self.fin_owed() && len == self.unsent_bytes() && self.usable_window() > len
     }
 
     /// Bytes the peer's window still admits beyond `SND.NXT`.
@@ -174,7 +248,7 @@ impl<const BUF: usize> Tcb<BUF> {
         } else {
             return Ok(false);
         };
-        let fin = self.fin_owed() && len == unsent;
+        let fin = self.fin_rides(len);
         // Nagle (RFC 9293 §3.7.4) in Minshall's variant, as Linux
         // `tcp_nagle_check`: a short segment waits while an earlier short
         // one is unacknowledged, unless it carries the FIN.
@@ -329,10 +403,12 @@ impl<const BUF: usize> Tcb<BUF> {
             self.pmtu_probe_failed();
         }
         if s.payload_len() > mss {
-            if !self.rtx.split(i, s.start.wrapping_add(mss)) {
-                // No slot for the split: sending the first MSS while
-                // marking the whole segment retransmitted would strand the
-                // rest until the RTO. Wait for an ACK to free a slot.
+            let at = s.start.wrapping_add(mss);
+            // With no record for the split, merge two newer ones to make
+            // one; failing that, wait for an ACK to free one: sending the
+            // first MSS while marking the whole segment retransmitted would
+            // strand the rest until the RTO.
+            if !self.rtx.split(i, at) && !(self.rtx.coalesce_after(i) && self.rtx.split(i, at)) {
                 return Ok(false);
             }
             if let Some(n) = self.rtx.get(i).copied() {
@@ -420,7 +496,10 @@ impl<const BUF: usize> Tcb<BUF> {
         } else {
             0
         };
-        if self.sack_enabled && (self.dsack.is_some() || !self.ooo.is_empty()) {
+        // A FIN held out of order is SACKed with the data (Linux reports
+        // its sequence number as part of the segment's `end_seq`).
+        let fin = self.ooo_fin.map(|h| (h.seq, h.tag));
+        if self.sack_enabled && (self.dsack.is_some() || !self.ooo.is_empty() || fin.is_some()) {
             let cap = u32::from(self.local_mss.min(self.peer_mss).min(self.pmtu_mss));
             let budget = cap.saturating_sub(payload_len).min(40);
             // Encoded sizes: TS + n blocks = 12 + 8n; n blocks alone = 4 + 8n.
@@ -432,7 +511,7 @@ impl<const BUF: usize> Tcb<BUF> {
                     sb.push(l, r);
                 }
                 let more = n.saturating_sub(sb.len());
-                self.ooo.fill_sack_blocks(&mut sb, more);
+                self.ooo.fill_sack_blocks(&mut sb, more, fin);
                 opts.sack = sb;
             }
         }
@@ -450,8 +529,11 @@ impl<const BUF: usize> Tcb<BUF> {
     ) -> Result<bool, TcpError> {
         let opts = self.segment_options(payload.len as u32);
         let queued = self.emit_segment(fl, seq, self.rcv_nxt, &opts, payload, ect)?;
-        if queued {
-            self.on_ack_sent(); // the ACK rides on this segment
+        // The ACK rides on this segment, unless a D-SACK owed did not fit
+        // (a retransmission keeps its size): then the ACK carrying it is
+        // still owed.
+        if queued && self.dsack.is_none() {
+            self.on_ack_sent();
         }
         Ok(queued)
     }
@@ -709,8 +791,8 @@ impl<const BUF: usize> Tcb<BUF> {
     }
 
     /// After the application drained the receive ring: announce a window
-    /// that at least doubled and grew by two segments, so a sender
-    /// throttled by our window does not idle until the delayed ACK.
+    /// that grew enough to matter, so a sender throttled by our window does
+    /// not idle until the delayed ACK or its next probe.
     pub(super) fn maybe_send_window_update(&mut self) -> Result<(), TcpError> {
         if !matches!(
             self.state,
@@ -724,7 +806,11 @@ impl<const BUF: usize> Tcb<BUF> {
             0
         };
         let (_, new) = self.outbound_window(false);
-        if new >= cur.saturating_add(2 * u32::from(self.local_mss)) && new >= 2 * cur {
+        // Linux `__tcp_cleanup_rbuf`: a window that at least doubled, or
+        // reopened from zero (receiver SWS avoidance has already held it
+        // shut until a useful amount is free), so a sender stalled on our
+        // window does not wait for its next zero-window probe.
+        if new > cur && new >= 2 * cur {
             self.send_pure_ack()?;
         }
         Ok(())

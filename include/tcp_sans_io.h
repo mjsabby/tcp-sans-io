@@ -145,11 +145,15 @@ int32_t tcp_set_secret(TcpStreamHandle* handle, const uint8_t* secret);
 int32_t tcp_set_mtu(TcpStreamHandle* handle, uint16_t mtu);
 
 /* Report a reduced path MTU mid-connection (e.g. from an ICMP "fragmentation
- * needed" the host received). Shrinks the segment size for the rest of the
- * connection and retransmits in-flight segments that no longer fit. Without
- * ICMP the stack still clamps the MSS after repeated timeouts of large
- * segments (path-MTU black-hole fallback), then probes the larger size again
- * (after 10 s, backing off to 10 min) and restores it once a probe arrives. */
+ * needed" quoting this connection's 4-tuple; its quoted sequence number is
+ * not checked). Shrinks the segment size and retransmits in-flight segments
+ * that no longer fit. Like a route's learned PMTU in Linux, the report holds
+ * for 10 minutes; then one segment probes the old size, which is restored if
+ * it arrives (a fresh report of the smaller size holds it 10 more minutes).
+ * Without ICMP the stack still clamps the MSS after repeated timeouts of
+ * large segments (path-MTU black-hole fallback), then probes the larger size
+ * again (after 10 s, backing off to 10 min) and restores it once a probe
+ * arrives. */
 int32_t tcp_update_pmtu(TcpStreamHandle* handle, uint64_t now_ms, uint16_t mtu);
 
 /* FIN_WAIT_2 timeout (0 disables; default 60 s): after our FIN is ACKed the

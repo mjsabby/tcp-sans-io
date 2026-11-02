@@ -1369,7 +1369,11 @@ fn listener_stray_ack(spec: Spec) -> Verdict {
     l.send(&a);
     l.advance(10 * MS);
     let rst = l.take().iter().any(|g| g.seg.has(RST));
-    Verdict::Info(if rst { "RST" } else { "dropped silently" }.into())
+    if rst {
+        pass("RST")
+    } else {
+        Verdict::Warn("dropped silently: a stranded peer retries until it times out".into())
+    }
 }
 
 pub fn probes() -> Vec<Probe> {
@@ -1581,20 +1585,10 @@ pub struct ProbeResult {
     pub verdict: Verdict,
 }
 
-/// Probes that only describe behaviour (tcp-sans-io's silence towards an ACK
-/// to a listener is a deliberate deviation). Every other probe must pass for
-/// tcp-sans-io in `--check`.
-const UNGATED: &[&str] = &["ACK to a listener"];
-
 impl ProbeResult {
-    /// For `--check`: a tcp-sans-io result that is not what it must be.
+    /// For `--check`: a tcp-sans-io result that is not a pass.
     pub fn regressed(&self) -> bool {
-        self.spec.is_ours()
-            && match &self.verdict {
-                Verdict::Pass(_) => false,
-                Verdict::Info(_) => !UNGATED.contains(&self.id),
-                Verdict::Warn(_) | Verdict::Fail(_) => true,
-            }
+        self.spec.is_ours() && !matches!(self.verdict, Verdict::Pass(_))
     }
 }
 
@@ -1668,7 +1662,7 @@ mod tests {
         assert!(r("PAWS", Spec::Ours, na()).regressed());
         assert!(r("PAWS", Spec::Ours, Verdict::Fail("x".into())).regressed());
         assert!(!r("PAWS", Spec::Ours, Verdict::Pass(String::new())).regressed());
-        assert!(!r("ACK to a listener", Spec::Ours, Verdict::Info("RST".into())).regressed());
+        assert!(r("ACK to a listener", Spec::Ours, Verdict::Info("RST".into())).regressed());
         assert!(!r("PAWS", Spec::SMOL, Verdict::Fail("x".into())).regressed());
     }
 }

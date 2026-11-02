@@ -62,6 +62,8 @@ struct LinkCfg {
     drop_data: (u64, u64),
     /// Also drop the payload-carrying packets with these indices.
     drop_idx: &'static [u64],
+    /// Drop every packet entering the link in `[lo, hi)` µs (an outage).
+    blackout: (u64, u64),
     /// Remove D-SACK blocks, as from a receiver that never sends them.
     strip_dsack: bool,
 }
@@ -77,6 +79,7 @@ impl LinkCfg {
             reorder_extra_us: 0,
             drop_data: (0, 0),
             drop_idx: &[],
+            blackout: (0, 0),
             strip_dsack: false,
         }
     }
@@ -214,6 +217,11 @@ impl Link {
                 self.stats.data_dropped += 1;
                 return;
             }
+        }
+        if (self.cfg.blackout.0..self.cfg.blackout.1).contains(&now) {
+            self.stats.random_drops += 1;
+            self.stats.data_dropped += u64::from(data);
+            return;
         }
         if self.rng.chance_ppm(self.cfg.loss_ppm) {
             self.stats.random_drops += 1;
@@ -792,6 +800,68 @@ fn sub_millisecond_lost_retransmission_is_repaired_without_rto() {
         o.report(&std::format!("virtual link 200us, {name}"), bytes);
         assert_eq!(o.a.rto_count, 0, "{name}: left to the RTO");
         assert!(o.secs < 0.02, "{name}: repaired in {:.3} s", o.secs);
+    }
+}
+
+/// A virtual link (200 µs RTT) loses the last data segment before a bare
+/// FIN. The receiver SACKs the FIN it holds out of order, so RACK finds
+/// the loss within milliseconds instead of leaving it to the RTO.
+#[test]
+fn sub_millisecond_loss_before_a_bare_fin_is_repaired_without_rto() {
+    let link = LinkCfg::new(0, 10_000, 1024).delay_us(100);
+    let mut s = Sim::new(link.drop_data(0, 1), link, 4, 0, 0);
+    assert!(s.run(1_000_000, |s| {
+        s.a.state() == State::Established && s.b.state() == State::Established
+    }));
+    s.f_ab.total = 1448;
+    s.f_ab.done_us = None;
+    assert!(s.run(1_000_000, |s| {
+        s.f_ab.sent == 1448 && s.a.debug_snapshot().snd_nxt != s.a.debug_snapshot().snd_una
+    }));
+    s.a.close().unwrap();
+    let o = s.run_transfer(1_000_000);
+    o.report("virtual link 200us, data lost before a bare FIN", 1448);
+    assert_eq!(o.a.rto_count, 0, "left to the RTO");
+    assert!(o.secs < 0.02, "repaired in {:.3} s", o.secs);
+}
+
+/// A spurious timeout on a virtual link (a 300 ms ACK outage: the data
+/// got through, the ACKs did not) earns D-SACKs for what the timer
+/// resent. They show a delay, not reordering, so RACK still declares the
+/// next losses at once: three segments lost mid-burst, then the first
+/// retransmission, are repaired within a millisecond, as without the
+/// outage, not after a reordering window or the RTO.
+#[test]
+fn spurious_timeout_does_not_teach_rack_reordering() {
+    for outage in [false, true] {
+        let v = LinkCfg::new(0, 10_000, 1024).delay_us(100);
+        let mut rev = v;
+        if outage {
+            rev.blackout = (50_000, 350_000);
+        }
+        let mut s = Sim::new(v, rev, 4, 0, 0);
+        assert!(s.run(1_000_000, |s| s.a.state() == State::Established));
+        // A trickle of data across the outage.
+        let mut t = s.now_us;
+        while t < 1_200_000 {
+            s.f_ab.total += 4 * 1448;
+            assert!(s.run(t + 2_000_000, |s| s.f_ab.recvd == s.f_ab.total));
+            t = s.now_us.max(t + 20_000);
+            let quiet = t;
+            let _ = s.run(quiet, |s| s.now_us >= quiet);
+            s.now_us = s.now_us.max(quiet);
+        }
+        let p1 = s.a.stats();
+        assert_eq!(p1.rto_count > 0, outage, "the outage caused the timeout");
+        let n = s.ab.stats.data_in;
+        let drops = std::vec![n + 15, n + 16, n + 17, n + 30].into_boxed_slice();
+        s.ab.cfg.drop_idx = Box::leak(drops);
+        let start = s.now_us;
+        s.f_ab.total += 30 * 1448;
+        assert!(s.run(start + 5_000_000, |s| s.f_ab.recvd == s.f_ab.total));
+        let took = s.now_us - start;
+        assert_eq!(s.a.stats().rto_count, p1.rto_count, "outage={outage}: RTO");
+        assert!(took < 1_500, "outage={outage}: repaired in {took} us");
     }
 }
 

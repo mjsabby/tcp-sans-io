@@ -81,7 +81,9 @@ pump loop*. The non-obvious rules that bindings get wrong:
   `WOULD_BLOCK` from `send` as backpressure, `CONNECTION_CLOSED` from `recv`
   as EOF.
 - After `close`, keep pumping until `tcp_state` is `CLOSED`, `recv` any bytes
-  still `READABLE` (the peer's data before its FIN), then `destroy`.
+  still `READABLE` (the peer's data before its FIN or RST), then `destroy`.
+  After a peer's RST, `recv` returns the bytes already received first and
+  `CONNECTION_RESET` after the last of them (as Linux).
 - Route each outbound packet by its own destination address: a listener
   answers *other* peers (SYN cookies) while its half-open slot is busy.
 - One handle is single-threaded — the stack has no internal locking. If

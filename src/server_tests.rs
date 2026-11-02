@@ -416,14 +416,16 @@ fn listen_requires_a_secret() {
 }
 
 #[test]
-fn listen_drops_stray_bare_ack_silently() {
+fn listen_answers_stray_bare_ack_with_a_rate_limited_rst() {
     let mut s = make_listener();
     s.set_now(0);
     s.listen().expect("listen");
 
-    // Forged third-ACK without a prior SYN (not a valid cookie). It must be
-    // silently dropped — never promote to ESTABLISHED — and must *not*
-    // reflect a RST (avoid amplification).
+    // A forged third ACK without a prior SYN (not a valid cookie), or a
+    // peer stranded with a connection the host no longer holds. It must
+    // never promote to ESTABLISHED; it draws <SEQ=SEG.ACK><CTL=RST> (RFC
+    // 9293 §3.10.7.2, as Linux), at most one per rate-limit interval so the
+    // listener cannot be used as a reflector.
     let bogus = build_in(
         flags::ACK,
         CLIENT_ISS.wrapping_add(1),
@@ -436,10 +438,13 @@ fn listen_drops_stray_bare_ack_silently() {
     );
     s.inject_packet(&bogus).expect("inject bogus ACK");
     assert_eq!(s.state(), State::Listen, "must remain in LISTEN");
-    assert!(
-        try_pop(&mut s).is_none(),
-        "must not respond — no reflection"
-    );
+    let rst = pop(&mut s);
+    assert_eq!(rst.flags, flags::RST);
+    assert_eq!(rst.seq, SERVER_ISS.wrapping_add(1), "SEQ = SEG.ACK");
+    s.set_now(100);
+    s.inject_packet(&bogus).expect("inject bogus ACK again");
+    assert!(try_pop(&mut s).is_none(), "RST replies are rate limited");
+    assert_eq!(s.state(), State::Listen);
 }
 
 #[test]
@@ -1013,7 +1018,10 @@ fn cookie_rejects_forged_third_ack() {
     s.set_now(1);
     s.inject_packet(&forged).expect("inject forged ACK");
     assert_eq!(s.state(), State::Listen, "forged cookie must not promote");
-    assert!(try_pop(&mut s).is_none(), "no reflection for failed cookie");
+    // As any other ACK to a listener (and as Linux): one rate-limited RST.
+    let rst = pop(&mut s);
+    assert_eq!((rst.flags, rst.seq), (flags::RST, 0xdead_beef));
+    assert!(try_pop(&mut s).is_none());
 
     // Nor can a forged cookie take over a busy slot.
     occupy_slot(&mut s);
