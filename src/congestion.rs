@@ -11,8 +11,9 @@
 //! A loss-triggered reduction (fast recovery or RTO) is undone if D-SACKs
 //! later show that every retransmission of the episode was needless
 //! (RFC 3708 detection with an Eifel-style response, as Linux
-//! `tcp_try_undo_dsack`): reordering or a delay spike must not cost the
-//! window.
+//! `tcp_try_undo_dsack`), and a timeout also once timestamps show the
+//! original transmission arrived (Eifel detection, RFC 3522): reordering
+//! or a delay spike must not cost the window.
 
 /// Congestion-avoidance state (named after Linux's `tcp_ca_state`).
 #[repr(u8)]
@@ -275,6 +276,23 @@ impl Reno {
         self.recovery_point = snd_nxt;
     }
 
+    /// Eifel response (RFC 4015, restoring fully as Linux
+    /// `tcp_try_undo_loss` does): timestamps showed that a timeout was
+    /// spurious — the original transmission arrived, it was only delayed —
+    /// so restore the window from before it and leave RTO recovery. Returns
+    /// `true` if a timeout episode was undone.
+    pub fn undo_spurious_rto(&mut self) -> bool {
+        if !self.undo_valid || self.state != CaState::Loss {
+            return false;
+        }
+        self.cwnd = self.cwnd.max(self.prior_cwnd);
+        self.ssthresh = self.ssthresh.max(self.prior_ssthresh);
+        self.state = CaState::Open;
+        self.ca_acc = 0;
+        self.undo_valid = false;
+        true
+    }
+
     /// End the episode once `SND.UNA` passes the recovery point. Returns
     /// `true` if an episode ended on this call.
     pub fn maybe_exit(&mut self, snd_una: u32) -> bool {
@@ -396,6 +414,30 @@ mod tests {
         r.on_retransmit();
         assert!(!r.on_dsack(0, 1000, M));
         assert_eq!(r.ssthresh, 10 * M);
+    }
+
+    #[test]
+    fn spurious_rto_undo_restores_the_window_once() {
+        let mut r = Reno::new(40 * M);
+        r.ssthresh = 60 * M;
+        assert!(!r.undo_spurious_rto(), "no timeout to undo");
+        r.on_rto(40 * M, 100, 9000, M);
+        r.on_rto(40 * M, 100, 9000, M); // a backed-off repeat of the same episode
+        assert_eq!((r.cwnd, r.state()), (M, CaState::Loss));
+        assert!(r.undo_spurious_rto());
+        assert_eq!(
+            (r.cwnd, r.ssthresh, r.state()),
+            (40 * M, 60 * M, CaState::Open)
+        );
+        assert!(!r.undo_spurious_rto(), "already undone");
+        r.on_retransmit();
+        assert!(!r.on_dsack(100, 1100, M), "nor undone again by a D-SACK");
+
+        // A timeout during an ECN reduction keeps the reduction.
+        let mut r = Reno::new(20 * M);
+        r.enter_cwr(20 * M, 21_000, M);
+        r.on_rto(20 * M, 100, 21_000, M);
+        assert!(!r.undo_spurious_rto());
     }
 
     #[test]

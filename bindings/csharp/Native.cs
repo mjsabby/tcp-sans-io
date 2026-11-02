@@ -160,7 +160,7 @@ internal struct TcpStats
     public uint RcvWnd;
     public byte CaState;
     public byte State;
-    public ushort Reserved;
+    public ushort SpuriousRtos;
 }
 
 internal enum TcpState : byte
