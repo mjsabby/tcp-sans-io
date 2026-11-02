@@ -342,11 +342,9 @@ impl<const BUF: usize> Tcb<BUF> {
                 return Err("ring target outside its limits");
             }
         }
-        // Every byte of window advertised is backed by free receive space,
-        // up to the rounding of a scaled window (less than one unit).
+        // Every byte of window advertised is backed by free receive space.
         let promised = self.beyond_rcv_nxt(Some(self.rcv_adv_edge));
-        let slack = (1usize << self.rcv_wscale) - 1;
-        if promised > self.recv_ring.free().saturating_add(slack) {
+        if promised > self.recv_ring.free() {
             return Err("advertised window exceeds the receive buffer");
         }
         // A live loan lies inside the send ring's free space.
