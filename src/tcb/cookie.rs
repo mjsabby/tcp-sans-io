@@ -342,8 +342,9 @@ impl<const BUF: usize> Tcb<BUF> {
             self.sack_enabled = opts.sack;
             self.ecn_enabled = opts.ecn;
         }
-        // The earliest our SYN-ACK can have left: no TSecr predates it.
-        self.syn_xmit_ms = self.now_ms.saturating_sub(2 * COOKIE_TIME_BUCKET_MS);
+        // RTT samples believe no TSecr from before our first data segment,
+        // and none of those predates this promotion.
+        self.syn_xmit_ms = self.now_ms;
         self.snd_wnd = self.scale_peer_window(seg.window);
         self.max_snd_wnd = self.snd_wnd;
         self.snd_wl1 = seg.seq;

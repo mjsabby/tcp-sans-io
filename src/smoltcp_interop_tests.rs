@@ -294,6 +294,111 @@ fn smoltcp_handshake_only() {
     );
 }
 
+/// smoltcp recovers by duplicate ACKs alone, counting only data-less
+/// ones. Our third duplicate ACK must stay data-less when the host's
+/// egress was paused as it was owed (it goes out on resume ahead of the
+/// data queued meanwhile), or smoltcp waits for its timeout.
+#[test]
+fn a_deferred_duplicate_ack_still_drives_smoltcp_fast_retransmit() {
+    for paused in [false, true] {
+        let mut h = InteropHarness::new();
+        {
+            let cx = h.iface.context();
+            h.sockets
+                .get_mut::<tcp::Socket>(h.tcp_handle)
+                .connect(
+                    cx,
+                    IpEndpoint::new(
+                        IpAddress::v4(OUR_IP[0], OUR_IP[1], OUR_IP[2], OUR_IP[3]),
+                        OUR_PORT,
+                    ),
+                    SMOLTCP_PORT,
+                )
+                .unwrap();
+        }
+        assert!(h.pump_until(2000, |h| h.our.state() == State::Established
+            && h.sockets.get::<tcp::Socket>(h.tcp_handle).state()
+                == tcp::State::Established));
+        h.tick();
+        h.tick();
+        h.sockets
+            .get_mut::<tcp::Socket>(h.tcp_handle)
+            .send_slice(&vec![0x61; 5 * 1460])
+            .unwrap();
+        h.tick();
+        let data: Vec<_> = h
+            .device
+            .tx
+            .drain(..)
+            .filter(|p| !crate::wire::parse(p).unwrap().payload.is_empty())
+            .collect();
+        assert_eq!(data.len(), 5);
+        let missing = crate::wire::parse(&data[0]).unwrap().seq;
+        let flush = |h: &mut InteropHarness| {
+            let mut buf = [0u8; crate::MAX_PACKET];
+            loop {
+                let n = h.our.extract_packet(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                h.device.rx.push_back(buf[..n].to_vec());
+            }
+            h.iface.poll(
+                Instant::from_millis(h.now_ms as i64),
+                &mut h.device,
+                &mut h.sockets,
+            );
+        };
+        // The first ACK updates the window; the next two are duplicates.
+        for p in &data[1..4] {
+            h.now_ms += 1;
+            h.our.set_now(h.now_ms);
+            h.our.inject_packet(p).unwrap();
+            flush(&mut h);
+        }
+        let already_repaired = h.device.tx.iter().any(|p| {
+            let p = crate::wire::parse(p).unwrap();
+            !p.payload.is_empty() && p.seq == missing
+        });
+        assert!(
+            !already_repaired,
+            "the test must stop before the third duplicate ACK"
+        );
+        h.device.tx.clear();
+        h.our.send(&vec![0x62; 1460]).unwrap();
+        h.our.set_egress_paused(paused);
+        h.now_ms += 1;
+        h.our.set_now(h.now_ms);
+        h.our.inject_packet(&data[4]).unwrap();
+        h.our.set_egress_paused(false);
+        h.our.tick().unwrap();
+        flush(&mut h);
+        let mut repair_ms = None;
+        let start = h.now_ms;
+        for dt in 0..1500 {
+            while let Some(p) = h.device.tx.pop_front() {
+                let p = crate::wire::parse(&p).unwrap();
+                if !p.payload.is_empty() && p.seq == missing {
+                    repair_ms.get_or_insert(dt);
+                }
+            }
+            if repair_ms.is_some() {
+                break;
+            }
+            h.now_ms = start + dt + 1;
+            h.iface.poll(
+                Instant::from_millis(h.now_ms as i64),
+                &mut h.device,
+                &mut h.sockets,
+            );
+        }
+        assert!(
+            repair_ms.is_some_and(|ms| ms < 20),
+            "paused={paused}: repair after {repair_ms:?} ms"
+        );
+    }
+}
+
 #[test]
 fn smoltcp_active_open_bulk_transfer() {
     let mut h = InteropHarness::new();

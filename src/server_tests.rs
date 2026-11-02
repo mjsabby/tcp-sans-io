@@ -575,7 +575,8 @@ fn syn_rcvd_answers_other_peers_statelessly() {
     assert!(try_pop(&mut s).is_none());
     assert_eq!(s.state(), State::SynRcvd, "stay locked to original peer");
 
-    // Other segments from a stranger are still not ours.
+    // A stranger's ACK that is not a valid cookie is answered as in LISTEN
+    // (Linux: the listener's RST <SEQ=SEG.ACK>); the half-open stays.
     let stray = build_in_from(
         ATTACKER_IP,
         ATTACKER_PORT,
@@ -588,11 +589,14 @@ fn syn_rcvd_answers_other_peers_statelessly() {
         false,
         &[],
     );
+    s.inject_packet(&stray).expect("busy listener answers");
+    let rst = pop(&mut s);
     assert_eq!(
-        s.inject_packet(&stray),
-        Err(crate::TcpError::NotForUs),
-        "an ACK that is not a valid cookie is not ours"
+        (rst.dst_ip, rst.flags, rst.seq),
+        (ATTACKER_IP, flags::RST, synack.seq.wrapping_add(1))
     );
+    assert!(try_pop(&mut s).is_none());
+    assert_eq!(s.state(), State::SynRcvd);
 
     // The original handshake completes undisturbed.
     let ack = build_in(
@@ -1023,10 +1027,13 @@ fn cookie_rejects_forged_third_ack() {
     assert_eq!((rst.flags, rst.seq), (flags::RST, 0xdead_beef));
     assert!(try_pop(&mut s).is_none());
 
-    // Nor can a forged cookie take over a busy slot.
+    // Nor can a forged cookie take over a busy slot; it is answered as in
+    // LISTEN.
     occupy_slot(&mut s);
-    assert_eq!(s.inject_packet(&forged), Err(crate::TcpError::NotForUs));
+    s.inject_packet(&forged).expect("busy listener answers");
     assert_eq!(s.state(), State::SynRcvd);
+    let rst = pop(&mut s);
+    assert_eq!((rst.flags, rst.seq), (flags::RST, 0xdead_beef));
     assert!(try_pop(&mut s).is_none());
 }
 

@@ -71,14 +71,17 @@ impl<const BUF: usize> Tcb<BUF> {
         if self.state == State::Closed {
             return Ok(());
         }
-        self.maybe_send_data()?;
+        // An ACK owed now goes alone, ahead of data, as on receipt: a
+        // delayed ACK whose time has come (Linux's timer would have sent it
+        // already) or an immediate one a full or paused egress held back,
+        // which a peer counting duplicate ACKs must see data-less.
         if self.pending_ack && self.ack_deadline.due(now) {
             // The reply did not come in time to carry it: not interactive
             // after all (Linux `tcp_delack_timer_handler`).
             self.pingpong = false;
             self.send_pure_ack()?;
         }
-        Ok(())
+        self.maybe_send_data()
     }
 
     fn backoff_rto(&mut self) {
@@ -181,6 +184,7 @@ impl<const BUF: usize> Tcb<BUF> {
             self.cc.frto_off();
         }
         self.frto_new = false;
+        self.frto_hold = false;
         self.queue_cwr();
         self.rtx.mark_all_lost();
         self.reno_sacked = 0;
@@ -228,7 +232,8 @@ impl<const BUF: usize> Tcb<BUF> {
         let eligible = self.sack_enabled
             && self.tlp_state_ok()
             && self.tlp_end_seq.is_none()
-            && self.snd_una != self.snd_nxt;
+            && self.snd_una != self.snd_nxt
+            && !self.rack_deadline.is_armed();
         if !eligible {
             return Ok(());
         }
@@ -246,6 +251,22 @@ impl<const BUF: usize> Tcb<BUF> {
                 let len = unsent.min(mss);
                 let fin = self.fin_rides(len);
                 (self.emit_new(len, fin)?, false)
+            } else if self.pmtu_probe_inflight
+                && self.snd_una == self.pmtu_probe_start
+                && self.rtx.len() == 1
+            {
+                // A path-MTU probe alone in flight drew nothing back: too
+                // big, most likely. Resend its data at the size in use
+                // without a congestion response, as Linux does once ACKs
+                // show a probe lost ("MTU probe failure: don't reduce
+                // cwnd"); a probe of its first MSS (Linux: an inconclusive
+                // MTU probe) would leave the rest for RACK to find lost and
+                // halve the window over it. The tick sends it; the RTO
+                // restarts, as for any probe.
+                self.pmtu_probe_failed();
+                self.simple_retransmit();
+                self.arm_rto();
+                return Ok(());
             } else {
                 match self.rtx.len().checked_sub(1) {
                     Some(i) if self.rtx.get(i).is_some_and(|s| !s.has(seg_flags::SACKED)) => {

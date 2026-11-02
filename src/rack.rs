@@ -148,6 +148,14 @@ pub struct Rack {
     /// End sequence of an outstanding tail-loss-probe retransmission, set
     /// for each ACK (see [`Self::on_delivered`]).
     pub tlp_probe_end: Option<u32>,
+    /// `RACK.segment` is a retransmission delivered within the clock's
+    /// tick, which a late original's ACK could equally explain (see
+    /// [`detect_loss`]).
+    ambiguous: bool,
+    /// A delivery passed the filter since the ACK path last ran loss
+    /// detection (Linux `rack.advanced`): an ACK that delivered nothing
+    /// cannot mark anything new, so it need not walk the queue.
+    pub advanced: bool,
 }
 
 impl Rack {
@@ -168,6 +176,8 @@ impl Rack {
             dsack_round_active: false,
             dsack_round: 0,
             tlp_probe_end: None,
+            ambiguous: false,
+            advanced: false,
         }
     }
 
@@ -203,6 +213,7 @@ impl Rack {
         }
         // Step 2: retransmission ambiguity filter.
         let rtt = u32::try_from(now.saturating_sub(seg.xmit_ts)).unwrap_or(u32::MAX);
+        let mut ambiguous = false;
         if seg.has(seg_flags::EVER_RETRANS) {
             // The ACK echoes this transmission or a later one, and no
             // earlier one shares its millisecond: TSecr names what arrived.
@@ -233,12 +244,19 @@ impl Rack {
                     return; // implausibly fast: acks the original
                 }
             }
+            // Within the clock's tick the filter cannot rule out a late
+            // original (Linux, timing in microseconds, often can): unless
+            // the echo or the probe shows this transmission arrived, its
+            // delivery must not condemn data sent after the original.
+            ambiguous = rtt <= 1 && !echoed && self.tlp_probe_end != Some(seg.end);
         }
+        self.advanced = true;
         self.rtt = rtt;
         if !self.valid || sent_after(seg.xmit_seq, seg.end, self.xmit_seq, self.end_seq) {
             self.valid = true;
             self.xmit_seq = seg.xmit_seq;
             self.end_seq = seg.end;
+            self.ambiguous = ambiguous;
         }
     }
 
@@ -291,6 +309,12 @@ impl Rack {
 /// whose deadline (`xmit_ts + RACK.rtt + reo_wnd`) has passed. Returns
 /// whether anything was newly marked and, if some candidates are still
 /// inside the reordering window, the delay (ms) after which to re-run.
+/// When `RACK.segment` is a retransmission a late original's ACK could
+/// explain, never-retransmitted data above it was first sent after that
+/// original, and it waits at least the reordering floor: a late original
+/// ACKed across a tick used to condemn a whole window in flight. A
+/// retransmission sent before it is judged as usual, so a lost one is
+/// still resent at once.
 pub fn detect_loss(rack: &Rack, q: &mut RtxQueue, now: u64, reo_wnd: u32) -> (bool, Option<u64>) {
     if !rack.valid {
         return (false, None);
@@ -298,6 +322,7 @@ pub fn detect_loss(rack: &Rack, q: &mut RtxQueue, now: u64, reo_wnd: u32) -> (bo
     let mut timeout = 0u64;
     let mut marked = false;
     let thresh = u64::from(rack.rtt).saturating_add(u64::from(reo_wnd));
+    let floor_thresh = u64::from(rack.rtt).saturating_add(u64::from(reo_wnd.max(REO_WND_MIN_MS)));
     let mut i = 0;
     while let Some(s) = q.get(i).copied() {
         if s.has(seg_flags::SACKED) {
@@ -323,7 +348,11 @@ pub fn detect_loss(rack: &Rack, q: &mut RtxQueue, now: u64, reo_wnd: u32) -> (bo
             }
             continue;
         }
-        let deadline = s.xmit_ts.saturating_add(thresh);
+        let after_original =
+            rack.ambiguous && !s.has(seg_flags::EVER_RETRANS) && seq_ge(s.start, rack.end_seq);
+        let deadline = s
+            .xmit_ts
+            .saturating_add(if after_original { floor_thresh } else { thresh });
         if now >= deadline {
             q.mark_lost(idx);
             marked = true;

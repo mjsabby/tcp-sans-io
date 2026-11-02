@@ -83,20 +83,27 @@ impl<const BUF: usize> Tcb<BUF> {
     /// cookie SYN-ACK, holding no state; a valid cookie ACK proves the peer
     /// receives our packets — which a pending half-open has not yet shown —
     /// so it takes over the slot. Spoofed SYNs therefore cannot lock a
-    /// listener out, however fast they arrive.
+    /// listener out, however fast they arrive. Any other ACK is answered as
+    /// in LISTEN (see [`Self::on_listen`]).
     fn on_busy_listener(&mut self, seg: &Segment<'_>) -> Result<(), TcpError> {
-        if self.state != State::SynRcvd || !self.is_listener || !self.cookie_secret_set {
+        if self.state != State::SynRcvd || !self.is_listener {
             return Err(TcpError::NotForUs);
         }
         let ctl = seg.has(flags::RST) || seg.has(flags::FIN);
-        if seg.has(flags::SYN) && !seg.has(flags::ACK) && !ctl {
+        if seg.has(flags::SYN) && !seg.has(flags::ACK) && !ctl && self.cookie_secret_set {
             return self.emit_cookie_synack(seg);
         }
-        if seg.has(flags::ACK) && !seg.has(flags::SYN) && !seg.has(flags::RST) {
-            if let Some(opts) = self.validate_cookie(seg) {
-                self.reset_to_listen_or_closed();
-                return self.promote_via_cookie(seg, opts);
+        if seg.has(flags::ACK) && !seg.has(flags::RST) {
+            if !seg.has(flags::SYN) {
+                if let Some(opts) = self.validate_cookie(seg) {
+                    self.reset_to_listen_or_closed();
+                    return self.promote_via_cookie(seg, opts);
+                }
             }
+            if self.oow_allowed() {
+                self.emit_rst_to(seg, seg.ack, 0, flags::RST)?;
+            }
+            return Ok(());
         }
         Err(TcpError::NotForUs)
     }
@@ -302,17 +309,26 @@ impl<const BUF: usize> Tcb<BUF> {
         }
         if seg.has(flags::SYN) {
             if seg.has(flags::ACK) {
-                // Simultaneous open: the peer's SYN-ACK acknowledges our SYN.
-                if !self.is_listener && seg.seq == self.irs && seg.ack == self.iss.wrapping_add(1) {
+                // An ACK of something we never sent draws a RST
+                // <SEQ=SEG.ACK> (RFC 9293 §3.10.7.4, Linux `tcp_check_req`).
+                if seg.ack != self.iss.wrapping_add(1) {
+                    if self.oow_allowed() {
+                        self.emit_rst_to(seg, seg.ack, 0, flags::RST)?;
+                    }
+                    return Ok(());
+                }
+                // Simultaneous open: the peer's SYN-ACK acknowledges our
+                // SYN. It passes PAWS and updates TS.Recent like any
+                // segment (Linux `tcp_validate_incoming`, `tcp_ack`).
+                if !self.is_listener && seg.seq == self.irs {
+                    if self.paws_reject(seg) {
+                        return self.send_oow_ack();
+                    }
+                    self.update_ts_recent(seg);
                     return self.complete_passive_open(seg);
                 }
-                if self.oow_allowed() {
-                    self.emit_rst_to(seg, seg.ack, 0, flags::RST)?;
-                }
-                return Ok(());
-            }
-            // Retransmitted SYN: our SYN-ACK was lost.
-            if seg.seq == self.irs {
+            } else if seg.seq == self.irs {
+                // Retransmitted SYN: our SYN-ACK was lost.
                 if self.oow_allowed() {
                     let _ = self.emit_synack()?;
                 }
@@ -327,7 +343,9 @@ impl<const BUF: usize> Tcb<BUF> {
             // listener's half-open returns to LISTEN (RFC 9293
             // §3.10.7.4; Linux resets it with a RST, which would refuse
             // the new attempt), so the peer's next SYN starts afresh; an
-            // active open's is challenged (RFC 5961 §4).
+            // active open's is challenged (RFC 5961 §4). A SYN-ACK that
+            // acknowledges our SYN is treated alike: a RST <SEQ=SEG.ACK>
+            // would land at RCV.NXT of a peer that took our SYN-ACK.
             if !self.acceptable(seg.seq, 1) || !self.is_listener {
                 return self.send_oow_ack();
             }
@@ -338,6 +356,18 @@ impl<const BUF: usize> Tcb<BUF> {
             return Ok(());
         }
         if seg.ack != self.iss.wrapping_add(1) {
+            // The peer may have completed an earlier handshake by cookie,
+            // its SYN-ACK delayed past a retransmitted SYN that took this
+            // slot: a valid cookie proves the peer holds that connection,
+            // which this slot's SYN-ACK has not, and a RST <SEQ=SEG.ACK>
+            // would land at its RCV.NXT. Linux finds the cookie too, then
+            // drops it as a duplicate of the request; promoting serves it.
+            if self.is_listener {
+                if let Some(opts) = self.validate_cookie(seg) {
+                    self.reset_to_listen_or_closed();
+                    return self.promote_via_cookie(seg, opts);
+                }
+            }
             if self.oow_allowed() {
                 self.emit_rst_to(seg, seg.ack, 0, flags::RST)?;
             }
@@ -612,8 +642,9 @@ impl<const BUF: usize> Tcb<BUF> {
         // Only a data-less ACK counts as a duplicate (RFC 5681 §2), so a
         // sender recovering by duplicate ACKs alone (no SACK — smoltcp,
         // for one) would see them ride on our data and stall until its
-        // timeout in a two-way transfer.
-        if ack_due && self.pending_ack {
+        // timeout in a two-way transfer. That includes one owed from before
+        // (held back by a full egress, or a delayed ACK not yet ticked out).
+        if self.pending_ack && (ack_due || self.ack_deadline.due(self.now_ms)) {
             self.send_pure_ack()?;
         }
         self.maybe_send_data()
@@ -679,9 +710,9 @@ impl<const BUF: usize> Tcb<BUF> {
                     .saturating_add(u64::from(payload_len));
                 self.note_dsack(seg.seq, end);
             }
-            return self.send_pure_ack();
-        }
-        if at_once && payload_len > 0 && seq_le(end, self.rcv_nxt) {
+            // Its ACK field may have moved our window: send below.
+            self.send_pure_ack()?;
+        } else if at_once && payload_len > 0 && seq_le(end, self.rcv_nxt) {
             // Duplicate data: answer at once, with a D-SACK (RFC 2883) so the
             // sender learns the retransmission was spurious, and ACK the
             // data after it at once too (Linux `tcp_data_queue`: a sender

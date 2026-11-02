@@ -884,6 +884,44 @@ fn sub_millisecond_reordering_is_tolerated() {
     assert_eq!(o.a.rto_count, 0);
 }
 
+/// The same reordering, where a reordered original's fast retransmission
+/// leaves late in one millisecond and the original's cumulative ACK comes
+/// back early in the next. RACK times the retransmission at 1 ms, which its
+/// ambiguity filter cannot tell from the 1 ms minimum RTT, so the
+/// retransmission became RACK's newest delivery, and with no reordering
+/// window yet everything outstanding sent before it, a whole window of data
+/// still in flight, was marked lost at once (105 segments for seed 1).
+/// Linux, timing in microseconds, sees a retransmission ACKed faster than
+/// the minimum RTT and ignores it (`tcp_rack_advance`).
+#[test]
+fn late_original_acked_across_a_millisecond_does_not_condemn_the_window() {
+    let link = LinkCfg::new(0, 10_000, 1024)
+        .delay_us(50)
+        .reorder_us(10_000, 100);
+    let rev = LinkCfg::new(0, 10_000, 1024).delay_us(50);
+    let bytes = 8 * MIB;
+    let mut s = Sim::new(link, rev, 1, bytes, 0);
+    let o = s.run_transfer(60_000_000);
+    o.report("virtual link 100us, 1% +100us reorder, seed 1", bytes);
+    let spurious = o.b.dup_bytes_received as f64 / SMSS;
+    assert!(spurious <= 10.0, "{spurious:.0} spurious retransmissions");
+    assert_eq!(o.a.rto_count, 0);
+    // The worst of 24 seeds: 262 spurious retransmissions over 16 MiB.
+    let mut s = Sim::new(link, rev, 18, 2 * bytes, 0);
+    let o = s.run_transfer(60_000_000);
+    o.report("virtual link 100us, 1% +100us reorder, seed 18", 2 * bytes);
+    let spurious = o.b.dup_bytes_received as f64 / SMSS;
+    assert!(spurious <= 10.0, "{spurious:.0} spurious retransmissions");
+    assert_eq!(o.a.rto_count, 0);
+    // Both directions at once.
+    let mut s = Sim::new(link, link, 1, 4 * MIB, 4 * MIB);
+    let o = s.run_transfer(60_000_000);
+    o.report("virtual link 100us, 1% +100us reorder, both ways", 4 * MIB);
+    let spurious = (o.a.dup_bytes_received + o.b.dup_bytes_received) as f64 / SMSS;
+    assert!(spurious <= 20.0, "{spurious:.0} spurious retransmissions");
+    assert_eq!((o.a.rto_count, o.b.rto_count), (0, 0));
+}
+
 /// The same reordering through a shallow queue (256 packets): once
 /// reordering is seen, RACK waits out its window (at least 2 ms with a
 /// millisecond clock) before declaring a queue drop lost, while the sender

@@ -394,15 +394,17 @@ impl RtxQueue {
     }
 
     /// Make room for a split when the queue is full: merge the newest
-    /// adjacent pair of segments after `i` that are in the same state and
-    /// were sent once (neither SACKed nor retransmitted), so the counters
-    /// stay exact. One spare record serves one split, but a path MTU that
-    /// shrinks again before anything is acknowledged needs another for
-    /// every retransmission, and nothing could be acknowledged without
-    /// them. The merged segment keeps the later send time and is split
-    /// again when it is retransmitted. Returns whether a record was freed.
+    /// adjacent pair of segments after `i` that are in the same state with
+    /// no transmission in flight beyond their first (neither SACKed nor
+    /// being retransmitted), so the counters stay exact. One spare record
+    /// serves one split, but a path MTU that shrinks again before anything
+    /// is acknowledged needs another for every retransmission, and nothing
+    /// could be acknowledged without them. The merged segment keeps the
+    /// later send time, counts as retransmitted if either half was, and is
+    /// split again when it is retransmitted. Returns whether a record was
+    /// freed.
     pub fn coalesce_after(&mut self, i: usize) -> bool {
-        const STATE: u8 = SACKED | LOST | RETRANS | EVER_RETRANS;
+        const STATE: u8 = SACKED | LOST | RETRANS;
         let mut j = match self.len.checked_sub(2) {
             Some(j) => j,
             None => return false,
@@ -412,12 +414,15 @@ impl RtxQueue {
                 return false;
             };
             if a.flags & STATE == b.flags & STATE
-                && a.flags & (SACKED | RETRANS | EVER_RETRANS | FIN) == 0
+                && a.flags & (SACKED | RETRANS | FIN) == 0
                 && a.end == b.start
             {
                 let merged = Seg {
                     start: a.start,
-                    flags: (a.flags & !PSH) | (b.flags & (FIN | PSH)),
+                    flags: (a.flags & !(PSH | EVER_RETRANS | DISTINCT_TS))
+                        | ((a.flags | b.flags) & EVER_RETRANS)
+                        | (a.flags & b.flags & DISTINCT_TS)
+                        | (b.flags & (FIN | PSH)),
                     ..b
                 };
                 if let Some(d) = self.get_mut(j) {
@@ -448,8 +453,11 @@ impl RtxQueue {
     }
 
     /// Cumulative ACK up to `una`: remove (or trim) covered segments,
-    /// calling `f` with each segment's pre-removal state (`newly_acked` =
-    /// whether it had not been SACKed). Returns the sequence bytes removed.
+    /// calling `f` with each removed segment's pre-removal state
+    /// (`newly_acked` = whether it had not been SACKed). A segment ACKed only
+    /// in part is trimmed without a call: it has not been delivered, so it
+    /// gives no RTT sample and does not advance RACK (Linux
+    /// `tcp_clean_rtx_queue` stops at it). Returns the sequence bytes removed.
     pub fn ack_to<F: FnMut(&Seg, bool)>(&mut self, una: u32, mut f: F) -> u32 {
         let mut removed = 0u32;
         while let Some(s) = self.get(0).copied() {
@@ -462,7 +470,6 @@ impl RtxQueue {
                 self.lost_hint = self.lost_hint.saturating_sub(1);
             } else if seq_lt(s.start, una) {
                 // Partially acknowledged: trim the head.
-                f(&s, !s.has(SACKED));
                 self.add_counts(&s, false);
                 let trimmed = Seg { start: una, ..s };
                 self.add_counts(&trimmed, true);

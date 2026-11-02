@@ -1283,3 +1283,36 @@ fn dsack_of_a_timeout_retransmission_is_not_reordering() {
     assert_eq!(t.stats.dsacks_received, 1);
     assert!(!t.rack.reordering_seen);
 }
+
+/// Linux `tcp_rack_mark_lost`: an ACK that delivers nothing new runs no
+/// RACK loss detection, so a peer repeating one cannot make every ACK walk
+/// the retransmission queue. What comes due meanwhile is the reordering
+/// timer's, which such an ACK leaves armed.
+#[test]
+fn an_ack_that_delivers_nothing_runs_no_rack_detection() {
+    let mut t = established();
+    t.sack_enabled = true;
+    t.send(&[0x5a; 3 * 1460]).unwrap();
+    t.tick().unwrap();
+    let segs = drain(&mut t);
+    assert_eq!(segs.len(), 3);
+    let sack = TcpOptions {
+        sack: SackBlocks::one(segs[2].0, segs[2].0 + 1460),
+        ..TcpOptions::NONE
+    };
+    let dupack = peer_pkt(PEER_ISS + 1, segs[0].0, flags::ACK, 65535, &sack, &[]);
+    t.set_now(11);
+    t.inject_packet(&dupack).unwrap();
+    let deadline = t.rack_deadline.get().expect("reordering timer armed");
+    // Repeated once the deadline has come, before the host ticks.
+    t.set_now(deadline);
+    t.inject_packet(&dupack).unwrap();
+    assert_eq!(t.rtx.lost_bytes(), 0);
+    assert_eq!(t.rack_deadline.get(), Some(deadline));
+    t.tick().unwrap();
+    let out = drain(&mut t);
+    assert!(
+        out.iter().any(|p| p.0 == segs[0].0 && p.3 == 1460),
+        "{out:?}"
+    );
+}

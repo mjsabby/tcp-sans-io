@@ -336,8 +336,13 @@ pub struct Tcb<const BUF: usize = BUF_CAP> {
     /// are the timer's, so their D-SACKs show a delay, not reordering.
     rto_span: Option<(u32, u32)>,
     /// F-RTO step 2.b (Linux `REXMIT_NEW`): the ACK just processed asks the
-    /// next send to put out new data rather than presumed-lost segments.
+    /// next send to put out new data, Nagle aside, rather than
+    /// presumed-lost segments.
     frto_new: bool,
+    /// Step 2.b's new data went out: nothing is resent until the next ACK
+    /// tells whether the timeout was spurious (Linux `tcp_xmit_recovery`
+    /// returns before `tcp_xmit_retransmit_queue`).
+    frto_hold: bool,
     /// Duplicate-ACK counter (RFC 6582 NewReno; RFC 6675 DupThresh fallback
     /// when a SACK connection receives block-less duplicate ACKs).
     dup_acks: u8,
@@ -701,6 +706,7 @@ impl<const BUF: usize> Tcb<BUF> {
         self.tlp_is_retrans = false;
         self.rto_span = None;
         self.frto_new = false;
+        self.frto_hold = false;
         self.dup_acks = 0;
         self.reno_sacked = 0;
         self.dsack_segs = 0;
@@ -1130,9 +1136,10 @@ impl<const BUF: usize> Tcb<BUF> {
         }
         if mss == self.pmtu_mss {
             // The size in use, reported again (a probe above it did not
-            // fit): it holds for another 10 minutes.
+            // fit): it holds for another 10 minutes. The probe stays
+            // marked, so its loss is a failed probe rather than congestion
+            // (Linux leaves `icsk_mtup.probe_size` to the loss detection).
             if self.pmtu_restore_mss != 0 {
-                self.pmtu_probe_inflight = false;
                 self.pmtu_probe_backoff_ms = PMTU_PROBE_MAX_MS;
                 self.pmtu_probe_at = expires;
             }

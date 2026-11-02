@@ -233,9 +233,13 @@ impl Reno {
 
     /// Enter CWR (RFC 3168 §6.1.2 ECN response, or RFC 8985 §7.4 repaired
     /// tail loss): the same PRR reduction, but nothing is retransmitted.
-    /// Congestion was signalled explicitly, so it is never undone.
+    /// Congestion was signalled explicitly, so it is never undone: an
+    /// F-RTO undo of a timeout during it ends the Loss state but leaves the
+    /// window reduced (Linux `tcp_enter_cwr`: `tp->prior_ssthresh = 0`).
     pub fn enter_cwr(&mut self, snd_nxt: u32, mss: u32, peer_wnd: u32) {
         self.undo_valid = false;
+        self.prior_cwnd = 0;
+        self.prior_ssthresh = 0;
         self.begin_reduction(CaState::Cwr, snd_nxt, mss, peer_wnd);
     }
 
@@ -311,8 +315,12 @@ impl Reno {
 
     /// F-RTO's test may still show the current timeout spurious (see
     /// [`Self::on_rto`]); the caller checks for acknowledged originals.
+    /// Unlike the D-SACK and timestamp tests it needs no valid undo state
+    /// (Linux `tcp_try_undo_loss(sk, true)` bypasses `tcp_may_undo`): after
+    /// a timeout during CWR it ends the Loss state, and [`Self::undo`]
+    /// restores nothing ([`Self::enter_cwr`] cleared the prior window).
     pub fn frto_undo_possible(&self) -> bool {
-        self.frto && self.undo_valid && self.state == CaState::Loss
+        self.frto && self.state == CaState::Loss
     }
 
     /// F-RTO is over for this timeout: the loss was real, or its test

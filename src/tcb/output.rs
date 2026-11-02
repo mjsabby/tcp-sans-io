@@ -102,11 +102,16 @@ impl<const BUF: usize> Tcb<BUF> {
                 sent = true;
             }
             // F-RTO step 2.b (Linux `tcp_xmit_recovery`, `REXMIT_NEW`): new
-            // data only (see `send_one`), and no resend on this ACK if any
-            // went out; if none could go, F-RTO is over: resend as usual.
-            if core::mem::take(&mut self.frto_new) && !sent {
-                self.cc.frto_off();
-                continue;
+            // data only, Nagle aside (see `send_one`, `send_new`), and if
+            // any went out, nothing resent until the next ACK; if none
+            // could go, F-RTO is over: resend as usual.
+            if core::mem::take(&mut self.frto_new) {
+                if sent {
+                    self.frto_hold = true;
+                } else {
+                    self.cc.frto_off();
+                    continue;
+                }
             }
             break;
         }
@@ -117,13 +122,17 @@ impl<const BUF: usize> Tcb<BUF> {
         }
         let is_limited = core::mem::take(&mut self.cwnd_hit) || self.pipe() >= self.cc.cwnd;
         // Stopped by a full egress ring with data still queued, not by the
-        // windows: the burst goes on once the host drains the ring, so its
-        // use of cwnd is judged then (Linux sends a whole window in one
-        // `tcp_write_xmit`). Judged now, a sender idle for an RTO before
-        // writing a full window would decay cwnd as application limited.
+        // windows: the burst goes on once the host drains the ring, so
+        // whether cwnd went unused is judged then (Linux sends a whole
+        // window in one `tcp_write_xmit`). Judged now, a sender idle for an
+        // RTO before writing a full window would decay cwnd as application
+        // limited. The round's use of cwnd is recorded all the same, so a
+        // sender the host's egress holds back is not cwnd-limited and its
+        // window does not grow without bound (Linux `tcp_write_xmit` after
+        // `tcp_small_queue_check`).
         let mid_burst = stalled && !is_limited && self.unsent_bytes() > 0;
-        if (sent || is_limited) && !mid_burst {
-            self.cwnd_validate(is_limited);
+        if sent || is_limited {
+            self.cwnd_validate(is_limited, mid_burst);
         }
         self.update_persist();
         Ok(())
@@ -135,8 +144,9 @@ impl<const BUF: usize> Tcb<BUF> {
     /// grow while it is being used (RFC 7661 in spirit). A sender that has
     /// used less than its window for an RTO decays it (Linux
     /// `tcp_cwnd_application_limited`), so a stale window is not burst out
-    /// later.
-    fn cwnd_validate(&mut self, is_limited: bool) {
+    /// later; not `mid_burst` (see [`Self::send_data`]).
+    #[inline]
+    fn cwnd_validate(&mut self, is_limited: bool, mid_burst: bool) {
         let pipe = self.pipe();
         if seq_ge(self.snd_una, self.cwnd_limited_seq)
             || is_limited
@@ -153,7 +163,7 @@ impl<const BUF: usize> Tcb<BUF> {
         }
         let outstanding = self.snd_nxt.wrapping_sub(self.snd_una);
         self.cwnd_used = self.cwnd_used.max(outstanding);
-        if self.now_ms.saturating_sub(self.cwnd_stamp_ms) >= u64::from(self.rto_ms) {
+        if !mid_burst && self.now_ms.saturating_sub(self.cwnd_stamp_ms) >= u64::from(self.rto_ms) {
             // Not if the application is blocked on a full send buffer.
             if self.cc.state() == congestion::CaState::Open && self.send_ring.free() > 0 {
                 let iw = congestion::initial_window(self.mss_payload());
@@ -173,9 +183,9 @@ impl<const BUF: usize> Tcb<BUF> {
     }
 
     fn send_one(&mut self) -> Result<bool, TcpError> {
-        // F-RTO step 2.b puts out new data in place of resends (see
-        // `send_data`).
-        if !self.frto_new {
+        // F-RTO step 2.b puts out new data in place of resends, and none
+        // follow on the same ACK (see `send_data`).
+        if !self.frto_new && !self.frto_hold {
             if let Some(i) = self.rtx.next_lost() {
                 if self.pipe() >= self.cc.cwnd {
                     self.cwnd_hit = true;
@@ -251,10 +261,12 @@ impl<const BUF: usize> Tcb<BUF> {
         let fin = self.fin_rides(len);
         // Nagle (RFC 9293 §3.7.4) in Minshall's variant, as Linux
         // `tcp_nagle_check`: a short segment waits while an earlier short
-        // one is unacknowledged, unless it carries the FIN.
+        // one is unacknowledged, unless it carries the FIN, or is F-RTO's
+        // probe of new data (Linux `tcp_xmit_recovery`: `TCP_NAGLE_OFF`).
         if len < mss
             && !fin
             && !self.nodelay
+            && !self.frto_new
             && seq_gt(self.snd_sml, self.snd_una)
             && !seq_gt(self.snd_sml, self.snd_nxt)
         {
@@ -426,6 +438,14 @@ impl<const BUF: usize> Tcb<BUF> {
         let fin = s.has(seg_flags::FIN) && plen == s.payload_len();
         let push = plen > 0 && s.has(seg_flags::PSH) && plen == s.payload_len();
         let fl = flags::ACK | if push { flags::PSH } else { 0 } | if fin { flags::FIN } else { 0 };
+        // An owed ACK goes on its own first (Linux lets the resend carry
+        // it): a peer that already holds the resent data may drop it as
+        // older than its last ACK (Linux `tcp_sequence`) without reading
+        // its ACK field, and the peer's own data would then wait for its
+        // tail loss probe.
+        if self.pending_ack {
+            self.send_pure_ack()?;
+        }
         if !self.emit_data_segment(fl, s.start, payload, false)? {
             return Ok(false);
         }
