@@ -578,3 +578,189 @@ mod tests {
         assert_eq!(drain(&mut r), [0, 1, 2, 3], "spare bytes are never read");
     }
 }
+
+/// Model-checked with Kani (`cargo kani --features std`): each harness
+/// covers every state of a ring with the given storage — any contents,
+/// cursors anywhere, any capacity and target, any arguments. The code is
+/// the same for every power of two, so small storage covers its cases.
+#[cfg(kani)]
+mod proofs {
+    use super::Ring;
+
+    /// A ring in any consistent state.
+    fn any_ring<const N: usize>() -> Ring<N> {
+        let shift: u8 = kani::any();
+        kani::assume(u32::from(shift) <= N.ilog2());
+        any_ring_of::<N>(shift)
+    }
+
+    /// A ring in any consistent state with capacity `N >> shift`.
+    fn any_ring_of<const N: usize>(shift: u8) -> Ring<N> {
+        let target_shift: u8 = kani::any();
+        kani::assume(u32::from(target_shift) <= N.ilog2());
+        let head: usize = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= N >> shift);
+        Ring {
+            buf: kani::any(),
+            head,
+            tail: head.wrapping_add(len),
+            len,
+            shift,
+            target_shift,
+        }
+    }
+
+    /// The byte `k` places past the read cursor: readable for `k < len`,
+    /// then free space, where out-of-order data is parked.
+    fn byte<const N: usize>(r: &Ring<N>, k: usize) -> u8 {
+        r.buf[r.head.wrapping_add(k) & (r.capacity() - 1)]
+    }
+
+    /// A resize keeps every live byte (readable, or parked within `keep`)
+    /// at its offset, and room for `reserve` (a window already promised);
+    /// a refused one changes nothing; with nothing live, no byte moves (a
+    /// reset resizes the send ring even while its free space is lent out).
+    /// From capacity `N >> shift`, read cursor at `at` within it, to any
+    /// target. The ring uses the read cursor only modulo its capacity (and
+    /// the write cursor only as `head + len`), so `at` covers every cursor.
+    fn resize_keeps_bytes_and_promises<const N: usize>(shift: u8, at: usize) {
+        let mut r = any_ring_of::<N>(shift);
+        r.head = at;
+        r.tail = at.wrapping_add(r.len);
+        let (keep, reserve, k): (usize, usize, usize) = (kani::any(), kani::any(), kani::any());
+        let (buf, head, tail, len, shift) = (r.buf, r.head, r.tail, r.len, r.shift);
+        let (cap, target) = (r.capacity(), r.target());
+        let live = len.saturating_add(keep);
+        let at_k = byte(&r, k);
+        if r.try_resize(keep, reserve) {
+            assert_eq!(r.capacity(), target);
+            assert_eq!(r.len, len);
+            assert!(r.debug_valid().is_ok());
+            if target != cap {
+                assert!(live <= target);
+                assert!(len.saturating_add(reserve) <= target);
+            }
+            if k < live {
+                assert_eq!(byte(&r, k), at_k);
+            }
+        } else {
+            assert!(r.buf == buf);
+            assert_eq!((r.head, r.tail, r.len, r.shift), (head, tail, len, shift));
+        }
+        if live == 0 {
+            assert!(r.buf == buf);
+        }
+    }
+
+    // One harness per starting capacity of a 16-byte ring (16 down to 1
+    // byte, so every resize between powers of two up to 16), each over every
+    // cursor position. Both concrete, `rotate_left` takes its one reachable
+    // algorithm; left symbolic, the checker unrolls all three.
+    fn resize_from<const N: usize>(shift: u8) {
+        for at in 0..N >> shift {
+            resize_keeps_bytes_and_promises::<N>(shift, at);
+        }
+    }
+
+    #[kani::proof]
+    #[kani::unwind(18)]
+    fn resize_from_16_bytes() {
+        resize_from::<16>(0);
+    }
+
+    #[kani::proof]
+    #[kani::unwind(18)]
+    fn resize_from_8_bytes() {
+        resize_from::<16>(1);
+    }
+
+    #[kani::proof]
+    #[kani::unwind(18)]
+    fn resize_from_4_bytes() {
+        resize_from::<16>(2);
+    }
+
+    #[kani::proof]
+    #[kani::unwind(18)]
+    fn resize_from_2_bytes() {
+        resize_from::<16>(3);
+    }
+
+    #[kani::proof]
+    #[kani::unwind(18)]
+    fn resize_from_1_byte() {
+        resize_from::<16>(4);
+    }
+
+    /// Received data lands only in free space, after the readable bytes,
+    /// in order, and leaves those bytes alone.
+    #[kani::proof]
+    #[kani::unwind(40)]
+    fn data_lands_only_in_free_space() {
+        let mut r = any_ring::<16>();
+        let src: [u8; 16] = kani::any();
+        let (n, j, k): (usize, usize, usize) = (kani::any(), kani::any(), kani::any());
+        kani::assume(n <= 16);
+        let (len, free) = (r.len, r.free());
+        let at_j = byte(&r, j);
+        let w = r.write(&src[..n]);
+        assert_eq!(w, n.min(free));
+        assert_eq!(r.len, len + w);
+        assert!(r.debug_valid().is_ok());
+        if j < len {
+            assert_eq!(byte(&r, j), at_j);
+        }
+        if k < w {
+            assert_eq!(byte(&r, len + k), src[k]);
+        }
+    }
+
+    /// Out-of-order data parked past the write cursor stays inside the free
+    /// space and never touches a readable byte.
+    #[kani::proof]
+    #[kani::unwind(40)]
+    fn parked_data_stays_in_free_space() {
+        let mut r = any_ring::<16>();
+        let src: [u8; 16] = kani::any();
+        let (off, n, j, k): (usize, usize, usize, usize) =
+            (kani::any(), kani::any(), kani::any(), kani::any());
+        kani::assume(n <= 16);
+        let (len, free) = (r.len, r.free());
+        let at_j = byte(&r, j);
+        let w = r.write_at(off, &src[..n]);
+        assert!(w <= free.saturating_sub(off));
+        assert_eq!(r.len, len);
+        if j < len {
+            assert_eq!(byte(&r, j), at_j);
+        }
+        if k < w {
+            assert_eq!(byte(&r, len + off + k), src[k]);
+        }
+    }
+
+    /// Space lent out by `free_regions` and filled in place (the first slice
+    /// first) becomes readable in order on `commit`, and lies inside the
+    /// free space.
+    #[kani::proof]
+    #[kani::unwind(40)]
+    fn a_loan_filled_in_place_is_committed_in_order() {
+        let mut r = any_ring::<16>();
+        let fill: [u8; 16] = kani::any();
+        let (max, k): (usize, usize) = (kani::any(), kani::any());
+        let (len, free) = (r.len, r.free());
+        let n = {
+            let (a, b) = r.free_regions(max);
+            let (na, nb) = (a.len(), b.len());
+            a.copy_from_slice(&fill[..na]);
+            b.copy_from_slice(&fill[na..na + nb]);
+            na + nb
+        };
+        assert_eq!(n, max.min(free));
+        assert_eq!(r.commit(n), n);
+        assert!(r.debug_valid().is_ok());
+        if k < n {
+            assert_eq!(byte(&r, len + k), fill[k]);
+        }
+    }
+}

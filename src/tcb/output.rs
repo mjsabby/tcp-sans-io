@@ -572,12 +572,7 @@ impl<const BUF: usize> Tcb<BUF> {
         } else {
             0
         };
-        let fits = (self.recv_ring.free() as u32) >> shift;
-        let mut units = (adv >> shift).min(fits);
-        if (units << shift) < cur {
-            units = cur.div_ceil(1u32 << shift).min(fits);
-        }
-        let units = units.min(u32::from(u16::MAX));
+        let units = scale_window(adv, cur, self.recv_ring.free() as u32, shift);
         (units as u16, units << shift)
     }
 
@@ -601,5 +596,83 @@ impl<const BUF: usize> Tcb<BUF> {
             self.send_pure_ack()?;
         }
         Ok(())
+    }
+}
+
+/// The window to advertise, in units of `2^shift` bytes (at most
+/// `u16::MAX`): the offer `adv` rounded down, or, where that would move the
+/// right edge already advertised (`cur` bytes past `RCV.NXT`) left, rounded
+/// up to keep it — but never past the `free` bytes the receive ring can
+/// still hold.
+fn scale_window(adv: u32, cur: u32, free: u32, shift: u32) -> u32 {
+    let fits = free >> shift;
+    let mut units = (adv >> shift).min(fits);
+    if (units << shift) < cur {
+        units = cur.div_ceil(1u32 << shift).min(fits);
+    }
+    units.min(u32::from(u16::MAX))
+}
+
+/// Model-checked with Kani (`cargo kani --features std`) for every 32-bit
+/// input and every window scale.
+#[cfg(kani)]
+mod proofs {
+    use super::scale_window;
+
+    /// Largest window scale (RFC 7323 §2.3).
+    const MAX_SHIFT: u32 = 14;
+
+    fn any_input() -> (u32, u32, u32, u32) {
+        let shift: u32 = kani::any();
+        kani::assume(shift <= MAX_SHIFT);
+        (kani::any(), kani::any(), kani::any(), shift)
+    }
+
+    /// Every byte offered fits in the receive ring, and the window field
+    /// holds it.
+    #[kani::proof]
+    fn never_offers_space_the_ring_lacks() {
+        let (adv, cur, free, shift) = any_input();
+        let units = scale_window(adv, cur, free, shift);
+        assert!(units <= u32::from(u16::MAX));
+        assert!(u64::from(units) << shift <= u64::from(free));
+    }
+
+    /// A ring without room for one unit advertises a zero window.
+    #[kani::proof]
+    fn a_full_ring_offers_nothing() {
+        let (adv, cur, free, shift) = any_input();
+        kani::assume(free < 1 << shift);
+        assert_eq!(scale_window(adv, cur, free, shift), 0);
+    }
+
+    /// While the ring can still hold the edge already advertised (and the
+    /// scale was negotiated for the ring), the edge moves left by less than
+    /// one unit: the retraction RFC 7323 §2.4 allows, no more.
+    #[kani::proof]
+    fn retracts_the_edge_by_less_than_one_unit() {
+        let (adv, cur, free, shift) = any_input();
+        kani::assume(cur <= free && u64::from(cur) <= u64::from(u16::MAX) << shift);
+        let offered = u64::from(scale_window(adv, cur, free, shift)) << shift;
+        assert!(offered + (1 << shift) > u64::from(cur));
+    }
+
+    /// Nothing is held back: the offer rounded down, as far as it fits.
+    #[kani::proof]
+    fn offers_all_the_window_that_fits() {
+        let (adv, cur, free, shift) = any_input();
+        let units = scale_window(adv, cur, free, shift);
+        assert!(units >= (adv >> shift).min(free >> shift).min(u32::from(u16::MAX)));
+    }
+
+    /// The inductive step for "every advertised byte is backed by free
+    /// receive space": the right edge only moves right, to `RCV.NXT` plus
+    /// the window just offered, so a promise backed before stays backed.
+    #[kani::proof]
+    fn advertising_keeps_every_promise_backed() {
+        let (adv, cur, free, shift) = any_input();
+        kani::assume(cur <= free);
+        let offered = scale_window(adv, cur, free, shift) << shift;
+        assert!(cur.max(offered) <= free);
     }
 }

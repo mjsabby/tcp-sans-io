@@ -843,6 +843,7 @@ proof.
 | **smoltcp interop** | Against smoltcp (the dominant no_std Rust TCP stack, used in embedded). In-memory channel between two userspace stacks — completely independent codebases negotiating options + sequencing data. | `src/smoltcp_interop_tests.rs` |
 | **Real Linux TUN** | Against the Linux kernel TCP stack via TUN | `bindings/gvisor/tun_test.go` |
 | **Fuzzing** | Codec, resizable ring and full-TCB sessions under libFuzzer with invariant, no-burst and liveness oracles; buffer limits, `send_reserve` loans and overwritten reclaimable storage in every TCB target | `fuzz/fuzz_targets/` |
+| **Model checking** | Kani proofs: the advertised receive window never offers space the ring lacks, for every input and window scale; ring resizes keep every live byte and the promised room; received and parked data stay in free space; a filled loan commits in order | `src/tcb/output.rs`, `src/ring.rs` (`cargo kani --features std`) |
 | **Same-path benchmark** | tcp-sans-io vs Linux Reno / CUBIC through one netem-shaped router to the same kernel peer, both directions, retransmissions vs router drops | `bindings/netem/bench.sh` |
 | **packetdrill-DSL runner** | Per-packet conformance scripts in packetdrill syntax | `bindings/packetdrill/*.go` + `scripts/*.pkt` |
 | **eBPF uprobe observability** | bpftrace uprobes on the cdylib's FFI entry points (counts + latency histograms) | `bindings/bpf/` |
@@ -927,6 +928,38 @@ allocation failures and unreachable slice-bounds branches:
 ```sh
 cargo +nightly fuzz run tcb_client_session -- -max_total_time=600 -timeout=60
 ```
+
+### Model checking (Kani)
+
+`cargo kani --features std` (Linux or macOS, [Kani](https://model-checking.github.io/kani/))
+proves, rather than samples, the properties behind "every advertised window
+byte is backed by receive space":
+
+- **Advertising** (`src/tcb/output.rs`), for every 32-bit input and window
+  scale:
+  - the window offered fits in the ring's free space;
+  - a ring without room for one unit offers zero;
+  - the edge already advertised retracts by less than one unit;
+  - nothing that fits is held back.
+- **Receiving and resizing** (`src/ring.rs`), for every state of a 16-byte
+  ring (any contents, cursors, capacity, target and arguments):
+  - received data lands only in free space, after the readable bytes;
+  - parked out-of-order data never touches a readable byte;
+  - a resize keeps every readable or parked byte at its offset, and room for
+    the promised window;
+  - a refused resize changes nothing, and with nothing live no byte moves;
+  - a `send_reserve` loan filled in place commits in order.
+
+Together these make "advertised bytes ≤ free space" an inductive invariant:
+- the right edge only moves right, to `RCV.NXT` plus a window that fits;
+- data is taken only into free space, advancing `RCV.NXT` by as much;
+- reads only add free space;
+- a shrink keeps the promise.
+
+`debug_validate_invariants` checks the composed invariant after every step of
+every test and fuzz target. The 13 harnesses take about 40 s with `-j 13`.
+Planting #17's rounding bug, a resize that ignores the promise, or a shrink
+that drops parked bytes each makes the proofs fail.
 
 ### Other canonical suites not (yet) integrated
 

@@ -48,6 +48,8 @@ panic = "abort"
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 unused_must_use = "deny"
+# Model-checking harnesses (`cargo kani --features std`).
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
 
 [lints.clippy]
 unwrap_used = "deny"
