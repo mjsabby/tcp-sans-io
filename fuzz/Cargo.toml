@@ -80,3 +80,10 @@ path = "fuzz_targets/tcb_adversary.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "ring_model"
+path = "fuzz_targets/ring_model.rs"
+test = false
+doc = false
+bench = false

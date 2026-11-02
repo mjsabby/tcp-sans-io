@@ -10,6 +10,13 @@
 //! a liveness oracle (`debug_check_liveness`) additionally trips the instant a
 //! black-hole forms (outstanding data with no retransmit timer, or queued data
 //! under a zero window with no persist timer).
+//!
+//! Buffer sizing rides along: each side opens with fuzzer-chosen buffer limits
+//! (fixed, autotuned, pinned small, or arbitrary) that change again
+//! mid-transfer; every step overwrites the storage `reclaimable` lists; and
+//! data goes in through `send` or through space lent by `send_reserve`, filled
+//! at once but committed on a later step (an asynchronous host), so a resize
+//! that moved lent space would corrupt the byte-exact stream.
 
 use tcp_sans_io::{Endpoint, State, Tcb, TcbConfig, TcpError, MAX_PACKET};
 
@@ -35,6 +42,70 @@ fn check<const BUF: usize>(tcb: &Tcb<BUF>) {
     if let Err(e) = tcb.debug_validate_invariants() {
         panic!("TCB invariant failed: {e}");
     }
+}
+
+/// Buffer limits from two fuzzer bytes: fixed at `BUF`, autotuned over the
+/// whole range, pinned at the smallest size, or arbitrary power-of-two bounds.
+fn limits<const BUF: usize>(a: u8, b: u8) -> (usize, usize, usize, usize) {
+    let size = |x: u8| 1usize << (12 + usize::from(x % 9));
+    match a % 4 {
+        0 => (BUF, BUF, BUF, BUF),
+        1 => (0, BUF, 0, BUF),
+        2 => (0, 0, 0, 0),
+        _ => {
+            let (s0, s1, r0, r1) = (size(a >> 2), size(b), size(b >> 4), size(a ^ b));
+            (s0.min(s1), s0.max(s1), r0.min(r1), r0.max(r1))
+        }
+    }
+}
+
+/// Overwrite storage the TCB will not read before writing it again (the
+/// front of large spans, where ring data would land first).
+fn poison<const BUF: usize>(t: &mut Tcb<BUF>) {
+    for s in t.reclaimable() {
+        let n = s.len().min(64 * 1024);
+        s[..n].fill(0xA5);
+    }
+}
+
+/// Add stream bytes from `sent` (at most `cap`, up to `xfer`) through `send`,
+/// or through space lent by `send_reserve`: filled at once, committed (whole
+/// or in part) on a later call, as an asynchronous host does. Returns the
+/// bytes appended to the stream; `loan` tracks lent, filled bytes.
+#[allow(clippy::too_many_arguments)]
+fn offer<const BUF: usize>(
+    t: &mut Tcb<BUF>,
+    stream: u32,
+    sent: u32,
+    xfer: u32,
+    cap: usize,
+    loan: &mut usize,
+    b: u8,
+    hold: bool,
+) -> u32 {
+    if *loan > 0 {
+        if hold && b & 1 == 0 {
+            return 0;
+        }
+        let k = if b & 2 == 0 { *loan } else { *loan / 2 };
+        *loan = 0;
+        return no_internal(t.send_commit(k)).map_or(0, |n| n as u32);
+    }
+    let take = (cap as u32).min(xfer - sent) as usize;
+    if take == 0 {
+        return 0;
+    }
+    if b % 4 == 0 {
+        if let Some((x, y)) = no_internal(t.send_reserve(take)) {
+            for (i, v) in x.iter_mut().chain(y.iter_mut()).enumerate() {
+                *v = pat(stream, sent + i as u32);
+            }
+            *loan = x.len() + y.len();
+        }
+        return 0;
+    }
+    let chunk: Vec<u8> = (0..take).map(|i| pat(stream, sent + i as u32)).collect();
+    no_internal(t.send(&chunk)).map_or(0, |w| w as u32)
 }
 
 fn pat(stream: u32, off: u32) -> u8 {
@@ -147,6 +218,15 @@ pub fn run<const BUF: usize>(data: &[u8], xfer: u32, send_cap: usize) {
     cli.set_keepalive(0, 0, 0);
     srv.set_keepalive(0, 0, 0);
     srv.set_secret(&[0x5e; 16]);
+    let mut fi = 0usize;
+    let poisoning = data.first().is_some_and(|b| b & 0x80 == 0);
+    for t in [&mut cli, &mut srv] {
+        let (a, b) = (next_byte(data, &mut fi), next_byte(data, &mut fi));
+        let (s0, s1, r0, r1) = limits::<BUF>(a, b);
+        if no_internal(t.set_buffer_limits(s0, s1, r0, r1)).is_none() {
+            return;
+        }
+    }
     if srv.listen().is_err() || cli.connect().is_err() {
         return;
     }
@@ -161,11 +241,10 @@ pub fn run<const BUF: usize>(data: &[u8], xfer: u32, send_cap: usize) {
     let mut closing = false;
 
     let mut pkt = [0u8; MAX_PACKET];
-    let mut chunk = [0u8; 4096];
     let mut rbuf = [0u8; 4096];
-    let cap = send_cap.min(chunk.len());
+    let cap = send_cap.min(4096);
+    let (mut cli_loan, mut srv_loan) = (0usize, 0usize);
 
-    let mut fi = 0usize;
     let mut drop_budget = 4000u32;
 
     let mut mono_c = {
@@ -336,25 +415,28 @@ pub fn run<const BUF: usize>(data: &[u8], xfer: u32, send_cap: usize) {
             }
         }
 
+        // New buffer limits on one side now and then (while input lasts).
+        let knob = next_byte(data, &mut fi);
+        if input_left && knob & 0x1f == 0 {
+            let (a, b) = (next_byte(data, &mut fi), next_byte(data, &mut fi));
+            let (s0, s1, r0, r1) = limits::<BUF>(a, b);
+            let t = if knob & 0x20 != 0 { &mut cli } else { &mut srv };
+            let _ = no_internal(t.set_buffer_limits(s0, s1, r0, r1));
+            check(t);
+        }
+
         // Offer data each way.
+        let hold = fi < data.len();
         if cli.state() == State::Established && cli_sent < xfer {
-            let take = (cap as u32).min(xfer - cli_sent) as usize;
-            for (i, b) in chunk.iter_mut().take(take).enumerate() {
-                *b = pat(CLI_STREAM, cli_sent + i as u32);
-            }
-            if let Some(w) = no_internal(cli.send(&chunk[..take])) {
-                cli_sent += w as u32;
-            }
+            let b = next_byte(data, &mut fi);
+            cli_sent += offer(&mut cli, CLI_STREAM, cli_sent, xfer, cap, &mut cli_loan, b, hold);
         }
         if srv.state() == State::Established && srv_sent < xfer {
-            let take = (cap as u32).min(xfer - srv_sent) as usize;
-            for (i, b) in chunk.iter_mut().take(take).enumerate() {
-                *b = pat(SRV_STREAM, srv_sent + i as u32);
-            }
-            if let Some(w) = no_internal(srv.send(&chunk[..take])) {
-                srv_sent += w as u32;
-            }
+            let b = next_byte(data, &mut fi);
+            srv_sent += offer(&mut srv, SRV_STREAM, srv_sent, xfer, cap, &mut srv_loan, b, hold);
         }
+        check(&cli);
+        check(&srv);
 
         // Drain + verify (byte-exact, in-order).
         if let Some(n) = no_internal(cli.recv(&mut rbuf)) {
@@ -378,6 +460,12 @@ pub fn run<const BUF: usize>(data: &[u8], xfer: u32, send_cap: usize) {
                 }
             }
             srv_recv += n as u32;
+        }
+
+        // The host may overwrite reclaimable storage between any two calls.
+        if poisoning {
+            poison(&mut cli);
+            poison(&mut srv);
         }
 
         // Monotonic-progress oracle: cumulative cursors never regress —

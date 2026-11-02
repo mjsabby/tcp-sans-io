@@ -326,6 +326,17 @@ fuzz_target!(|data: &[u8]| {
     }
 
     let Some(mut tcb) = make_tcb() else { return };
+    // Bits 1-2 of the first byte size the rings: fixed (default), autotuned,
+    // pinned at 4 KiB, or a 16 KiB send ring with an autotuned receive ring.
+    // Sized rings also see their reclaimable storage overwritten every step.
+    let sizing = (data.first().copied().unwrap_or(0) >> 1) & 3;
+    let (s0, s1, r0, r1) = match sizing {
+        0 => (usize::MAX, usize::MAX, usize::MAX, usize::MAX),
+        1 => (0, usize::MAX, 0, usize::MAX),
+        2 => (0, 0, 0, 0),
+        _ => (16384, 16384, 0, usize::MAX),
+    };
+    no_internal(tcb.set_buffer_limits(s0, s1, r0, r1));
 
     let mut now: u64 = 0;
     let mut hi = OUR_ISS.wrapping_add(1);
@@ -377,6 +388,13 @@ fuzz_target!(|data: &[u8]| {
             no_internal(tcb.close());
             closed = true;
             observe_state(&mut prev_state, &tcb);
+        }
+
+        if sizing != 0 {
+            for span in tcb.reclaimable() {
+                let n = span.len().min(64 * 1024);
+                span[..n].fill(0xA5);
+            }
         }
 
         // 2. Advance the clock and emit.

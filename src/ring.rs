@@ -1,13 +1,19 @@
-//! Fixed-capacity, zero-allocation byte ring buffer.
+//! Zero-allocation byte ring buffer with a resizable capacity.
 //!
-//! Used for both the application-facing send and receive queues. Capacity is
-//! statically chosen via const generics so the ring itself lives inside the
-//! [`crate::tcb::Tcb`] without ever touching an allocator.
+//! Used for both the application-facing send and receive queues. The storage
+//! (`N` bytes, statically chosen via const generics) lives inside the
+//! [`crate::tcb::Tcb`] without ever touching an allocator, and is a
+//! *reservation*: the ring only ever reads or writes its first
+//! [`Ring::capacity`] bytes, a power of two that [`Ring::try_resize`] moves
+//! toward [`Ring::target`]. Storage past the capacity is never touched, so
+//! when the host backs the TCB with lazily allocated memory the resident size
+//! follows the capacity rather than `N`. The default (all-zero) state uses all
+//! of `N`: a ring that is never resized behaves exactly like a fixed one.
 
 use crate::error::TcpError;
 
-/// SPSC byte ring with capacity `N`. `N` *must* be a power of two — this is
-/// checked at construction time so the modulo can be a cheap mask.
+/// SPSC byte ring over `N` bytes of storage. `N` *must* be a power of two —
+/// this is checked at construction time so the modulo can be a cheap mask.
 pub struct Ring<const N: usize> {
     #[cfg(feature = "heap-buffers")]
     buf: alloc::boxed::Box<[u8]>, // always length N; allocated off the stack
@@ -16,6 +22,10 @@ pub struct Ring<const N: usize> {
     head: usize, // read cursor (next byte to read)
     tail: usize, // write cursor (next byte to write)
     len: usize,  // bytes currently stored
+    /// Capacity in use is `N >> shift`; 0 (the all-zero state) is all of `N`.
+    shift: u8,
+    /// Capacity to converge to: `N >> target_shift`.
+    target_shift: u8,
 }
 
 impl<const N: usize> Ring<N> {
@@ -31,32 +41,51 @@ impl<const N: usize> Ring<N> {
             head: 0,
             tail: 0,
             len: 0,
+            shift: 0,
+            target_shift: 0,
         })
     }
 
-    /// Heap-backed construction: the allocator zeroes the `N`-byte buffer in
-    /// place, so no `[u8; N]` is ever materialized on the stack. This is what
-    /// lets `Box::new(Tcb::new())` avoid a multi-MiB stack temporary in debug
-    /// builds (no RVO). Returns `Overflow` on bad `N` or allocation failure.
+    /// Heap-backed construction: the allocator zeroes the `N`-byte buffer, so
+    /// no `[u8; N]` is ever materialized on the stack. This is what lets
+    /// `Box::new(Tcb::new())` avoid a multi-MiB stack temporary in debug
+    /// builds (no RVO). The zeroing path (`calloc`) hands large allocations
+    /// out as untouched zero pages, so storage past the capacity is never
+    /// backed by memory. Returns `Overflow` on bad `N` or allocation failure.
     #[cfg(feature = "heap-buffers")]
     pub fn new() -> Result<Self, TcpError> {
         if N == 0 || (N & (N - 1)) != 0 {
             return Err(TcpError::Overflow);
         }
-        let mut v: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
-        v.try_reserve_exact(N).map_err(|_| TcpError::Overflow)?;
-        v.resize(N, 0);
+        let layout = core::alloc::Layout::array::<u8>(N).map_err(|_| TcpError::Overflow)?;
+        // SAFETY: `layout` has a non-zero size (`N > 0` is checked above).
+        let p = unsafe { alloc::alloc::alloc_zeroed(layout) };
+        if p.is_null() {
+            return Err(TcpError::Overflow);
+        }
+        // SAFETY: `p` is a fresh, zero-initialised allocation of `N` bytes
+        // made with the layout `Box<[u8]>` frees it with (`[u8; N]`).
+        let buf = unsafe { alloc::boxed::Box::from_raw(core::ptr::slice_from_raw_parts_mut(p, N)) };
         Ok(Self {
-            buf: v.into_boxed_slice(),
+            buf,
             head: 0,
             tail: 0,
             len: 0,
+            shift: 0,
+            target_shift: 0,
         })
     }
 
+    /// Bytes of storage in use (a power of two, at most `N`).
     #[inline]
     pub const fn capacity(&self) -> usize {
-        N
+        N >> self.shift
+    }
+
+    /// The capacity [`Self::try_resize`] moves to (see [`Self::set_target`]).
+    #[inline]
+    pub const fn target(&self) -> usize {
+        N >> self.target_shift
     }
 
     #[inline]
@@ -69,9 +98,110 @@ impl<const N: usize> Ring<N> {
         self.len == 0
     }
 
+    /// Free space within the current capacity: what may be written now.
     #[inline]
     pub const fn free(&self) -> usize {
-        N - self.len
+        self.capacity().saturating_sub(self.len)
+    }
+
+    /// Free space within both the capacity and the target: what may be
+    /// *offered* (advertised to a peer, accepted from an application) while
+    /// a smaller target waits to take effect. Equals [`Self::free`] unless a
+    /// shrink is pending.
+    #[inline]
+    pub const fn room(&self) -> usize {
+        let cap = self.capacity();
+        let target = self.target();
+        let limit = if target < cap { target } else { cap };
+        limit.saturating_sub(self.len)
+    }
+
+    /// Ask for a capacity of `bytes`, clamped to `1..=N` and rounded down to a
+    /// power of two. It takes effect at the next successful
+    /// [`Self::try_resize`]; until then [`Self::room`] already honours a
+    /// smaller target.
+    pub fn set_target(&mut self, bytes: usize) {
+        let b = bytes.clamp(1, N);
+        let log_b = b.checked_ilog2().unwrap_or(0);
+        let log_n = N.checked_ilog2().unwrap_or(0);
+        self.target_shift = u8::try_from(log_n.saturating_sub(log_b)).unwrap_or(0);
+    }
+
+    /// Move the capacity to the target, if everything that must survive fits
+    /// in it: the readable bytes, `keep` bytes parked past the write cursor
+    /// whose contents must be preserved (see [`Self::write_at`]), and
+    /// `reserve` bytes of free space past the readable bytes that must stay
+    /// writable (a window already promised to a peer). Returns whether the
+    /// capacity now equals the target.
+    ///
+    /// Bytes keep their offsets from the cursors, so offsets the caller holds
+    /// ([`Self::peek_at`], [`Self::write_at`]) stay valid; their storage
+    /// addresses do not, so never resize while space lent out through
+    /// [`Self::free_regions`] is still being filled. Nothing moves when the
+    /// live bytes already sit below the new boundary without wrapping;
+    /// otherwise they move to the start of the storage, at most one
+    /// capacity's worth of copying.
+    pub fn try_resize(&mut self, keep: usize, reserve: usize) -> bool {
+        let cap = self.capacity();
+        let new = self.target();
+        if new == cap {
+            return true;
+        }
+        let span = self.len.saturating_add(keep);
+        if span > cap || self.len.saturating_add(keep.max(reserve)) > new {
+            return false;
+        }
+        let at = self.head & (cap - 1);
+        let base = if at.saturating_add(span) <= cap.min(new) {
+            at // already below both boundaries: nothing moves
+        } else if at + span <= cap {
+            // Contiguous but above the new (smaller) boundary.
+            if let Some(s) = self.buf.get_mut(..cap) {
+                s.copy_within(at..at + span, 0);
+            }
+            0
+        } else {
+            // Wraps the end of the storage in use: rotate it to the front.
+            if let Some(s) = self.buf.get_mut(..cap) {
+                s.rotate_left(at);
+            }
+            0
+        };
+        self.head = base;
+        self.tail = base + self.len;
+        self.shift = self.target_shift;
+        true
+    }
+
+    /// Storage the ring will not read before writing it again, for a host to
+    /// release (for example `madvise(MADV_DONTNEED)` on the whole pages
+    /// inside it) or overwrite freely: all of it when the ring holds nothing
+    /// (no readable bytes and `keep == 0` parked bytes), otherwise everything
+    /// past the capacity. Free space lent out through [`Self::free_regions`]
+    /// is the caller's to exclude.
+    pub fn spare_mut(&mut self, keep: usize) -> &mut [u8] {
+        let from = if self.len == 0 && keep == 0 {
+            0
+        } else {
+            self.capacity()
+        };
+        self.buf.get_mut(from..).unwrap_or_default()
+    }
+
+    /// Internal consistency (tests and fuzz targets).
+    #[cfg(any(test, feature = "std"))]
+    pub fn debug_valid(&self) -> Result<(), &'static str> {
+        let log_n = N.checked_ilog2().unwrap_or(0);
+        if u32::from(self.shift) > log_n || u32::from(self.target_shift) > log_n {
+            return Err("ring capacity shift out of range");
+        }
+        if self.len > self.capacity() {
+            return Err("ring holds more than its capacity");
+        }
+        if self.tail.wrapping_sub(self.head) != self.len {
+            return Err("ring cursors disagree with its length");
+        }
+        Ok(())
     }
 
     /// Append as many bytes from `src` as will fit. Returns the number copied.
@@ -80,8 +210,9 @@ impl<const N: usize> Ring<N> {
         if n == 0 {
             return 0;
         }
-        let mask = N - 1;
-        let first = core::cmp::min(n, N - (self.tail & mask));
+        let cap = self.capacity();
+        let mask = cap - 1;
+        let first = core::cmp::min(n, cap - (self.tail & mask));
         // SAFETY-equivalent: bounds are derived from `mask` + `min`, both safe.
         let tail_off = self.tail & mask;
         if let (Some(dst), Some(s)) = (
@@ -114,9 +245,9 @@ impl<const N: usize> Ring<N> {
         if n == 0 {
             return 0;
         }
-        let mask = N - 1;
-        let head_off = self.head & mask;
-        let first = core::cmp::min(n, N - head_off);
+        let cap = self.capacity();
+        let head_off = self.head & (cap - 1);
+        let first = core::cmp::min(n, cap - head_off);
         if let (Some(d), Some(s)) = (
             dst.get_mut(..first),
             self.buf.get(head_off..head_off + first),
@@ -143,9 +274,9 @@ impl<const N: usize> Ring<N> {
         if n == 0 {
             return 0;
         }
-        let mask = N - 1;
-        let start = (self.head.wrapping_add(offset)) & mask;
-        let first = core::cmp::min(n, N - start);
+        let cap = self.capacity();
+        let start = (self.head.wrapping_add(offset)) & (cap - 1);
+        let first = core::cmp::min(n, cap - start);
         if let (Some(d), Some(s)) = (dst.get_mut(..first), self.buf.get(start..start + first)) {
             d.copy_from_slice(s);
         }
@@ -172,9 +303,9 @@ impl<const N: usize> Ring<N> {
         if n == 0 {
             return 0;
         }
-        let mask = N - 1;
-        let start = self.tail.wrapping_add(offset) & mask;
-        let first = core::cmp::min(n, N - start);
+        let cap = self.capacity();
+        let start = self.tail.wrapping_add(offset) & (cap - 1);
+        let first = core::cmp::min(n, cap - start);
         if let (Some(dst), Some(s)) = (self.buf.get_mut(start..start + first), src.get(..first)) {
             dst.copy_from_slice(s);
         }
@@ -203,8 +334,9 @@ impl<const N: usize> Ring<N> {
     /// storage. Bytes written there become readable through [`Self::commit`].
     pub fn free_regions(&mut self, max: usize) -> (&mut [u8], &mut [u8]) {
         let n = core::cmp::min(max, self.free());
-        let start = self.tail & (N - 1);
-        let first = core::cmp::min(n, N - start);
+        let cap = self.capacity();
+        let start = self.tail & (cap - 1);
+        let first = core::cmp::min(n, cap - start);
         let wrapped = n - first;
         match self.buf.split_at_mut_checked(start) {
             Some((before, after)) => (
@@ -226,7 +358,8 @@ impl<const N: usize> Ring<N> {
     /// previous bytes simply become unreachable as `len` returns to 0);
     /// callers that need the storage zeroed must do so explicitly.
     /// Used when a TCB reverts from `SynRcvd` back to `Listen` so a fresh
-    /// connection inherits empty rings without re-allocating.
+    /// connection inherits empty rings without re-allocating. The capacity
+    /// and target are kept.
     pub fn clear(&mut self) {
         self.head = 0;
         self.tail = 0;
@@ -294,5 +427,340 @@ mod tests {
         assert_eq!(out, [0xaa, 0xaa, 1, 2, 3, 4, 5, 6, 7]);
         let (a, b) = r.free_regions(3);
         assert_eq!((a.len(), b.len()), (3, 0), "clipped to max");
+    }
+
+    /// Ring holding the stream bytes `from..to` (byte `i` is `i as u8`).
+    fn push(r: &mut Ring<16>, from: u8, to: u8) {
+        let bytes: std::vec::Vec<u8> = (from..to).collect();
+        assert_eq!(r.write(&bytes), bytes.len());
+    }
+
+    fn drain(r: &mut Ring<16>) -> std::vec::Vec<u8> {
+        let mut out = [0u8; 16];
+        let n = r.read(&mut out);
+        out[..n].to_vec()
+    }
+
+    #[test]
+    fn a_new_ring_uses_all_of_its_storage() {
+        let r: Ring<16> = Ring::new().unwrap();
+        assert_eq!(
+            (r.capacity(), r.target(), r.free(), r.room()),
+            (16, 16, 16, 16)
+        );
+        r.debug_valid().unwrap();
+    }
+
+    #[test]
+    fn set_target_rounds_down_to_a_power_of_two_within_the_storage() {
+        let mut r: Ring<16> = Ring::new().unwrap();
+        for (ask, want) in [(0, 1), (1, 1), (3, 2), (4, 4), (9, 8), (16, 16), (999, 16)] {
+            r.set_target(ask);
+            assert_eq!(r.target(), want, "set_target({ask})");
+            assert_eq!(r.capacity(), 16, "only try_resize moves the capacity");
+        }
+    }
+
+    #[test]
+    fn growing_rotates_wrapped_bytes_and_keeps_parked_ones() {
+        let mut r: Ring<16> = Ring::new().unwrap();
+        r.set_target(8);
+        assert!(r.try_resize(0, 0));
+        push(&mut r, 0, 6);
+        let mut sink = [0u8; 4];
+        assert_eq!(r.read(&mut sink), 4);
+        push(&mut r, 6, 11); // bytes 4..11 wrap the 8-byte storage
+        assert_eq!(r.write_at(0, &[11]), 1, "park byte 11 past the tail");
+        r.set_target(16);
+        assert!(r.try_resize(1, 0));
+        assert_eq!((r.capacity(), r.head), (16, 0), "rotated to the front");
+        r.debug_valid().unwrap();
+        assert_eq!(r.commit(1), 1);
+        assert_eq!(drain(&mut r), (4..12).collect::<std::vec::Vec<u8>>());
+    }
+
+    #[test]
+    fn shrinking_copies_contiguous_bytes_below_the_new_boundary() {
+        let mut r: Ring<16> = Ring::new().unwrap();
+        push(&mut r, 0, 10);
+        let mut sink = [0u8; 8];
+        assert_eq!(r.read(&mut sink), 8);
+        r.set_target(4);
+        assert!(r.try_resize(0, 0));
+        assert_eq!((r.capacity(), r.head, r.free()), (4, 0, 2));
+        push(&mut r, 10, 12);
+        assert_eq!(r.write(&[0]), 0, "full at the new capacity");
+        assert_eq!(drain(&mut r), [8, 9, 10, 11]);
+    }
+
+    #[test]
+    fn shrinking_moves_nothing_when_the_bytes_already_fit() {
+        let mut r: Ring<16> = Ring::new().unwrap();
+        push(&mut r, 0, 5);
+        let mut sink = [0u8; 2];
+        assert_eq!(r.read(&mut sink), 2);
+        r.set_target(8);
+        assert!(r.try_resize(0, 0));
+        assert_eq!((r.capacity(), r.head, r.tail), (8, 2, 5), "in place");
+        assert_eq!(drain(&mut r), [2, 3, 4]);
+    }
+
+    #[test]
+    fn shrinking_rotates_bytes_that_wrap() {
+        let mut r: Ring<16> = Ring::new().unwrap();
+        push(&mut r, 0, 14);
+        let mut sink = [0u8; 12];
+        assert_eq!(r.read(&mut sink), 12);
+        push(&mut r, 14, 17); // 12..17 wraps the 16-byte storage
+        r.set_target(8);
+        assert!(r.try_resize(0, 0));
+        assert_eq!((r.capacity(), r.head), (8, 0));
+        assert_eq!(drain(&mut r), [12, 13, 14, 15, 16]);
+    }
+
+    #[test]
+    fn a_shrink_waits_for_data_parked_bytes_and_promised_space() {
+        let mut r: Ring<16> = Ring::new().unwrap();
+        push(&mut r, 0, 6);
+        r.set_target(4);
+        assert_eq!((r.room(), r.free()), (0, 10), "nothing new is offered");
+        assert!(!r.try_resize(0, 0), "6 readable bytes exceed 4");
+        let mut sink = [0u8; 3];
+        assert_eq!(r.read(&mut sink), 3);
+        assert_eq!(r.room(), 1);
+        assert!(!r.try_resize(0, 2), "3 + 2 promised bytes exceed 4");
+        assert!(!r.try_resize(2, 0), "3 + 2 parked bytes exceed 4");
+        assert!(r.try_resize(1, 1));
+        assert_eq!((r.capacity(), r.free(), r.room()), (4, 1, 1));
+        assert_eq!(drain(&mut r), [3, 4, 5]);
+        r.set_target(8);
+        assert!(
+            !r.try_resize(5, 0),
+            "a parked span past the capacity is refused"
+        );
+        assert!(r.try_resize(4, 0));
+    }
+
+    /// The consistency check is live: it trips on each corruption it guards.
+    #[test]
+    fn debug_valid_reports_corrupt_state() {
+        let mut r: Ring<16> = Ring::new().unwrap();
+        r.shift = 5;
+        assert_eq!(r.debug_valid(), Err("ring capacity shift out of range"));
+        r.shift = 0;
+        r.len = 17;
+        assert_eq!(r.debug_valid(), Err("ring holds more than its capacity"));
+        r.len = 0;
+        r.tail = 1;
+        assert_eq!(
+            r.debug_valid(),
+            Err("ring cursors disagree with its length")
+        );
+        r.tail = 0;
+        r.debug_valid().unwrap();
+    }
+
+    #[test]
+    fn spare_storage_is_all_of_an_empty_ring_else_what_lies_past_the_capacity() {
+        let mut r: Ring<16> = Ring::new().unwrap();
+        assert_eq!(r.spare_mut(0).len(), 16);
+        r.set_target(4);
+        assert!(r.try_resize(0, 0));
+        assert_eq!(r.spare_mut(0).len(), 16, "empty");
+        assert_eq!(
+            r.spare_mut(1).len(),
+            12,
+            "parked bytes live in the capacity"
+        );
+        push(&mut r, 0, 1);
+        r.spare_mut(0).fill(0xA5);
+        push(&mut r, 1, 4);
+        assert_eq!(drain(&mut r), [0, 1, 2, 3], "spare bytes are never read");
+    }
+}
+
+/// Model-checked with Kani (`cargo kani --features std`): each harness
+/// covers every state of a ring with the given storage — any contents,
+/// cursors anywhere, any capacity and target, any arguments. The code is
+/// the same for every power of two, so small storage covers its cases.
+#[cfg(kani)]
+mod proofs {
+    use super::Ring;
+
+    /// A ring in any consistent state.
+    fn any_ring<const N: usize>() -> Ring<N> {
+        let shift: u8 = kani::any();
+        kani::assume(u32::from(shift) <= N.ilog2());
+        any_ring_of::<N>(shift)
+    }
+
+    /// A ring in any consistent state with capacity `N >> shift`.
+    fn any_ring_of<const N: usize>(shift: u8) -> Ring<N> {
+        let target_shift: u8 = kani::any();
+        kani::assume(u32::from(target_shift) <= N.ilog2());
+        let head: usize = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= N >> shift);
+        Ring {
+            buf: kani::any(),
+            head,
+            tail: head.wrapping_add(len),
+            len,
+            shift,
+            target_shift,
+        }
+    }
+
+    /// The byte `k` places past the read cursor: readable for `k < len`,
+    /// then free space, where out-of-order data is parked.
+    fn byte<const N: usize>(r: &Ring<N>, k: usize) -> u8 {
+        r.buf[r.head.wrapping_add(k) & (r.capacity() - 1)]
+    }
+
+    /// A resize keeps every live byte (readable, or parked within `keep`)
+    /// at its offset, and room for `reserve` (a window already promised);
+    /// a refused one changes nothing; with nothing live, no byte moves (a
+    /// reset resizes the send ring even while its free space is lent out).
+    /// From capacity `N >> shift`, read cursor at `at` within it, to any
+    /// target. The ring uses the read cursor only modulo its capacity (and
+    /// the write cursor only as `head + len`), so `at` covers every cursor.
+    fn resize_keeps_bytes_and_promises<const N: usize>(shift: u8, at: usize) {
+        let mut r = any_ring_of::<N>(shift);
+        r.head = at;
+        r.tail = at.wrapping_add(r.len);
+        let (keep, reserve, k): (usize, usize, usize) = (kani::any(), kani::any(), kani::any());
+        let (buf, head, tail, len, shift) = (r.buf, r.head, r.tail, r.len, r.shift);
+        let (cap, target) = (r.capacity(), r.target());
+        let live = len.saturating_add(keep);
+        let at_k = byte(&r, k);
+        if r.try_resize(keep, reserve) {
+            assert_eq!(r.capacity(), target);
+            assert_eq!(r.len, len);
+            assert!(r.debug_valid().is_ok());
+            if target != cap {
+                assert!(live <= target);
+                assert!(len.saturating_add(reserve) <= target);
+            }
+            if k < live {
+                assert_eq!(byte(&r, k), at_k);
+            }
+        } else {
+            assert!(r.buf == buf);
+            assert_eq!((r.head, r.tail, r.len, r.shift), (head, tail, len, shift));
+        }
+        if live == 0 {
+            assert!(r.buf == buf);
+        }
+    }
+
+    // One harness per starting capacity of a 16-byte ring (16 down to 1
+    // byte, so every resize between powers of two up to 16), each over every
+    // cursor position. Both concrete, `rotate_left` takes its one reachable
+    // algorithm; left symbolic, the checker unrolls all three.
+    fn resize_from<const N: usize>(shift: u8) {
+        for at in 0..N >> shift {
+            resize_keeps_bytes_and_promises::<N>(shift, at);
+        }
+    }
+
+    #[kani::proof]
+    #[kani::unwind(18)]
+    fn resize_from_16_bytes() {
+        resize_from::<16>(0);
+    }
+
+    #[kani::proof]
+    #[kani::unwind(18)]
+    fn resize_from_8_bytes() {
+        resize_from::<16>(1);
+    }
+
+    #[kani::proof]
+    #[kani::unwind(18)]
+    fn resize_from_4_bytes() {
+        resize_from::<16>(2);
+    }
+
+    #[kani::proof]
+    #[kani::unwind(18)]
+    fn resize_from_2_bytes() {
+        resize_from::<16>(3);
+    }
+
+    #[kani::proof]
+    #[kani::unwind(18)]
+    fn resize_from_1_byte() {
+        resize_from::<16>(4);
+    }
+
+    /// Received data lands only in free space, after the readable bytes,
+    /// in order, and leaves those bytes alone.
+    #[kani::proof]
+    #[kani::unwind(40)]
+    fn data_lands_only_in_free_space() {
+        let mut r = any_ring::<16>();
+        let src: [u8; 16] = kani::any();
+        let (n, j, k): (usize, usize, usize) = (kani::any(), kani::any(), kani::any());
+        kani::assume(n <= 16);
+        let (len, free) = (r.len, r.free());
+        let at_j = byte(&r, j);
+        let w = r.write(&src[..n]);
+        assert_eq!(w, n.min(free));
+        assert_eq!(r.len, len + w);
+        assert!(r.debug_valid().is_ok());
+        if j < len {
+            assert_eq!(byte(&r, j), at_j);
+        }
+        if k < w {
+            assert_eq!(byte(&r, len + k), src[k]);
+        }
+    }
+
+    /// Out-of-order data parked past the write cursor stays inside the free
+    /// space and never touches a readable byte.
+    #[kani::proof]
+    #[kani::unwind(40)]
+    fn parked_data_stays_in_free_space() {
+        let mut r = any_ring::<16>();
+        let src: [u8; 16] = kani::any();
+        let (off, n, j, k): (usize, usize, usize, usize) =
+            (kani::any(), kani::any(), kani::any(), kani::any());
+        kani::assume(n <= 16);
+        let (len, free) = (r.len, r.free());
+        let at_j = byte(&r, j);
+        let w = r.write_at(off, &src[..n]);
+        assert!(w <= free.saturating_sub(off));
+        assert_eq!(r.len, len);
+        if j < len {
+            assert_eq!(byte(&r, j), at_j);
+        }
+        if k < w {
+            assert_eq!(byte(&r, len + off + k), src[k]);
+        }
+    }
+
+    /// Space lent out by `free_regions` and filled in place (the first slice
+    /// first) becomes readable in order on `commit`, and lies inside the
+    /// free space.
+    #[kani::proof]
+    #[kani::unwind(40)]
+    fn a_loan_filled_in_place_is_committed_in_order() {
+        let mut r = any_ring::<16>();
+        let fill: [u8; 16] = kani::any();
+        let (max, k): (usize, usize) = (kani::any(), kani::any());
+        let (len, free) = (r.len, r.free());
+        let n = {
+            let (a, b) = r.free_regions(max);
+            let (na, nb) = (a.len(), b.len());
+            a.copy_from_slice(&fill[..na]);
+            b.copy_from_slice(&fill[na..na + nb]);
+            na + nb
+        };
+        assert_eq!(n, max.min(free));
+        assert_eq!(r.commit(n), n);
+        assert!(r.debug_valid().is_ok());
+        if k < n {
+            assert_eq!(byte(&r, len + k), fill[k]);
+        }
     }
 }

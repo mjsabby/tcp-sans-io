@@ -70,7 +70,13 @@ fn drain(t: &mut Tcb) -> Vec<(u32, u32, u8, usize)> {
 
 /// Established client (no timestamps/SACK, so packets are easy to script).
 fn established() -> Box<Tcb> {
+    established_with(|_| {})
+}
+
+/// [`established`], with `setup` applied before the TCB connects.
+fn established_with(setup: impl FnOnce(&mut Tcb)) -> Box<Tcb> {
     let mut t = Box::new(Tcb::new(cfg(1000)).unwrap());
+    setup(&mut t);
     t.set_now(0);
     t.connect().unwrap();
     drain(&mut t);
@@ -1017,6 +1023,345 @@ fn recovery_started_by_a_large_cumulative_ack_does_not_overshoot_prr() {
         "information-free duplicate ACK released data: {again:?}"
     );
     t.debug_validate_invariants().unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Buffer sizing (`tune.rs`)
+// ---------------------------------------------------------------------------
+
+/// Peer stream byte `i` (relative to the first data byte after the SYN).
+fn peer_byte(i: u32) -> u8 {
+    (i.wrapping_mul(2_654_435_761) >> 24) as u8
+}
+
+fn peer_data(t: &mut Tcb, off: u32, len: u32) {
+    let payload: Vec<u8> = (off..off + len).map(peer_byte).collect();
+    t.inject_packet(&peer_pkt(
+        PEER_ISS + 1 + off,
+        1001,
+        flags::ACK,
+        65535,
+        &TcpOptions::NONE,
+        &payload,
+    ))
+    .unwrap();
+}
+
+/// Read everything readable and check it continues the peer's stream at
+/// `*at`.
+fn read_peer(t: &mut Tcb, at: &mut u32) {
+    let mut buf = [0u8; 4096];
+    while let Ok(n) = t.recv(&mut buf) {
+        if n == 0 {
+            break;
+        }
+        for (k, &b) in buf[..n].iter().enumerate() {
+            assert_eq!(
+                b,
+                peer_byte(*at + k as u32),
+                "stream byte {}",
+                *at + k as u32
+            );
+        }
+        *at += n as u32;
+    }
+}
+
+/// Payload of every staged data segment, in order.
+fn drain_payload(t: &mut Tcb) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut buf = [0u8; MAX_PACKET];
+    while let Ok(n) = t.extract_packet(&mut buf) {
+        if n == 0 {
+            break;
+        }
+        out.extend_from_slice(wire::parse(&buf[..n]).unwrap().payload);
+    }
+    out
+}
+
+/// A TCB that never calls `set_buffer_limits` keeps fixed `BUF`-byte rings.
+#[test]
+fn rings_are_fixed_at_buf_by_default() {
+    let mut t = established();
+    assert_eq!(t.buffer_capacity(), (crate::BUF_CAP, crate::BUF_CAP));
+    assert_eq!(t.send(&[1; 5000]), Ok(5000));
+    assert_eq!(t.send_ring.room(), t.send_ring.free());
+    assert_eq!(t.recv_ring.room(), t.recv_ring.free());
+    t.debug_validate_invariants().unwrap();
+}
+
+#[test]
+fn buffer_limits_are_normalised_validated_and_reset_by_reinit() {
+    use crate::BUF_CAP;
+    let mut t: Box<Tcb> = Box::new(Tcb::new(cfg(1000)).unwrap());
+    assert_eq!(
+        t.set_buffer_limits(8192, 4096, 0, 0),
+        Err(TcpError::InvalidState)
+    );
+    assert_eq!(
+        t.buffer_capacity(),
+        (BUF_CAP, BUF_CAP),
+        "rejected: no change"
+    );
+    t.set_buffer_limits(0, 5000, 9000, usize::MAX).unwrap();
+    assert_eq!(
+        (t.snd_buf_min, t.snd_buf_max, t.rcv_buf_min, t.rcv_buf_max),
+        (4096, 4096, 8192, BUF_CAP)
+    );
+    assert_eq!(
+        t.buffer_capacity(),
+        (4096, super::INITIAL_RING_CAP.min(BUF_CAP)),
+        "a closed TCB moves to the initial capacities at once"
+    );
+    t.debug_validate_invariants().unwrap();
+    t.reinit(cfg(2000));
+    assert_eq!(t.buffer_capacity(), (BUF_CAP, BUF_CAP));
+    assert_eq!((t.snd_buf_min, t.rcv_buf_max), (BUF_CAP, BUF_CAP));
+    t.debug_validate_invariants().unwrap();
+}
+
+/// Lowering the receive maximum mid-connection never takes back window
+/// already advertised: the right edge of every ACK stays put until the
+/// peer has used the promised space, then the ring shrinks.
+#[test]
+fn a_receive_shrink_never_retracts_the_advertised_window() {
+    use super::seq_ge;
+    let mut t = established();
+    t.set_buffer_limits(crate::BUF_CAP, crate::BUF_CAP, 4096, 16384)
+        .unwrap();
+    assert_eq!(
+        t.buffer_capacity().1,
+        crate::BUF_CAP,
+        "65535 bytes promised"
+    );
+    let mut edge = t.rcv_adv_edge;
+    let (mut off, mut read) = (0u32, 0u32);
+    for i in 0..80u64 {
+        t.set_now(20 + i);
+        peer_data(&mut t, off, 1000);
+        off += 1000;
+        read_peer(&mut t, &mut read);
+        t.tick().unwrap();
+        let mut buf = [0u8; MAX_PACKET];
+        while let Ok(n) = t.extract_packet(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            let s = wire::parse(&buf[..n]).unwrap();
+            let right = s.ack.wrapping_add(u32::from(s.window));
+            assert!(seq_ge(right, edge), "window retracted at {i}");
+            assert!(
+                right == edge || right.wrapping_sub(s.ack) <= 16384,
+                "offered past the 16 KiB target"
+            );
+            edge = right;
+        }
+        t.debug_validate_invariants().unwrap();
+    }
+    assert_eq!(read, off, "every byte delivered");
+    assert_eq!(t.buffer_capacity().1, 16384, "the promise was used up");
+}
+
+/// Space lent by `send_reserve` never moves: a shrink waits for the commit.
+#[test]
+fn a_loan_holds_back_a_send_shrink() {
+    let mut t = established();
+    let (a, _) = t.send_reserve(3000).unwrap();
+    assert_eq!(a.len(), 3000);
+    a.fill(0x77);
+    t.set_buffer_limits(4096, 4096, crate::BUF_CAP, crate::BUF_CAP)
+        .unwrap();
+    assert_eq!(t.buffer_capacity().0, crate::BUF_CAP, "lent space moved");
+    t.debug_validate_invariants().unwrap();
+    assert_eq!(t.send_commit(3000), Ok(3000));
+    assert_eq!(t.buffer_capacity().0, 4096, "the commit let it shrink");
+    assert_eq!(
+        t.send(&[0x88; 2000]),
+        Ok(1096),
+        "only the target is offered"
+    );
+    assert_eq!(t.send_reserve(10).err(), Some(TcpError::WouldBlock), "full");
+    t.set_now(20);
+    t.tick().unwrap();
+    let mut want = std::vec![0x77u8; 3000];
+    want.extend_from_slice(&[0x88; 1096]);
+    assert_eq!(drain_payload(&mut t), want);
+    t.debug_validate_invariants().unwrap();
+}
+
+/// Out-of-order bytes parked in the receive ring survive its growth, and
+/// come out in order once the hole is filled.
+#[test]
+fn parked_out_of_order_data_survives_growth() {
+    use crate::BUF_CAP;
+    let mut t = established_with(|t| {
+        t.set_buffer_limits(BUF_CAP, BUF_CAP, 8192, 8192).unwrap();
+    });
+    assert_eq!(t.buffer_capacity().1, 8192);
+    let mut read = 0;
+    t.set_now(20);
+    peer_data(&mut t, 1000, 1000); // parked at [1000, 2000)
+    let big = 65536.min(BUF_CAP);
+    t.set_buffer_limits(BUF_CAP, BUF_CAP, big, big).unwrap();
+    assert_eq!(t.buffer_capacity().1, big, "growing is always safe");
+    peer_data(&mut t, 0, 1000);
+    read_peer(&mut t, &mut read);
+    assert_eq!(read, 2000);
+    t.debug_validate_invariants().unwrap();
+}
+
+/// A shrink applies as soon as the window promised and the parked span fit,
+/// without waiting for the hole, and the parked bytes survive the move.
+#[test]
+fn a_shrink_applies_around_parked_out_of_order_data() {
+    use crate::BUF_CAP;
+    let mut t = established_with(|t| {
+        t.set_buffer_limits(BUF_CAP, BUF_CAP, 8192, 8192).unwrap();
+    });
+    t.set_buffer_limits(BUF_CAP, BUF_CAP, 4096, 4096).unwrap();
+    assert_eq!(t.buffer_capacity().1, 8192, "8192 bytes promised");
+    t.set_now(20);
+    peer_data(&mut t, 6000, 1000); // parked at [6000, 7000)
+    for k in 0..4 {
+        peer_data(&mut t, k * 1460, 1460.min(5000 - k * 1460));
+        drain(&mut t);
+    }
+    assert_eq!(t.buffer_capacity().1, 8192, "5000 unread bytes");
+    let mut read = 0;
+    read_peer(&mut t, &mut read);
+    assert_eq!(read, 5000);
+    assert_eq!(
+        t.buffer_capacity().1,
+        4096,
+        "3192 promised + parked at +1000..+2000 fit"
+    );
+    assert!(!t.ooo.is_empty(), "data still parked");
+    t.debug_validate_invariants().unwrap();
+    peer_data(&mut t, 5000, 1000);
+    read_peer(&mut t, &mut read);
+    assert_eq!(read, 7000, "parked bytes delivered in order");
+    t.debug_validate_invariants().unwrap();
+}
+
+/// `reclaimable` lists only storage the TCB will not read: whole empty
+/// rings, ring space past the capacity, and idle egress slots — never lent
+/// space or staged packets.
+#[test]
+fn reclaimable_lists_only_storage_the_tcb_will_not_read() {
+    use crate::{BUF_CAP, MAX_PACKET};
+    let slots = crate::tx_ring::TX_RING_CAP * MAX_PACKET;
+    let mut t = established_with(|t| {
+        t.set_buffer_limits(4096, 65536, 4096, 65536).unwrap();
+    });
+    // Past the (initial) capacity: none with `small-buffers`' 32 KiB rings.
+    let past = BUF_CAP - super::INITIAL_RING_CAP.min(BUF_CAP);
+    let lens = |t: &mut Tcb| t.reclaimable().map(|s| s.len());
+    assert_eq!(lens(&mut t), [BUF_CAP, BUF_CAP, slots], "all empty");
+    assert_eq!(t.send(&[1; 100]), Ok(100));
+    assert_eq!(lens(&mut t)[0], past, "past the send capacity");
+    let _ = t.send_reserve(10).unwrap();
+    assert_eq!(lens(&mut t)[0], 0, "a loan hides the send ring");
+    assert_eq!(t.send_commit(0), Ok(0));
+    t.set_now(20);
+    t.tick().unwrap();
+    assert_eq!(lens(&mut t)[2], 0, "staged packets hide the egress slots");
+    drain(&mut t);
+    peer_data(&mut t, 3000, 500);
+    assert_eq!(lens(&mut t)[1], past, "parked data keeps the ring");
+    // Whatever the host does to those bytes, the stream is unaffected.
+    for s in t.reclaimable() {
+        s.fill(0xA5);
+    }
+    peer_data(&mut t, 0, 3000);
+    let mut read = 0;
+    read_peer(&mut t, &mut read);
+    assert_eq!(read, 3500);
+    let n = t.send_ring.len();
+    let sent: Vec<u8> = drain_payload(&mut t);
+    assert!(sent.iter().all(|&b| b == 1), "send ring bytes intact");
+    assert!(sent.len() <= n);
+    t.debug_validate_invariants().unwrap();
+}
+
+#[test]
+fn init_in_place_zeroed_matches_init_in_place() {
+    use std::alloc::{alloc_zeroed, Layout};
+    let layout = Layout::new::<Tcb>();
+    // SAFETY: zeroed storage of `Tcb`'s layout, owned by the box from here.
+    let mut a = unsafe {
+        let p = alloc_zeroed(layout).cast::<Tcb>();
+        assert!(!p.is_null());
+        Tcb::init_in_place_zeroed(p, cfg(1000)).unwrap();
+        Box::from_raw(p)
+    };
+    let mut b = Box::new(Tcb::new(cfg(1000)).unwrap());
+    for t in [&mut a, &mut b] {
+        t.set_now(5);
+        t.connect().unwrap();
+    }
+    let mut pa = [0u8; MAX_PACKET];
+    let mut pb = [0u8; MAX_PACKET];
+    let na = a.extract_packet(&mut pa).unwrap();
+    let nb = b.extract_packet(&mut pb).unwrap();
+    assert_eq!(&pa[..na], &pb[..nb]);
+    assert_eq!(a.stats(), b.stats());
+    a.debug_validate_invariants().unwrap();
+}
+
+/// The buffer invariants `debug_validate_invariants` checks are live: each
+/// one trips on the state it guards against.
+#[test]
+fn buffer_invariants_catch_what_they_guard_against() {
+    let fresh = || {
+        established_with(|t| {
+            t.set_buffer_limits(4096, 65536, 4096, 65536).unwrap();
+        })
+    };
+    let mut t = fresh();
+    t.debug_validate_invariants().unwrap();
+    t.snd_buf_min = 3000;
+    assert_eq!(
+        t.debug_validate_invariants(),
+        Err("buffer limits out of range")
+    );
+    let mut t = fresh();
+    t.recv_ring.set_target(2048);
+    assert_eq!(
+        t.debug_validate_invariants(),
+        Err("ring target outside its limits")
+    );
+    let mut t = fresh();
+    t.rcv_adv_edge = t.rcv_nxt.wrapping_add(70_000);
+    assert_eq!(
+        t.debug_validate_invariants(),
+        Err("advertised window exceeds the receive buffer")
+    );
+    let mut t = fresh();
+    let _ = t.send_reserve(1000).unwrap();
+    t.send_lent = 100_000;
+    assert_eq!(
+        t.debug_validate_invariants(),
+        Err("lent send space exceeds the free space")
+    );
+}
+
+/// Ring storage must be a power of two, whichever way the TCB is built.
+#[test]
+fn a_ring_size_that_is_not_a_power_of_two_is_refused() {
+    use std::alloc::{alloc_zeroed, dealloc, Layout};
+    assert!(matches!(Tcb::<3>::new(cfg(1)), Err(TcpError::Overflow)));
+    let layout = Layout::new::<Tcb<3>>();
+    // SAFETY: zeroed storage of `Tcb<3>`'s layout; refused, so never a TCB.
+    unsafe {
+        let p = alloc_zeroed(layout).cast::<Tcb<3>>();
+        assert!(!p.is_null());
+        assert_eq!(
+            Tcb::init_in_place_zeroed(p, cfg(1)),
+            Err(TcpError::Overflow)
+        );
+        dealloc(p.cast(), layout);
+    }
 }
 
 /// Every byte up to the right edge the TCB advertised fits in its receive

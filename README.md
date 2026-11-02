@@ -91,8 +91,8 @@ shows what that costs against Linux CUBIC on lossy long paths.
 
 ### Memory footprint
 
-Per connection, `tcp_handle_size()` is **2,176,896 bytes (≈ 2.08 MiB)** with
-default features, or **139,520 bytes (136 KiB)** with `small-buffers`:
+Per connection, `tcp_handle_size()` is **2,177,016 bytes (≈ 2.08 MiB)** with
+default features, or **139,640 bytes (136 KiB)** with `small-buffers`:
 
 - `BUF_CAP` send ring + receive ring (2 × 1 MiB; 2 × 32 KiB with
   `small-buffers`). Out-of-order data is parked inside the receive ring at
@@ -114,6 +114,48 @@ need under 32 KiB of the calling thread's stack. `Tcb::new` returns the
 whole TCB by value, so pure-Rust callers should box it (or use
 `init_in_place`); the repository's `.cargo/config.toml` raises
 `RUST_MIN_STACK` for tests that keep TCBs on the stack.
+
+### Elastic buffers
+
+`tcp_set_buffer_limits` (`Tcb::set_buffer_limits`) bounds each ring's
+*capacity* — a power of two between 4 KiB and `BUF_CAP` — inside its fixed
+`BUF_CAP` storage. The stack only ever touches the first `capacity` bytes of a
+ring, so on lazily backed memory a connection pays for the capacity it uses:
+
+- **Equal bounds pin a ring.** The default pins both at `BUF_CAP`: a host that
+  never calls it keeps today's fixed rings, byte for byte.
+- **Distinct bounds autotune it.** Each connection starts at 64 KiB. A ring
+  grows at once to the next power of two when a round trip needs more —
+  receive: twice what was both received and read per RTT, plus Linux-style
+  headroom while that rate is growing (dynamic right-sizing); send: twice the
+  usable window while the application finds the ring full — and shrinks to
+  the largest recent need at most once per epoch (8 RTTs, at least 1 s).
+- **A shrink never breaks a promise.** The receive ring keeps room for the
+  window already advertised (RFC 9293 never retracts it) and for data parked
+  out of order; until it fits, no new window is offered past the target. The
+  send ring keeps its data and never moves while `send_reserve` space is lent.
+  Window scale is negotiated for `BUF_CAP`, so a ring can always grow back.
+
+For memory to follow capacity, back each handle with untouched zero pages
+(anonymous `mmap`, or `calloc` of a large block) and initialise it with
+`tcp_init_zeroed` (`Tcb::init_in_place_zeroed`) — `tcp_init` zero-fills, which
+touches every page. `tcp_reclaimable` (`Tcb::reclaimable`) lists storage the
+stack will not read before writing it again (ring space past each capacity, a
+whole empty ring, idle egress slots); `madvise(MADV_DONTNEED)` its whole pages
+to hand them back, for example once a connection has been idle a while.
+
+The conformance harness measures each handle with `mincore` (Linux; 256 KiB
+each way under loss, duplication and reordering):
+
+| Handle | Resident while transferring | After close |
+|---|---|---|
+| `tcp_init`, fixed rings | 2128 KiB | 2128 KiB |
+| `tcp_init_zeroed` on `mmap`, autotuned 4 KiB – 1 MiB | 164 – 176 KiB | 24 – 28 KiB (spans released) |
+
+In the link simulation (`src/sim_tests.rs`), autotuned rings match fixed
+megabyte rings on a 100 Mbit/s × 80 ms path (10.39 MB/s both, growing to
+1 MiB), settle at 512 KiB send / 256 KiB receive on 50 Mbit/s × 20 ms, and
+shrink to 4 – 8 KiB behind a slow reader.
 
 ## Connection state machine
 
@@ -140,7 +182,8 @@ SVG from [`docs/state-machine.dot`](docs/state-machine.dot).
 ## Extents and bounds
 
 Every data structure in the stack is fixed-capacity — there is no
-allocator and nothing grows with peer behaviour. The table lists each
+allocator and nothing grows with peer behaviour (ring capacities move only
+within their fixed storage, see *Elastic buffers*). The table lists each
 bound, where it lives, and what it caps. **The central invariant is that
 every one of these is a *performance* knob, not a *correctness* knob**
 (see "Why the bounds are sound" below): exceeding a capacity always
@@ -149,7 +192,8 @@ mis-ordering, corruption, a panic, or an unbounded loop.
 
 | Bound | Value | Where | What it limits |
 |---|---|---|---|
-| `BUF_CAP` | 1 MiB (32 KiB w/ `small-buffers`) | `lib.rs` | Send + receive ring capacity: the receive window, out-of-order storage and the in-flight ceiling per RTT. Power of two; the window-scale shift derives from it (5 at 1 MiB). |
+| `BUF_CAP` | 1 MiB (32 KiB w/ `small-buffers`) | `lib.rs` | Send + receive ring storage, and their largest capacity: the receive window, out-of-order storage and the in-flight ceiling per RTT. Power of two; the window-scale shift derives from it (5 at 1 MiB). |
+| Ring capacity limits | `BUF_CAP` (default) / `MIN_RING_CAP` 4 KiB – `BUF_CAP` | `tcb/tune.rs` | `set_buffer_limits` bounds; autotuned rings start at `INITIAL_RING_CAP` (64 KiB) and shrink at most once per epoch (8 RTTs, ≥ 1 s). |
 | `MSS` / `MAX_PACKET` | 1460 / 1500 B | `lib.rs` | Largest payload / datagram. `tcp_set_mtu` lowers both (576–1500). |
 | `OOO_MAX_RANGES` | 512 (32 w/ `small-buffers`) | `ooo.rs` | Disjoint out-of-order ranges held in the receive ring: one per two full segments of buffer, enough for a full window with every other segment lost. |
 | `RTX_QUEUE_CAP` | 1024 | `rtx_queue.rs` | Segments in flight. When full, new data waits for ACKs; nothing is evicted, so every in-flight segment keeps SACK/RACK coverage. |
@@ -625,7 +669,8 @@ free(mem);                             // you own the memory
   then `tcp_destroy` + free.
 - **Bound the number of concurrent TCBs** and refuse/evict past that budget.
   Each TCB is independent and costs `tcp_handle_size()` (~2.08 MiB default,
-  136 KiB under `small-buffers`) — including for the 60–120 s it spends in
+  136 KiB under `small-buffers`; resident memory far less with *Elastic
+  buffers*) — including for the 60–120 s it spends in
   `TIME_WAIT`; the per-connection reapers (R2 / USER TIMEOUT / keepalive /
   FIN_WAIT_2, all on by default) bound how long a stalled or vanished peer
   holds a connection, never the aggregate *count* — only the host can do
@@ -786,10 +831,10 @@ proof.
 
 | Layer | What it covers | Files |
 |---|---|---|
-| **Property tests** | Wire codec round-trips; checksum integrity; serial-arithmetic; out-of-order reassembly vs a model | `src/property_tests.rs` (proptest, 4096 cases each) |
+| **Property tests** | Wire codec round-trips; checksum integrity; serial-arithmetic; out-of-order reassembly vs a model; resizable ring (any mix of I/O, parking, retargets and resizes) vs a model | `src/property_tests.rs` (proptest, 4096 cases each) |
 | **Security regressions** | One test per finding of the public-deployment review: blind injection, RFC 5961 challenge/rate limits, forged zero window, PAWS, timestamp poisoning by a rejected ACK, ACK storms, old-data reflection, listener RSTs, SYN-SENT RST, simultaneous open, half-open replacement, cookie options, keyed timestamps, FIN_WAIT_2, slow-reader / zero-window stalls, no SACKed retransmits, ECE handling, no sequence rewinds, full-window out-of-order, D-SACK (reported and believed), forged TSecr, reply gating for unacceptable segments, MTU / PMTU / black-hole, FFI stack use, NULL / zero-length / misaligned FFI arguments. Second review: TS.Recent only after ACK validation, CE on a CWR segment, FIN after the peer's FIN, zero-window probe ACKs, out-of-order data beyond a FIN, FIN_WAIT_2 trickle and TIME_WAIT pinning, keyed listener ISNs, hybrid cookies (option preservation, spoofed-SYN lockout, rotation), black-hole probing | `src/security_tests.rs` |
-| **Link simulation** | Two real TCBs over a seeded discrete-event link (bottleneck queue, delay, loss, reordering, ACK loss, burst and tail loss, slow reader, chaos with sequence wrap). Asserts retransmissions equal drops, goodput vs the Mathis bound, TLP before RTO, clean closes, and that `next_deadline()` never leaves a host spinning | `src/sim_tests.rs` |
-| **TCB internals** | R2 / SYN retry limits, keepalive, USER TIMEOUT, lost FIN, TIME_WAIT restart (and no restart by a forged FIN), FIN edge cases (FIN after FIN, out-of-order FIN consumed with one ACK and processed in SEG.SEQ order, ACK carried by a retransmitted FIN), unread data across the final close, byte-exact data after SND.UNA laps back to ISS (4 GiB; release builds), in-place init, liveness oracles, deadline reporting | `src/tcb/tests.rs` |
+| **Link simulation** | Two real TCBs over a seeded discrete-event link (bottleneck queue, delay, loss, reordering, ACK loss, burst and tail loss, slow reader, chaos with sequence wrap). Asserts retransmissions equal drops, goodput vs the Mathis bound, TLP before RTO, clean closes, and that `next_deadline()` never leaves a host spinning. Autotuned buffers: goodput equal to fixed rings, steady-state and slow-reader sizes, and random limit changes with every reclaimable byte overwritten at every step | `src/sim_tests.rs` |
+| **TCB internals** | R2 / SYN retry limits, keepalive, USER TIMEOUT, lost FIN, TIME_WAIT restart (and no restart by a forged FIN), FIN edge cases (FIN after FIN, out-of-order FIN consumed with one ACK and processed in SEG.SEQ order, ACK carried by a retransmitted FIN), unread data across the final close, byte-exact data after SND.UNA laps back to ISS (4 GiB; release builds), in-place init, liveness oracles, deadline reporting; buffer limits (a shrink never retracts the advertised window, waits for a `send_reserve` loan, keeps parked out-of-order data), `reclaimable` | `src/tcb/tests.rs` |
 | **C ABI ownership** | `tcp_destroy` releases the `heap-buffers` rings (counting allocator, own binary): `cargo test --release --features std,heap-buffers --test ffi_heap_buffers` | `tests/ffi_heap_buffers.rs` |
 | **Conformance tests** | Exact wire bytes per spec scenario | `src/conformance_tests.rs` |
 | **Loopback tests** | End-to-end behavioral tests via in-memory peer | `src/loopback_tests.rs` |
@@ -797,7 +842,8 @@ proof.
 | **gVisor interop** | Against Google's reference netstack | `bindings/gvisor/*_test.go` |
 | **smoltcp interop** | Against smoltcp (the dominant no_std Rust TCP stack, used in embedded). In-memory channel between two userspace stacks — completely independent codebases negotiating options + sequencing data. | `src/smoltcp_interop_tests.rs` |
 | **Real Linux TUN** | Against the Linux kernel TCP stack via TUN | `bindings/gvisor/tun_test.go` |
-| **Fuzzing** | Codec and full-TCB sessions under libFuzzer with invariant, no-burst and liveness oracles | `fuzz/fuzz_targets/` |
+| **Fuzzing** | Codec, resizable ring and full-TCB sessions under libFuzzer with invariant, no-burst and liveness oracles; buffer limits, `send_reserve` loans and overwritten reclaimable storage in every TCB target | `fuzz/fuzz_targets/` |
+| **Model checking** | Kani proofs: the advertised receive window never offers space the ring lacks, for every input and window scale; ring resizes keep every live byte and the promised room; received and parked data stay in free space; a filled loan commits in order | `src/tcb/output.rs`, `src/ring.rs` (`cargo kani --features std`) |
 | **Same-path benchmark** | tcp-sans-io vs Linux Reno / CUBIC through one netem-shaped router to the same kernel peer, both directions, retransmissions vs router drops | `bindings/netem/bench.sh` |
 | **packetdrill-DSL runner** | Per-packet conformance scripts in packetdrill syntax | `bindings/packetdrill/*.go` + `scripts/*.pkt` |
 | **eBPF uprobe observability** | bpftrace uprobes on the cdylib's FFI entry points (counts + latency histograms) | `bindings/bpf/` |
@@ -865,17 +911,55 @@ catching accidental `#[no_mangle]` removals. See
 
 ### Coverage-guided fuzzing (`fuzz/`)
 
-Six `cargo-fuzz` targets: `wire_parse` and `wire_parse_emit_roundtrip`
-(the codec), `tcb_inject_sequence` (arbitrary datagram streams into one
-TCB), `tcb_client_session` (a scripted peer with state-transition,
-sequence-monotonicity, no-burst and liveness oracles) and `tcb_loopback` /
-`tcb_loopback_small` (two TCBs over a fuzzer-controlled channel). Each ran
-10 minutes clean on this code (≈ 300 M executions for the codec targets,
-0.1–1.3 M for the TCB targets):
+Nine `cargo-fuzz` targets: `wire_parse` and `wire_parse_emit_roundtrip`
+(the codec), `ring_model` (the resizable ring against a model),
+`tcb_inject_sequence` (arbitrary datagram streams into one TCB),
+`tcb_hostile_peer` and `tcb_adversary` (structured hostile peers against a
+listener / an established connection), `tcb_client_session` (a scripted peer
+with state-transition, sequence-monotonicity, no-burst and liveness oracles)
+and `tcb_loopback` / `tcb_loopback_small` (two TCBs over a fuzzer-controlled
+channel). The TCB targets also drive buffer limits, `send_reserve` loans and
+overwritten reclaimable storage (see `fuzz/README.md`). Each ran 10 minutes
+clean on this code (≈ 300 M executions for the codec targets, 4 M for
+`ring_model`, 0.09–2 M for the TCB targets), and their corpora reach every
+line of `ring.rs` and `tcb/tune.rs` but invariant-violation returns,
+allocation failures and unreachable slice-bounds branches:
 
 ```sh
 cargo +nightly fuzz run tcb_client_session -- -max_total_time=600 -timeout=60
 ```
+
+### Model checking (Kani)
+
+`cargo kani --features std` (Linux or macOS, [Kani](https://model-checking.github.io/kani/))
+proves, rather than samples, the properties behind "every advertised window
+byte is backed by receive space":
+
+- **Advertising** (`src/tcb/output.rs`), for every 32-bit input and window
+  scale:
+  - the window offered fits in the ring's free space;
+  - a ring without room for one unit offers zero;
+  - the edge already advertised retracts by less than one unit;
+  - nothing that fits is held back.
+- **Receiving and resizing** (`src/ring.rs`), for every state of a 16-byte
+  ring (any contents, cursors, capacity, target and arguments):
+  - received data lands only in free space, after the readable bytes;
+  - parked out-of-order data never touches a readable byte;
+  - a resize keeps every readable or parked byte at its offset, and room for
+    the promised window;
+  - a refused resize changes nothing, and with nothing live no byte moves;
+  - a `send_reserve` loan filled in place commits in order.
+
+Together these make "advertised bytes ≤ free space" an inductive invariant:
+- the right edge only moves right, to `RCV.NXT` plus a window that fits;
+- data is taken only into free space, advancing `RCV.NXT` by as much;
+- reads only add free space;
+- a shrink keeps the promise.
+
+`debug_validate_invariants` checks the composed invariant after every step of
+every test and fuzz target. The 13 harnesses take about 40 s with `-j 13`.
+Planting #17's rounding bug, a resize that ignores the promise, or a shrink
+that drops parked bytes each makes the proofs fail.
 
 ### Other canonical suites not (yet) integrated
 
@@ -892,7 +976,7 @@ src/
 ├── error.rs             # TcpError + FFI error codes
 ├── state.rs             # RFC 9293 state machine enum
 ├── wire.rs              # IPv4 + TCP codec (parse/emit, options, checksums)
-├── ring.rs              # Fixed-capacity byte ring (+ positional writes for out-of-order data)
+├── ring.rs              # Byte ring with a resizable capacity (+ positional writes for out-of-order data)
 ├── ooo.rs               # Out-of-order range tracker (SACK block generation)
 ├── rtx_queue.rs         # Per-segment retransmission queue / SACK scoreboard / pipe
 ├── rack.rs              # RACK-TLP loss detection (RFC 8985), windowed min RTT
@@ -905,6 +989,7 @@ src/
 │   ├── output.rs        # Transmission, SWS avoidance, options, windows, emitters
 │   ├── timers.rs        # tick(): TLP, RTO, RACK, persist, keepalive, user timeout, ...
 │   ├── cookie.rs        # SYN cookies, keyed ISN / timestamp offsets, SipHash-2-4
+│   ├── tune.rs          # Buffer limits, autotuning, reclaimable storage
 │   └── tests.rs         # TCB-internal timer / lifecycle tests
 ├── ffi.rs               # Stable C ABI
 ├── selftest.rs          # tcp_selftest(): in-process two-stack conformance check

@@ -277,6 +277,24 @@ struct Sim {
     f_ab: Flow,
     f_ba: Flow,
     start_us: u64,
+    /// Overwrite each TCB's reclaimable storage at every step.
+    poison: bool,
+    /// Change buffer limits at random moments.
+    limit_chaos: Option<Rng>,
+    /// Largest (send, receive) capacity each TCB reached.
+    peak: [(usize, usize); 2],
+}
+
+/// Buffer limits `(snd_min, snd_max, rcv_min, rcv_max)`.
+type Limits = (usize, usize, usize, usize);
+
+/// Overwrite (the front of) every span the TCB will not read before writing
+/// it again; the byte-exact flows catch any span that was still live.
+fn poison(t: &mut Tcb) {
+    for s in t.reclaimable() {
+        let n = s.len().min(256 * 1024);
+        s[..n].fill(0xA5);
+    }
 }
 
 fn drain_into(t: &mut Tcb, link: &mut Link, now_us: u64) {
@@ -309,7 +327,23 @@ impl Sim {
         ba_bytes: usize,
         iss: (u32, u32),
     ) -> Self {
-        let a = boxed_tcb(TcbConfig {
+        Self::build(fwd, rev, seed, (ab_bytes, ba_bytes), iss, None)
+    }
+
+    /// `new`, with buffer limits set on both TCBs before they open.
+    fn tuned(fwd: LinkCfg, rev: LinkCfg, seed: u64, bytes: (usize, usize), l: Limits) -> Self {
+        Self::build(fwd, rev, seed, bytes, (0x1234_5678, 0x8765_4321), Some(l))
+    }
+
+    fn build(
+        fwd: LinkCfg,
+        rev: LinkCfg,
+        seed: u64,
+        (ab_bytes, ba_bytes): (usize, usize),
+        iss: (u32, u32),
+        limits: Option<Limits>,
+    ) -> Self {
+        let mut a = boxed_tcb(TcbConfig {
             local: Endpoint {
                 ip: A_IP,
                 port: 40_000,
@@ -327,6 +361,10 @@ impl Sim {
             iss: iss.1,
             initial_rto_ms: 1000,
         });
+        if let Some((s0, s1, r0, r1)) = limits {
+            a.set_buffer_limits(s0, s1, r0, r1).unwrap();
+            b.set_buffer_limits(s0, s1, r0, r1).unwrap();
+        }
         b.set_now(0);
         b.set_secret(&[0x42; 16]);
         b.listen().unwrap();
@@ -339,6 +377,9 @@ impl Sim {
             f_ab: Flow::new(0x00, ab_bytes),
             f_ba: Flow::new(0x5A, ba_bytes),
             start_us: 0,
+            poison: false,
+            limit_chaos: None,
+            peak: [(0, 0); 2],
         };
         s.a.set_now(0);
         s.a.connect().unwrap();
@@ -348,7 +389,10 @@ impl Sim {
 
     fn tick_all(&mut self) {
         let ms = self.now_us / 1000;
-        for (t, link) in [(&mut self.a, &mut self.ab), (&mut self.b, &mut self.ba)] {
+        for (i, (t, link)) in [(&mut self.a, &mut self.ab), (&mut self.b, &mut self.ba)]
+            .into_iter()
+            .enumerate()
+        {
             t.set_now(ms);
             t.tick().unwrap();
             drain_into(t, link, self.now_us);
@@ -358,6 +402,11 @@ impl Sim {
                     d > ms,
                     "armed deadline {d} not in the future after tick at {ms}"
                 );
+            }
+            let (snd, rcv) = t.buffer_capacity();
+            self.peak[i] = (self.peak[i].0.max(snd), self.peak[i].1.max(rcv));
+            if self.poison {
+                poison(t);
             }
         }
     }
@@ -383,6 +432,26 @@ impl Sim {
     fn app(&mut self) {
         if self.a.state() == State::Established && self.start_us == 0 {
             self.start_us = self.now_us;
+        }
+        if let Some(rng) = self.limit_chaos.as_mut() {
+            if rng.chance_ppm(2000) {
+                const BUF: usize = crate::BUF_CAP;
+                const CHOICES: [Limits; 6] = [
+                    (4096, 4096, 4096, 4096),
+                    (4096, BUF, 4096, BUF),
+                    (8192, 65536, 8192, 65536),
+                    (BUF, BUF, BUF, BUF),
+                    (65536, 262_144, 4096, 16384),
+                    (4096, 16384, 65536, 262_144),
+                ];
+                let (s0, s1, r0, r1) = CHOICES[(rng.next() % 6) as usize];
+                let t = if rng.next() & 1 == 0 {
+                    &mut self.a
+                } else {
+                    &mut self.b
+                };
+                t.set_buffer_limits(s0, s1, r0, r1).unwrap();
+            }
         }
         self.f_ab.pump_send(&mut self.a);
         self.f_ba.pump_send(&mut self.b);
@@ -464,6 +533,17 @@ impl Sim {
             fwd: self.ab.stats,
             rev: self.ba.stats,
         }
+    }
+
+    /// Stay idle for `ms`, then trade one small message each way.
+    fn ping_after(&mut self, ms: u64) {
+        self.now_us += ms * 1000;
+        self.f_ab = Flow::new(0x61, 1000);
+        self.f_ba = Flow::new(0x62, 1000);
+        let limit = self.now_us + 10_000_000;
+        assert!(self.run(limit, |s| {
+            s.f_ab.done_us.is_some() && s.f_ba.done_us.is_some()
+        }));
     }
 
     /// Both sides close; the four-way handshake must finish under the same
@@ -697,6 +777,102 @@ fn chaos_seeds_complete_with_integrity() {
         let o = s.run_transfer(900_000_000);
         o.report(&std::format!("chaos seed {seed}"), 1280 * 1024);
         assert!(o.a.rto_count + o.b.rto_count <= 6, "RTO-driven recovery");
+        s.close_both();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Autotuned buffers (`set_buffer_limits`)
+// ---------------------------------------------------------------------------
+
+const TUNED: Limits = (4096, crate::BUF_CAP, 4096, crate::BUF_CAP);
+
+/// From 64 KiB rings, autotuning fills the bottleneck as well as fixed
+/// megabyte rings do, and in steady state the rings stay near what the path
+/// holds (BDP 125 KB plus a 96 KB queue) — slow start may briefly overshoot.
+#[test]
+#[cfg(not(feature = "small-buffers"))] // sized for megabyte rings
+fn autotuned_rings_fill_the_bottleneck_near_the_bdp() {
+    let fwd = LinkCfg::new(10, 50, 64);
+    let rev = LinkCfg::new(10, 50, 64);
+    let bytes = 16 * MIB;
+    let mut s = Sim::tuned(fwd, rev, 1, (bytes, 0), TUNED);
+    let o = s.run_transfer(60_000_000);
+    o.report("autotuned clean 50Mbit/20ms q64", bytes);
+    let end = (s.a.buffer_capacity(), s.b.buffer_capacity());
+    println!(
+        "peak capacities: A {:?} B {:?}; at the end A {:?} B {:?}",
+        s.peak[0], s.peak[1], end.0, end.1
+    );
+    let line = 50e6 / 8.0 * SMSS / 1500.0;
+    assert!(o.goodput(bytes) >= 0.85 * line, "underfilled link");
+    assert_eq!(o.a.rto_count, 0);
+    o.assert_no_spurious_storm(2);
+    assert!(end.0 .0 <= 512 * 1024, "sender ring {:?}", end.0);
+    assert!(end.1 .1 <= 512 * 1024, "receiver ring {:?}", end.1);
+    assert_eq!(s.peak[1].0, crate::INITIAL_RING_CAP, "B never sends");
+    s.close_both();
+}
+
+/// On a long fat pipe the rings grow to the full window, and goodput stays
+/// that of fixed megabyte rings.
+#[test]
+#[cfg(not(feature = "small-buffers"))] // sized for megabyte rings
+fn autotuned_rings_grow_to_a_long_fat_pipe() {
+    let link = LinkCfg::new(40, 100, 1000);
+    let bytes = 32 * MIB;
+    let fixed = Sim::new(link, link, 7, bytes, 0).run_transfer(120_000_000);
+    fixed.report("fixed 100Mbit/80ms", bytes);
+    let mut s = Sim::tuned(link, link, 7, (bytes, 0), TUNED);
+    let tuned = s.run_transfer(120_000_000);
+    tuned.report("autotuned 100Mbit/80ms", bytes);
+    println!("peak capacities: A {:?} B {:?}", s.peak[0], s.peak[1]);
+    assert!(tuned.goodput(bytes) >= 0.9 * fixed.goodput(bytes));
+    assert_eq!(s.peak[0].0, crate::BUF_CAP, "sender grew to the window");
+    assert_eq!(s.peak[1].1, crate::BUF_CAP, "receiver grew to the window");
+}
+
+/// After a bulk phase, a slow reader shrinks both ends' rings back down: the
+/// sender's as its usable window collapses, the receiver's once the peer has
+/// used up the window it had been promised.
+#[test]
+#[cfg(not(feature = "small-buffers"))] // sized for megabyte rings
+fn autotuned_rings_shrink_when_the_reader_slows_down() {
+    let link = LinkCfg::new(10, 50, 64);
+    let mut s = Sim::tuned(link, link, 2, (4 * MIB, 0), TUNED);
+    s.run_transfer(60_000_000);
+    let grown = (s.a.buffer_capacity().0, s.b.buffer_capacity().1);
+    assert!(grown.0 >= 256 * 1024 && grown.1 >= 256 * 1024, "{grown:?}");
+    // More than the receiver's outstanding promise, read at 100 KB/s.
+    s.f_ab = Flow::new(0x33, 1536 * 1024);
+    s.f_ab.read_rate = Some(100);
+    s.f_ab.last_read_ms = s.now_us / 1000;
+    let limit = s.now_us + 60_000_000;
+    assert!(
+        s.run(limit, |s| s.f_ab.done_us.is_some()),
+        "slow phase stalled"
+    );
+    // Shrinks are decided once per epoch: let one pass, then talk again.
+    s.ping_after(2000);
+    let small = (s.a.buffer_capacity().0, s.b.buffer_capacity().1);
+    println!("grown {grown:?} -> slow reader {small:?}");
+    assert!(small.0 <= 16 * 1024, "sender ring {small:?}");
+    assert!(small.1 <= 16 * 1024, "receiver ring {small:?}");
+    s.close_both();
+}
+
+/// Loss, reordering, random limit changes in both TCBs at any moment, and
+/// every reclaimable byte overwritten at every step: the streams stay byte
+/// exact (the flows check every byte) and the invariants hold.
+#[test]
+fn reclaimed_storage_and_limit_changes_never_corrupt_the_stream() {
+    for seed in 0..6u64 {
+        let link = LinkCfg::new(5, 20, 32).loss(10_000).reorder(20_000, 3);
+        let mut s = Sim::tuned(link, link, 300 + seed, (MIB, 512 * 1024), TUNED);
+        s.poison = true;
+        s.limit_chaos = Some(Rng(seed + 1));
+        let o = s.run_transfer(900_000_000);
+        o.report(&std::format!("limit chaos seed {seed}"), 1536 * 1024);
         s.close_both();
     }
 }
