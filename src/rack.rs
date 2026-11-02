@@ -292,14 +292,17 @@ impl Rack {
         self.reo_wnd_persist = self.reo_wnd_persist.saturating_add(1).min(16);
     }
 
-    /// Step 4: the reordering window in ms.
+    /// Step 4: the reordering window in ms: `min_RTT/4` per D-SACK step,
+    /// capped at SRTT (Linux `tcp_rack_reo_wnd`). Multiplied before the
+    /// division, as whole milliseconds would make `min_RTT/4` 0 below 4 ms
+    /// and leave D-SACKs nothing to widen.
     pub fn reo_wnd(&self, srtt: u32, in_recovery: bool, sacked_bytes: u32, mss: u32) -> u32 {
         if !self.reordering_seen && (in_recovery || sacked_bytes >= DUP_THRESH.saturating_mul(mss))
         {
             return 0;
         }
-        let base = self.min_rtt.get().unwrap_or(srtt) / 4;
-        base.saturating_mul(self.reo_wnd_extra + 1)
+        let min_rtt = self.min_rtt.get().unwrap_or(srtt);
+        (min_rtt.saturating_mul(self.reo_wnd_extra + 1) / 4)
             .max(REO_WND_MIN_MS)
             .min(srtt.max(REO_WND_MIN_MS))
     }
@@ -310,11 +313,12 @@ impl Rack {
 /// whether anything was newly marked and, if some candidates are still
 /// inside the reordering window, the delay (ms) after which to re-run.
 /// When `RACK.segment` is a retransmission a late original's ACK could
-/// explain, never-retransmitted data above it was first sent after that
-/// original, and it waits at least the reordering floor: a late original
-/// ACKed across a tick used to condemn a whole window in flight. A
-/// retransmission sent before it is judged as usual, so a lost one is
-/// still resent at once.
+/// explain, what may have been sent after that original — never-
+/// retransmitted data above it, and any retransmission — waits at least
+/// the reordering floor: a late original ACKed across a tick used to
+/// condemn a whole window in flight, and one SACKed behind the peer's data
+/// in a two-way transfer the resends sent just before its own. A lost one
+/// is resent when the floor has passed, by the reordering timer.
 pub fn detect_loss(rack: &Rack, q: &mut RtxQueue, now: u64, reo_wnd: u32) -> (bool, Option<u64>) {
     if !rack.valid {
         return (false, None);
@@ -349,7 +353,7 @@ pub fn detect_loss(rack: &Rack, q: &mut RtxQueue, now: u64, reo_wnd: u32) -> (bo
             continue;
         }
         let after_original =
-            rack.ambiguous && !s.has(seg_flags::EVER_RETRANS) && seq_ge(s.start, rack.end_seq);
+            rack.ambiguous && (s.has(seg_flags::EVER_RETRANS) || seq_ge(s.start, rack.end_seq));
         let deadline = s
             .xmit_ts
             .saturating_add(if after_original { floor_thresh } else { thresh });
@@ -502,6 +506,36 @@ mod tests {
         assert!(q.get(1).unwrap().has(LOST));
     }
 
+    /// Two resends leave in one tick; the second's late original is SACKed
+    /// (behind the peer's data in a two-way transfer) and credited to that
+    /// resend, within the tick of its leaving: ambiguous. The first resend
+    /// may have been sent after that original, so it waits out the floor
+    /// rather than being condemned at once.
+    #[test]
+    fn ambiguous_resend_does_not_condemn_an_earlier_resend_of_its_tick() {
+        let mut q = queue(&[100, 100, 100, 100]);
+        let mut r = Rack::new();
+        r.sample_rtt(101, 1);
+        for i in [1, 3] {
+            let s = *q.get(i).unwrap();
+            q.sack(s.start, s.end, |_| ());
+            r.on_delivered(&s, 101, None, true);
+        }
+        q.mark_lost(0);
+        q.mark_lost(2);
+        q.on_retransmit(0, 102);
+        q.on_retransmit(2, 102);
+        let s2 = *q.get(2).unwrap();
+        q.sack(s2.start, s2.end, |_| ());
+        r.on_delivered(&s2, 102, None, true);
+        assert!(r.valid && r.ambiguous);
+        let (m, t) = detect_loss(&r, &mut q, 102, 0);
+        assert!(!m, "a resend condemned by an ambiguous delivery");
+        assert_eq!(t, Some(2));
+        let (m, _) = detect_loss(&r, &mut q, 104, 0);
+        assert!(m && q.get(0).unwrap().has(LOST));
+    }
+
     #[test]
     fn dsack_grows_reordering_window() {
         let mut r = Rack::new();
@@ -515,6 +549,18 @@ mod tests {
         );
         r.on_dsack(1000, 6000); // same round: no further growth
         assert_eq!(r.reo_wnd(100, true, 0, 1000), 20);
+    }
+
+    /// Below a 4 ms minimum RTT, D-SACKs still widen the window (up to
+    /// SRTT): `min_RTT/4` in whole milliseconds is 0 at every step.
+    #[test]
+    fn dsacks_widen_the_window_below_a_4_ms_min_rtt() {
+        let mut r = Rack::new();
+        r.sample_rtt(1000, 1);
+        for i in 0..12u32 {
+            r.on_dsack(1000 + i * 2000, 2000 + i * 2000);
+        }
+        assert_eq!(r.reo_wnd(5, true, 10 * 1448, 1448), 3);
     }
 
     #[test]

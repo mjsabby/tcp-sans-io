@@ -241,6 +241,11 @@ fn build_in_full_ws(
 /// Drive the standard 3-way handshake using Timestamps. Returns the peer's
 /// own TSval echoed by us (i.e. what we'll see as `tsecr` on data).
 fn handshake_with_ts(tcb: &mut Tcb, now: &mut u64) -> u32 {
+    handshake_with_ts_sack(tcb, now, true)
+}
+
+/// As [`handshake_with_ts`], with SACK negotiated or not.
+fn handshake_with_ts_sack(tcb: &mut Tcb, now: &mut u64, sack_permitted: bool) -> u32 {
     tcb.set_now(*now);
     tcb.connect().expect("connect");
 
@@ -261,9 +266,8 @@ fn handshake_with_ts(tcb: &mut Tcb, now: &mut u64) -> u32 {
     assert_eq!(syn.mss, Some(1460), "SYN must carry MSS=1460");
     let (cli_tsval, _) = syn.ts.expect("SYN must offer Timestamps");
 
-    // SYN-ACK with peer TS=42 and SACK_PERMITTED echoed back (we always
-    // offer SACK in our SYN; honouring it lets the SACK-driven fast-
-    // retransmit path reach test code).
+    // SYN-ACK with peer TS=42, echoing SACK_PERMITTED unless asked not to
+    // (we always offer SACK in our SYN).
     *now += 5;
     let peer_ts = 42u32;
     let synack = build_in_full(
@@ -273,7 +277,7 @@ fn handshake_with_ts(tcb: &mut Tcb, now: &mut u64) -> u32 {
         PEER_WIN,
         Some(1460),
         Some((peer_ts, cli_tsval)),
-        true,
+        sack_permitted,
         None,
         &[],
     );
@@ -1167,10 +1171,11 @@ fn piggybacked_acks_are_not_dup_acks() {
     );
 }
 
-/// Three pure-ACK duplicates with `ack == snd_una` and unchanged window
-/// MUST trigger fast retransmit. This is the canonical RFC 5681 §3.2
-/// trigger and the test guards against any regression that would over-
-/// suppress dup-ACK counting (e.g. mis-applied window-change check).
+/// Without SACK, three pure-ACK duplicates with `ack == snd_una` and
+/// unchanged window MUST trigger fast retransmit. This is the canonical RFC
+/// 5681 §3.2 trigger and the test guards against any regression that would
+/// over-suppress dup-ACK counting (e.g. mis-applied window-change check).
+/// (With SACK, RACK decides, as in Linux.)
 ///
 /// Post-PRR (RFC 6937) behavior: cwnd is NOT collapsed to 1*MSS — that's
 /// the Tahoe behavior the original test asserted. Instead PRR sets
@@ -1181,7 +1186,7 @@ fn piggybacked_acks_are_not_dup_acks() {
 fn pure_dup_acks_trigger_fast_retransmit() {
     let mut tcb = make_tcb();
     let mut now = 0u64;
-    let peer_ts = handshake_with_ts(&mut tcb, &mut now);
+    let peer_ts = handshake_with_ts_sack(&mut tcb, &mut now, false);
 
     let payload: ::std::vec::Vec<u8> = (0..1460).map(|i| (i & 0xFF) as u8).collect();
     let n = tcb.send(&payload).expect("send");

@@ -25,7 +25,6 @@ use std::println;
 use std::vec::Vec;
 
 use crate::tcb::{events, Endpoint, Tcb, TcbConfig, TcbStats};
-use crate::tx_ring::TX_RING_CAP;
 use crate::State;
 use crate::MAX_PACKET;
 
@@ -66,6 +65,24 @@ struct LinkCfg {
     blackout: (u64, u64),
     /// Remove D-SACK blocks, as from a receiver that never sends them.
     strip_dsack: bool,
+    /// How the sending host feeds the bottleneck queue.
+    host: Host,
+}
+
+/// How a host hands its TCB's packets to the bottleneck queue (a device
+/// queue such as a TUN queue or virtio ring, when the host can see it).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Host {
+    /// Every packet at once; the queue tail-drops what does not fit, like a
+    /// router's.
+    Push,
+    /// A packet only while the queue has room: the rest waits in the TCB's
+    /// egress ring, which stops the TCB when it fills.
+    Ring,
+    /// As `Ring`, and the TCB's egress is paused (`set_egress_paused`) once
+    /// the queue is half full and resumed below a quarter, so segments are
+    /// built when they can leave (Linux TCP Small Queues in spirit).
+    Pause,
 }
 
 impl LinkCfg {
@@ -81,6 +98,7 @@ impl LinkCfg {
             drop_idx: &[],
             blackout: (0, 0),
             strip_dsack: false,
+            host: Host::Push,
         }
     }
     const fn loss(mut self, ppm: u32) -> Self {
@@ -113,6 +131,10 @@ impl LinkCfg {
         self.strip_dsack = true;
         self
     }
+    const fn host(mut self, host: Host) -> Self {
+        self.host = host;
+        self
+    }
 }
 
 #[derive(Default, Debug, Clone, Copy)]
@@ -127,11 +149,16 @@ struct LinkStats {
 struct Link {
     cfg: LinkCfg,
     rng: Rng,
-    busy_until: u64,
+    /// When the bottleneck finishes sending what it holds, in ns: a
+    /// 1500-byte packet takes 1.2 µs at 10 Gbit/s, so whole microseconds
+    /// per packet would cap the link at 6 Gbit/s.
+    busy_until_ns: u64,
     departures: VecDeque<u64>,
     flight: BinaryHeap<Reverse<(u64, u64, Vec<u8>)>>,
     order: u64,
     stats: LinkStats,
+    /// `Host::Pause`: the sending TCB's egress is paused.
+    paused: bool,
 }
 
 fn payload_len(pkt: &[u8]) -> usize {
@@ -195,12 +222,37 @@ impl Link {
         Self {
             cfg,
             rng: Rng(seed | 1),
-            busy_until: 0,
+            busy_until_ns: 0,
             departures: VecDeque::new(),
             flight: BinaryHeap::new(),
             order: 0,
             stats: LinkStats::default(),
+            paused: false,
         }
+    }
+
+    /// Packets in the bottleneck queue (or on the wire leaving it) at `now`.
+    fn backlog(&mut self, now: u64) -> usize {
+        while self.departures.front().is_some_and(|&d| d <= now) {
+            self.departures.pop_front();
+        }
+        self.departures.len()
+    }
+
+    /// Whether the host hands the queue another packet now.
+    fn admits(&mut self, now: u64) -> bool {
+        self.cfg.host == Host::Push
+            || self.cfg.rate_bps == 0
+            || self.backlog(now) < self.cfg.queue_pkts
+    }
+
+    /// When the queue next frees a slot, if the host is holding packets back.
+    fn next_room(&mut self, now: u64, held: bool) -> Option<u64> {
+        if self.cfg.host == Host::Push || !(held || self.paused) {
+            return None;
+        }
+        self.backlog(now);
+        self.departures.front().copied()
     }
 
     fn send(&mut self, now: u64, mut pkt: Vec<u8>) {
@@ -239,10 +291,10 @@ impl Link {
                 return;
             }
             let bits = pkt.len() as u64 * 8;
-            let tx_us = (bits * 1_000_000).div_ceil(self.cfg.rate_bps);
-            self.busy_until = self.busy_until.max(now) + tx_us;
-            self.departures.push_back(self.busy_until);
-            depart = self.busy_until;
+            let tx_ns = (bits * 1_000_000_000).div_ceil(self.cfg.rate_bps);
+            self.busy_until_ns = self.busy_until_ns.max(now * 1000) + tx_ns;
+            depart = self.busy_until_ns.div_ceil(1000);
+            self.departures.push_back(depart);
         }
         let mut at = depart + self.cfg.delay_us;
         if self.rng.chance_ppm(self.cfg.reorder_ppm) {
@@ -368,12 +420,22 @@ struct Sim {
 fn drain_into(t: &mut Tcb, link: &mut Link, now_us: u64) -> usize {
     let mut buf = [0u8; MAX_PACKET];
     let mut packets = 0;
-    while let Ok(n) = t.extract_packet(&mut buf) {
+    while link.admits(now_us) {
+        let Ok(n) = t.extract_packet(&mut buf) else {
+            break;
+        };
         if n == 0 {
             break;
         }
         link.send(now_us, buf[..n].to_vec());
         packets += 1;
+    }
+    if link.cfg.host == Host::Pause
+        && !link.paused
+        && link.backlog(now_us) >= link.cfg.queue_pkts / 2
+    {
+        t.set_egress_paused(true);
+        link.paused = true;
     }
     packets
 }
@@ -437,18 +499,31 @@ impl Sim {
 
     fn tick_all(&mut self) {
         let ms = self.now_us / 1000;
+        let now_us = self.now_us;
         for (t, link) in [(&mut self.a, &mut self.ab), (&mut self.b, &mut self.ba)] {
             t.set_now(ms);
+            if link.paused && link.backlog(now_us) <= link.cfg.queue_pkts / 4 {
+                t.set_egress_paused(false);
+                link.paused = false;
+            }
             // The host contract: tick again after draining a full egress
             // ring, which stopped the stack mid-window.
             for _ in 0..64 {
                 t.tick().unwrap();
-                if drain_into(t, link, self.now_us) < TX_RING_CAP {
+                let full = t.debug_egress_full();
+                if drain_into(t, link, now_us) == 0 || !full {
                     break;
                 }
             }
             t.debug_validate_invariants().unwrap();
-            if let Some(d) = t.debug_next_deadline() {
+            // Output a full or paused egress holds back (an owed ACK) waits
+            // for the host to drain or resume it, not for a deadline.
+            let next = if t.debug_egress_full() {
+                t.next_deadline()
+            } else {
+                t.debug_next_deadline()
+            };
+            if let Some(d) = next {
                 assert!(
                     d > ms,
                     "armed deadline {d} not in the future after tick at {ms}"
@@ -505,11 +580,16 @@ impl Sim {
                 .iter()
                 .any(|f| f.read_rate.is_some() && f.recvd < f.total)
                 .then_some(self.now_us + 1000);
+            let now = self.now_us;
+            let held_a = self.a.debug_snapshot().tx_len > 0;
+            let held_b = self.b.debug_snapshot().tx_len > 0;
             let Some(next) = [
                 tcb,
                 self.ab.next_delivery(),
                 self.ba.next_delivery(),
                 reader,
+                self.ab.next_room(now, held_a),
+                self.ba.next_room(now, held_b),
             ]
             .into_iter()
             .flatten()
@@ -828,11 +908,14 @@ fn sub_millisecond_loss_before_a_bare_fin_is_repaired_without_rto() {
 /// A spurious timeout on a virtual link (a 300 ms ACK outage: the data
 /// got through, the ACKs did not) earns D-SACKs for what the timer
 /// resent. They show a delay, not reordering, so RACK still declares the
-/// next losses at once: three segments lost mid-burst, then the first
-/// retransmission, are repaired within a millisecond, as without the
-/// outage, not after a reordering window or the RTO.
+/// next losses as without the outage: three segments lost mid-burst, then
+/// the first retransmission, are repaired as fast either way, not after a
+/// widened reordering window or the RTO. (The lost retransmission waits
+/// out the 2 ms floor: only SACKs within the tick its successors left show
+/// it, which a late original's could equally explain.)
 #[test]
 fn spurious_timeout_does_not_teach_rack_reordering() {
+    let mut took_without = 0;
     for outage in [false, true] {
         let v = LinkCfg::new(0, 10_000, 1024).delay_us(100);
         let mut rev = v;
@@ -861,7 +944,15 @@ fn spurious_timeout_does_not_teach_rack_reordering() {
         assert!(s.run(start + 5_000_000, |s| s.f_ab.recvd == s.f_ab.total));
         let took = s.now_us - start;
         assert_eq!(s.a.stats().rto_count, p1.rto_count, "outage={outage}: RTO");
-        assert!(took < 1_500, "outage={outage}: repaired in {took} us");
+        assert!(took < 2_500, "outage={outage}: repaired in {took} us");
+        if outage {
+            assert!(
+                took <= took_without,
+                "repaired in {took} us after the outage, {took_without} us without"
+            );
+        } else {
+            took_without = took;
+        }
     }
 }
 
@@ -953,6 +1044,114 @@ fn sub_millisecond_reordering_through_a_shallow_queue_halves_the_window() {
         o.fwd.data_in
     );
     assert_eq!(o.a.rto_count, 0);
+}
+
+/// Both ways through a 64-packet queue with 1% of packets 0.1 ms late:
+/// once reordering is seen, RACK's 2 ms reordering window (the millisecond
+/// clock's floor) lets ACKs mark a slow-start overshoot lost only in part,
+/// and the reordering timer marks the rest — hundreds of segments at once.
+/// Resending them all at once (cwnd still read pipe + its last PRR step)
+/// overflowed the queue again, and with nothing sent after the lost
+/// resends, only a tail loss probe (one segment out: 200 ms) or the RTO
+/// repaired them (0.22 s and 0.27 s, against 0.03 s and 0.07 s).
+#[test]
+fn two_way_shallow_queue_reordering_recovers_without_a_timeout() {
+    for (rate, seed) in [(10_000, 6u64), (2_500, 9)] {
+        let link = LinkCfg::new(0, rate, 64)
+            .delay_us(50)
+            .reorder_us(10_000, 100);
+        let bytes = 16 * MIB;
+        let mut s = Sim::new(link, link, seed, bytes, bytes);
+        let o = s.run_transfer(600_000_000);
+        o.report(
+            &std::format!(
+                "virtual link 100us, {rate} Mbit/s, 1% +100us reorder, 64-pkt queue, both ways, seed {seed}"
+            ),
+            bytes,
+        );
+        let timeouts = (o.a.rto_count, o.b.rto_count, o.a.tlp_count, o.b.tlp_count);
+        assert_eq!(timeouts, (0, 0, 0, 0), "seed {seed}: RTOs, TLPs");
+        assert!(o.secs < 0.1, "seed {seed}: {:.3} s", o.secs);
+        for (name, tx, link) in [("A", &o.a, &o.fwd), ("B", &o.b, &o.rev)] {
+            assert!(
+                u64::from(tx.segs_retrans) <= link.data_dropped + 8,
+                "seed {seed} {name}: {} retransmissions for {} drops",
+                tx.segs_retrans,
+                link.data_dropped
+            );
+        }
+    }
+}
+
+/// Both ways at 1 Gbit/s through a 64-packet queue, 1% of packets 0.1 ms
+/// late: SACKs queue behind the peer's data, and one for a resend's late
+/// original arrived within the tick the resend left. Credited to the
+/// resend, it condemned the resends sent just before it in that tick at
+/// once (42 spurious retransmissions in this run).
+#[test]
+fn late_original_does_not_condemn_resends_of_the_same_tick() {
+    let link = LinkCfg::new(0, 1_000, 64)
+        .delay_us(50)
+        .reorder_us(10_000, 100);
+    let mut s = Sim::new(link, link, 4, 8 * MIB, 8 * MIB);
+    let o = s.run_transfer(60_000_000);
+    o.report(
+        "virtual link 100us, 1 Gbit/s, 1% +100us reorder, 64-pkt queue, both ways",
+        8 * MIB,
+    );
+    for (name, rx) in [("A", &o.b), ("B", &o.a)] {
+        let spurious = rx.dup_bytes_received as f64 / SMSS;
+        assert!(
+            spurious <= 10.0,
+            "{name}: {spurious:.0} spurious retransmissions"
+        );
+    }
+}
+
+/// What a two-way transfer over a virtual link needs to finish without a
+/// single retransmission or probe: a host that hands packets to the device
+/// queue only while it has room, leaving the rest in the TCB's egress ring
+/// (`Host::Ring`), or that pauses the TCB's egress as the queue fills
+/// (`Host::Pause`). The queue then never overflows, as a router's does on
+/// every slow-start overshoot and Reno sawtooth (hundreds of segments per
+/// run at 64–256 packets, as in the tests above). With 1% of packets
+/// 0.1 ms late, only the first reordering is taken for a loss (one
+/// recovery, at most four segments resent over seeds 1–8), before any has
+/// been seen (as Linux: `tcp_rack_reo_wnd`).
+#[test]
+fn two_way_virtual_link_with_host_backpressure_retransmits_nothing() {
+    for host in [Host::Ring, Host::Pause] {
+        for (rate, queue) in [(10_000, 64), (10_000, 256), (1_000, 64)] {
+            for late in [false, true] {
+                let mut link = LinkCfg::new(0, rate, queue).delay_us(50).host(host);
+                if late {
+                    link = link.reorder_us(10_000, 100);
+                }
+                let bytes = 4 * MIB;
+                let mut s = Sim::new(link, link, 1, bytes, bytes);
+                let o = s.run_transfer(60_000_000);
+                let name = std::format!(
+                    "virtual link 100us, {} Mbit/s, {queue}-pkt queue, host {}, both ways{}",
+                    rate,
+                    if host == Host::Ring { "ring" } else { "pause" },
+                    if late { ", 1% +100us reorder" } else { "" }
+                );
+                o.report(&name, bytes);
+                for (st, l) in [(&o.a, &o.fwd), (&o.b, &o.rev)] {
+                    assert_eq!(l.data_dropped, 0, "{name}");
+                    assert_eq!((st.rto_count, st.tlp_count), (0, 0), "{name}");
+                    let (recoveries, resends) = if late { (1, 4) } else { (0, 0) };
+                    assert!(
+                        st.fast_recoveries <= recoveries && st.segs_retrans <= resends,
+                        "{name}: {} recoveries, {} retransmissions",
+                        st.fast_recoveries,
+                        st.segs_retrans
+                    );
+                }
+                s.close_both();
+            }
+        }
+    }
 }
 
 /// Request/response over a clean virtual link (200 µs RTT, 10 Gbit/s), from

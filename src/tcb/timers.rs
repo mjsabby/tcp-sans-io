@@ -5,6 +5,7 @@ use super::{
     BLACKHOLE_RTO_STEP2, MAX_RETRANSMITS, MAX_SYN_RCVD_RETRIES, MAX_SYN_RETRIES, PMTU_PROBE_MIN_MS,
     RTO_MAX_MS,
 };
+use crate::congestion::CaState;
 use crate::error::TcpError;
 use crate::rtx_queue::seg_flags;
 use crate::state::State;
@@ -49,15 +50,27 @@ impl<const BUF: usize> Tcb<BUF> {
         }
         if self.rack_deadline.due(now) {
             self.rack_deadline = Deadline::OFF;
-            if self.rack_detect() && !self.cc.in_loss_recovery() {
-                // Linux `tcp_rack_reo_timeout`. Already recovering, cwnd
-                // stands and the newly lost segments leave pipe, so they
-                // go out below; a PRR step here (no ACK clocked it) could
-                // set cwnd = pipe and send nothing.
-                self.enter_fast_recovery();
-                // No ACK clocked this: credit one segment so PRR may send.
+            if self.rack_detect() {
+                let recovering = self.cc.state() == CaState::Recovery;
+                if !self.cc.in_loss_recovery() {
+                    // Linux `tcp_rack_reo_timeout`.
+                    self.enter_fast_recovery();
+                }
+                // No ACK clocked this: one segment of credit, as Linux gives
+                // the timer when it enters recovery. Already recovering, a
+                // PRR step too (Linux: none): what the timer marked just left
+                // pipe, and cwnd, set by the last ACK, would send it all at
+                // once. With a millisecond clock the reordering window is at
+                // least 2 ms, so the timer, not ACKs, may mark most of a
+                // window (Linux, timing in µs, marks it on ACKs, each a PRR
+                // step); resent at once into a shallow queue, the resends
+                // were lost and only a tail loss probe or the RTO repaired
+                // them. At least one goes now to restart the ACK clock.
                 let (pipe, mss) = (self.pipe(), self.mss_payload());
                 self.cc.prr_update(mss, pipe, mss, false);
+                if recovering {
+                    self.cc.cwnd = self.cc.cwnd.max(pipe.saturating_add(mss));
+                }
             }
         }
         if self.persist_deadline.due(now) {

@@ -345,21 +345,21 @@ impl<const BUF: usize> Tcb<BUF> {
         // ---- Loss detection --------------------------------------------
         // RACK whenever SACK is negotiated, if this ACK delivered something
         // (Linux `tcp_rack_mark_lost`: otherwise nothing new can be lost
-        // before the reordering timer, which stays armed). Duplicate ACKs
-        // that carry no SACK blocks at all (non-SACK peer, or blocks
-        // stripped by a middlebox) fall back to RFC 6675 DupThresh / RFC
-        // 6582 NewReno. Not when this ACK showed a hole filled by a delayed
-        // original while retransmissions are still out (Linux
-        // `tcp_try_undo_partial`): reordering is deeper than assumed, so
-        // nothing more is marked lost.
+        // before the reordering timer, which stays armed); RFC 6675
+        // DupThresh / RFC 6582 NewReno otherwise (Linux `tcp_is_reno`). A
+        // duplicate ACK without SACK blocks on a SACK connection counts for
+        // nothing: it would override RACK's reordering window. Not when
+        // this ACK showed a hole filled by a delayed original while
+        // retransmissions are still out (Linux `tcp_try_undo_partial`):
+        // reordering is deeper than assumed, so nothing more is marked lost.
         let mut newly_lost = self.sack_enabled
             && !hold_detection
             && core::mem::take(&mut self.rack.advanced)
             && self.rack_detect();
-        if !sack_present && !hold_detection {
+        if !self.sack_enabled && !hold_detection {
             let (lost, dup) = self.newreno_detect(seg, acked, wnd_before);
             newly_lost |= lost;
-            if dup && !self.sack_enabled {
+            if dup {
                 let outstanding = self.snd_nxt.wrapping_sub(self.data_una());
                 if self.reno_sacked.saturating_add(mss) <= outstanding {
                     self.reno_sacked += mss;
@@ -713,8 +713,8 @@ impl<const BUF: usize> Tcb<BUF> {
         marked
     }
 
-    /// RFC 6582 NewReno / RFC 6675 DupThresh loss marking for ACKs without
-    /// SACK information. Returns `(newly_lost, was_duplicate_ack)`.
+    /// RFC 6582 NewReno / RFC 6675 DupThresh loss marking when SACK was not
+    /// negotiated. Returns `(newly_lost, was_duplicate_ack)`.
     fn newreno_detect(&mut self, seg: &Segment<'_>, acked: u32, wnd_before: u32) -> (bool, bool) {
         if acked == 0 {
             let dup = seg.payload.is_empty()
@@ -731,10 +731,7 @@ impl<const BUF: usize> Tcb<BUF> {
             return (false, dup);
         }
         // Partial ACK during NewReno recovery: the next segment is lost too.
-        if !self.sack_enabled
-            && self.cc.state() == CaState::Recovery
-            && seq_lt(self.snd_una, self.cc.recovery_point())
-        {
+        if self.cc.state() == CaState::Recovery && seq_lt(self.snd_una, self.cc.recovery_point()) {
             self.rtx.mark_lost(0);
             return (true, false);
         }

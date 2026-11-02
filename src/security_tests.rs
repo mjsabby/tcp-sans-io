@@ -5477,7 +5477,9 @@ fn a_retransmitted_fin_that_acks_data_still_lets_queued_data_out() {
 /// `tcp_sacktag_one`, `tcp_ack_update_rtt`). Here it lowers `min_rtt` from
 /// the handshake's 2 ms to the path's sub-millisecond floor of 1 ms, so
 /// RACK takes the SACKed resends that follow as delivered and repairs a
-/// lost one at once rather than leaving it to the RTO.
+/// lost one rather than leaving it to the RTO: once the reordering floor
+/// has passed, as SACKs within the tick the resends left could equally be
+/// for late originals.
 #[test]
 fn a_sack_of_data_never_resent_samples_the_rtt() {
     let (mut c, sseq, iss) = established_rtt(1000, 2, true, false);
@@ -5487,8 +5489,10 @@ fn a_sack_of_data_never_resent_samples_the_rtt() {
     let resent = ts_ack(&mut c, sseq, 1010, b[0].0, 1010, &[(b[3].0, b[9].1)]);
     assert_eq!(resent.iter().filter(|o| o.len > 0).count(), 3);
     assert_eq!(c.stats().min_rtt_ms, 1);
-    let out = ts_ack(&mut c, sseq, 1010, b[0].0, 1010, &[(b[1].0, b[9].1)]);
-    assert!(out.iter().any(|o| o.len > 0 && o.seq == b[0].0), "{out:?}");
+    ts_ack(&mut c, sseq, 1010, b[0].0, 1010, &[(b[1].0, b[9].1)]);
+    let (again, now) = first_data(&mut c, 1010, 1100);
+    assert_eq!((again.seq, now), (b[0].0, 1012));
+    assert_eq!(c.stats().rto_count, 0);
 }
 
 /// An ACK inside a segment trims it but delivers nothing whole, so it
@@ -6022,4 +6026,73 @@ fn a_valid_cookie_ack_after_its_peer_retook_the_slot_promotes() {
     }
     assert_eq!(peer.state(), State::Established, "{out:?}");
     assert_eq!(s.state(), State::Established);
+}
+
+// ---------------------------------------------------------------------------
+// Two-way virtual links (audit iteration 5)
+// ---------------------------------------------------------------------------
+
+/// With SACK negotiated, RACK alone declares losses (Linux `tcp_is_reno`
+/// picks duplicate-ACK counting only for connections without SACK): three
+/// duplicate ACKs that happen to carry no SACK blocks used to resend the
+/// hole at once, overriding the reordering window RACK was waiting out
+/// after reordering had been seen.
+#[test]
+fn sackless_duplicate_acks_do_not_override_rack_on_a_sack_connection() {
+    let (mut c, sseq, iss) = established_rtt(1000, 0, true, false);
+    ts_ack(&mut c, sseq, 1000, iss + 1, 1000, &[]);
+    // Reordering seen: segment 1 is SACKed before segment 0 arrives.
+    let w = send_burst(&mut c, 1000, 3 * 1448);
+    ts_ack(&mut c, sseq, 1000, w[0].0, 1000, &[w[1]]);
+    ts_ack(&mut c, sseq, 1000, w[2].1, 1000, &[]);
+    let b = send_burst(&mut c, 1010, 4 * 1448);
+    ts_ack(&mut c, sseq, 1010, b[0].0, 1010, &[(b[1].0, b[3].1)]);
+    for _ in 0..3 {
+        ts_ack(&mut c, sseq, 1010, b[0].0, 1010, &[]);
+    }
+    assert_eq!(c.stats().segs_retrans, 0);
+    // The reordering window still ends it, if the hole stays.
+    let (resend, _) = first_data(&mut c, 1010, 1100);
+    assert_eq!(resend.seq, b[0].0);
+}
+
+/// Resends leave in one tick; a SACK of a later resend's late original,
+/// within that tick, is credited to the resend (ambiguous at a 1 ms clock)
+/// and used to condemn the resends sent just before it at once. They may
+/// have been sent after that original: they wait out the reordering floor.
+#[test]
+fn resends_of_a_tick_survive_a_late_originals_sack_in_it() {
+    let (mut c, sseq, iss) = established_rtt(1000, 0, true, false);
+    ts_ack(&mut c, sseq, 1000, iss + 1, 1000, &[]);
+    let segs = send_burst(&mut c, 1000, 10 * 1448);
+    assert_eq!(segs.len(), 10);
+    let retx1 = ts_ack(
+        &mut c,
+        sseq,
+        1001,
+        segs[0].0,
+        1000,
+        &[(segs[3].0, segs[7].1)],
+    );
+    assert_eq!(retx1.iter().filter(|o| o.len > 0).count(), 3);
+    let retx2 = ts_ack(
+        &mut c,
+        sseq,
+        1001,
+        segs[0].0,
+        1000,
+        &[(segs[3].0, segs[7].1), (segs[9].0, segs[9].1)],
+    );
+    assert_eq!(retx2.iter().filter(|o| o.len > 0).count(), 1);
+    assert_eq!(c.stats().segs_retrans, 4);
+    let spurious = ts_ack(
+        &mut c,
+        sseq,
+        1001,
+        segs[0].0,
+        1000,
+        &[(segs[3].0, segs[9].1)],
+    );
+    assert_eq!(spurious.iter().filter(|o| o.len > 0).count(), 0);
+    assert_eq!(c.stats().segs_retrans, 4);
 }

@@ -977,6 +977,13 @@ impl<const BUF: usize> Tcb<BUF> {
         .min()
     }
 
+    /// Whether nothing more can be staged: the egress ring is full or the
+    /// host paused egress (diagnostic only).
+    #[cfg(any(test, feature = "std"))]
+    pub fn debug_egress_full(&self) -> bool {
+        self.egress_full()
+    }
+
     /// Earliest output-producing armed deadline (excludes TIME_WAIT expiry).
     #[cfg(any(test, feature = "std"))]
     pub fn debug_next_deadline(&self) -> Option<u64> {
@@ -1016,7 +1023,12 @@ impl<const BUF: usize> Tcb<BUF> {
     /// keepalive probe goes out on the first `tick()` after resuming, the
     /// persist timer retries one RTO later, and a tail-loss probe waits
     /// until one PTO after the resume (the peer only then starts draining
-    /// what queued up). Resume after [`Self::set_now`], then `tick()`.
+    /// what queued up), but never past the RTO. Resume after
+    /// [`Self::set_now`], then `tick()`.
+    ///
+    /// Pause before the device queue toward the peer overflows (at about
+    /// half its capacity, or a millisecond of data) and resume once it falls
+    /// below a quarter: a queue that never overflows forces no loss.
     #[inline]
     pub fn set_egress_paused(&mut self, paused: bool) {
         if self.egress_paused && !paused && self.tlp_deadline.is_armed() {
