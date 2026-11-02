@@ -12,8 +12,8 @@
 
 use super::{
     seq_ge, seq_gt, seq_in_range, seq_le, seq_lt, Deadline, Endpoint, HeldFin, Tcb, ACK_PUSHED,
-    ACK_PUSHED2, DELAYED_ACK_MS, MIN_PEER_MSS, PAWS_IDLE_MS, RCV_MSS_INITIAL, TIME_WAIT_MAX_MS,
-    TIME_WAIT_MS,
+    ACK_PUSHED2, DELAYED_ACK_MS, MAX_QUICKACKS, MIN_PEER_MSS, PAWS_IDLE_MS, RCV_MSS_INITIAL,
+    TIME_WAIT_MAX_MS, TIME_WAIT_MS,
 };
 use crate::congestion::{self, Reno};
 use crate::error::TcpError;
@@ -40,6 +40,19 @@ impl<const BUF: usize> Tcb<BUF> {
             State::Listen => self.on_listen(seg),
             State::SynSent => self.on_syn_sent(seg),
             State::SynRcvd => self.on_syn_rcvd(seg),
+            // Closed in SYN-RECEIVED: a retransmitted SYN still means our
+            // SYN-ACK was lost.
+            State::FinWait1
+                if self.syn_unacked
+                    && seg.seq == self.irs
+                    && seg.flags & (flags::SYN | flags::ACK | flags::RST | flags::FIN)
+                        == flags::SYN =>
+            {
+                if self.oow_allowed() {
+                    let _ = self.emit_synack()?;
+                }
+                Ok(())
+            }
             State::Established
             | State::FinWait1
             | State::FinWait2
@@ -153,7 +166,6 @@ impl<const BUF: usize> Tcb<BUF> {
         self.snd_wnd = u32::from(seg.window);
         self.max_snd_wnd = self.snd_wnd;
         self.snd_wl1 = seg.seq;
-        self.snd_wl2 = seg.ack;
         if let Some(mss) = seg.options.mss {
             self.peer_mss = mss.max(MIN_PEER_MSS);
         }
@@ -257,7 +269,7 @@ impl<const BUF: usize> Tcb<BUF> {
         };
         if let Some(r) = sample {
             if r < 60_000 {
-                self.update_rtt(r);
+                self.update_rtt(r, Some(r));
             }
         }
     }
@@ -345,7 +357,6 @@ impl<const BUF: usize> Tcb<BUF> {
         } else {
             seg.seq
         };
-        self.snd_wl2 = seg.ack;
         if self.syn_rcvd_retries > 0 {
             self.syn_retransmitted = true;
         }
@@ -360,6 +371,19 @@ impl<const BUF: usize> Tcb<BUF> {
         }
         // The third ACK may carry data or a FIN.
         self.on_synchronized(seg)
+    }
+
+    /// The peer acknowledged our SYN-ACK after the application closed in
+    /// SYN-RECEIVED (its FIN already out): finish what
+    /// [`Self::complete_passive_open`] sets up, short of the state (Linux
+    /// `tcp_rcv_synrecv_state_fastopen`).
+    pub(super) fn complete_closed_handshake(&mut self, seg: &Segment<'_>) {
+        if self.syn_rcvd_retries > 0 {
+            self.syn_retransmitted = true;
+        }
+        self.handshake_rtt_sample(seg);
+        self.syn_rcvd_retries = 0;
+        self.on_established();
     }
 
     /// Common setup on entering ESTABLISHED.
@@ -423,7 +447,8 @@ impl<const BUF: usize> Tcb<BUF> {
         let fin = seg.has(flags::FIN);
         let seg_len = payload_len + u32::from(fin) + u32::from(seg.has(flags::SYN));
         // A bare FIN at RCV.NXT needs no buffer space: accept it even into a
-        // zero window (Linux does the same).
+        // zero window, as current Linux does for stacks that send one in a
+        // loop (older kernels drop it, so ours waits for the window).
         let bare_fin = fin && payload_len == 0 && seg.seq == self.rcv_nxt;
         let acceptable = self.acceptable(seg.seq, seg_len) || bare_fin;
         // RFC 9293 §3.10.7.4: a zero window accepts no text, but "special
@@ -484,8 +509,23 @@ impl<const BUF: usize> Tcb<BUF> {
             if seg.has(flags::CWR) {
                 self.ce_observed = false;
             }
-            if seg.ecn == ecn::CE {
-                self.ce_observed = true;
+            // Linux `__tcp_ecn_check_ce`: ACK at once while the sender has
+            // yet to learn of a CE mark (its window may be small), and after
+            // a Not-ECT segment among ECT ones (likely a retransmission).
+            match seg.ecn {
+                ecn::CE => {
+                    if !self.ce_observed {
+                        self.enter_quickack_mode(2);
+                    }
+                    self.ce_observed = true;
+                    self.ecn_seen = true;
+                }
+                ecn::NOT_ECT => {
+                    if self.ecn_seen {
+                        self.enter_quickack_mode(2);
+                    }
+                }
+                _ => self.ecn_seen = true,
             }
         }
         self.on_peer_alive();
@@ -495,6 +535,12 @@ impl<const BUF: usize> Tcb<BUF> {
             return Ok(()); // our FIN was ACKed in LAST-ACK
         }
         if zero_window_probe {
+            // Linux `tcp_data_queue`: data into a zero window is out of
+            // window; ACK it at once, and the next data too.
+            if payload_len > 0 {
+                self.enter_quickack_mode(MAX_QUICKACKS);
+                self.pending_ack = true;
+            }
             self.send_pure_ack()?;
             return self.maybe_send_data();
         }
@@ -527,6 +573,7 @@ impl<const BUF: usize> Tcb<BUF> {
         }
 
         if ack_now {
+            self.pending_ack = true; // owed for this segment
             self.send_pure_ack()?;
         } else if advanced {
             self.schedule_delayed_ack(payload_len);
@@ -580,19 +627,35 @@ impl<const BUF: usize> Tcb<BUF> {
             let restart = self.now_ms.saturating_add(TIME_WAIT_MS);
             let cap = self.time_wait_since_ms.saturating_add(TIME_WAIT_MAX_MS);
             self.time_wait_deadline = Deadline::at(restart.min(cap));
+            if payload_len > 0 {
+                // Data came back with it: D-SACK it like any duplicate.
+                self.stats.dup_bytes_received = self
+                    .stats
+                    .dup_bytes_received
+                    .saturating_add(u64::from(payload_len));
+                self.note_dsack(seg.seq, end);
+            }
             return self.send_pure_ack();
         }
         if at_once && payload_len > 0 && seq_le(end, self.rcv_nxt) {
             // Duplicate data: answer at once, with a D-SACK (RFC 2883) so the
-            // sender learns the retransmission was spurious.
+            // sender learns the retransmission was spurious, and ACK the
+            // data after it at once too (Linux `tcp_data_queue`: a sender
+            // retransmitting is recovering).
             self.stats.dup_bytes_received = self
                 .stats
                 .dup_bytes_received
                 .saturating_add(u64::from(payload_len));
             self.note_dsack(seg.seq, end);
+            self.enter_quickack_mode(MAX_QUICKACKS);
+            self.pending_ack = true;
             self.send_pure_ack()?;
         } else if at_once && seq_ge(seg.seq, self.rcv_nxt) && self.recv_ring.free() == 0 {
             // Beyond the window: the peer probing our zero window.
+            if payload_len > 0 {
+                self.enter_quickack_mode(MAX_QUICKACKS);
+                self.pending_ack = true;
+            }
             self.send_pure_ack()?;
         } else {
             self.send_oow_ack()?;
@@ -641,6 +704,7 @@ impl<const BUF: usize> Tcb<BUF> {
     /// TS.Recent, or TS.Recent cannot be trusted — expired after a long
     /// idle, or 0 from a peer that stamps its SYN with 0 (a later real
     /// clock may look "negative" against it).
+    #[inline]
     fn paws_ok(&self, tsval: u32, win: i32) -> bool {
         (self.ts_recent.wrapping_sub(tsval) as i32) <= win
             || self.now_ms.saturating_sub(self.ts_recent_stamp) > PAWS_IDLE_MS
@@ -906,8 +970,18 @@ impl<const BUF: usize> Tcb<BUF> {
     /// the held ACK "pushed" when the segment ended a write — a short one,
     /// or a full one with PSH; a second short one marks it twice.
     fn note_data_received(&mut self, payload_len: u32, psh: bool) {
+        // Linux `tcp_event_data_recv`: the first data, and data after an
+        // idle RTO, are ACKed at once for a while: the sender is starting,
+        // or restarting from a small window.
+        let idle = self
+            .last_data_recv_ms
+            .is_none_or(|t| self.now_ms.saturating_sub(t) > u64::from(self.rto_ms));
+        if idle {
+            self.incr_quickack(MAX_QUICKACKS);
+        }
         self.last_data_recv_ms = Some(self.now_ms);
         let rcv_mss = u32::from(self.rcv_mss.max(1));
+        let lss = core::mem::take(&mut self.last_seg_size);
         if payload_len >= rcv_mss {
             self.rcv_mss = u16::try_from(payload_len)
                 .unwrap_or(u16::MAX)
@@ -916,6 +990,20 @@ impl<const BUF: usize> Tcb<BUF> {
                 self.ack_pushed |= ACK_PUSHED;
             }
         } else {
+            // Short of `rcv_mss`, but of a full segment's size by the look
+            // of it (Linux: 536 bytes with headers, or 88 not ending a
+            // write): twice in a row, the peer's segments shrank (a path
+            // MTU drop on its side), so adopt the size rather than take
+            // every one for the end of a write.
+            let len = payload_len + 20 + if self.ts_enabled { 12 } else { 0 };
+            if len >= 536 + 20 || (len >= 88 + 20 && !psh) {
+                let size = u16::try_from(payload_len).unwrap_or(u16::MAX);
+                self.last_seg_size = size;
+                if size == lss {
+                    self.rcv_mss = size;
+                    return;
+                }
+            }
             if self.ack_pushed & ACK_PUSHED != 0 {
                 self.ack_pushed |= ACK_PUSHED2;
             }
@@ -927,17 +1015,42 @@ impl<const BUF: usize> Tcb<BUF> {
     /// full-sized segment, otherwise within `DELAYED_ACK_MS`. A coalesced
     /// segment counts as the number of MSS-sized segments it spans, and,
     /// as in Linux (`__tcp_ack_snd_check`), more than one receive MSS of
-    /// unacknowledged data is ACKed at once whatever the segment sizes.
+    /// unacknowledged data is ACKed at once whatever the segment sizes, as
+    /// is every segment in quickack mode.
     fn schedule_delayed_ack(&mut self, payload_len: u32) {
         let full = payload_len / u32::from(self.local_mss.max(1));
         let units = full.clamp(1, u32::from(u8::MAX)) as u8;
         self.delayed_ack_count = self.delayed_ack_count.saturating_add(units);
         self.pending_ack = true;
         let unacked = self.rcv_nxt.wrapping_sub(self.last_ack_sent);
-        if self.delayed_ack_count >= 2 || unacked > u32::from(self.rcv_mss.max(1)) {
+        if self.delayed_ack_count >= 2
+            || unacked > u32::from(self.rcv_mss.max(1))
+            || self.in_quickack_mode()
+        {
             let _ = self.send_pure_ack();
         } else if !self.ack_deadline.is_armed() {
             self.ack_deadline = Deadline::at(self.now_ms.saturating_add(DELAYED_ACK_MS));
         }
+    }
+
+    /// Linux `tcp_incr_quickack`: ACK the next segments at once — as many
+    /// as half the advertised window holds in receive-MSS segments, at
+    /// least 2, at most `max`.
+    fn incr_quickack(&mut self, max: u8) {
+        let per = 2 * u32::from(self.rcv_mss.max(1));
+        let n = (self.rcv_wnd / per).max(2).min(u32::from(max)) as u8;
+        self.quick_acks = self.quick_acks.max(n);
+    }
+
+    /// Linux `tcp_enter_quickack_mode`: quick ACKs, and not interactive.
+    fn enter_quickack_mode(&mut self, max: u8) {
+        self.incr_quickack(max);
+        self.pingpong = false;
+    }
+
+    /// Linux `tcp_in_quickack_mode`.
+    #[inline]
+    fn in_quickack_mode(&self) -> bool {
+        self.quick_acks > 0 && !self.pingpong
     }
 }

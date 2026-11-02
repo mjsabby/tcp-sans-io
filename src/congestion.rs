@@ -164,15 +164,17 @@ impl Reno {
     }
 
     /// The window a reduction halves: `cwnd`, as Linux
-    /// (`tcp_reno_ssthresh`), capped by the peer's window. Not RFC 5681's
-    /// FlightSize: with SACK that also counts data the receiver holds above
-    /// a hole, and RACK waits out its reordering window (≥ 2 ms with a
-    /// millisecond clock) before declaring a loss while a fast sender keeps
-    /// filling the peer's window past the hole, so FlightSize/2 could stay
-    /// above what the path holds and every episode overflowed the queue
-    /// again. The cap keeps RFC 5681's reason for FlightSize: slow start
-    /// may grow `cwnd` to twice a flight the peer's window limits, and half
-    /// of that would not slow the sender at all.
+    /// (`tcp_reno_ssthresh`), capped by the largest window the peer has
+    /// offered. Not RFC 5681's FlightSize: with SACK that also counts data
+    /// the receiver holds above a hole, and RACK waits out its reordering
+    /// window (≥ 2 ms with a millisecond clock) before declaring a loss
+    /// while a fast sender keeps filling the peer's window past the hole, so
+    /// FlightSize/2 could stay above what the path holds and every episode
+    /// overflowed the queue again. The cap keeps RFC 5681's reason for
+    /// FlightSize: slow start may grow `cwnd` to twice a flight the peer's
+    /// window limits, and half of that would not slow the sender at all.
+    /// The largest window, not the current one: a reader that is briefly
+    /// behind must not deepen the reduction.
     fn reduction_window(&self, peer_wnd: u32) -> u32 {
         self.cwnd.min(peer_wnd)
     }
@@ -210,7 +212,7 @@ impl Reno {
     }
 
     /// Enter fast recovery (RFC 6937): halve `ssthresh`, pace with PRR.
-    /// `peer_wnd`: the peer's current window (see
+    /// `peer_wnd`: the largest window the peer has offered (see
     /// [`Self::reduction_window`]).
     pub fn enter_recovery(
         &mut self,
@@ -230,6 +232,34 @@ impl Reno {
     pub fn enter_cwr(&mut self, snd_nxt: u32, mss: u32, peer_wnd: u32) {
         self.undo_valid = false;
         self.begin_reduction(CaState::Cwr, snd_nxt, mss, peer_wnd);
+    }
+
+    /// Linux `tcp_simple_retransmit`: segments were lost to their size (a
+    /// smaller path MTU, a path-MTU probe that did not get through), not to
+    /// congestion. Resend them in the Loss state, which holds off fast
+    /// recovery and probes until `SND.NXT` is acknowledged, without
+    /// reducing the window: `ssthresh` becomes at least ¾ of `cwnd`, which
+    /// stands, and there is nothing to undo. A timeout before the episode
+    /// ends still reduces ([`Self::on_rto`]).
+    pub fn enter_simple_loss(&mut self, snd_nxt: u32) {
+        if self.state == CaState::Loss {
+            return;
+        }
+        self.ssthresh = self.current_ssthresh();
+        self.prior_cwnd = 0;
+        self.prior_ssthresh = 0;
+        self.undo_valid = false;
+        self.state = CaState::Loss;
+        self.recovery_point = snd_nxt;
+    }
+
+    /// RFC 8985 §7.4.2 (Linux `tcp_process_tlp_ack`): a tail loss probe
+    /// repaired a loss. The reduction is entered and ended at once:
+    /// `cwnd = ssthresh`, congestion avoidance counting afresh.
+    pub fn on_tlp_repair(&mut self, mss: u32, peer_wnd: u32) {
+        self.ssthresh = (self.reduction_window(peer_wnd) / 2).max(mss.saturating_mul(2));
+        self.cwnd = self.ssthresh;
+        self.ca_acc = 0;
     }
 
     /// Upgrade a CWR episode to fast recovery when loss is found during it
@@ -308,6 +338,12 @@ impl Reno {
         if !self.undo_valid || self.undo_retrans == 0 || !seq_ge(start, self.undo_marker) {
             return false;
         }
+        // Once the episode is over, only its own retransmissions (below its
+        // recovery point) can still show it spurious: a D-SACK for a later
+        // one, such as a tail loss probe, says nothing about it.
+        if self.state == CaState::Open && !seq_ge(self.recovery_point, end) {
+            return false;
+        }
         let segs = end.wrapping_sub(start).div_ceil(mss.max(1)).max(1);
         self.undo_retrans = self.undo_retrans.saturating_sub(segs);
         if self.undo_retrans > 0 {
@@ -359,13 +395,27 @@ impl Reno {
         }
     }
 
-    /// RFC 5681 §3.1 retransmission timeout. `ssthresh` is only reduced for
-    /// the first timeout of an episode (not again while recovering the same
-    /// window, nor during an ECN reduction, as Linux `tcp_enter_loss`);
-    /// `cwnd` collapses to one segment. `seed`: see [`Self::arm_undo`].
-    pub fn on_rto(&mut self, snd_una: u32, snd_nxt: u32, mss: u32, seed: UndoSeed, peer_wnd: u32) {
+    /// RFC 5681 §3.1 retransmission timeout; `cwnd` collapses to one
+    /// segment. As Linux `tcp_enter_loss`, `ssthresh` is reduced unless the
+    /// timeout falls inside a fast-recovery or ECN episode, or `repeat`s a
+    /// timeout no ACK of new data has answered since (a backoff of the same
+    /// loss). `seed`: see [`Self::arm_undo`].
+    pub fn on_rto(
+        &mut self,
+        snd_una: u32,
+        snd_nxt: u32,
+        mss: u32,
+        seed: UndoSeed,
+        peer_wnd: u32,
+        repeat: bool,
+    ) {
         let episode_over = seq_ge(snd_una, self.recovery_point);
-        if self.state == CaState::Open || episode_over {
+        let reduce = match self.state {
+            CaState::Open => true,
+            CaState::Loss => episode_over || !repeat,
+            CaState::Recovery | CaState::Cwr => episode_over,
+        };
+        if reduce {
             self.arm_undo(snd_una, seed);
             self.ssthresh = (self.reduction_window(peer_wnd) / 2).max(mss.saturating_mul(2));
         } else if self.state == CaState::Cwr {
@@ -378,9 +428,15 @@ impl Reno {
     }
 
     /// End the episode once `SND.UNA` passes the recovery point. Returns
-    /// `true` if an episode ended on this call.
+    /// `true` if an episode ended on this call. CWR is held until something
+    /// beyond it is ACKed, so the CWR flag has reached the receiver and a
+    /// late ECN-Echo for the same marks cannot reduce again (Linux
+    /// `tcp_fastretrans_alert`).
     pub fn maybe_exit(&mut self, snd_una: u32) -> bool {
         if self.state == CaState::Open || !seq_ge(snd_una, self.recovery_point) {
+            return false;
+        }
+        if self.state == CaState::Cwr && snd_una == self.recovery_point {
             return false;
         }
         if self.in_reduction() {
@@ -526,7 +582,7 @@ mod tests {
         assert_eq!(r.cwnd, 20 * M);
 
         let mut r = Reno::new(40 * M);
-        r.on_rto(100, 9000, M, UndoSeed::default(), u32::MAX);
+        r.on_rto(100, 9000, M, UndoSeed::default(), u32::MAX, false);
         r.on_retransmit(0);
         assert!(r.on_dsack(100, 1100, M), "spurious timeout");
         assert_eq!((r.cwnd, r.state()), (40 * M, CaState::Open));
@@ -599,7 +655,7 @@ mod tests {
         assert!(delayed(&r, 99));
         // Otherwise the episode's own first retransmission is the reference,
         // across the wrap of the 32-bit timestamp clock.
-        r.on_rto(25_000, 30_000, M, UndoSeed::default(), u32::MAX);
+        r.on_rto(25_000, 30_000, M, UndoSeed::default(), u32::MAX, false);
         r.on_retransmit((1u64 << 32) + 10);
         r.on_retransmit((1u64 << 32) + 20);
         assert!(delayed(&r, u32::MAX - 5));
@@ -617,19 +673,51 @@ mod tests {
         // ceil(2000 * 8000 / 16000) = 1000 more than pipe.
         assert_eq!(r.cwnd, 15 * M);
         let mut r = Reno::new(40 * M);
-        r.on_rto(0, 20_000, M, UndoSeed::default(), 16 * M);
+        r.on_rto(0, 20_000, M, UndoSeed::default(), 16 * M, false);
         assert_eq!(r.ssthresh, 8 * M);
     }
 
     #[test]
-    fn rto_collapses_window_and_reduces_ssthresh_once_per_episode() {
+    fn rto_collapses_window_and_reduces_ssthresh_once_per_unanswered_timeout() {
         let mut r = Reno::new(40 * M);
-        r.on_rto(100, 9000, M, UndoSeed::default(), u32::MAX);
+        r.on_rto(100, 9000, M, UndoSeed::default(), u32::MAX, false);
         assert_eq!((r.cwnd, r.ssthresh, r.state()), (M, 20 * M, CaState::Loss));
-        r.on_rto(100, 9000, M, KEEP_STAMP, u32::MAX); // backoff of the same episode
+        r.on_rto(100, 9000, M, KEEP_STAMP, u32::MAX, true); // backoff of the same loss
         assert_eq!(r.ssthresh, 20 * M, "not halved again");
+        // An ACK of new data answered it: a later timeout is a new loss
+        // (Linux `tcp_enter_loss`, Loss without RTO retransmissions).
+        r.cwnd = 8 * M;
+        r.on_rto(3000, 9000, M, KEEP_STAMP, u32::MAX, false);
+        assert_eq!((r.cwnd, r.ssthresh), (M, 4 * M));
         assert!(r.maybe_exit(9000));
         assert_eq!(r.cwnd, M, "slow start continues after RTO recovery");
+    }
+
+    #[test]
+    fn simple_loss_keeps_the_window_but_a_timeout_in_it_reduces() {
+        let mut r = Reno::new(40 * M);
+        r.ssthresh = 20 * M;
+        r.enter_simple_loss(9000);
+        assert_eq!(
+            (r.cwnd, r.ssthresh, r.state()),
+            (40 * M, 30 * M, CaState::Loss)
+        );
+        assert!(!r.packet_delayed(None, 100, true), "nothing to undo");
+        r.on_ack(40 * M, M, true);
+        assert_eq!(r.cwnd, 41 * M, "the window keeps growing");
+        r.on_rto(100, 9000, M, UndoSeed::default(), u32::MAX, false);
+        assert_eq!((r.cwnd, r.ssthresh), (M, 41 * M / 2));
+    }
+
+    #[test]
+    fn tlp_repair_halves_the_window_and_counts_avoidance_afresh() {
+        let mut r = Reno::new(20 * M);
+        r.ssthresh = 10 * M;
+        r.on_ack(19 * M, M, true); // most of a window toward the next MSS
+        r.on_tlp_repair(M, u32::MAX);
+        assert_eq!((r.cwnd, r.ssthresh), (10 * M, 10 * M));
+        r.on_ack(5 * M, M, true);
+        assert_eq!(r.cwnd, 10 * M, "credit from before the reduction counted");
     }
 
     #[test]

@@ -39,10 +39,10 @@ that costs against Linux CUBIC on lossy long paths.
 | Half-open replacement (a new SYN recycles a stalled `SYN_RCVD` slot) | — (single-slot listener policy) | ✅ |
 | SYN cookies while the half-open slot is busy (a valid cookie ACK takes the slot over); WS / SACK / ECN kept via timestamp bits; key derived from the host secret or set explicitly, surviving one rotation | RFC 4987 | ✅ |
 | ISN selection | RFC 6528 | ✅ keyed by `tcp_set_secret` on passive opens (`tcp_listen` requires a secret); host-supplied `iss` on active |
-| MSS; MTU / PMTU (`tcp_set_mtu`, `tcp_update_pmtu`, black-hole clamp, probing back up) | RFC 9293, RFC 1191, RFC 4821 (spirit) | ✅ |
+| MSS; MTU / PMTU (`tcp_set_mtu`, `tcp_update_pmtu`, black-hole clamp, probing back up); what a smaller path MTU, or a probe that did not get through, lost is resent without reducing the window | RFC 9293, RFC 1191, RFC 4821 (spirit) | ✅ Linux `tcp_simple_retransmit` |
 | Timestamps: RTTM, PAWS (pure ACKs included, but for Linux's exemption of a reordered old ACK), keyed per-connection offset | RFC 7323 §3–5 | ✅ Linux `tcp_paws_discard` / `tcp_disordered_ack` |
 | Window Scale | RFC 7323 §2 | ✅ |
-| SACK, both directions; receiver holds the whole window out of order; blocks beyond `SND.NXT` or not above `SND.UNA` ignored; a receiver that reneges gets max(SRTT/2, 10 ms) before the timeout resends | RFC 2018 | ✅ Linux `tcp_is_sackblock_valid` / `tcp_check_sack_reneging` |
+| SACK, both directions; receiver holds the whole window out of order; blocks beyond `SND.NXT` or not above `SND.UNA` ignored; blocks on an ACK reordered behind a newer one still count; a receiver that reneges gets max(SRTT/2, 10 ms) before the timeout resends | RFC 2018 | ✅ Linux `tcp_is_sackblock_valid` / `tcp_check_sack_reneging` |
 | D-SACK, both directions (drives RACK's reordering window) | RFC 2883, RFC 3708 | ✅ |
 | Spurious fast recovery / RTO undone: D-SACKs for every retransmission (an unresolved tail loss probe included), an ACK whose timestamp echo predates the first one (receivers without D-SACK too), or a hole filled before anything was resent; never past an ECN-Echo | RFC 3708, RFC 3522 | ✅ Linux-style (`tcp_try_undo_*`, `tcp_packet_delayed`) |
 | RTO with Karn's algorithm; RTO = SRTT + max(4·RTTVAR, 200 ms), SRTT / RTTVAR in fixed point | RFC 6298 | ✅ Linux `tcp_rtt_estimator` / `tcp_set_rto` |
@@ -51,14 +51,14 @@ that costs against Linux CUBIC on lossy long paths.
 | Initial window of 10 segments | RFC 6928 | ✅ |
 | RACK-TLP: time-based loss detection, tail loss probe (also during an ECN reduction) | RFC 8985 | ✅ primary loss detection |
 | Duplicate-ACK fast retransmit (peers without SACK) | RFC 5681 §3.2 | ✅ fallback |
-| ECN (ECT(0) on new data; CE echoed only from data segments; ECE → one CWR reduction per window) | RFC 3168 | ✅ |
+| ECN (ECT(0) on new data; CE echoed only from data segments; ECE → one CWR reduction per window; CWR sent after every reduction, withdrawn if it is undone first) | RFC 3168 | ✅ Linux `tcp_ecn_queue_cwr` / `tcp_ecn_withdraw_cwr` |
 | Blind-attack hardening: RST, SYN and ACK checks, rate-limited challenge ACKs | RFC 5961 §3–5, §7 | ✅ |
 | Silly-window avoidance, sender and receiver | RFC 9293 §3.8.6.2 | ✅ |
 | Nagle in Minshall's variant (a short segment waits only behind an unacknowledged short one); `tcp_set_nodelay` turns it off | RFC 9293 §3.7.4 | ✅ on by default, as Linux |
 | PSH on the segment that ends the queued data (and every half window), not on every segment | RFC 9293 §3.9.1 | ✅ as Linux `tcp_mark_push` |
-| Window-update rule (SND.WL1 / WL2) | RFC 9293 §3.10.7.4 | ✅ a forged future WL1 cannot freeze it (nor at the handshake) |
-| Zero-window persist probes | RFC 9293 §3.8.6.1 | ✅ Linux-style probe at `SND.UNA − 1` |
-| Delayed ACK: at once for every 2nd segment, more than one MSS unacknowledged, out-of-order data, a hole filled in whole or part, and duplicates; else 40 ms. A read that empties the receive queue sends an ACK a short or pushed segment earned, unless the connection is interactive | RFC 1122 §4.2.3.2, RFC 5681 §4.2 | ✅ Linux `__tcp_ack_snd_check` / `tcp_cleanup_rbuf` |
+| Window-update rule (SND.WL1 / WL2) | RFC 9293 §3.10.7.4 | ✅ Linux `tcp_may_update_window`: a reordered ACK cannot shrink the window; a forged future WL1 cannot freeze it (nor at the handshake) |
+| Zero-window persist probes | RFC 9293 §3.8.6.1 | ✅ Linux-style probe at `SND.UNA − 1`; an owed FIN waits for the window like data; timeouts into a zero window count only while unanswered |
+| Delayed ACK: at once for every 2nd segment, more than one MSS unacknowledged, out-of-order data, a hole filled in whole or part, and duplicates; in quickack mode (a connection's first segments, data after an idle RTO, after duplicate or out-of-window data, a new CE mark) for every segment; else 40 ms. A read that empties the receive queue sends an ACK a short or pushed segment earned, unless the connection is interactive | RFC 1122 §4.2.3.2, RFC 5681 §4.2 | ✅ Linux `__tcp_ack_snd_check` / `tcp_enter_quickack_mode` / `tcp_cleanup_rbuf` |
 | R2 retransmission limit, USER TIMEOUT, keepalive | RFC 9293 §3.8.3–3.8.4 | ✅ on by default |
 | FIN_WAIT_2 timeout | Linux `tcp_fin_timeout` | ✅ 60 s, restarted only by the application reading |
 | TIME_WAIT, re-ACK and restart on a retransmitted FIN | RFC 9293 §3.10.7.4 | ✅ 60 s; restarts capped at 120 s after entry |
@@ -89,14 +89,22 @@ known differences:
 
 | Area | tcp-sans-io | Linux | Why |
 |---|---|---|---|
-| Clock | Milliseconds, from the host | Microseconds (`tcp_mstamp`) | No clock of its own. RACK's reordering window is at least 2 ms and the TLP timeout `max(2·SRTT, 10 ms)` (Linux: `min_RTT/4` in µs and `2·SRTT + 2 ms`), so on sub-millisecond paths loss is declared a little later; see *Clock model*. |
+| Clock | Milliseconds, from the host | Microseconds (`tcp_mstamp`) | No clock of its own. RACK's reordering window is at least 2 ms and the TLP timeout `max(2·SRTT, 10 ms)` (Linux: `min_RTT/4` in µs and `2·SRTT + 2 ms`), so on sub-millisecond paths loss is declared a little later; and a SACKed retransmission timed at 0 ms against a 1 ms minimum RTT still counts as delivered until the path has shown reordering, where Linux needs no such slack. See *Clock model*. |
 | Congestion control | Reno | CUBIC (+ HyStart) | See *Deliberately deferred*. |
 | Loss reduction | Halves `min(cwnd, peer window)` | Halves `cwnd` | Slow start may grow `cwnd` to twice a flight the peer's window caps (as in Linux), and halving that would not slow the sender: with a 1 MiB window the first reduction after a slow-start overshoot would be a no-op. |
 | Send buffer | Fixed `BUF_CAP` ring, the same size as the largest window it can fill | Autotuned to about twice `cwnd` | Allocation-free. A bulk sender that keeps the peer's window full can drain the ring and send a short segment mid-stream; Nagle then holds the transfer's last short segment behind it for up to an RTT. `close()` (the FIN rides on it) or `set_nodelay(true)` ends a transfer without the wait. |
-| SACK on data segments | Only when the blocks fit beside the payload, so not on full-sized segments | Shrinks the payload to carry them | Pure ACKs (sent at once for out-of-order data) always carry them; only piggybacked ACKs in two-way transfers omit them. |
-| Quick ACKs | Every second segment, a short or pushed segment the application read, out-of-order data, filled holes and duplicates are ACKed at once | Also ACKs every segment for a while at the start of a connection, after an idle RTO and after out-of-window data (`tcp_enter_quickack_mode`) | Not yet modelled. |
+| SACK on retransmissions | A retransmission keeps its size and carries the blocks only if they fit | Splits the segment to fit them (`__tcp_retransmit_skb`) | No re-segmentation of the retransmission queue. New data segments shrink to carry them, as in Linux, and pure ACKs always do. |
 | RST in `CLOSING` / `LAST_ACK` | Reports `ConnectionReset` only if data of ours (beyond the FIN) was undelivered | Always `ECONNRESET` | Everything the application sent arrived, so the stream completed. |
 | PAWS reference expiry | 24 days idle (RFC 7323 §5.5) | About 36 minutes (`TCP_PAWS_WRAP`, sized for microsecond timestamps) | Our timestamps are milliseconds, which take 24 days to wrap. |
+| Late D-SACK undo | Once an episode has ended, only D-SACKs below its recovery point can undo it | Any D-SACK above `undo_marker` counts | A D-SACK for a later tail loss probe would otherwise undo an earlier, real loss's reduction. |
+| Timestamp undo reference | An unresolved tail loss probe keeps it, as a retransmission still in flight | `tcp_any_retrans_done` does not count the probe | The probe's own ACK would otherwise pass for a delayed original's and undo a real loss. |
+| Spurious timeout detection | D-SACK and timestamps (Eifel) | Also F-RTO (RFC 5682, on by default) | Timestamps cover it whenever they are negotiated; F-RTO for peers without them is deferred. |
+| Timeouts into a zero window | Count toward R2 only while unanswered | Given up once the peer has been silent for 2·`TCP_RTO_MAX` (240 s) | Counted like persist probes; the USER TIMEOUT bounds both. |
+| SYN-cookie timestamps | On only if the ACK echoes our SYN-ACK's TSval | On whenever the ACK carries the option | RFC 7323 §3.2: otherwise they were never negotiated. |
+| ECN on active opens | Always requested | Requested only with `tcp_ecn=1` (the default, 2, accepts it but does not ask) | Virtual links and modern queues mark rather than drop; a retransmitted SYN falls back without it. |
+| USER TIMEOUT, keepalive | On by default (5 min; keepalive after 10 min idle, 4 probes 60 s apart) | Off unless set (`TCP_USER_TIMEOUT`, `SO_KEEPALIVE` with 2 h idle) | A library connection has no process exit to reap it; both can be turned off. |
+| FIN_WAIT_2 timeout | 60 s even while the application holds the TCB (restarted by reads; 0 turns it off) | Only for orphaned sockets (`tcp_fin_timeout`) | A sans-I/O TCB cannot tell whether its owner still cares; the host decides. |
+| SYN in TIME_WAIT | Challenge ACK (RFC 5961 §4); a new connection takes a new TCB | May reuse the TIME_WAIT for a new connection with higher sequence numbers or timestamps (`tcp_timewait_state_process`) | One connection per TCB; the host demultiplexes new connections. |
 
 ## Design constraints
 
@@ -174,7 +182,7 @@ mis-ordering, corruption, a panic, or an unbounded loop.
 | `OOO_MAX_RANGES` | 512 (32 w/ `small-buffers`) | `ooo.rs` | Disjoint out-of-order ranges held in the receive ring: one per two full segments of buffer, enough for a full window with every other segment lost. |
 | `RTX_QUEUE_CAP` | 1024 | `rtx_queue.rs` | Segments in flight. When full, new data waits for ACKs; nothing is evicted, so every in-flight segment keeps SACK/RACK coverage. |
 | `TX_RING_CAP` | 32 | `tx_ring.rs` | Egress packets staged before the host must drain. |
-| SACK blocks emitted | ≤ 4 (≤ 3 with timestamps) | `tcb/output.rs` | Bounded by the 40-byte option area; dropped from full-sized data segments rather than shrinking the payload. |
+| SACK blocks emitted | ≤ 4 (≤ 3 with timestamps) | `tcb/output.rs` | Bounded by the 40-byte option area. New data segments shrink their payload to carry them (Linux `tcp_current_mss`); a full-sized retransmission carries only what fits. |
 | `INITIAL_WINDOW` | 10 × SMSS (14,480 B with timestamps) | `congestion.rs` | RFC 6928 initial cwnd. |
 | `MIN_PEER_MSS` | 64 B | `tcb/mod.rs` | Floor on a peer-requested MSS (bounds per-byte header and queue cost). |
 | `RTO_MIN` / `RTO_MAX` | 200 ms / 60 s | `tcb/mod.rs` | RTO = SRTT + max(4·RTTVAR, `RTO_MIN`) as Linux, so even a steady path keeps a 200 ms margin; exponential backoff is capped at `RTO_MAX`. |
@@ -466,21 +474,22 @@ scenario):
 
 | Scenario | Goodput | Retransmits / drops | RTOs | TLPs | Duplicates at receiver |
 |---|---|---|---|---|---|
-| 50 Mbit/s, 20 ms, 64-packet queue (slow-start overshoot) | 5.72 MB/s (95 % of line rate) | 129 / 129 | 0 | 0 | 0 |
-| 1 % random loss, 20 ms | 0.92 MB/s (1.04 × Mathis) | 34 / 34 | 0 | 0 | 0 |
-| 1 % random loss, 50 ms | 0.34 MB/s (0.95 × Mathis) | 34 / 34 | 0 | 0 | 0 |
-| 0.1 % random loss, 20 ms | 9.43 MB/s | 1 / 1 | 0 | 0 | 0 |
+| 50 Mbit/s, 20 ms, 64-packet queue (slow-start overshoot) | 5.73 MB/s (95 % of line rate) | 143 / 143 | 0 | 0 | 0 |
+| 1 % random loss, 20 ms | 0.93 MB/s (1.05 × Mathis) | 34 / 34 | 0 | 0 | 0 |
+| 1 % random loss, 50 ms | 0.33 MB/s (0.93 × Mathis) | 34 / 34 | 0 | 0 | 0 |
+| 0.1 % random loss, 20 ms | 9.50 MB/s | 1 / 1 | 0 | 0 | 0 |
 | 40 consecutive packets lost in one window | 9.58 MB/s | 40 / 40 | 0 | 0 | 0 |
 | Last 3 of 10 segments lost | repaired in 110 ms | 3 / 3 | 0 | 1 | 0 |
 | The same on a virtual link (200 µs RTT) | repaired in 10 ms | 3 / 3 | 0 | 1 | 0 |
-| 2 % reordering (+4 ms), no loss | 5.66 MB/s (94 % of line rate) | 1 / 0 | 0 | 0 | 1 (reduction undone; D-SACK widens RACK's window) |
-| The same, receiver sends no D-SACK | 5.66 MB/s (94 % of line rate) | 34 / 0 | 0 | 0 | 34 (each reduction undone via timestamps) |
-| Virtual link: 10 Gbit/s, 100 µs RTT, 1 % reordering (+100 µs) | 718.5 MB/s | 2 / 0 | 0 | 0 | 2 |
+| Virtual link (200 µs RTT): 3 of 30 lost, then the first retransmission | repaired in 1 ms | 4 / 4 | 0 | 0 | 0 |
+| 2 % reordering (+4 ms), no loss | 5.67 MB/s (94 % of line rate) | 1 / 0 | 0 | 0 | 1 (reduction undone; D-SACK widens RACK's window) |
+| The same, receiver sends no D-SACK | 5.66 MB/s (94 % of line rate) | 37 / 0 | 0 | 0 | 36 (each reduction undone via timestamps) |
+| Virtual link: 10 Gbit/s, 100 µs RTT, 1 % reordering (+100 µs) | 718.7 MB/s | 2 / 0 | 0 | 0 | 2 |
 | The same through a 256-packet queue | 656.5 MB/s | 423 / 421 | 0 | 0 | 2 |
-| 20 % ACK loss | 5.44 MB/s | 0 / 0 | 0 | 0 | 0 |
-| Both directions, 1 % loss each way | 1.14 MB/s | 10 / 10 | 0 | 0 | 0 |
+| 20 % ACK loss | 5.43 MB/s | 0 / 0 | 0 | 0 | 0 |
+| Both directions, 1 % loss each way | 1.11 MB/s | 9 / 9 | 0 | 0 | 0 |
 | Slow reader (500 KB/s) | 0.50 MB/s | 0 / 0 | 0 | 0 | 0 |
-| 6 chaos seeds: 2 % loss + 3 % reordering both ways, sequence wrap | 1.0–2.7 MB/s | 253 / 240 | 0 | 0 | 8 (reordering) |
+| 6 chaos seeds: 2 % loss + 3 % reordering both ways, sequence wrap | 0.97–1.78 MB/s | 101 / 93 (one direction) | 0 | 1 | 7 (reordering) |
 
 The senders keep Nagle on (the default) and do not close, so a transfer's
 last short segment can wait about one RTT for the ACK of an earlier one
@@ -490,9 +499,10 @@ why random loss tracks the Mathis model.
 
 A virtual link (a VMM's virtio ring or a TUN device) has a sub-millisecond
 RTT the millisecond clock cannot resolve. The tail-loss row there is
-repaired by the probe in 10 ms, not by a 200 ms timeout. Mild reordering
-costs two needless retransmissions in 32 MiB, both undone. Through a
-shallow queue, each overflow costs one halving, not repeated ones.
+repaired by the probe in 10 ms, not by a 200 ms timeout, and a lost
+retransmission by RACK within the millisecond. Mild reordering costs two
+needless retransmissions in 32 MiB, both undone. Through a shallow queue,
+each overflow costs one halving, not repeated ones.
 
 ### Reproducing
 
@@ -564,8 +574,8 @@ loss-recovery probes model a 10 ms RTT after a 64 KiB warm-up.
 | **D-SACK**: duplicate reported | 2883 | ✅ yes | ℹ️ no |
 | **out-of-order FIN**: EOF only after the hole fills | 9293 §3.10.7.4 | ✅ | ⚠️ FIN discarded: the peer must resend it |
 | **immediate ACK for out-of-order data**: dup ACK not delayed | 5681 §4.2 | ✅ immediate | ✅ immediate |
-| **ACK every 2nd full segment**: 8 segments, 120 µs apart | 9293 §3.8.6.3, 5681 §4.2 | ✅ 4 ACKs / 8 segments | ✅ 4 ACKs / 8 segments |
-| **delayed ACK < 500 ms**: one small segment | 9293 §3.8.6.3 (MUST-40) | ✅ 40 ms | ✅ 10 ms |
+| **ACK every 2nd full segment**: 8 segments, 120 µs apart | 9293 §3.8.6.3, 5681 §4.2 | ✅ 8 ACKs / 8 segments | ✅ 4 ACKs / 8 segments |
+| **delayed ACK < 500 ms**: one small segment | 9293 §3.8.6.3 (MUST-40) | ✅ 0 ms | ✅ 10 ms |
 | **bad checksum dropped**: flipped payload byte | 9293 §3.1 | ✅ | ✅ |
 | **RTO backoff**: intervals between retransmissions | 6298 §5.5 | ✅ TLP 0.2 s, then 0.2, 0.4, 0.8, 1.6 s | ✅ 1.0, 2.0, 4.0, 8.0, 16.0 s |
 | **fast retransmit**: 3 dup ACKs: resend before RTO | 5681 §3.2 | ✅ repaired in 10 ms | ✅ repaired in 10 ms |
@@ -607,30 +617,31 @@ resent sequence space, both directions.
 
 | Case (client → server) | tcp-sans-io → smoltcp | smoltcp → tcp-sans-io | tcp-sans-io → tcp-sans-io | smoltcp → smoltcp |
 |---|---|---|---|---|
-| **clean**: 1 MiB each way; 10 ms RTT, 100 Mbit/s | ✅ 212 ms · 0 rtx | ✅ 217 ms · 0 rtx | ✅ 134 ms · 0 rtx | ✅ 172 ms · 0 rtx |
-| **loss 2%**: 2% random loss both ways | ✅ 2.79 s · 40 rtx | ✅ 3.04 s · 47 rtx | ✅ 606 ms · 19 rtx | ✅ 3.97 s · 42 rtx |
-| **reorder 3%**: 3% of packets held back 3 ms, both ways | ✅ 562 ms · 38 rtx | ✅ 927 ms · 35 rtx | ✅ 128 ms · 7 rtx | ✅ 1.99 s · 28 rtx |
-| **duplicate 2%**: 2% of packets delivered twice | ✅ 209 ms · 0 rtx | ✅ 210 ms · 0 rtx | ✅ 132 ms · 0 rtx | ✅ 172 ms · 0 rtx |
-| **corrupt 1%**: 1% of packets get a flipped byte (checksums must catch it) | ✅ 1.61 s · 20 rtx | ✅ 693 ms · 17 rtx | ✅ 534 ms · 11 rtx | ✅ 1.70 s · 26 rtx |
-| **kitchen sink**: 1% loss, 1% reorder, 1% duplicate, 0.5% corrupt, both ways | ✅ 2.43 s · 167 rtx | ✅ 1.38 s · 46 rtx | ✅ 769 ms · 28 rtx | ✅ 5.28 s · 30 rtx |
-| **ACK loss 20%**: 2 MiB upload; 20% of the reverse path lost | ✅ 202 ms · 0 rtx | ✅ 3.99 s · 2 rtx | ✅ 203 ms · 0 rtx | ✅ 3.94 s · 2 rtx |
-| **SYN, SYN-ACK lost**: first SYN and first SYN-ACK dropped | ✅ 123 ms · 0 rtx | ✅ 128 ms · 0 rtx | ✅ 32 ms · 0 rtx | ✅ 138 ms · 0 rtx |
-| **server MTU 576**: server MSS 536: both directions must honour it | ✅ 84 ms · 0 rtx | ✅ 102 ms · 0 rtx | ✅ 72 ms · 0 rtx | ✅ 99 ms · 0 rtx |
+| **clean**: 1 MiB each way; 10 ms RTT, 100 Mbit/s | ✅ 202 ms · 0 rtx | ✅ 207 ms · 0 rtx | ✅ 134 ms · 0 rtx | ✅ 172 ms · 0 rtx |
+| **loss 2%**: 2% random loss both ways | ✅ 1.92 s · 36 rtx | ✅ 1.82 s · 28 rtx | ✅ 825 ms · 26 rtx | ✅ 3.97 s · 42 rtx |
+| **reorder 3%**: 3% of packets held back 3 ms, both ways | ✅ 544 ms · 29 rtx | ✅ 696 ms · 24 rtx | ✅ 131 ms · 9 rtx | ✅ 1.99 s · 28 rtx |
+| **duplicate 2%**: 2% of packets delivered twice | ✅ 203 ms · 0 rtx | ✅ 206 ms · 0 rtx | ✅ 134 ms · 0 rtx | ✅ 172 ms · 0 rtx |
+| **corrupt 1%**: 1% of packets get a flipped byte (checksums must catch it) | ✅ 678 ms · 24 rtx | ✅ 685 ms · 21 rtx | ✅ 599 ms · 11 rtx | ✅ 1.70 s · 26 rtx |
+| **kitchen sink**: 1% loss, 1% reorder, 1% duplicate, 0.5% corrupt, both ways | ✅ 1.95 s · 41 rtx | ✅ 869 ms · 32 rtx | ✅ 701 ms · 27 rtx | ✅ 5.28 s · 30 rtx |
+| **ACK loss 20%**: 2 MiB upload; 20% of the reverse path lost | ✅ 202 ms · 0 rtx | ✅ 1.87 s · 1 rtx | ✅ 203 ms · 0 rtx | ✅ 3.94 s · 2 rtx |
+| **SYN, SYN-ACK lost**: first SYN and first SYN-ACK dropped | ✅ 122 ms · 0 rtx | ✅ 128 ms · 0 rtx | ✅ 32 ms · 0 rtx | ✅ 138 ms · 0 rtx |
+| **server MTU 576**: server MSS 536: both directions must honour it | ✅ 84 ms · 0 rtx | ✅ 107 ms · 0 rtx | ✅ 72 ms · 0 rtx | ✅ 99 ms · 0 rtx |
 | **slow reader**: 64 KiB buffers; 1 MiB to a 100 KB/s reader (zero windows) | ✅ 10.48 s · 0 rtx | ✅ 10.48 s · 0 rtx | ✅ 10.48 s · 0 rtx | ✅ 10.48 s · 0 rtx |
 | **4 KiB smoltcp window**: smoltcp with 4 KiB buffers; 256 KiB each way | ✅ 1.19 s · 0 rtx | ✅ 1.19 s · 0 rtx | ✅ 59 ms · 0 rtx | ✅ 835 ms · 0 rtx |
-| **half-close**: 64 KiB request + FIN, then 1 MiB response + FIN | ✅ 189 ms · 0 rtx | ✅ 173 ms · 0 rtx | ✅ 142 ms · 0 rtx | ✅ 253 ms · 0 rtx |
-| **simultaneous close**: 64 KiB each way, then both FIN at t=200 ms (FINs cross) | ✅ 131 ms · 0 rtx | ✅ 136 ms · 0 rtx | ✅ 32 ms · 0 rtx | ✅ 77 ms · 0 rtx |
-| **sequence wrap**: both ISNs within 1 MiB of 2^32; 2 MiB each way, 1% loss | ✅ 1.13 s · 30 rtx | ✅ 1.26 s · 38 rtx | ✅ 1.04 s · 25 rtx | ✅ 3.46 s · 42 rtx |
-| **no timestamps**: smoltcp without its TS generator (its default); 1% loss | ✅ 324 ms · 11 rtx | ✅ 692 ms · 13 rtx | ✅ 530 ms · 12 rtx | ✅ 1.72 s · 23 rtx |
+| **half-close**: 64 KiB request + FIN, then 1 MiB response + FIN | ✅ 177 ms · 0 rtx | ✅ 171 ms · 0 rtx | ✅ 142 ms · 0 rtx | ✅ 253 ms · 0 rtx |
+| **simultaneous close**: 64 KiB each way, then both FIN at t=200 ms (FINs cross) | ✅ 122 ms · 0 rtx | ✅ 119 ms · 0 rtx | ✅ 32 ms · 0 rtx | ✅ 77 ms · 0 rtx |
+| **sequence wrap**: both ISNs within 1 MiB of 2^32; 2 MiB each way, 1% loss | ✅ 1.16 s · 35 rtx | ✅ 1.13 s · 39 rtx | ✅ 1.10 s · 24 rtx | ✅ 3.46 s · 42 rtx |
+| **no timestamps**: smoltcp without its TS generator (its default); 1% loss | ✅ 1.66 s · 19 rtx | ✅ 611 ms · 14 rtx | ✅ 542 ms · 12 rtx | ✅ 1.72 s · 23 rtx |
 | **peer aborts**: server aborts (RST) after 256 KiB of a 1 MiB upload | ✅ | ✅ | ✅ | ✅ |
 
-- In the *loss*, *reorder*, *corrupt* and *kitchen sink* rows the slow
-  direction is smoltcp's: in the mixed pairs tcp-sans-io's stream finishes
-  in 0.15–0.93 s, smoltcp's in 0.57–3.05 s. smoltcp counts only
-  payload-free duplicate ACKs, so the other side's data segments, which
-  carry the same ACK, reset its count; a missed fast retransmit then waits
-  out its 1 s minimum RTO (the *corrupt* and *kitchen sink* rows with
-  tcp-sans-io as the client).
+- In the *loss*, *reorder*, *corrupt*, *kitchen sink* and *no
+  timestamps* rows the slow direction is smoltcp's: in the mixed pairs
+  tcp-sans-io's stream finishes in 0.40–0.85 s, smoltcp's in 0.55–1.96 s.
+  smoltcp counts only payload-free duplicate ACKs that leave the window
+  unchanged, so the other side's data segments, which carry the same ACK,
+  and a window the receiving application opened by reading both reset its
+  count; a missed fast retransmit then waits out its 1 s minimum RTO (the
+  cells near 2 s).
 - **ACK loss**: smoltcp starts with a 2 KB congestion window, so one lost
   ACK early on leaves nothing in flight and it waits out its 1 s minimum
   RTO (twice, here).
@@ -649,7 +660,7 @@ re-established.
 
 | Stack | Segments | Panics | Invariant violations | Connections reset by a fuzzed segment |
 |---|---|---|---|---|
-| tcp-sans-io | 1000000 | 0 | 0 | 2189 |
+| tcp-sans-io | 1000000 | 0 | 0 | 2291 |
 | smoltcp | 1000000 | 0 | n/a | 46902 |
 
 The reset counts mostly follow from the RST rule above: smoltcp honours
@@ -669,17 +680,17 @@ senders meet the same random losses.
 
 | Profile (sender → receiver) | tcp-sans-io → tcp-sans-io | smoltcp → smoltcp | smoltcp/reno → smoltcp/reno | smoltcp → tcp-sans-io | tcp-sans-io → smoltcp |
 |---|---|---|---|---|---|
-| **lan**: 1 ms, 1000 Mbit/s, 200-pkt queue; 64 MiB | 960.3 | 199.5 | 335.4 | 325.0 | 954.9 |
-| **wan**: 40 ms, 100 Mbit/s, 160-pkt queue; 32 MiB | 89.9 | 19.0 | 54.3 | 21.1 | 88.8 |
-| **wan-0.1**: 40 ms, 100 Mbit/s, 160-pkt queue, 0.1% loss; 16 MiB | 15.4 (10.9–20.9) | 8.9 (8.4–12.3) | 9.1 (7.0–12.5) | 8.8 (7.9–11.5) | 15.0 (10.9–19.8) |
-| **wan-1**: 40 ms, 100 Mbit/s, 160-pkt queue, 1% loss; 4 MiB | 4.3 (3.3–4.6) | 2.6 (1.8–3.5) | 2.5 (1.6–3.0) | 2.5 (1.6–3.3) | 4.3 (3.3–4.6) |
-| **metro-0.1**: 10 ms, 200 Mbit/s, 80-pkt queue, 0.1% loss; 32 MiB | 49.6 (43.0–55.7) | 35.6 (22.8–37.4) | 31.5 (25.6–32.4) | 31.3 (24.6–37.5) | 48.8 (41.1–55.0) |
-| **lossy-5**: 20 ms, 50 Mbit/s, 80-pkt queue, 5% loss; 2 MiB | 3.0 (2.8–3.2) | 0.3 (0.3–0.4) | 0.3 (0.3–0.4) | 0.3 | 3.0 (2.8–3.3) |
-| **shallow**: 20 ms, 100 Mbit/s, 16-pkt queue; 32 MiB | 62.1 | 35.9 | 36.0 | 35.4 | 62.4 |
-| **reorder-2**: 20 ms, 50 Mbit/s, 1000-pkt queue, 2% +4 ms reorder; 8 MiB | 46.0 (45.4–46.4) | 6.9 (6.2–7.9) | 6.6 (6.1–6.9) | 6.6 (6.2–7.2) | 45.8 (45.5–46.1) |
-| **burst-40**: 20 ms, 100 Mbit/s, 1000-pkt queue, 40 consecutive drops; 4 MiB | 76.7 | 12.0 | 11.9 | 12.1 | 76.6 |
-| **virt**: 0.1 ms, 10000 Mbit/s, 256-pkt queue; 64 MiB | 9585.1 | 499.6 | 499.7 | 500.0 | 9466.5 |
-| **virt-reorder**: 0.1 ms, 10000 Mbit/s, 256-pkt queue, 1% +0.1 ms reorder; 32 MiB | 8374.7 (8292.7–9499.4) | 953.7 (884.4–987.3) | 927.8 (879.2–946.2) | 971.3 (831.1–1005.7) | 7729.0 (6446.3–9542.0) |
+| **lan**: 1 ms, 1000 Mbit/s, 200-pkt queue; 64 MiB | 960.5 | 199.5 | 335.4 | 327.3 | 954.9 |
+| **wan**: 40 ms, 100 Mbit/s, 160-pkt queue; 32 MiB | 89.6 | 19.0 | 54.3 | 24.1 | 88.8 |
+| **wan-0.1**: 40 ms, 100 Mbit/s, 160-pkt queue, 0.1% loss; 16 MiB | 15.2 (10.9–20.4) | 8.9 (8.4–12.3) | 9.1 (7.0–12.5) | 9.2 (8.3–11.7) | 15.0 (10.9–19.8) |
+| **wan-1**: 40 ms, 100 Mbit/s, 160-pkt queue, 1% loss; 4 MiB | 4.3 (3.3–4.6) | 2.6 (1.8–3.5) | 2.5 (1.6–3.0) | 2.5 (1.7–3.3) | 4.3 (3.3–4.6) |
+| **metro-0.1**: 10 ms, 200 Mbit/s, 80-pkt queue, 0.1% loss; 32 MiB | 49.0 (41.1–55.0) | 35.6 (22.8–37.4) | 31.5 (25.6–32.4) | 26.5 (25.2–37.8) | 48.8 (41.1–55.0) |
+| **lossy-5**: 20 ms, 50 Mbit/s, 80-pkt queue, 5% loss; 2 MiB | 3.0 (2.8–3.2) | 0.3 (0.3–0.4) | 0.3 (0.3–0.4) | 0.4 (0.4–0.5) | 3.0 (2.8–3.2) |
+| **shallow**: 20 ms, 100 Mbit/s, 16-pkt queue; 32 MiB | 62.7 | 35.9 | 36.0 | 36.4 | 62.4 |
+| **reorder-2**: 20 ms, 50 Mbit/s, 1000-pkt queue, 2% +4 ms reorder; 8 MiB | 46.1 (45.4–46.4) | 6.9 (6.2–7.9) | 6.6 (6.1–6.9) | 7.3 (6.1–7.9) | 45.8 (45.5–46.1) |
+| **burst-40**: 20 ms, 100 Mbit/s, 1000-pkt queue, 40 consecutive drops; 4 MiB | 76.7 | 12.0 | 11.9 | 12.3 | 76.6 |
+| **virt**: 0.1 ms, 10000 Mbit/s, 256-pkt queue; 64 MiB | 9596.2 | 499.6 | 499.7 | 500.4 | 9531.5 |
+| **virt-reorder**: 0.1 ms, 10000 Mbit/s, 256-pkt queue, 1% +0.1 ms reorder; 32 MiB | 8315.3 (8161.1–8644.2) | 953.7 (884.4–987.3) | 927.8 (879.2–946.2) | 1068.0 (885.9–1095.8) | 7729.0 (6446.3–9542.0) |
 
 Retransmitted segments / data segments the link dropped / retransmissions
 of data the link had already delivered (medians; a receiver may have
@@ -689,17 +700,17 @@ settles after delivery (both links idle, nothing unacknowledged; at most
 
 | Profile | tcp-sans-io → tcp-sans-io | smoltcp → smoltcp | smoltcp/reno → smoltcp/reno | smoltcp → tcp-sans-io | tcp-sans-io → smoltcp |
 |---|---|---|---|---|---|
-| lan | 294 / 294 / 0 | 458 / 155 / 303 | 422 / 143 / 279 | 447 / 142 / 305 | 511 / 290 / 221 |
-| wan | 232 / 232 / 0 | 712 / 239 / 473 | 679 / 228 / 451 | 683 / 228 / 455 | 268 / 172 / 96 |
-| wan-0.1 | 242 / 242 / 0 | 167 / 52 / 115 | 17 / 17 / 0 | 151 / 51 / 100 | 277 / 181 / 96 |
+| lan | 290 / 290 / 0 | 458 / 155 / 303 | 422 / 143 / 279 | 454 / 142 / 312 | 511 / 290 / 221 |
+| wan | 162 / 162 / 0 | 712 / 239 / 473 | 679 / 228 / 451 | 723 / 231 / 492 | 268 / 172 / 96 |
+| wan-0.1 | 172 / 172 / 0 | 167 / 52 / 115 | 17 / 17 / 0 | 193 / 60 / 133 | 277 / 181 / 96 |
 | wan-1 | 23 / 23 / 0 | 23 / 23 / 0 | 23 / 23 / 0 | 23 / 23 / 0 | 23 / 23 / 0 |
-| metro-0.1 | 224 / 224 / 0 | 385 / 144 / 241 | 385 / 144 / 241 | 409 / 144 / 259 | 120 / 104 / 16 |
-| lossy-5 | 78 / 78 / 0 | 84 / 78 / 7 | 84 / 78 / 6 | 84 / 78 / 8 | 78 / 78 / 0 |
-| shallow | 25 / 25 / 0 | 34 / 12 / 22 | 37 / 12 / 25 | 52 / 17 / 35 | 26 / 26 / 0 |
-| reorder-2 | 1 / 0 / 1 | 29 / 0 / 29 | 31 / 0 / 31 | 32 / 0 / 32 | 34 / 0 / 34 |
+| metro-0.1 | 104 / 104 / 0 | 385 / 144 / 241 | 385 / 144 / 241 | 478 / 160 / 318 | 120 / 104 / 16 |
+| lossy-5 | 78 / 78 / 0 | 84 / 78 / 7 | 84 / 78 / 6 | 90 / 80 / 13 | 78 / 78 / 0 |
+| shallow | 26 / 26 / 0 | 34 / 12 / 22 | 37 / 12 / 25 | 34 / 12 / 22 | 26 / 26 / 0 |
+| reorder-2 | 1 / 0 / 1 | 29 / 0 / 29 | 31 / 0 / 31 | 31 / 0 / 31 | 34 / 0 / 34 |
 | burst-40 | 40 / 40 / 0 | 78 / 40 / 38 | 78 / 40 / 38 | 78 / 40 / 38 | 40 / 40 / 0 |
-| virt | 430 / 430 / 0 | 508 / 172 / 336 | 508 / 172 / 336 | 496 / 172 / 324 | 624 / 346 / 278 |
-| virt-reorder | 383 / 382 / 1 | 188 / 0 / 188 | 178 / 0 / 178 | 189 / 0 / 189 | 12 / 0 / 12 |
+| virt | 388 / 388 / 0 | 508 / 172 / 336 | 508 / 172 / 336 | 503 / 173 / 330 | 624 / 346 / 278 |
+| virt-reorder | 381 / 380 / 1 | 188 / 0 / 188 | 178 / 0 / 178 | 196 / 0 / 196 | 12 / 0 / 12 |
 
 Reading the numbers:
 
@@ -733,7 +744,7 @@ Reading the numbers:
   needless retransmission per 32 MiB; its other retransmissions repair
   queue overflows, each answered by one halving of the window.
 - **As receivers** the two are close: with tcp-sans-io sending, smoltcp's
-  receiver costs at most 3 % (8 % on *virt-reorder*).
+  receiver costs at most 3 % (7 % on *virt-reorder*).
 
 ### CPU cost
 
@@ -745,20 +756,21 @@ interleaved runs, ± half the range.
 
 | Bulk transfer, 1 GiB (sender → receiver) | Sender Gbit/s, per packet | Receiver Gbit/s, per packet | ACKs / 100 segments, per packet | Sender Gbit/s, batched | Receiver Gbit/s, batched | ACKs / 100 segments, batched |
 |---|---|---|---|---|---|---|
-| tcp-sans-io → tcp-sans-io | 33.8 ±3% | 41.3 ±4% | 51 | 34.1 ±3% | 41.5 ±2% | 51 |
-| smoltcp → smoltcp | 35.8 ±3% | 36.9 ±3% | 50 | 48.9 ±2% | 52.4 ±2% | 0 |
+| tcp-sans-io → tcp-sans-io | 35.7 ±3% | 43.6 ±5% | 51 | 35.3 ±3% | 42.9 ±4% | 51 |
+| smoltcp → smoltcp | 37.4 ±3% | 38.5 ±3% | 50 | 50.3 ±4% | 53.1 ±4% | 0 |
 
 | 64 B request / 64 B response (client ⇄ server) | Client µs / transaction | Server µs / transaction | Packets / transaction | Transactions per core-second (both ends) |
 |---|---|---|---|---|
-| tcp-sans-io ⇄ tcp-sans-io | 0.34 ±2% | 0.30 ±2% | 2.00 | 1579501 |
-| smoltcp (Nagle off) ⇄ smoltcp (Nagle off) | 0.35 ±1% | 0.29 ±2% | 2.00 | 1564095 |
+| tcp-sans-io ⇄ tcp-sans-io | 0.35 ±3% | 0.31 ±4% | 2.00 | 1519603 |
+| smoltcp (Nagle off) ⇄ smoltcp (Nagle off) | 0.35 ±2% | 0.28 ±2% | 2.00 | 1587469 |
 
 *Per packet* hands each datagram over and lets the stack act on it before
 the next (one read per packet, as from a TUN or WireGuard device);
 *batched* hands a side the whole flight and lets it act once. Per packet
-both stacks ACK about every second segment; tcp-sans-io costs 6 % more to
+both stacks ACK about every second segment; tcp-sans-io costs 5 % more to
 send with (its Linux-style loss recovery, RTT estimator and window
-validation run on every ACK) and receives 12 % cheaper. Batched, smoltcp
+validation run on every ACK) and receives 12 % cheaper; a request and
+response cost it 4 % more. Batched, smoltcp
 answers a whole flight
 (up to 1 MiB) with a single ACK: cheaper, but a stretch ACK that would
 make the sender burst on a real path. The cross pairs are left out on

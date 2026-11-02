@@ -312,7 +312,9 @@ impl<const BUF: usize> Tcb<BUF> {
             self.snd_wscale = ws;
             self.rcv_wscale = Self::WS;
         }
-        if let Some((tsval, _)) = seg.options.ts {
+        // Timestamps only if our SYN-ACK carried them: its TSval comes back
+        // as a nonzero TSecr (RFC 7323 §3.2: no TSopt unless negotiated).
+        if let Some((tsval, _)) = seg.options.ts.filter(|&(_, e)| e != 0) {
             self.ts_enabled = true;
             self.ts_recent = tsval;
             self.ts_recent_stamp = self.now_ms;
@@ -322,8 +324,9 @@ impl<const BUF: usize> Tcb<BUF> {
         self.snd_wnd = self.scale_peer_window(seg.window);
         self.max_snd_wnd = self.snd_wnd;
         self.snd_wl1 = seg.seq;
-        self.snd_wl2 = seg.ack;
-        self.rcv_adv_edge = self.rcv_nxt;
+        // The SYN-ACK offered the (unscaled) free space: never shrink it.
+        let offered = self.recv_ring.free().min(usize::from(u16::MAX)) as u32;
+        self.rcv_adv_edge = self.rcv_nxt.wrapping_add(offered);
         self.last_ack_sent = self.rcv_nxt;
         self.cc =
             crate::congestion::Reno::new(crate::congestion::initial_window(self.mss_payload()));

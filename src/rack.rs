@@ -184,8 +184,9 @@ impl Rack {
 
     /// Steps 2 and 3 for one newly delivered (cumulatively ACKed or SACKed)
     /// segment. `tsecr_ms` is the ACK's TSecr mapped back onto the host
-    /// clock (TSecr − TS offset), if timestamps are in use.
-    pub fn on_delivered(&mut self, seg: &Seg, now: u64, tsecr_ms: Option<u32>) {
+    /// clock (TSecr − TS offset), if timestamps are in use; `sacked`: the
+    /// delivery was reported by a SACK block.
+    pub fn on_delivered(&mut self, seg: &Seg, now: u64, tsecr_ms: Option<u32>, sacked: bool) {
         // Step 3: reordering — a never-retransmitted segment delivered below
         // the highest sequence delivered by *earlier* ACKs arrived out of
         // order (Linux compares with `prior_fack` likewise).
@@ -211,9 +212,14 @@ impl Rack {
             // so a fast delivery of it is the probe itself. Below 1 ms the
             // clock reads its RTT as 0 against a `min_rtt` floored at 1,
             // and filtering it would leave the rest of a lost tail to the
-            // RTO.
+            // RTO. So it would any SACKed retransmission there, and a lost
+            // retransmission before it would wait for the RTO: until the
+            // path has shown reordering (an original arriving late could
+            // then pass for the retransmission), a tick of slack. Linux,
+            // timing in microseconds, needs none.
             if let Some(m) = self.min_rtt.get() {
-                if rtt < m && self.tlp_probe_end != Some(seg.end) {
+                let slack = u32::from(sacked && m <= 1 && !self.reordering_seen);
+                if rtt.saturating_add(slack) < m && self.tlp_probe_end != Some(seg.end) {
                     return; // implausibly fast: acks the original
                 }
             }
@@ -346,7 +352,7 @@ mod tests {
         // Segment 3 (sent t=101) is SACKed at t=120: RTT 19.
         let s3 = *q.get(3).unwrap();
         q.sack(s3.start, s3.end, |_| ());
-        r.on_delivered(&s3, 120, None);
+        r.on_delivered(&s3, 120, None, false);
         assert_eq!(r.rtt, 19);
         // Not in recovery, 1 segment SACKed: reo_wnd = srtt/4 without a min_rtt sample.
         let reo = r.reo_wnd(20, false, 100, 100);
@@ -368,13 +374,13 @@ mod tests {
         q.on_retransmit(0, 200); // retransmitted at t=200
         let seg0 = *q.get(0).unwrap();
         // ACK arrives at t=201 echoing the original transmission (t=100).
-        r.on_delivered(&seg0, 201, Some(100));
+        r.on_delivered(&seg0, 201, Some(100), false);
         assert!(!r.valid, "ambiguous retransmission must not advance RACK");
         // Without timestamps the min_rtt check rejects the 1 ms "RTT".
-        r.on_delivered(&seg0, 201, None);
+        r.on_delivered(&seg0, 201, None, false);
         assert!(!r.valid);
         // A genuine ACK of the retransmission (RTT 60 >= min_rtt) is accepted.
-        r.on_delivered(&seg0, 260, Some(200));
+        r.on_delivered(&seg0, 260, Some(200), false);
         assert!(r.valid);
         assert_eq!(r.rtt, 60);
     }
@@ -388,10 +394,10 @@ mod tests {
         let mut r = Rack::new();
         r.on_ack_start();
         let s3 = *q.get(3).unwrap();
-        q.sack(s3.start, s3.end, |s| r.on_delivered(s, 120, None));
+        q.sack(s3.start, s3.end, |s| r.on_delivered(s, 120, None, false));
         q.ack_to(1200, |s, newly| {
             if newly {
-                r.on_delivered(s, 120, None);
+                r.on_delivered(s, 120, None, false);
             }
         });
         assert!(!r.reordering_seen);
@@ -400,7 +406,7 @@ mod tests {
         r.on_ack_start();
         q.ack_to(1400, |s, newly| {
             if newly {
-                r.on_delivered(s, 125, None);
+                r.on_delivered(s, 125, None, false);
             }
         });
         assert!(r.reordering_seen);
@@ -426,7 +432,7 @@ mod tests {
         for i in [1, 2, 3] {
             let s = *q.get(i).unwrap();
             q.sack(s.start, s.end, |_| ());
-            r.on_delivered(&s, 200, None);
+            r.on_delivered(&s, 200, None, false);
         }
         let (m, _) = detect_loss(&r, &mut q, 200, 0);
         assert!(!m, "retransmission falsely marked lost");
@@ -447,7 +453,7 @@ mod tests {
         // sent *after* it, so it is not a loss candidate.
         let s2 = *q.get(2).unwrap();
         q.sack(s2.start, s2.end, |_| ());
-        r.on_delivered(&s2, 160, None);
+        r.on_delivered(&s2, 160, None, false);
         let (m, _) = detect_loss(&r, &mut q, 10_000, 0);
         assert!(m);
         assert!(

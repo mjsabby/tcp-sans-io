@@ -425,7 +425,10 @@ impl RtxQueue {
     }
 
     /// Mark every segment fully inside `[left, right)` as SACKed, splitting
-    /// segments the block only partially covers (when there is room).
+    /// segments the block only partially covers while that leaves the slot
+    /// [`Self::has_room_for_new`] keeps free for a retransmission split
+    /// (otherwise the partial coverage is ignored, as Linux
+    /// `tcp_match_skb_to_sack` ignores it for a single-segment skb).
     /// Calls `f` for each newly SACKed segment; returns newly SACKed bytes.
     pub fn sack<F: FnMut(&Seg)>(&mut self, left: u32, right: u32, mut f: F) -> u32 {
         if !seq_lt(left, right) || self.is_empty() {
@@ -448,7 +451,7 @@ impl RtxQueue {
         };
         // Partial coverage at the left edge: split so a segment starts at l.
         if let Some(s) = self.get(i).copied() {
-            if seq_lt(s.start, l) && !s.has(SACKED) && self.split(i, l) {
+            if seq_lt(s.start, l) && !s.has(SACKED) && self.has_room_for_new() && self.split(i, l) {
                 i += 1;
             }
         }
@@ -469,7 +472,7 @@ impl RtxQueue {
             }
             if seq_lt(r, s.end) {
                 // Block ends inside this segment: split, then SACK the lower part.
-                if !self.split(i, r) {
+                if !self.has_room_for_new() || !self.split(i, r) {
                     break;
                 }
                 continue;

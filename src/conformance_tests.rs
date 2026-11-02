@@ -872,6 +872,40 @@ fn l4_csum_trusted_inject_skips_tcp_checksum_only() {
     assert_eq!(buf, payload);
 }
 
+/// Spend the quick ACKs (Linux quickack mode) a connection's first data
+/// earns: one-byte segments until one's ACK is held, then let that delayed
+/// ACK go and read the bytes. Returns the peer's next sequence number.
+fn spend_quick_acks(tcb: &mut Tcb, now: &mut u64, mut seq: u32, tsv: u32) -> u32 {
+    for _ in 0..64 {
+        tcb.set_now(*now);
+        let one = build_in(
+            flags::ACK,
+            seq,
+            ISS.wrapping_add(1),
+            PEER_WIN,
+            None,
+            Some((tsv, 0)),
+            &[0x55],
+        );
+        tcb.inject_packet(&one).expect("inject");
+        seq = seq.wrapping_add(1);
+        let acked = try_pop(tcb).is_some();
+        while try_pop(tcb).is_some() {}
+        if !acked {
+            break;
+        }
+        *now += 1;
+    }
+    *now += 50;
+    tcb.set_now(*now);
+    tcb.tick().expect("tick");
+    while try_pop(tcb).is_some() {}
+    let mut buf = [0u8; 128];
+    while tcb.recv(&mut buf).expect("recv") > 0 {}
+    while try_pop(tcb).is_some() {}
+    seq
+}
+
 /// A segment spanning several MSS (GRO/TSO-coalesced) counts as that many
 /// full-sized segments for delayed-ACK purposes, so it is ACKed at once.
 #[test]
@@ -879,8 +913,11 @@ fn multi_mss_segment_is_acked_immediately() {
     let mut tcb = make_tcb();
     let mut now = 0u64;
     let _ = handshake_with_ts(&mut tcb, &mut now);
+    // Past quickack mode, which ACKs every segment of a new connection.
+    let seq = spend_quick_acks(&mut tcb, &mut now, PSS.wrapping_add(1), 50);
 
-    let seq = PSS.wrapping_add(1);
+    now += 1;
+    tcb.set_now(now);
     let big = build_in(
         flags::ACK,
         seq,

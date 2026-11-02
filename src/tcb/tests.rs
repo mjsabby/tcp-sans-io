@@ -181,6 +181,50 @@ fn r2_counter_resets_on_ack_progress() {
     assert_eq!(t.state(), State::Established);
 }
 
+/// Timeouts into a zero window the peer keeps answering are window probes,
+/// not R2 retransmissions (Linux `tcp_retransmit_timer`): the connection
+/// outlives the R2 budget, and gives up only once the peer falls silent.
+#[test]
+fn zero_window_timeouts_count_only_while_unanswered() {
+    let mut t = established();
+    t.set_user_timeout(0);
+    t.send(&[0xAB; 1000]).unwrap();
+    t.tick().unwrap();
+    drain(&mut t);
+    ack(&mut t, 1001, 0); // the window shuts with data in flight
+    for _ in 0..2 * usize::from(MAX_RETRANSMITS) {
+        run_timers(&mut t, 1, |_| false);
+        ack(&mut t, 1001, 0); // reading nothing, but alive
+    }
+    assert_eq!(t.state(), State::Established);
+    assert!(t.stats.rto_count > u32::from(MAX_RETRANSMITS));
+    run_timers(&mut t, 100, |t| t.state() == State::Closed);
+    assert_eq!(t.state(), State::Closed, "a silent peer is given up on");
+}
+
+/// The receive MSS follows a peer whose segments shrink (a path-MTU drop
+/// on its side): two of one smaller size in a row lower it (Linux
+/// `tcp_measure_rcv_mss`), rather than each counting as a write's end.
+#[test]
+fn receive_mss_follows_a_peer_whose_segments_shrink() {
+    let mut t = established();
+    let mut seq = PEER_ISS + 1;
+    for len in [1460usize, 1460, 1200, 1200] {
+        let p = peer_pkt(
+            seq,
+            1001,
+            flags::ACK,
+            65535,
+            &TcpOptions::NONE,
+            &std::vec![1u8; len],
+        );
+        t.inject_packet(&p).unwrap();
+        seq += len as u32;
+        drain(&mut t);
+    }
+    assert_eq!(t.rcv_mss, 1200);
+}
+
 #[test]
 fn syn_sent_gives_up_after_syn_retries() {
     let mut t = Box::new(Tcb::new(cfg(1000)).unwrap());
@@ -221,15 +265,28 @@ fn lost_fin_is_retransmitted() {
 }
 
 #[test]
-fn fin_is_sent_into_a_zero_window() {
+fn fin_waits_for_the_window_then_goes_out_when_it_opens() {
     let mut t = established();
     ack(&mut t, 1001, 0);
     t.close().unwrap();
     let out = drain(&mut t);
     assert!(
-        out.iter().any(|p| p.2 & flags::FIN != 0),
-        "FIN owes no window"
+        !out.iter().any(|p| p.2 & flags::FIN != 0),
+        "a zero window admits no FIN (Linux `tcp_snd_wnd_test`)"
     );
+    t.debug_check_liveness().unwrap();
+    // The persist timer probes the window, without the FIN.
+    let at = t.next_deadline().unwrap();
+    t.set_now(at);
+    t.tick().unwrap();
+    let probe = drain(&mut t);
+    assert!(!probe.is_empty() && probe.iter().all(|p| p.2 & flags::FIN == 0));
+    t.debug_check_liveness().unwrap();
+    // The window opens: the FIN goes out at once.
+    ack(&mut t, 1001, 100);
+    assert!(drain(&mut t)
+        .iter()
+        .any(|p| p.2 & flags::FIN != 0 && p.0 == 1001));
 }
 
 #[test]

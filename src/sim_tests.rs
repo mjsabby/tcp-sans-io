@@ -60,6 +60,8 @@ struct LinkCfg {
     reorder_extra_us: u64,
     /// Drop payload-carrying packets whose link-entry index is in `[lo, hi)`.
     drop_data: (u64, u64),
+    /// Also drop the payload-carrying packets with these indices.
+    drop_idx: &'static [u64],
     /// Remove D-SACK blocks, as from a receiver that never sends them.
     strip_dsack: bool,
 }
@@ -74,6 +76,7 @@ impl LinkCfg {
             reorder_ppm: 0,
             reorder_extra_us: 0,
             drop_data: (0, 0),
+            drop_idx: &[],
             strip_dsack: false,
         }
     }
@@ -97,6 +100,10 @@ impl LinkCfg {
     }
     const fn drop_data(mut self, lo: u64, hi: u64) -> Self {
         self.drop_data = (lo, hi);
+        self
+    }
+    const fn drop_idx(mut self, idx: &'static [u64]) -> Self {
+        self.drop_idx = idx;
         self
     }
     const fn strip_dsack(mut self) -> Self {
@@ -201,7 +208,9 @@ impl Link {
         if data {
             let idx = self.stats.data_in;
             self.stats.data_in += 1;
-            if (self.cfg.drop_data.0..self.cfg.drop_data.1).contains(&idx) {
+            if (self.cfg.drop_data.0..self.cfg.drop_data.1).contains(&idx)
+                || self.cfg.drop_idx.contains(&idx)
+            {
                 self.stats.data_dropped += 1;
                 return;
             }
@@ -760,6 +769,30 @@ fn sub_millisecond_tail_loss_is_repaired_without_rto() {
     assert_eq!(o.a.rto_count, 0, "tail left to the RTO");
     assert_eq!((o.a.tlp_count, o.a.segs_retrans), (1, 3));
     assert!(o.secs < 0.02, "repaired in {:.3} s", o.secs);
+}
+
+/// A virtual link (200 µs RTT) that loses three segments mid-burst, then
+/// the first of their retransmissions. The later retransmissions are SACKed
+/// within the millisecond they left, so their RTT reads 0 against a 1 ms
+/// `min_rtt`; RACK's retransmission ambiguity filter used to discard them,
+/// and nothing could find the lost retransmission before the RTO.
+#[test]
+fn sub_millisecond_lost_retransmission_is_repaired_without_rto() {
+    for (name, drops) in [
+        ("3 of 30 lost", &[15u64, 16, 17][..]),
+        (
+            "3 of 30 lost, then the first retransmission",
+            &[15, 16, 17, 30][..],
+        ),
+    ] {
+        let rev = LinkCfg::new(0, 10_000, 1024).delay_us(100);
+        let bytes = 30 * 1448;
+        let mut s = Sim::new(rev.drop_idx(drops), rev, 4, bytes, 0);
+        let o = s.run_transfer(10_000_000);
+        o.report(&std::format!("virtual link 200us, {name}"), bytes);
+        assert_eq!(o.a.rto_count, 0, "{name}: left to the RTO");
+        assert!(o.secs < 0.02, "{name}: repaired in {:.3} s", o.secs);
+    }
 }
 
 /// Mild reordering on a virtual link (100 µs RTT, 1 % of packets 100 µs

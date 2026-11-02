@@ -127,8 +127,17 @@ impl<const BUF: usize> Tcb<BUF> {
         if self.snd_una == self.snd_nxt {
             return Ok(());
         }
-        self.rtx_count = self.rtx_count.saturating_add(1);
-        if self.rtx_count > MAX_RETRANSMITS {
+        // Into a zero window the retransmissions are window probes the peer
+        // answers: they count toward R2 only while unanswered (Linux
+        // `tcp_retransmit_timer` gives up only on a silent peer), so a
+        // reader that keeps its window shut is not aborted.
+        let repeat = self.rtx_count != 0;
+        if self.snd_wnd != 0 {
+            self.rtx_count = self.rtx_count.saturating_add(1);
+        } else {
+            self.probes_out = self.probes_out.saturating_add(1);
+        }
+        if self.rtx_count > MAX_RETRANSMITS || self.probes_out > MAX_RETRANSMITS {
             self.abort_local();
             return Ok(());
         }
@@ -148,8 +157,10 @@ impl<const BUF: usize> Tcb<BUF> {
             self.snd_nxt,
             self.mss_payload(),
             seed,
-            self.snd_wnd,
+            self.max_snd_wnd,
+            repeat,
         );
+        self.queue_cwr();
         self.rtx.mark_all_lost();
         self.reno_sacked = 0;
         self.tlp_end_seq = None;
@@ -207,7 +218,7 @@ impl<const BUF: usize> Tcb<BUF> {
             return Ok(());
         }
         let unsent = self.unsent_bytes();
-        let mss = self.mss_payload();
+        let mss = self.data_mss();
         let usable = self.usable_window();
         let (sent, is_retrans) =
             if unsent > 0 && usable >= unsent.min(mss) && self.rtx.has_room_for_new() {
@@ -239,7 +250,8 @@ impl<const BUF: usize> Tcb<BUF> {
     fn on_persist_timer(&mut self) -> Result<(), TcpError> {
         self.persist_deadline = Deadline::OFF;
         let unsent = self.unsent_bytes();
-        if unsent == 0 || self.snd_una != self.snd_nxt {
+        let stuck = |t: &Self| (t.unsent_bytes() > 0 || t.fin_owed()) && t.snd_una == t.snd_nxt;
+        if !stuck(self) {
             return Ok(());
         }
         if self.egress_full() {
@@ -249,20 +261,20 @@ impl<const BUF: usize> Tcb<BUF> {
         }
         let usable = self.usable_window();
         if usable > 0 && self.rtx.has_room_for_new() {
-            let len = usable.min(unsent).min(self.mss_payload());
+            let len = usable.min(unsent).min(self.data_mss());
             let fin = self.fin_owed() && len == unsent;
             let _ = self.emit_new(len, fin)?;
         } else {
             let _ = self.emit_probe(self.snd_una.wrapping_sub(1))?;
-            self.rtx_count = self.rtx_count.saturating_add(1);
-            if self.rtx_count > MAX_RETRANSMITS {
+            self.probes_out = self.probes_out.saturating_add(1);
+            if self.probes_out > MAX_RETRANSMITS {
                 self.abort_local();
                 return Ok(());
             }
         }
         let base = self.persist_backoff_ms.max(self.rto_ms);
         self.persist_backoff_ms = base.saturating_mul(2).min(RTO_MAX_MS);
-        if self.unsent_bytes() > 0 && self.snd_una == self.snd_nxt {
+        if stuck(self) {
             self.persist_deadline = Deadline::at(
                 self.now_ms
                     .saturating_add(u64::from(self.persist_backoff_ms)),
