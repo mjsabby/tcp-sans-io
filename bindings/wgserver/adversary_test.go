@@ -83,9 +83,11 @@ func runOne(t *testing.T, drv *Transport, port uint16, srcPort uint16, msg strin
 // TestWGServer_SynFlood_NoCookies fires a SYN flood with forged
 // random sources at a listener without an explicit cookie secret. The
 // single-TCB-per-port listener holds the first SYN in SYN_RCVD; later
-// SYNs are answered with SYN cookies keyed from the host secret, and the
-// legitimate client's valid cookie ACK takes the slot over — so it gets
-// through at once instead of waiting for the forged half-open to expire.
+// SYNs are answered with SYN cookies keyed from the host secret. With no
+// spare listener to hand it to, the legitimate client's valid cookie ACK
+// (or its next segment) takes the slot over once the forged half-open's
+// SYN-ACK has gone unanswered for an RTO — instead of waiting for the
+// forged half-open to expire.
 //
 // This asserts the server is not held hostage by a flood. Gated by
 // STRESS=1.

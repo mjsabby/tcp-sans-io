@@ -25,6 +25,11 @@ pub enum TcpError {
     ConnectionClosed = -8,
     /// Numeric conversion / arithmetic boundary error (defensive).
     Overflow = -9,
+    /// A listener whose half-open slot holds a live handshake was handed a
+    /// valid SYN-cookie ACK from another peer. It keeps its half-open and
+    /// takes nothing: give the same datagram to a fresh listener (same
+    /// secrets), which turns it into that peer's connection.
+    ListenerBusy = -10,
 }
 
 impl TcpError {

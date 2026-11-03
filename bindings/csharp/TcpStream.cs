@@ -170,10 +170,28 @@ internal sealed class TcpStream : IDisposable
         lock (_sync) Check(Native.tcp_set_mtu(_storage, mtu));
     }
 
-    /// <summary>Report a smaller path MTU mid-connection (e.g. from ICMP).</summary>
+    /// <summary>Report a smaller path MTU mid-connection (for ICMP, prefer
+    /// <see cref="UpdatePmtuIcmp"/>).</summary>
     public void UpdatePmtu(ulong nowMs, ushort mtu)
     {
         lock (_sync) Check(Native.tcp_update_pmtu(_storage, nowMs, mtu));
+    }
+
+    /// <summary>
+    /// Report the MTU of an ICMP "fragmentation needed" quoting this
+    /// connection, with the quoted TCP header's sequence number. Returns
+    /// false (and changes nothing) if that sequence number is not in flight,
+    /// as Linux checks.
+    /// </summary>
+    public bool UpdatePmtuIcmp(ulong nowMs, ushort mtu, uint quotedSeq)
+    {
+        lock (_sync)
+        {
+            int rc = Native.tcp_update_pmtu_icmp(_storage, nowMs, mtu, quotedSeq);
+            if (rc == (int)TcpErrorCode.NotForUs) return false;
+            Check(rc);
+            return true;
+        }
     }
 
     /// <summary>
@@ -278,8 +296,12 @@ internal sealed class TcpStream : IDisposable
     /// Feed one inbound IPv4+TCP datagram. Returns true if accepted; false
     /// for the contract's benign drop-and-continue rejections (NotForUs /
     /// MalformedPacket / InvalidState — normal under a hostile or mis-routed
-    /// wire). Throws only for genuinely unexpected codes. Drain
-    /// <see cref="ExtractPacket"/> until null after every call.
+    /// wire). A listener busy with a live half-open throws
+    /// <see cref="TcpException"/> with <c>ListenerBusy</c> for another peer's
+    /// valid SYN-cookie ACK: inject the same datagram into a fresh listener,
+    /// which becomes that peer's connection. Throws otherwise only for
+    /// genuinely unexpected codes. Drain <see cref="ExtractPacket"/> until
+    /// null after every call.
     /// </summary>
     public bool InjectPacket(ReadOnlySpan<byte> packet, ulong nowMs)
     {

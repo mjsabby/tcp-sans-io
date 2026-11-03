@@ -78,6 +78,10 @@ const TIME_WAIT_MS: u64 = 60_000;
 const TIME_WAIT_MAX_MS: u64 = 2 * TIME_WAIT_MS;
 const RTO_MAX_MS: u32 = 60_000;
 const RTO_MIN_MS: u32 = 200;
+/// The first data RTO when the handshake gave no RTT sample (a SYN or
+/// SYN-ACK resent without timestamps, or a cookie): Linux
+/// `TCP_TIMEOUT_FALLBACK`, RFC 6298 §5.7.
+const RTO_FALLBACK_MS: u32 = 3_000;
 /// Delayed-ACK quantum (Linux default is 40 ms; RFC 5681 caps at 500 ms).
 const DELAYED_ACK_MS: u64 = 40;
 /// [`Tcb::ack_pushed`] bits (Linux `ICSK_ACK_PUSHED`, `ICSK_ACK_PUSHED2`).
@@ -478,7 +482,13 @@ pub struct Tcb<const BUF: usize = BUF_CAP> {
     time_wait_since_ms: u64,
     fin_wait2_timeout_ms: u32,
     fin_wait2_deadline: Deadline,
+    /// The application read in `FIN_WAIT_2`: the next `tick` restarts the
+    /// timeout from its own time.
+    fin_wait2_read: bool,
     error: Option<TcpError>,
+    /// `(SEQ, ACK)` of the connection's final RST, owed while the egress
+    /// ring was full: staged as soon as the host takes a packet out.
+    owed_rst: Option<(u32, u32)>,
 
     // ---- Egress staging.
     tx_ring: TxRing,
@@ -518,9 +528,6 @@ pub struct Tcb<const BUF: usize = BUF_CAP> {
     cookie_secret_explicit: bool,
     /// A cookie SYN-ACK was sent under the current key.
     cookie_secret_used: bool,
-    /// Cookie ACKs are accepted until then: two time buckets after the last
-    /// cookie SYN-ACK (Linux `tcp_synq_no_recent_overflow`); 0 = never.
-    cookies_valid_until_ms: u64,
     /// The key before the last rotation, kept while cookies issued under it
     /// can still be valid (until `prev_cookie_until_ms`).
     prev_cookie_secret: [u8; 16],
@@ -604,6 +611,7 @@ impl<const BUF: usize> Tcb<BUF> {
             core::ptr::write_bytes(p, 0, 1);
             core::ptr::addr_of_mut!((*p).state).write(State::Closed);
             core::ptr::addr_of_mut!((*p).error).write(None);
+            core::ptr::addr_of_mut!((*p).owed_rst).write(None);
             core::ptr::addr_of_mut!((*p).tlp_end_seq).write(None);
             core::ptr::addr_of_mut!((*p).rto_span).write(None);
             core::ptr::addr_of_mut!((*p).ooo_fin).write(None);
@@ -640,7 +648,6 @@ impl<const BUF: usize> Tcb<BUF> {
         self.cookie_secret_set = false;
         self.cookie_secret_explicit = false;
         self.cookie_secret_used = false;
-        self.cookies_valid_until_ms = 0;
         self.prev_cookie_secret = [0; 16];
         self.prev_cookie_secret_set = false;
         self.prev_cookie_until_ms = 0;
@@ -658,6 +665,11 @@ impl<const BUF: usize> Tcb<BUF> {
         self.user_timeout_ms = DEFAULT_USER_TIMEOUT_MS;
         self.fin_wait2_timeout_ms = DEFAULT_FIN_WAIT2_TIMEOUT_MS;
         self.nodelay = false;
+        // Not per connection: what is staged may be for other peers (a
+        // listener's cookie SYN-ACKs and RSTs), and the limit on replies to
+        // stray segments must survive listener transitions.
+        self.tx_ring.clear();
+        self.last_oow_ms = Deadline::OFF;
         self.reset_connection_state();
         self.state = State::Closed;
     }
@@ -775,14 +787,14 @@ impl<const BUF: usize> Tcb<BUF> {
         self.time_wait_deadline = Deadline::OFF;
         self.time_wait_since_ms = 0;
         self.fin_wait2_deadline = Deadline::OFF;
+        self.fin_wait2_read = false;
         self.error = None;
-        self.tx_ring.clear();
+        self.owed_rst = None;
         self.syn_rcvd_retries = 0;
         self.keepalive_probes = 0;
         self.keepalive_deadline = Deadline::OFF;
         self.user_timeout_deadline = Deadline::OFF;
         self.ut_progress = 0;
-        self.last_oow_ms = Deadline::OFF;
         self.stats = TcbStats::default();
     }
 
@@ -1183,6 +1195,22 @@ impl<const BUF: usize> Tcb<BUF> {
         }
     }
 
+    /// [`Self::update_pmtu`] for an ICMP "fragmentation needed": taken only
+    /// if the sequence number the ICMP quotes from our segment lies in
+    /// `[SND.UNA, SND.NXT]` (Linux `tcp_v4_err`, RFC 5927 §4.1), so an
+    /// off-path forger who knows the 4-tuple must also hit the flight; each
+    /// smaller report resends what no longer fits. `NotForUs` otherwise, or
+    /// before the handshake started.
+    pub fn update_pmtu_icmp(&mut self, mtu: u16, quoted_seq: u32) -> Result<(), TcpError> {
+        let in_flight =
+            quoted_seq.wrapping_sub(self.snd_una) <= self.snd_nxt.wrapping_sub(self.snd_una);
+        if matches!(self.state, State::Closed | State::Listen) || !in_flight {
+            return Err(TcpError::NotForUs);
+        }
+        self.update_pmtu(mtu);
+        Ok(())
+    }
+
     /// Install a 128-bit host secret (from a CSPRNG). Keys the per-connection
     /// timestamp offset (so TSval does not reveal the host clock, RFC 7323
     /// §5.4) and per-SYN ISNs on listeners (RFC 6528). Unless
@@ -1194,7 +1222,7 @@ impl<const BUF: usize> Tcb<BUF> {
         self.secret = *secret;
         self.secret_set = true;
         if !self.cookie_secret_explicit {
-            self.install_cookie_key(cookie::derive_cookie_key(secret));
+            self.install_cookie_key(cookie::derive_cookie_key(secret), false);
         }
     }
 
@@ -1203,19 +1231,24 @@ impl<const BUF: usize> Tcb<BUF> {
     /// answers further SYNs with cookies while that slot is busy. Cookies
     /// issued under the previous key stay valid for their normal 64–128 s
     /// lifetime, so rotating no more often than every ~2 minutes never breaks
-    /// a handshake in progress. Also used as the host secret if
-    /// [`Tcb::set_secret`] was not called.
+    /// a handshake in progress. A listener set up within 128 s of a rotation
+    /// takes those cookies too if given the previous key first, then the
+    /// current one. Also used as the host secret if [`Tcb::set_secret`] was
+    /// not called.
     pub fn set_cookie_secret(&mut self, secret: &[u8; 16]) {
-        self.install_cookie_key(*secret);
+        self.install_cookie_key(*secret, true);
         self.cookie_secret_explicit = true;
     }
 
     /// Make `key` the current cookie key. The old one keeps validating for
     /// the lifetime of the cookies issued under it (two time buckets from
-    /// now) — and only if any were: otherwise every forged cookie ACK would
-    /// pay for a second key for nothing.
-    fn install_cookie_key(&mut self, key: [u8; 16]) {
-        if self.cookie_secret_set && self.cookie_secret != key && self.cookie_secret_used {
+    /// now), except a derived key that an explicit one replaces before any
+    /// cookie went out under it (the usual setup order, `set_secret` then
+    /// `set_cookie_secret`): every forged cookie ACK would pay for a second
+    /// key for nothing.
+    fn install_cookie_key(&mut self, key: [u8; 16], explicit: bool) {
+        let rotation = self.cookie_secret_used || self.cookie_secret_explicit == explicit;
+        if self.cookie_secret_set && self.cookie_secret != key && rotation {
             self.prev_cookie_secret = self.cookie_secret;
             self.prev_cookie_secret_set = true;
             self.prev_cookie_until_ms = self
@@ -1262,14 +1295,15 @@ impl<const BUF: usize> Tcb<BUF> {
     ///
     /// The listener holds one half-open connection at a time, statefully, so
     /// it keeps every option the client offers. While that slot is busy, SYNs
-    /// from other peers are answered with SYN cookies (no state); a valid
-    /// cookie ACK replaces the pending half-open, so spoofed SYNs cannot lock
-    /// the listener. A half-open whose SYN-ACK already needed a retransmit
-    /// also yields its slot to a SYN from a new peer. Cookie ACKs are taken
-    /// only within 128 s of this listener's last cookie (Linux
-    /// `tcp_synq_no_recent_overflow`), so a host running several listeners
-    /// on one port must deliver all of a handshake's packets (one 4-tuple)
-    /// to the same one.
+    /// from other peers are answered with SYN cookies (no state). Their valid
+    /// cookie ACKs come back as [`TcpError::ListenerBusy`] while the half-open
+    /// is live: inject the same datagram into a fresh listener set up like
+    /// this one, which becomes that peer's connection. A half-open whose
+    /// SYN-ACK already needed a retransmit yields its slot to such an ACK,
+    /// and to a SYN from a new peer, so spoofed SYNs cannot lock the
+    /// listener out. Any listener holding the cookie key takes a cookie ACK,
+    /// so the listener the host sets up after this one becomes a connection
+    /// takes those of its cookies.
     pub fn listen(&mut self) -> Result<(), TcpError> {
         match self.state {
             State::Closed | State::Listen | State::TimeWait => {}
@@ -1305,21 +1339,25 @@ impl<const BUF: usize> Tcb<BUF> {
         Ok(written)
     }
 
-    /// Lend the send ring's free space to the host to fill in place, for
-    /// example as the buffers of an asynchronous socket receive, instead of
-    /// copying the data in through [`Self::send`]. Returns up to `max` bytes
-    /// as two slices; the second is empty unless the space wraps the end of
-    /// the ring. Fill a prefix (the first slice first), then call
-    /// [`Self::send_commit`].
+    /// Lend the send ring's free space to the host to fill in place (a
+    /// socket `read` straight into it, say) instead of copying the data in
+    /// through [`Self::send`]. Returns up to `max` bytes as two slices; the
+    /// second is empty unless the space wraps the end of the ring. Fill a
+    /// prefix (the first slice first), then call [`Self::send_commit`].
     ///
-    /// The lent bytes stay the host's until that commit, whatever happens to
-    /// the connection meanwhile: the TCB neither reads nor writes them, and
-    /// `send` returns `WouldBlock` (`poll` drops `WRITABLE`). An asynchronous
-    /// host may therefore hold raw pointers to them across other calls, but
-    /// must commit before it calls `reinit` or drops the TCB. One loan at a
-    /// time: `InvalidState` while one is out or when the connection cannot
-    /// send, `WouldBlock` when the ring is full or `max` is 0. (Rust API
-    /// only.)
+    /// Write the slices while you hold them: they borrow the TCB. Until the
+    /// commit the loan stays out across other calls, whatever happens to
+    /// the connection meanwhile: the TCB neither reads nor writes the lent
+    /// bytes, and `send` returns `WouldBlock` (`poll` drops `WRITABLE`), so
+    /// what was written stays as written. Do not keep raw pointers into them
+    /// to write after another call, though (an asynchronous receive
+    /// completing into them, for one): every call takes `&mut self`, which
+    /// Rust's aliasing rules (Stacked Borrows, as Miri checks) let assume
+    /// nothing else writes the TCB, rings included, so such a write is
+    /// undefined behavior even though the TCB never looks. Commit, with 0 if
+    /// need be, before `reinit` or dropping the TCB. One loan at a time:
+    /// `InvalidState` while one is out or when the connection cannot send,
+    /// `WouldBlock` when the ring is full or `max` is 0. (Rust API only.)
     pub fn send_reserve(&mut self, max: usize) -> Result<(&mut [u8], &mut [u8]), TcpError> {
         if self.send_lent != 0 || !self.state.can_send() {
             return Err(TcpError::InvalidState);
@@ -1364,11 +1402,10 @@ impl<const BUF: usize> Tcb<BUF> {
         }
         let n = self.recv_ring.read(dst);
         if n > 0 {
+            // `recv` takes no clock, so `now_ms` may be a turn old: the next
+            // `tick` restarts the FIN_WAIT_2 timeout from its own time.
             if self.state == State::FinWait2 && self.fin_wait2_timeout_ms != 0 {
-                self.fin_wait2_deadline = Deadline::at(
-                    self.now_ms
-                        .saturating_add(u64::from(self.fin_wait2_timeout_ms)),
-                );
+                self.fin_wait2_read = true;
             }
             // Linux `__tcp_cleanup_rbuf`: a read that empties the receive
             // queue sends a held ACK at once if a short or pushed segment
@@ -1425,9 +1462,11 @@ impl<const BUF: usize> Tcb<BUF> {
         self.maybe_send_data()
     }
 
-    /// Abort: queue `RST+ACK` (seq = SND.NXT, ack = RCV.NXT) and drop all
-    /// state, received bytes not yet read included. Local-only in `LISTEN` /
-    /// `SYN_SENT`. Idempotent on `CLOSED`.
+    /// Abort: queue `RST+ACK` (seq = SND.NXT, ack = RCV.NXT) behind whatever
+    /// is still staged (with the egress ring full, as soon as the host
+    /// extracts a packet) and drop all state, received bytes not yet read
+    /// included. Local-only in `LISTEN` / `SYN_SENT`. Idempotent on
+    /// `CLOSED`.
     pub fn abort(&mut self) -> Result<(), TcpError> {
         match self.state {
             State::Closed => return Ok(()),
@@ -1435,11 +1474,7 @@ impl<const BUF: usize> Tcb<BUF> {
                 self.is_listener = false;
             }
             _ => {
-                let _ = self.emit_ctl(
-                    wire::flags::RST | wire::flags::ACK,
-                    self.snd_nxt,
-                    self.rcv_nxt,
-                )?;
+                self.emit_final_rst()?;
             }
         }
         self.recv_ring.clear();
@@ -1537,13 +1572,36 @@ impl<const BUF: usize> Tcb<BUF> {
     /// Pop one staged outbound datagram into `out` (0 when none pending).
     /// `out` must hold at least [`crate::MAX_PACKET`] bytes.
     pub fn extract_packet(&mut self, out: &mut [u8]) -> Result<usize, TcpError> {
-        self.tx_ring.pop_into(out)
+        let n = self.tx_ring.pop_into(out)?;
+        if self.owed_rst.is_some() {
+            self.stage_owed_rst();
+        }
+        Ok(n)
     }
 
     /// Pop one staged outbound datagram and lend it to `f` instead of
     /// copying it out (`None` when none is pending).
     pub fn extract_packet_with<R>(&mut self, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
-        self.tx_ring.pop_with(f)
+        let r = self.tx_ring.pop_with(f);
+        if self.owed_rst.is_some() {
+            self.stage_owed_rst();
+        }
+        r
+    }
+
+    /// Stage the final RST a full egress ring held back, now that a packet
+    /// left it.
+    #[cold]
+    #[inline(never)]
+    fn stage_owed_rst(&mut self) {
+        if let Some((seq, ack)) = self.owed_rst {
+            if !matches!(
+                self.emit_ctl(wire::flags::RST | wire::flags::ACK, seq, ack),
+                Ok(false)
+            ) {
+                self.owed_rst = None;
+            }
+        }
     }
 
     /// Feed an inbound IPv4+TCP datagram (checksums verified).

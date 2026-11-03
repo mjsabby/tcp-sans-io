@@ -365,7 +365,18 @@ impl Reno {
     /// was spurious: restore the prior window and leave recovery. Returns
     /// `true` when the episode was undone.
     pub fn on_dsack(&mut self, start: u32, end: u32, mss: u32) -> bool {
-        if !self.undo_valid || self.undo_retrans == 0 || !seq_ge(start, self.undo_marker) {
+        let segs = end.wrapping_sub(start).div_ceil(mss.max(1)).max(1);
+        self.on_dsack_segs(start, end, segs)
+    }
+
+    /// [`Self::on_dsack`] for `segs` needless retransmissions the caller
+    /// found in `[start, end)` (none counts for nothing).
+    pub fn on_dsack_segs(&mut self, start: u32, end: u32, segs: u32) -> bool {
+        if segs == 0
+            || !self.undo_valid
+            || self.undo_retrans == 0
+            || !seq_ge(start, self.undo_marker)
+        {
             return false;
         }
         // Once the episode is over, only its own retransmissions (below its
@@ -374,7 +385,6 @@ impl Reno {
         if self.state == CaState::Open && !seq_ge(self.recovery_point, end) {
             return false;
         }
-        let segs = end.wrapping_sub(start).div_ceil(mss.max(1)).max(1);
         self.undo_retrans = self.undo_retrans.saturating_sub(segs);
         if self.undo_retrans > 0 {
             return false;

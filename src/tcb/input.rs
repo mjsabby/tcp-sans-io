@@ -13,18 +13,21 @@
 use super::{
     seq_ge, seq_gt, seq_in_range, seq_le, seq_lt, Deadline, Endpoint, HeldFin, Tcb, ACK_PUSHED,
     ACK_PUSHED2, DELAYED_ACK_MS, MAX_QUICKACKS, MIN_PEER_MSS, PAWS_IDLE_MS, RCV_MSS_INITIAL,
-    TIME_WAIT_MAX_MS, TIME_WAIT_MS,
+    RTO_FALLBACK_MS, RTO_MAX_MS, TIME_WAIT_MAX_MS, TIME_WAIT_MS,
 };
 use crate::congestion::{self, Reno};
 use crate::error::TcpError;
 use crate::ooo::Insert;
 use crate::state::State;
-use crate::wire::{ecn, flags, Segment};
+use crate::wire::{self, ecn, flags, Segment};
 
 impl<const BUF: usize> Tcb<BUF> {
     pub(super) fn inject_segment(&mut self, seg: &Segment<'_>) -> Result<(), TcpError> {
         if seg.dst_ip != self.local.ip || seg.dst_port != self.local.port {
             return Err(TcpError::NotForUs);
+        }
+        if wire::martian_source(seg.src_ip, self.local.ip) {
+            return Err(TcpError::MalformedPacket);
         }
         let from_remote = seg.src_ip == self.remote.ip && seg.src_port == self.remote.port;
         if self.state != State::Listen && !from_remote {
@@ -98,11 +101,14 @@ impl<const BUF: usize> Tcb<BUF> {
 
     /// Segment from a peer other than the half-open's, while a listener's
     /// only slot is busy (hybrid SYN cookies). SYNs are answered with a
-    /// cookie SYN-ACK, holding no state; a valid cookie ACK proves the peer
-    /// receives our packets — which a pending half-open has not yet shown —
-    /// so it takes over the slot. Spoofed SYNs therefore cannot lock a
-    /// listener out, however fast they arrive. Any other ACK is answered as
-    /// in LISTEN (see [`Self::on_listen`]).
+    /// cookie SYN-ACK, holding no state. A valid cookie ACK is that peer's
+    /// connection, but the slot's handshake may be live too, so it is not
+    /// given up (as Linux, whose request sockets are independent): the
+    /// cookie ACK is returned as `ListenerBusy` for the host to hand to a
+    /// fresh listener. Only a half-open whose SYN-ACK went unanswered for an
+    /// RTO (typically a spoofed source) yields the slot to it, so spoofed
+    /// SYNs cannot lock out a host that does not hand off. Any other ACK is
+    /// answered as in LISTEN (see [`Self::on_listen`]).
     fn on_busy_listener(&mut self, seg: &Segment<'_>) -> Result<(), TcpError> {
         if self.state != State::SynRcvd || !self.is_listener {
             return Err(TcpError::NotForUs);
@@ -114,6 +120,9 @@ impl<const BUF: usize> Tcb<BUF> {
         if seg.has(flags::ACK) && !seg.has(flags::RST) {
             if !seg.has(flags::SYN) {
                 if let Some(opts) = self.validate_cookie(seg) {
+                    if self.syn_rcvd_retries == 0 {
+                        return Err(TcpError::ListenerBusy);
+                    }
                     self.reset_to_listen_or_closed();
                     return self.promote_via_cookie(seg, opts);
                 }
@@ -247,6 +256,7 @@ impl<const BUF: usize> Tcb<BUF> {
     }
 
     fn complete_active_open(&mut self, seg: &Segment<'_>) -> Result<(), TcpError> {
+        let retrans = u32::from(self.rtx_count);
         self.absorb_syn_options(seg);
         // RFC 3168 §6.1.1: ECN is on iff the SYN-ACK has ECE without CWR.
         self.ecn_enabled = seg.has(flags::ECE) && !seg.has(flags::CWR);
@@ -258,6 +268,7 @@ impl<const BUF: usize> Tcb<BUF> {
         self.rto_deadline = Deadline::OFF;
         self.state = State::Established;
         self.on_established();
+        self.handshake_loss_window(retrans, seg);
         // Data carried on a SYN-ACK (rare) is not accepted; our ACK of
         // `irs + 1` makes the peer retransmit it.
         self.send_pure_ack()
@@ -298,6 +309,22 @@ impl<const BUF: usize> Tcb<BUF> {
             if r < 60_000 {
                 self.update_rtt(r, Some(r));
             }
+        }
+    }
+
+    /// Linux `tcp_init_transfer`: after more than one SYN (or SYN-ACK)
+    /// retransmission the transfer starts from one segment, unless the
+    /// ACK's TSecr echoes the original's TSval, so the timeout was spurious
+    /// (`tcp_try_undo_spurious_syn`).
+    fn handshake_loss_window(&mut self, retrans: u32, seg: &Segment<'_>) {
+        let first = self.syn_xmit_ms as u32;
+        let spurious = self.ts_enabled
+            && seg
+                .options
+                .ts
+                .is_some_and(|(_, e)| e != 0 && self.tsecr_to_ms(e) == first);
+        if retrans > 1 && !spurious {
+            self.cc = Reno::new(self.mss_payload());
         }
     }
 
@@ -347,6 +374,10 @@ impl<const BUF: usize> Tcb<BUF> {
                     self.update_ts_recent(seg);
                     return self.complete_passive_open(seg);
                 }
+            } else if self.paws_reject(seg) {
+                // An old SYN (Linux `tcp_check_req`: ACK and drop) neither
+                // repeats our SYN-ACK nor resets the half-open.
+                return self.send_oow_ack();
             } else if seg.seq == self.irs {
                 // Retransmitted SYN: our SYN-ACK was lost.
                 if self.oow_allowed() {
@@ -407,6 +438,7 @@ impl<const BUF: usize> Tcb<BUF> {
 
     fn complete_passive_open(&mut self, seg: &Segment<'_>) -> Result<(), TcpError> {
         let is_syn = seg.has(flags::SYN);
+        let retrans = u32::from(self.syn_rcvd_retries);
         self.snd_una = seg.ack;
         self.snd_acked = u64::from(seg.ack.wrapping_sub(self.iss));
         self.syn_unacked = false;
@@ -433,6 +465,7 @@ impl<const BUF: usize> Tcb<BUF> {
         self.syn_rcvd_retries = 0;
         self.state = State::Established;
         self.on_established();
+        self.handshake_loss_window(retrans, seg);
         if is_syn {
             return self.send_pure_ack();
         }
@@ -445,17 +478,24 @@ impl<const BUF: usize> Tcb<BUF> {
     /// [`Self::complete_passive_open`] sets up, short of the state (Linux
     /// `tcp_rcv_synrecv_state_fastopen`).
     pub(super) fn complete_closed_handshake(&mut self, seg: &Segment<'_>) {
+        let retrans = u32::from(self.syn_rcvd_retries);
         if self.syn_rcvd_retries > 0 {
             self.syn_retransmitted = true;
         }
         self.handshake_rtt_sample(seg);
         self.syn_rcvd_retries = 0;
         self.on_established();
+        self.handshake_loss_window(retrans, seg);
     }
 
     /// Common setup on entering ESTABLISHED.
     pub(super) fn on_established(&mut self) {
         self.cc = Reno::new(congestion::initial_window(self.mss_payload()));
+        // No RTT sample from the handshake: not the SYN timer's backoff,
+        // but Linux's conservative 3 s (`tcp_init_metrics`).
+        if !self.rtt_first_sample {
+            self.rto_ms = RTO_FALLBACK_MS.max(self.init_rto_ms).min(RTO_MAX_MS);
+        }
         self.cwnd_limited = false;
         self.cwnd_limited_seq = self.snd_nxt;
         self.pipe_hiwat = 0;
@@ -528,13 +568,9 @@ impl<const BUF: usize> Tcb<BUF> {
             return self.on_unacceptable(seg, payload_len, fin);
         }
         if self.paws_reject(seg) {
-            // RFC 7323 §5.3 R1: ACK and drop. An old pure ACK below RCV.NXT
-            // is dropped silently, as Linux (an ACK of it would only
-            // repeat ours); data or a FIN is ACKed at once only if
-            // `may_answer_at_once`.
-            if payload_len == 0 && !fin && seq_lt(seg.seq, self.rcv_nxt) {
-                return Ok(());
-            }
+            // RFC 7323 §5.3 R1: ACK and drop; data or a FIN is ACKed at once
+            // only if `may_answer_at_once`. (An old pure ACK below RCV.NXT
+            // never gets here: `on_unacceptable` drops it.)
             return if self.may_answer_at_once(seg) {
                 self.send_pure_ack()
             } else {
@@ -702,6 +738,11 @@ impl<const BUF: usize> Tcb<BUF> {
         }
         if seg.has(flags::SYN) || !seg.has(flags::ACK) || !self.ack_acceptable(seg.ack) {
             return self.send_oow_ack();
+        }
+        // An old pure ACK below RCV.NXT that fails PAWS is dropped silently,
+        // as Linux does (`PAWS_OLD_ACK`): an ACK of it would only repeat ours.
+        if payload_len == 0 && !fin && seq_lt(seg.seq, self.rcv_nxt) && self.paws_reject(seg) {
+            return Ok(());
         }
         let end = seg.seq.wrapping_add(payload_len);
         let right_edge = self.rcv_nxt.wrapping_add(self.recv_ring.free() as u32);
@@ -957,9 +998,15 @@ impl<const BUF: usize> Tcb<BUF> {
             return self.absorb_ooo(seg_fin) || ack_now || held;
         }
         let end = seq.wrapping_add(take as u32);
-        match self.ooo.insert(seq, end, self.rcv_nxt) {
+        let ring = &mut self.recv_ring;
+        let store = |l: u32, r: u32| {
+            let at = l.wrapping_sub(seq) as usize;
+            if let Some(new) = data.get(at..r.wrapping_sub(seq) as usize) {
+                let _ = ring.write_at(off + at, new);
+            }
+        };
+        match self.ooo.insert_with(seq, end, self.rcv_nxt, store) {
             Insert::Stored { dup, dup_bytes } => {
-                let _ = self.recv_ring.write_at(off, data);
                 // Bytes already held arrived again: D-SACK the lowest run
                 // of them, also when the segment brought new bytes too
                 // (Linux `tcp_data_queue_ofo`).

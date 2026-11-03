@@ -309,6 +309,18 @@ pub fn build(spec: Spec, o: &Opts) -> Box<dyn Stack> {
     }
 }
 
+/// [`build`], with tcp-sans-io behind a [`Host`] that runs more than one
+/// socket on the port, as servers do. The probes use it (a spoofed SYN
+/// beside a real client); the benchmarks time one socket through
+/// [`build`].
+pub fn build_host(spec: Spec, o: &Opts) -> Box<dyn Stack> {
+    match spec {
+        Spec::Ours => Box::new(Host::<{ tcp_sans_io::BUF_CAP }>::new(o)),
+        Spec::Ours64k => Box::new(Host::<65536>::new(o)),
+        Spec::Smol { .. } => build(spec, o),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // tcp-sans-io
 // ---------------------------------------------------------------------------
@@ -398,6 +410,14 @@ impl<const B: usize> Ours<B> {
             n += 1;
         }
         n
+    }
+
+    /// `Stack::input`, telling [`Host`] what the TCB made of the datagram.
+    fn inject(&mut self, now: Time, pkt: &[u8]) -> Result<(), TcpError> {
+        self.at(now);
+        let r = self.tcb.inject_packet(pkt);
+        self.flush();
+        r
     }
 }
 
@@ -498,6 +518,142 @@ impl<const B: usize> Stack for Ours<B> {
     }
     fn stats(&self) -> Option<TcbStats> {
         Some(self.tcb.stats())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// tcp-sans-io behind a host with more than one socket on the port.
+// ---------------------------------------------------------------------------
+
+/// The IPv4 source address and TCP source port of a datagram.
+fn source(pkt: &[u8]) -> Option<([u8; 4], u16)> {
+    let ihl = usize::from(pkt.first()? & 0x0f) * 4;
+    let ip: [u8; 4] = pkt.get(12..16)?.try_into().ok()?;
+    let port = pkt.get(ihl..ihl + 2)?;
+    Some((ip, u16::from_be_bytes([port[0], port[1]])))
+}
+
+/// A server as the tcp-sans-io host contract asks (item 7): datagrams are
+/// routed by source, and a listener busy with a live half-open hands
+/// another peer's valid cookie ACK back (`ListenerBusy`) for a fresh
+/// listener, set up like the first, which becomes that peer's connection.
+/// The lab sees the connection with its own peer (`Opts::remote`); the
+/// host's other sockets run beside it, ticked and drained (the
+/// device-queue budget is the lab connection's).
+pub struct Host<const B: usize> {
+    conn: Ours<B>,
+    others: Vec<Ours<B>>,
+    o: Opts,
+}
+
+impl<const B: usize> Host<B> {
+    pub fn new(o: &Opts) -> Self {
+        Self {
+            conn: Ours::new(o),
+            others: Vec::new(),
+            o: *o,
+        }
+    }
+
+    fn sockets(&self) -> impl Iterator<Item = &Ours<B>> {
+        std::iter::once(&self.conn).chain(&self.others)
+    }
+}
+
+impl<const B: usize> Stack for Host<B> {
+    fn name(&self) -> String {
+        self.conn.name()
+    }
+    fn connect(&mut self, now: Time) {
+        self.conn.connect(now);
+    }
+    fn listen(&mut self, now: Time) {
+        self.conn.listen(now);
+    }
+    fn input(&mut self, now: Time, pkt: Pkt) {
+        let from_peer = source(&pkt) == Some(self.o.remote);
+        let mut r = Err(TcpError::NotForUs);
+        if !from_peer {
+            for s in &mut self.others {
+                r = s.inject(now, &pkt);
+                if r != Err(TcpError::NotForUs) {
+                    break;
+                }
+            }
+        }
+        if r == Err(TcpError::NotForUs) {
+            r = self.conn.inject(now, &pkt);
+        }
+        if r == Err(TcpError::ListenerBusy) {
+            let mut fresh = Ours::new(&self.o);
+            fresh.listen(now);
+            if fresh.inject(now, &pkt).is_ok() {
+                if from_peer {
+                    std::mem::swap(&mut self.conn, &mut fresh);
+                }
+                self.others.push(fresh);
+            }
+        }
+    }
+    fn process(&mut self, now: Time) {
+        self.conn.process(now);
+        for s in &mut self.others {
+            s.process(now);
+        }
+    }
+    fn poll(&mut self, now: Time) {
+        self.conn.poll(now);
+        for s in &mut self.others {
+            s.poll(now);
+        }
+    }
+    fn drain(&mut self, out: &mut Vec<Pkt>) {
+        self.conn.drain(out);
+        for s in &mut self.others {
+            s.drain(out);
+        }
+    }
+    fn set_tx_room(&mut self, room: usize) {
+        self.conn.set_tx_room(room);
+    }
+    fn holds_tx(&self) -> bool {
+        self.sockets().any(|s| s.holds_tx())
+    }
+    fn next_wake(&mut self, now: Time) -> Option<Time> {
+        let mut wake = self.conn.next_wake(now);
+        for s in &mut self.others {
+            if let Some(t) = s.next_wake(now) {
+                wake = Some(wake.map_or(t, |w| w.min(t)));
+            }
+        }
+        wake
+    }
+    fn send(&mut self, data: &[u8]) -> usize {
+        self.conn.send(data)
+    }
+    fn recv(&mut self, buf: &mut [u8]) -> Recv {
+        self.conn.recv(buf)
+    }
+    fn close(&mut self, now: Time) {
+        self.conn.close(now);
+    }
+    fn abort(&mut self, now: Time) {
+        self.conn.abort(now);
+    }
+    fn state(&self) -> St {
+        self.conn.state()
+    }
+    fn settled(&self) -> bool {
+        self.conn.settled()
+    }
+    fn was_reset(&self) -> bool {
+        self.conn.was_reset()
+    }
+    fn invariants(&self) -> Result<(), String> {
+        self.sockets().try_for_each(|s| s.invariants())
+    }
+    fn stats(&self) -> Option<TcbStats> {
+        self.conn.stats()
     }
 }
 

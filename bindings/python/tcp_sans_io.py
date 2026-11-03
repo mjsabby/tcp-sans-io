@@ -160,6 +160,9 @@ _lib.tcp_set_mtu.argtypes = [c_void_p, c_uint16]
 _lib.tcp_update_pmtu.restype = c_int32
 _lib.tcp_update_pmtu.argtypes = [c_void_p, c_uint64, c_uint16]
 
+_lib.tcp_update_pmtu_icmp.restype = c_int32
+_lib.tcp_update_pmtu_icmp.argtypes = [c_void_p, c_uint64, c_uint16, c_uint32]
+
 _lib.tcp_set_fin_wait2_timeout.restype = c_int32
 _lib.tcp_set_fin_wait2_timeout.argtypes = [c_void_p, c_uint64, c_uint32]
 
@@ -269,6 +272,7 @@ _ERR_NAMES = {
     -7: "ConnectionReset",
     -8: "ConnectionClosed",
     -9: "Overflow",
+    -10: "ListenerBusy",
 }
 
 
@@ -492,9 +496,24 @@ class TcpStream:
             _check(_lib.tcp_set_mtu(self._handle, c_uint16(mtu)))
 
     def update_pmtu(self, now_ms: int, mtu: int) -> None:
-        """Report a smaller path MTU mid-connection (e.g. from ICMP)."""
+        """Report a smaller path MTU mid-connection (for ICMP, prefer
+        :meth:`update_pmtu_icmp`)."""
         with self._lock:
             _check(_lib.tcp_update_pmtu(self._handle, c_uint64(now_ms), c_uint16(mtu)))
+
+    def update_pmtu_icmp(self, now_ms: int, mtu: int, quoted_seq: int) -> bool:
+        """Report the MTU of an ICMP "fragmentation needed" quoting this
+        connection, with the quoted TCP header's sequence number. Returns
+        False (and changes nothing) if that sequence number is not in
+        flight, as Linux checks."""
+        with self._lock:
+            rc = _lib.tcp_update_pmtu_icmp(
+                self._handle, c_uint64(now_ms), c_uint16(mtu), c_uint32(quoted_seq)
+            )
+            if rc == -5:  # NotForUs
+                return False
+            _check(rc)
+            return True
 
     def set_fin_wait2_timeout(self, now_ms: int, timeout_ms: int) -> None:
         """FIN_WAIT_2 timeout (default 60 s; 0 disables). Restarted only when
@@ -599,9 +618,12 @@ class TcpStream:
         Returns ``True`` if the stack accepted the datagram, ``False`` for
         the contract's benign drop-and-continue rejections (``NotForUs``,
         ``MalformedPacket``, ``InvalidState``) — normal under a hostile or
-        mis-routed wire, never fatal. Raises :class:`TcpError` only for
-        genuinely unexpected codes. Drain ``extract_packet`` until ``None``
-        after every call."""
+        mis-routed wire, never fatal. A listener busy with a live half-open
+        raises :class:`TcpError` ``ListenerBusy`` for another peer's valid
+        SYN-cookie ACK: inject the same datagram into a fresh listener, which
+        becomes that peer's connection. Raises otherwise only for genuinely
+        unexpected codes. Drain ``extract_packet`` until ``None`` after every
+        call."""
         if not packet:
             return False
         buf = (c_uint8 * len(packet)).from_buffer_copy(packet)

@@ -13,9 +13,12 @@
 //!
 //! Listeners are hybrid: the single half-open slot is used statefully
 //! (keeping every option), and cookies answer SYNs only while that slot is
-//! busy. Cookie ACKs are accepted only within two buckets of the last cookie
-//! sent (Linux `tcp_synq_no_recent_overflow`). A cookie validates against
-//! the current key and, after a rotation, the previous one while cookies
+//! busy. Any listener holding the key takes a cookie ACK, whenever it comes
+//! (Linux only within two minutes of the listener's last overflow,
+//! `tcp_synq_no_recent_overflow`): one connection per TCB, so the listener
+//! that sent the cookie has often become a connection by then, and the
+//! host's next listener must take it. A cookie validates against the
+//! current key and, after a rotation, the previous one while cookies
 //! issued under it can still be valid. The key is either installed
 //! explicitly or derived from the host secret.
 
@@ -113,15 +116,17 @@ impl<const BUF: usize> Tcb<BUF> {
         Self::tuple_hash(key, self.local, remote, b'T', 0) as u32
     }
 
-    /// The timestamp offset a cookie SYN-ACK to `remote` used. Without a
-    /// host secret the cookie key also keys it, so a cookie from before a
-    /// rotation used the previous key's.
+    /// The timestamp offset of a cookie SYN-ACK to `remote`: keyed by the
+    /// cookie key that issued it (the previous one after a rotation), so
+    /// the TSecr check and the promoted connection's TSvals agree with the
+    /// SYN-ACK whatever happened to the host secret since.
     fn cookie_ts_offset(&self, remote: Endpoint, prev_key: bool) -> u32 {
-        if prev_key && !self.secret_set {
-            self.ts_offset_with(&self.prev_cookie_secret, remote)
+        let key = if prev_key {
+            &self.prev_cookie_secret
         } else {
-            self.ts_offset_for(remote)
-        }
+            &self.cookie_secret
+        };
+        self.ts_offset_with(key, remote)
     }
 
     /// RFC 6528 ISN for a passive open when a host secret is installed:
@@ -191,7 +196,7 @@ impl<const BUF: usize> Tcb<BUF> {
         let cookie = self.compute_cookie(&self.cookie_secret, bucket, remote, mss_idx, seg.seq);
 
         // Options can only be preserved through the cookie via TSval bits.
-        let ts_off = self.ts_offset_for(remote);
+        let ts_off = self.cookie_ts_offset(remote, false);
         let now_ts = (self.now_ms as u32).wrapping_add(ts_off);
         let peer_ecn = seg.has(flags::ECE) && seg.has(flags::CWR);
         let (ts, wscale, sack_ok, ecn) = match seg.options.ts {
@@ -261,7 +266,6 @@ impl<const BUF: usize> Tcb<BUF> {
         if queued {
             self.stats.segs_out = self.stats.segs_out.saturating_add(1);
             self.cookie_secret_used = true;
-            self.cookies_valid_until_ms = self.now_ms.saturating_add(2 * COOKIE_TIME_BUCKET_MS);
         }
         Ok(())
     }
@@ -269,9 +273,9 @@ impl<const BUF: usize> Tcb<BUF> {
     /// Validate a bare ACK as the third leg of a cookie handshake. Never
     /// mutates state, so a busy listener can check before giving up its
     /// half-open. One guess per key: the cookie names its time bucket (its
-    /// parity). Only within two buckets of the last cookie sent.
+    /// parity).
     pub(super) fn validate_cookie(&self, seg: &Segment<'_>) -> Option<CookieOpts> {
-        if !self.cookie_secret_set || self.now_ms >= self.cookies_valid_until_ms {
+        if !self.cookie_secret_set {
             return None;
         }
         let remote = Endpoint {

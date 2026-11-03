@@ -896,7 +896,7 @@ fn cookie_connections_keep_window_scaling_and_sack() {
         "SACK offered in the cookie SYN-ACK"
     );
     let tsval = synack.opts.ts.unwrap().0;
-    s.inject_packet(&pkt(
+    let third = pkt(
         CLI,
         SRV,
         501,
@@ -905,8 +905,8 @@ fn cookie_connections_keep_window_scaling_and_sack() {
         65535,
         &ts(101, tsval),
         &[],
-    ))
-    .unwrap();
+    );
+    let mut s = hand_off(&mut s, &third, 10_000, |t| t.set_cookie_secret(&[7u8; 16]));
     assert_eq!(s.state(), State::Established);
     // Out-of-order data draws a SACK block, and our window is scaled.
     s.inject_packet(&pkt(
@@ -3548,7 +3548,8 @@ fn idle_cookie_listener_keeps_ws_and_sack_without_timestamps() {
 /// 200 spoofed SYNs per second used to lock a listener out: every time the
 /// half-open became replaceable, the attacker's next SYN took it. A busy
 /// listener now answers the legitimate client with a cookie, whose valid
-/// ACK takes over the slot.
+/// ACK the host hands to a fresh listener (`ListenerBusy`): the spoofed
+/// half-open in the slot is live, so it is not given up.
 #[test]
 fn spoofed_syn_flood_cannot_lock_out_a_listener() {
     let mut s = new_tcb(SRV, ([0; 4], 0), 1);
@@ -3582,7 +3583,7 @@ fn spoofed_syn_flood_cannot_lock_out_a_listener() {
         }
         if t == 1050 {
             let isn = legit_synack.expect("the legitimate client was answered");
-            s.inject_packet(&pkt(
+            let ack = pkt(
                 legit,
                 SRV,
                 778,
@@ -3591,18 +3592,18 @@ fn spoofed_syn_flood_cannot_lock_out_a_listener() {
                 65535,
                 &TcpOptions::NONE,
                 b"hi",
-            ))
-            .unwrap();
-            assert_eq!(s.state(), State::Established);
-            break;
+            );
+            let mut conn = hand_off(&mut s, &ack, t, |c| c.set_secret(&[3; 16]));
+            assert_eq!(
+                conn.state(),
+                State::Established,
+                "legitimate client locked out"
+            );
+            assert_eq!(recv_all(&mut conn), b"hi");
+            return;
         }
     }
-    assert_eq!(
-        s.state(),
-        State::Established,
-        "legitimate client locked out"
-    );
-    assert_eq!(recv_all(&mut s), b"hi");
+    unreachable!("the flood ran past the legitimate client's ACK");
 }
 
 /// With only a cookie secret (no host secret) the cookie key also keys the
@@ -3632,8 +3633,7 @@ fn cookie_promotion_after_rotation_keeps_the_timestamp_offset() {
     let synack = drain(&mut s).remove(0);
     let synack_tsval = synack.opts.ts.unwrap().0;
     s.set_cookie_secret(&[2; 16]);
-    s.set_now(10_050);
-    s.inject_packet(&pkt(
+    let third = pkt(
         CLI,
         SRV,
         501,
@@ -3642,8 +3642,12 @@ fn cookie_promotion_after_rotation_keeps_the_timestamp_offset() {
         65535,
         &ts(101, synack_tsval),
         b"GET /",
-    ))
-    .unwrap();
+    );
+    // A listener set up after the rotation gets the old key, then the new.
+    let mut s = hand_off(&mut s, &third, 10_050, |t| {
+        t.set_cookie_secret(&[1; 16]);
+        t.set_cookie_secret(&[2; 16]);
+    });
     assert_eq!(
         s.state(),
         State::Established,
@@ -4451,7 +4455,7 @@ fn cookie_handshake_ignores_timestamps_the_syn_ack_lacked() {
             &ts(123, tsecr),
             b"hi",
         );
-        s.inject_packet(&ack).unwrap();
+        let mut s = hand_off(&mut s, &ack, 10_020, |t| t.set_secret(&[1; 16]));
         assert_eq!(s.state(), State::Established, "tsecr {tsecr:#x}");
         drain(&mut s);
         let snap = s.debug_snapshot();
@@ -5753,7 +5757,7 @@ fn a_cookie_promoted_connection_takes_no_tsecr_from_before_it() {
         &ts(110, tsval(&cookie_synack)),
         &[],
     );
-    s.inject_packet(&third).unwrap();
+    let mut s = hand_off(&mut s, &third, now0 + 10, |t| t.set_secret(&[7u8; 16]));
     drain(&mut s);
     assert_eq!(s.state(), State::Established);
     let segs = send_burst(&mut s, now0 + 20, 1448);
@@ -6641,40 +6645,64 @@ fn third_ack(from: ([u8; 4], u16), synack: &Out) -> Vec<u8> {
     )
 }
 
-/// A listener takes cookie ACKs only within two buckets of a cookie it sent
-/// itself (Linux `tcp_synq_no_recent_overflow`). Every listener used to take
-/// them, so blind guesses counted against listeners that never needed
-/// cookies.
+/// The host's side of `ListenerBusy`: `busy`, its slot held by a live
+/// half-open, hands back another peer's cookie ACK at `now`, and a fresh
+/// listener the host sets up like its others (`setup`: the secrets) takes
+/// it and becomes that peer's connection.
+fn hand_off(busy: &mut Tcb, ack: &[u8], now: u64, setup: impl FnOnce(&mut Tcb)) -> Box<Tcb> {
+    busy.set_now(now);
+    assert_eq!(busy.inject_packet(ack), Err(TcpError::ListenerBusy));
+    let mut fresh = new_tcb(SRV, ([0; 4], 0), 1);
+    fresh.set_now(now);
+    setup(&mut fresh);
+    fresh.listen().unwrap();
+    fresh.inject_packet(ack).unwrap();
+    fresh
+}
+
+/// A listener that completes a handshake becomes that connection, so the
+/// host sets up the next listener; the cookies the first one sent while its
+/// slot was busy must connect there. A per-listener window (Linux
+/// `tcp_synq_no_recent_overflow`) refused them, as the next listener had
+/// sent none: of two clients connecting within one RTT, the second was
+/// reset. A cookie past its two buckets is still refused.
 #[test]
-fn a_cookie_ack_needs_a_recent_cookie_from_this_listener() {
+fn the_next_listener_takes_the_cookie_acks_its_predecessor_drew() {
+    const C2: ([u8; 4], u16) = ([10, 0, 0, 12], 50002);
     let mss = TcpOptions {
         mss: Some(1460),
         ..TcpOptions::NONE
     };
-    let (mut issuer, synack) = cookie_listener(10_000, CLI, &mss);
-    let mut idle = new_tcb(SRV, ([0; 4], 0), 1);
-    idle.set_secret(&[4; 16]);
-    idle.set_now(10_020);
-    idle.listen().unwrap();
-    let _ = idle.inject_packet(&third_ack(CLI, &synack));
-    assert_eq!(idle.state(), State::Listen, "took a cookie it never sent");
-    issuer.set_now(10_020);
-    issuer.inject_packet(&third_ack(CLI, &synack)).unwrap();
-    assert_eq!(issuer.state(), State::Established);
+    let listener = |now: u64| {
+        let mut s = new_tcb(SRV, ([0; 4], 0), 1);
+        s.set_secret(&[4; 16]);
+        s.set_now(now);
+        s.listen().unwrap();
+        s
+    };
+    let mut first = listener(10_000);
+    first
+        .inject_packet(&pkt(CLI, SRV, 500, 0, flags::SYN, 65535, &mss, &[]))
+        .unwrap();
+    let synack = drain(&mut first).remove(0);
+    first.set_now(10_001);
+    first
+        .inject_packet(&pkt(C2, SRV, 500, 0, flags::SYN, 65535, &mss, &[]))
+        .unwrap();
+    let cookie = drain(&mut first).remove(0);
+    assert_eq!(cookie.dst, C2, "no cookie SYN-ACK");
+    first.set_now(10_002);
+    first.inject_packet(&third_ack(CLI, &synack)).unwrap();
+    assert_eq!(first.state(), State::Established);
 
-    let peer = ([10, 0, 0, 9], 41000);
-    let (mut stale, _) = cookie_listener(10_000, CLI, &mss);
-    let (mut fresh, synack) = cookie_listener(138_000, peer, &mss);
-    stale.set_now(138_020);
-    let _ = stale.inject_packet(&third_ack(peer, &synack));
-    assert_ne!(
-        stale.state(),
-        State::Established,
-        "took a cookie 128 s after its last"
-    );
-    fresh.set_now(138_020);
-    fresh.inject_packet(&third_ack(peer, &synack)).unwrap();
-    assert_eq!(fresh.state(), State::Established);
+    let mut next = listener(10_002);
+    next.set_now(10_003);
+    next.inject_packet(&third_ack(C2, &cookie)).unwrap();
+    assert_eq!(next.state(), State::Established, "cookie client reset");
+
+    let mut late = listener(130_000);
+    let _ = late.inject_packet(&third_ack(C2, &cookie));
+    assert_eq!(late.state(), State::Listen, "took an expired cookie");
 }
 
 /// A blind forger needs one of the cookies the listener would take for its
@@ -6718,8 +6746,9 @@ fn a_syn_has_at_most_eight_valid_cookies() {
     };
     let (mut s, synack) = cookie_listener(70_000, CLI, &o);
     assert!(synack.opts.ts.is_some());
-    s.set_now(70_020);
-    s.inject_packet(&third_ack(CLI, &synack)).unwrap();
+    let s = hand_off(&mut s, &third_ack(CLI, &synack), 70_020, |t| {
+        t.set_secret(&[4; 16])
+    });
     assert_eq!(s.state(), State::Established, "options lost on the ACK");
     assert_eq!(s.stats().mss, 1460, "timestamps on");
     assert_eq!(s.debug_snapshot().snd_wnd, 65535, "window scaling on");
@@ -6788,4 +6817,652 @@ fn listener_packets_carry_ip_id_zero_and_connections_count_their_own() {
         quiet_data.first().map(|d| d.1),
         "packets to others moved the connection's numbering"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Public exposure (audit iteration 7)
+// ---------------------------------------------------------------------------
+
+/// An abort with the egress ring full (the host holding back what the
+/// device queue cannot take) lost its RST: `abort` succeeded, and draining
+/// afterwards, as the C header says, found none. The RST is now owed and
+/// staged as soon as the host takes a packet out, behind those staged
+/// before it, so it reaches the peer at its RCV.NXT.
+#[test]
+fn an_abort_with_a_full_egress_ring_still_resets_the_peer() {
+    let (mut c, sseq, iss) = established(100, true, false);
+    c.send(&[0x42; 1448]).unwrap();
+    c.set_now(111);
+    c.tick().unwrap();
+    for i in 0..31 {
+        let held = pkt(
+            SRV,
+            CLI,
+            sseq + 1 + 2 * i,
+            iss + 1,
+            flags::ACK,
+            8192,
+            &ts(10, 100),
+            b"X",
+        );
+        c.inject_packet(&held).unwrap();
+    }
+    assert!(c.debug_egress_full(), "the egress ring is not full");
+    let snd_nxt = iss + 1 + 1448;
+    c.abort().unwrap();
+    assert_eq!(c.state(), State::Closed);
+    let out = drain(&mut c);
+    let resets: Vec<&Out> = out.iter().filter(|o| o.flags & flags::RST != 0).collect();
+    assert_eq!(resets.len(), 1, "{} packets, no RST", out.len());
+    let last = out.last().unwrap();
+    assert!(
+        last.flags & flags::RST != 0 && last.seq == snd_nxt && last.ack == sseq,
+        "the RST is not last at SND.NXT: {last:?}"
+    );
+}
+
+/// An out-of-order segment repeating bytes already held used to overwrite
+/// them: `GOOD`, then `EVIL` at the same sequence, delivered `EVIL`. Held
+/// bytes keep their first copy (Linux `tcp_data_queue_ofo` drops a wholly
+/// duplicate segment; RFC 9293 §3.10.7.4 keeps just the new data), and of
+/// a partial overlap only the new bytes are stored.
+#[test]
+fn a_duplicate_out_of_order_segment_does_not_overwrite_held_bytes() {
+    let (mut c, sseq, iss) = established(100, true, false);
+    let seg = |c: &mut Tcb, at: u32, body: &[u8]| {
+        c.inject_packet(&pkt(
+            SRV,
+            CLI,
+            at,
+            iss + 1,
+            flags::ACK,
+            8192,
+            &ts(10, 100),
+            body,
+        ))
+        .unwrap();
+        drain(c)
+    };
+    seg(&mut c, sseq + 1, b"GOOD");
+    let out = seg(&mut c, sseq + 1, b"EVIL");
+    assert!(
+        out.iter()
+            .any(|o| o.opts.sack.as_slice().first() == Some(&(sseq + 1, sseq + 5))),
+        "the duplicate is not D-SACKed"
+    );
+    seg(&mut c, sseq + 3, b"xxNEW");
+    seg(&mut c, sseq, b"+");
+    assert_eq!(recv_all(&mut c), b"+GOODNEW");
+}
+
+/// A SYN from a source no host sends from (zero network, multicast, the
+/// limited broadcast, loopback to a non-loopback address) was answered with
+/// a SYN-ACK, stateful or cookie, aimed at that group or broadcast address.
+/// Linux drops these as martians before TCP (`ip_route_input_slow`).
+#[test]
+fn a_listener_ignores_segments_from_martian_sources() {
+    for busy in [false, true] {
+        for ip in [[0, 0, 0, 0], [224, 0, 0, 1], [255; 4], [127, 0, 0, 1]] {
+            let mut s = new_tcb(SRV, ([0; 4], 0), 1);
+            s.set_secret(&[7; 16]);
+            s.set_now(1000);
+            s.listen().unwrap();
+            if busy {
+                s.inject_packet(&pkt(
+                    ATTACKER,
+                    SRV,
+                    9,
+                    0,
+                    flags::SYN,
+                    65535,
+                    &TcpOptions::NONE,
+                    &[],
+                ))
+                .unwrap();
+                drain(&mut s);
+            }
+            let syn = pkt(
+                (ip, 1234),
+                SRV,
+                42,
+                0,
+                flags::SYN,
+                65535,
+                &TcpOptions::NONE,
+                &[],
+            );
+            assert_eq!(s.inject_packet(&syn), Err(TcpError::MalformedPacket));
+            let ack = pkt(
+                (ip, 1234),
+                SRV,
+                42,
+                7,
+                flags::ACK,
+                65535,
+                &TcpOptions::NONE,
+                &[],
+            );
+            let _ = s.inject_packet(&ack);
+            let out = drain(&mut s);
+            assert!(out.is_empty(), "busy {busy}: answered {ip:?}: {out:?}");
+        }
+    }
+}
+
+/// A host-secret rotation between a cookie SYN-ACK and its ACK: the derived
+/// cookie key keeps the previous key valid, but the TSecr was checked
+/// against the new secret's timestamp offset, so the connection came up
+/// with timestamps, window scaling and SACK off while the client had them
+/// on (and read our windows scaled). The cookie key that issued the SYN-ACK
+/// now keys its offset.
+#[test]
+fn a_host_secret_rotation_keeps_a_cookie_handshakes_options() {
+    let o = TcpOptions {
+        mss: Some(1460),
+        wscale: Some(7),
+        ts: Some((100, 0)),
+        sack_permitted: true,
+        ..TcpOptions::NONE
+    };
+    let (mut s, synack) = cookie_listener(10_000, CLI, &o);
+    let tsval = synack.opts.ts.expect("the SYN-ACK has timestamps").0;
+    s.set_secret(&[5; 16]);
+    let third = pkt(
+        CLI,
+        SRV,
+        501,
+        synack.seq + 1,
+        flags::ACK | flags::PSH,
+        65535,
+        &ts(101, tsval),
+        b"GET /",
+    );
+    // A listener set up after the rotation gets the old secret, then the new.
+    let mut s = hand_off(&mut s, &third, 10_050, |t| {
+        t.set_secret(&[4; 16]);
+        t.set_secret(&[5; 16]);
+    });
+    assert_eq!(s.state(), State::Established);
+    assert_eq!(s.stats().mss, 1448, "timestamps off");
+    s.set_now(10_100);
+    s.tick().unwrap();
+    let ack = drain(&mut s).pop().expect("the request is acknowledged");
+    let advance = ack.opts.ts.expect("no timestamps").0.wrapping_sub(tsval);
+    assert!(advance <= 100 + 64, "TSval jumped by {advance}");
+}
+
+/// Each smaller path-MTU report resends whatever no longer fits, so forged
+/// reports a byte apart cost about a flight each. Linux takes an ICMP only
+/// if the sequence number it quotes is in flight (`tcp_v4_err`);
+/// `update_pmtu_icmp` checks it too.
+#[test]
+fn a_path_mtu_report_must_quote_a_sequence_number_in_flight() {
+    let (mut c, _, iss) = established(1000, true, false);
+    let flight = send_burst(&mut c, 1010, 10 * 1448);
+    let (una, nxt) = (iss + 1, flight.last().unwrap().1);
+    for seq in [una.wrapping_sub(1), nxt + 1, una.wrapping_add(1 << 30)] {
+        assert_eq!(c.update_pmtu_icmp(1400, seq), Err(TcpError::NotForUs));
+    }
+    assert!(drain(&mut c).is_empty(), "a forged report resent data");
+    assert_eq!(c.stats().mss, 1448);
+    c.update_pmtu_icmp(1400, una + 1448).unwrap();
+    assert_eq!(c.stats().mss, 1400 - 40 - 12);
+    assert!(drain(&mut c).iter().any(|o| o.len > 0), "nothing resent");
+}
+
+/// A report larger than the size in use lowered the size probing restores
+/// for good: 576 and then 580 (reordered reports, or forged ones) left the
+/// connection at 528-byte segments forever, where 576 alone expires in 10
+/// minutes. Restoring a capped size now probes the full one again 10
+/// minutes later, as Linux re-probes.
+#[test]
+fn a_larger_path_mtu_report_does_not_make_a_reduction_permanent() {
+    let run = |reports: &[u16]| {
+        let (mut c, sseq, iss) = established(1000, true, false);
+        ts_ack(&mut c, sseq, 1020, iss + 1, 1000, &[]);
+        for &mtu in reports {
+            c.update_pmtu(mtu);
+        }
+        for minute in 1..=30 {
+            let now = 1020 + minute * 60_000;
+            send_burst(&mut c, now, 3 * 1448);
+            let end = c.debug_snapshot().snd_nxt;
+            ts_ack(&mut c, sseq, now + 1, end, now as u32, &[]);
+        }
+        c.stats().mss
+    };
+    assert_eq!(run(&[576]), 1448);
+    assert_eq!(run(&[576, 580]), 1448, "the reduction became permanent");
+}
+
+/// Opens `c`'s connection after `retries` SYN timeouts; the SYN-ACK has
+/// timestamps echoing the SYN sent at `echo` (an index into the SYNs), or
+/// none. Returns the time it arrived.
+fn open_after_syn_timeouts(c: &mut Tcb, retries: usize, echo: Option<usize>) -> u64 {
+    c.set_now(1000);
+    c.connect().unwrap();
+    let mut tsvals = vec![drain(c)[0].opts.ts.unwrap().0];
+    let mut now = 1000;
+    for _ in 0..retries {
+        now = c.next_deadline().unwrap();
+        c.set_now(now);
+        c.tick().unwrap();
+        tsvals.push(drain(c)[0].opts.ts.unwrap().0);
+    }
+    now += 10;
+    c.set_now(now);
+    let o = TcpOptions {
+        mss: Some(1460),
+        ts: echo.map(|i| (7, tsvals[i])),
+        ..TcpOptions::NONE
+    };
+    let synack = pkt(
+        SRV,
+        CLI,
+        SRV_ISS,
+        1_000_001,
+        flags::SYN | flags::ACK,
+        65535,
+        &o,
+        &[],
+    );
+    c.inject_packet(&synack).unwrap();
+    drain(c);
+    now
+}
+
+/// A handshake that gave no RTT sample (a SYN resent, no timestamps) left
+/// the SYN timer's backoff as the first data RTO: 2 s after one timeout, a
+/// minute after six. Linux falls back to 3 s (`tcp_init_metrics`, RFC 6298
+/// §5.7).
+#[test]
+fn the_first_data_rto_after_an_unsampled_handshake_is_three_seconds() {
+    for retries in [1, 6] {
+        let mut c = new_tcb(CLI, SRV, 1_000_000);
+        let now = open_after_syn_timeouts(&mut c, retries, None);
+        c.send(b"first request").unwrap();
+        c.tick().unwrap();
+        drain(&mut c);
+        assert_eq!(c.stats().rto_ms, 3000, "{retries} SYN timeouts");
+        assert_eq!(
+            c.next_deadline(),
+            Some(now + 3000),
+            "{retries} SYN timeouts"
+        );
+    }
+}
+
+/// More than one SYN timeout used to leave a ten-segment initial window.
+/// Linux starts such a transfer from one segment (`tcp_init_transfer`),
+/// unless the SYN-ACK's TSecr shows the first SYN arrived after all.
+#[test]
+fn repeated_syn_timeouts_start_the_transfer_from_one_segment() {
+    for (retries, echo, want) in [
+        (1, None, 10),
+        (2, None, 1),
+        (2, Some(2), 1),
+        (2, Some(0), 10),
+    ] {
+        let mut c = new_tcb(CLI, SRV, 1_000_000);
+        open_after_syn_timeouts(&mut c, retries, echo);
+        c.send(&[0x5a; 14 * 1448]).unwrap();
+        c.tick().unwrap();
+        let sent = drain(&mut c).iter().filter(|o| o.len > 0).count();
+        assert_eq!(sent, want, "{retries} timeouts, echo of SYN {echo:?}");
+    }
+}
+
+/// `recv` takes no clock (the C API has no time argument), so a read on a
+/// turn with no datagram restarted the FIN_WAIT_2 timeout from the last
+/// turn's time: data read a second before the old deadline left a second.
+/// The next `tick` now restarts it from its own time.
+#[test]
+fn a_read_restarts_fin_wait_2_from_the_time_of_its_turn() {
+    let (mut c, sseq, iss) = established(1000, true, false);
+    c.set_now(1010);
+    c.close().unwrap();
+    drain(&mut c);
+    c.set_now(1030);
+    c.inject_packet(&pkt(
+        SRV,
+        CLI,
+        sseq,
+        iss + 2,
+        flags::ACK | flags::PSH,
+        8192,
+        &ts(2, 0),
+        b"ab",
+    ))
+    .unwrap();
+    c.tick().unwrap();
+    drain(&mut c);
+    assert_eq!(c.state(), State::FinWait2);
+    assert_eq!(c.next_deadline(), Some(61_030));
+    let mut byte = [0u8; 1];
+    assert_eq!(c.recv(&mut byte), Ok(1));
+    c.set_now(60_000);
+    c.tick().unwrap();
+    assert_eq!(c.next_deadline(), Some(120_000));
+    c.set_now(61_030);
+    c.tick().unwrap();
+    assert_eq!(
+        c.state(),
+        State::FinWait2,
+        "timed out a second after a read"
+    );
+}
+
+/// An undo (F-RTO here) returns to Open while the head's retransmission is
+/// still out, marked lost and retransmitted; `lost_bytes() > 0` then
+/// re-entered fast recovery on the very ACK that undid the episode. Linux
+/// clears every loss mark on undo (`tcp_undo_cwnd_reduction`), so only a
+/// segment still awaiting its retransmission starts recovery.
+#[test]
+fn an_undo_does_not_reenter_recovery_for_a_resend_in_flight() {
+    let (mut c, sseq, _) = established_rtt(1000, 10, true, false);
+    let segs = send_burst(&mut c, 1020, 4 * 1448);
+    let cwnd = c.stats().cwnd;
+    let (_, now) = until_rto(&mut c, 1020, segs[0].0);
+    assert_eq!(c.stats().ca_state, 2, "no timeout");
+    ts_ack(
+        &mut c,
+        sseq,
+        now + 1,
+        segs[0].0,
+        65535,
+        &[(segs[1].0, segs[1].1)],
+    );
+    drain(&mut c);
+    assert_eq!(c.stats().ca_state, 0, "recovery re-entered after the undo");
+    assert_eq!(c.stats().fast_recoveries, 0);
+    assert_eq!(c.stats().cwnd, cwnd);
+}
+
+/// The same after a close in SYN_RCVD whose SYN-ACK timed out: the FIN it
+/// queued was marked lost and resent, and the third ACK entered fast
+/// recovery with nothing left to resend.
+#[test]
+fn the_third_ack_after_a_syn_ack_timeout_and_a_close_starts_no_recovery() {
+    let mut s = new_tcb(SRV, ([0; 4], 0), 7);
+    s.set_secret(&[1; 16]);
+    s.set_now(1000);
+    s.listen().unwrap();
+    let mss = TcpOptions {
+        mss: Some(1460),
+        ..TcpOptions::NONE
+    };
+    s.inject_packet(&pkt(CLI, SRV, 500, 0, flags::SYN, 65535, &mss, &[]))
+        .unwrap();
+    let synack = drain(&mut s).remove(0);
+    s.close().unwrap();
+    drain(&mut s);
+    let rto = s.next_deadline().unwrap();
+    s.set_now(rto);
+    s.tick().unwrap();
+    drain(&mut s);
+    s.set_now(rto + 10);
+    s.inject_packet(&third_ack(CLI, &synack)).unwrap();
+    drain(&mut s);
+    assert_eq!(
+        s.stats().fast_recoveries,
+        0,
+        "the third ACK started recovery"
+    );
+    assert_eq!(s.stats().ca_state, 0);
+}
+
+/// Each listener transition (a SYN taking the slot, an exact RST freeing
+/// it, a cookie promotion) reset the per-TCB rate limit on replies to
+/// stray segments, so cycling LISTEN ↔ SYN_RCVD with a known ISN drew a
+/// RST per stray ACK at line rate instead of one per 500 ms. The limit now
+/// spans connections, as Linux keeps it on the socket.
+#[test]
+fn listener_transitions_keep_the_reply_rate_limit() {
+    let mut s = new_tcb(SRV, ([0; 4], 0), 1);
+    s.set_secret(&[4; 16]);
+    s.set_now(10_000);
+    s.listen().unwrap();
+    let mss = TcpOptions {
+        mss: Some(1460),
+        ..TcpOptions::NONE
+    };
+    let mut rsts = 0;
+    for k in 0..10u8 {
+        let stray = pkt(
+            ([192, 0, 2, k], 40_000),
+            SRV,
+            1,
+            2,
+            flags::ACK,
+            65535,
+            &TcpOptions::NONE,
+            &[],
+        );
+        let _ = s.inject_packet(&stray);
+        rsts += drain(&mut s)
+            .iter()
+            .filter(|o| o.flags & flags::RST != 0)
+            .count();
+        s.inject_packet(&pkt(CLI, SRV, 500, 0, flags::SYN, 65535, &mss, &[]))
+            .unwrap();
+        s.inject_packet(&pkt(
+            CLI,
+            SRV,
+            501,
+            0,
+            flags::RST,
+            0,
+            &TcpOptions::NONE,
+            &[],
+        ))
+        .unwrap();
+        drain(&mut s);
+    }
+    assert_eq!(rsts, 1, "{rsts} RSTs to stray ACKs within one millisecond");
+}
+
+/// A listener transition cleared the egress ring, losing what was staged
+/// for other peers: a cookie SYN-ACK queued behind the host's full device
+/// queue vanished when the half-open's RST freed the slot.
+#[test]
+fn listener_transitions_keep_packets_staged_for_other_peers() {
+    let mss = TcpOptions {
+        mss: Some(1460),
+        ..TcpOptions::NONE
+    };
+    let (mut s, _) = cookie_listener(10_000, CLI, &mss);
+    let other = ([10, 0, 0, 99], 55_555);
+    s.inject_packet(&pkt(other, SRV, 800, 0, flags::SYN, 65535, &mss, &[]))
+        .unwrap();
+    let rst = pkt(ATTACKER, SRV, 10, 0, flags::RST, 0, &TcpOptions::NONE, &[]);
+    s.inject_packet(&rst).unwrap();
+    assert_eq!(s.state(), State::Listen);
+    assert!(
+        drain(&mut s)
+            .iter()
+            .any(|o| o.dst == other && o.flags & flags::SYN != 0),
+        "the cookie SYN-ACK staged for another peer was dropped"
+    );
+}
+
+/// A D-SACK for a segment above SND.UNA that was never resent (the network
+/// copied it, or the peer forged the block) counted toward the undo of a
+/// real loss episode whenever any retransmission had happened. Linux counts
+/// a D-SACK of queued data only for segments it resent (`tcp_sacktag_one`).
+#[test]
+fn a_dsack_for_data_never_resent_does_not_undo_a_real_loss() {
+    let (mut c, sseq, _) = established_rtt(1000, 10, true, false);
+    let segs = send_burst(&mut c, 1020, 5 * 1448);
+    let resent = ts_ack(
+        &mut c,
+        sseq,
+        1030,
+        segs[0].0,
+        1020,
+        &[(segs[1].0, segs[3].1)],
+    );
+    assert_eq!(
+        resent.first().map(|o| o.seq),
+        Some(segs[0].0),
+        "no fast retransmit"
+    );
+    let reduced = c.stats().ssthresh;
+    ts_ack(
+        &mut c,
+        sseq,
+        1045,
+        segs[4].1,
+        1030,
+        &[(segs[4].0, segs[4].1)],
+    );
+    assert_eq!(
+        c.stats().cwnd,
+        reduced,
+        "a duplicate of data sent once undid the loss"
+    );
+}
+
+/// A tail loss probe the peer's shrunken window cut short recorded SND.NXT
+/// as its end, so RACK did not recognise the SACK of the part sent as the
+/// probe's and found nothing lost. It now records the end of what was sent.
+#[test]
+fn a_tail_loss_probe_cut_by_the_window_is_recognised_by_its_end() {
+    let (mut c, sseq, iss) = established_rtt(1000, 10, true, false);
+    let segs = send_burst(&mut c, 1020, 2 * 1448);
+    c.set_now(1025);
+    c.inject_packet(&pkt(
+        SRV,
+        CLI,
+        sseq,
+        iss + 101,
+        flags::ACK,
+        15,
+        &ts(7, 1020),
+        &[],
+    ))
+    .unwrap();
+    drain(&mut c);
+    let pto = c.next_deadline().unwrap();
+    c.set_now(pto);
+    c.tick().unwrap();
+    let probe = drain(&mut c);
+    assert_eq!(probe.len(), 1);
+    assert_eq!((probe[0].seq, probe[0].len), (segs[1].0, 572));
+    ts_ack(
+        &mut c,
+        sseq,
+        pto + 2,
+        iss + 101,
+        1020,
+        &[(segs[1].0, segs[1].0 + 572)],
+    );
+    assert_eq!(
+        c.stats().fast_recoveries,
+        1,
+        "the probe's SACK found no loss"
+    );
+}
+
+/// A pure ACK below RCV.NXT with a TSval older than TS.Recent drew a
+/// (rate-limited) duplicate ACK; Linux drops it silently (`PAWS_OLD_ACK`).
+/// The check meant to do so came after the window check, which such an ACK
+/// never passes.
+#[test]
+fn an_old_pure_ack_failing_paws_is_dropped_silently() {
+    let (mut c, sseq, iss) = established(1000, true, false);
+    c.set_now(1020);
+    c.inject_packet(&pkt(
+        SRV,
+        CLI,
+        sseq,
+        iss + 1,
+        flags::ACK,
+        8192,
+        &ts(200, 1000),
+        b"hello",
+    ))
+    .unwrap();
+    drain(&mut c);
+    c.set_now(1025);
+    c.inject_packet(&pkt(
+        SRV,
+        CLI,
+        sseq + 2,
+        iss + 1,
+        flags::ACK,
+        8192,
+        &ts(50, 1000),
+        &[],
+    ))
+    .unwrap();
+    assert!(
+        drain(&mut c).is_empty(),
+        "an old ACK failing PAWS was answered"
+    );
+}
+
+/// An old SYN (a TSval below the one that opened the half-open) in
+/// SYN_RCVD skipped PAWS: in the window it sent the half-open back to
+/// LISTEN. Linux ACKs and drops it (`tcp_check_req`).
+#[test]
+fn an_old_syn_in_syn_rcvd_fails_paws() {
+    let mut s = new_tcb(SRV, ([0; 4], 0), 1);
+    s.set_secret(&[4; 16]);
+    s.set_now(10_000);
+    s.listen().unwrap();
+    let syn = |tsval| TcpOptions {
+        mss: Some(1460),
+        ts: Some((tsval, 0)),
+        ..TcpOptions::NONE
+    };
+    s.inject_packet(&pkt(CLI, SRV, 500, 0, flags::SYN, 65535, &syn(1000), &[]))
+        .unwrap();
+    drain(&mut s);
+    s.set_now(10_010);
+    s.inject_packet(&pkt(CLI, SRV, 501, 0, flags::SYN, 65535, &syn(500), &[]))
+        .unwrap();
+    drain(&mut s);
+    assert_eq!(s.state(), State::SynRcvd, "an old SYN reset the half-open");
+}
+
+/// A cookie ACK from another peer used to take a listener's slot from a
+/// live half-open: its client's third ACK then reached the next listener
+/// and was reset just after `connect()` succeeded, as happens when
+/// connections arrive in bursts. A busy listener now hands such an ACK back
+/// (`ListenerBusy`) for a fresh listener to take, so both connect, as with
+/// Linux's independent request sockets. A half-open whose SYN-ACK went
+/// unanswered for an RTO (a spoofed source, typically) still yields to it.
+#[test]
+fn a_cookie_ack_never_displaces_a_live_half_open() {
+    let mss = TcpOptions {
+        mss: Some(1460),
+        ..TcpOptions::NONE
+    };
+    let other = ([10, 0, 0, 7], 41_000);
+    let mut s = new_tcb(SRV, ([0; 4], 0), 1);
+    s.set_secret(&[4; 16]);
+    s.set_now(10_000);
+    s.listen().unwrap();
+    s.inject_packet(&pkt(CLI, SRV, 500, 0, flags::SYN, 65535, &mss, &[]))
+        .unwrap();
+    let synack = drain(&mut s).remove(0);
+    s.inject_packet(&pkt(other, SRV, 500, 0, flags::SYN, 65535, &mss, &[]))
+        .unwrap();
+    let cookie = drain(&mut s).remove(0);
+    let fresh = hand_off(&mut s, &third_ack(other, &cookie), 10_010, |t| {
+        t.set_secret(&[4; 16])
+    });
+    assert_eq!(fresh.state(), State::Established, "the cookie client");
+    assert!(drain(&mut s).is_empty(), "answered the handed-back ACK");
+    s.set_now(10_020);
+    s.inject_packet(&third_ack(CLI, &synack)).unwrap();
+    assert_eq!(s.state(), State::Established, "the half-open's client");
+
+    // A half-open whose SYN-ACK needed a retransmission yields the slot.
+    let (mut s, cookie) = cookie_listener(20_000, other, &mss);
+    s.set_now(21_000);
+    s.tick().unwrap();
+    drain(&mut s);
+    s.inject_packet(&third_ack(other, &cookie)).unwrap();
+    assert_eq!(s.state(), State::Established, "a stale half-open held on");
 }

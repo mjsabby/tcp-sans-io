@@ -122,6 +122,9 @@ internal static class Native
     public static extern int tcp_update_pmtu(IntPtr handle, ulong nowMs, ushort mtu);
 
     [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int tcp_update_pmtu_icmp(IntPtr handle, ulong nowMs, ushort mtu, uint quotedSeq);
+
+    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
     public static extern int tcp_set_fin_wait2_timeout(IntPtr handle, ulong nowMs, uint timeoutMs);
 
     [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
@@ -208,6 +211,7 @@ internal enum TcpErrorCode
     ConnectionReset = -7,
     ConnectionClosed = -8,
     Overflow = -9,
+    ListenerBusy = -10,
 }
 
 internal sealed class TcpException : Exception

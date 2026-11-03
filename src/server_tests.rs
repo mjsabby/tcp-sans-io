@@ -860,6 +860,20 @@ fn occupy_slot(s: &mut Tcb) {
     assert_eq!(s.state(), State::SynRcvd);
 }
 
+/// The host's side of `ListenerBusy`: `busy`'s slot holds a live half-open,
+/// so it hands back another peer's cookie ACK at `now`, and a fresh
+/// listener set up like it takes it and becomes that peer's connection.
+fn hand_off(busy: &mut Tcb, ack: &[u8], now: u64) -> Tcb {
+    busy.set_now(now);
+    assert_eq!(busy.inject_packet(ack), Err(crate::TcpError::ListenerBusy));
+    let mut fresh = make_listener();
+    fresh.set_cookie_secret(&COOKIE_SECRET);
+    fresh.set_now(now);
+    fresh.listen().expect("listen");
+    fresh.inject_packet(ack).expect("handed-off cookie ACK");
+    fresh
+}
+
 #[test]
 fn cookie_handshake_round_trip() {
     let mut s = make_listener();
@@ -908,8 +922,7 @@ fn cookie_handshake_round_trip() {
         false,
         &[],
     );
-    s.set_now(2);
-    s.inject_packet(&ack).expect("inject final ACK");
+    let s = hand_off(&mut s, &ack, 2);
     assert_eq!(
         s.state(),
         State::Established,
@@ -964,8 +977,7 @@ fn cookie_promoted_idle_connection_is_reaped_by_default_keepalive() {
         false,
         &[],
     );
-    s.set_now(2);
-    s.inject_packet(&ack).expect("inject final ACK");
+    let mut s = hand_off(&mut s, &ack, 2);
     assert_eq!(
         s.state(),
         State::Established,
@@ -1028,7 +1040,9 @@ fn cookie_rejects_forged_third_ack() {
     assert!(try_pop(&mut s).is_none());
 
     // Nor can a forged cookie take over a busy slot; it is answered as in
-    // LISTEN.
+    // LISTEN (after the 500 ms reply limit, which listener transitions
+    // no longer reset).
+    s.set_now(1_000);
     occupy_slot(&mut s);
     s.inject_packet(&forged).expect("busy listener answers");
     assert_eq!(s.state(), State::SynRcvd);
@@ -1073,7 +1087,7 @@ fn cookie_handshake_survives_one_time_bucket_rollover() {
         &[],
     );
     s.set_now(70_000);
-    s.inject_packet(&ack).expect("inject delayed ACK");
+    let s = hand_off(&mut s, &ack, 70_000);
     assert_eq!(s.state(), State::Established);
 }
 
@@ -1126,8 +1140,22 @@ fn cookie_ack_after_rotations(rotations: u8) -> State {
         &[],
     );
     s.set_now(1);
-    let _ = s.inject_packet(&ack);
-    s.state()
+    match s.inject_packet(&ack) {
+        // Valid: the host hands it to a fresh listener given the key
+        // history, the oldest key first.
+        Err(crate::TcpError::ListenerBusy) => {
+            let mut fresh = make_listener();
+            fresh.set_now(1);
+            fresh.set_cookie_secret(&COOKIE_SECRET);
+            for k in 0..rotations {
+                fresh.set_cookie_secret(&[0xA0 | k; 16]);
+            }
+            fresh.listen().expect("listen");
+            let _ = fresh.inject_packet(&ack);
+            fresh.state()
+        }
+        _ => s.state(),
+    }
 }
 
 /// Rotating the cookie secret keeps the previous key for validation, so a

@@ -9,7 +9,6 @@ use crate::congestion::CaState;
 use crate::error::TcpError;
 use crate::rtx_queue::seg_flags;
 use crate::state::State;
-use crate::wire::flags;
 
 impl<const BUF: usize> Tcb<BUF> {
     pub(super) fn run_timers(&mut self) -> Result<(), TcpError> {
@@ -22,10 +21,17 @@ impl<const BUF: usize> Tcb<BUF> {
             self.disarm_timers();
             return Ok(());
         }
+        if core::mem::take(&mut self.fin_wait2_read)
+            && self.state == State::FinWait2
+            && self.fin_wait2_timeout_ms != 0
+        {
+            self.fin_wait2_deadline =
+                Deadline::at(now.saturating_add(u64::from(self.fin_wait2_timeout_ms)));
+        }
         if self.state == State::FinWait2 && self.fin_wait2_deadline.due(now) {
             // The peer ACKed our FIN but never sent its own: reset it so it
             // cannot pin this TCB (Linux tcp_fin_timeout behaviour).
-            let _ = self.emit_ctl(flags::RST | flags::ACK, self.snd_nxt, self.rcv_nxt)?;
+            self.emit_final_rst()?;
             self.abort_local();
             return Ok(());
         }
@@ -267,6 +273,7 @@ impl<const BUF: usize> Tcb<BUF> {
         let unsent = self.unsent_bytes();
         let mss = self.data_mss();
         let usable = self.usable_window();
+        let mut probe_end = None;
         let (sent, is_retrans) =
             if unsent > 0 && usable >= unsent.min(mss) && self.rtx.has_room_for_new() {
                 let len = unsent.min(mss);
@@ -293,14 +300,32 @@ impl<const BUF: usize> Tcb<BUF> {
             } else {
                 match self.rtx.len().checked_sub(1) {
                     Some(i) if self.rtx.get(i).is_some_and(|s| !s.has(seg_flags::SACKED)) => {
-                        (self.retransmit(i, true)?, true)
+                        // Linux `tcp_send_loss_probe`: probe the tail's last
+                        // MSS, split off a longer segment (a merged pair, or
+                        // one sent before the path MTU shrank).
+                        let mss = self.mss_payload().max(1);
+                        let j = match self.rtx.get(i).copied() {
+                            Some(s) if s.payload_len() > mss => {
+                                let at = s.start.wrapping_add((s.payload_len() - 1) / mss * mss);
+                                if self.rtx.split(i, at) {
+                                    i + 1
+                                } else {
+                                    i
+                                }
+                            }
+                            _ => i,
+                        };
+                        let sent = self.retransmit(j, true)?;
+                        // What went out: the peer's window may have cut it.
+                        probe_end = self.rtx.get(j).map(|s| s.end);
+                        (sent, true)
                     }
                     _ => (false, false),
                 }
             };
         if sent {
             self.stats.tlp_count = self.stats.tlp_count.saturating_add(1);
-            self.tlp_end_seq = Some(self.snd_nxt);
+            self.tlp_end_seq = Some(probe_end.unwrap_or(self.snd_nxt));
             self.tlp_is_retrans = is_retrans;
             self.tlp_deadline = Deadline::OFF;
             self.arm_rto();
@@ -379,7 +404,7 @@ impl<const BUF: usize> Tcb<BUF> {
             // idle), so nothing was lost: close, keeping unread bytes
             // readable before EOF, as Linux delivers them. Anywhere else,
             // abort.
-            let _ = self.emit_ctl(flags::RST | flags::ACK, self.snd_nxt, self.rcv_nxt)?;
+            self.emit_final_rst()?;
             if self.state == State::CloseWait {
                 self.close_clean();
             } else {

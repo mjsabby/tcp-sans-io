@@ -38,6 +38,10 @@ extern "C" {
 #define TCP_ERR_CONNECTION_RESET  (-7)
 #define TCP_ERR_CONNECTION_CLOSED (-8)
 #define TCP_ERR_OVERFLOW          (-9)
+/* tcp_inject_packet on a listener busy with a live half-open: the datagram is
+ * another peer's valid SYN-cookie ACK. Give it to a fresh listener (same
+ * secrets), which becomes that peer's connection. */
+#define TCP_ERR_LISTENER_BUSY     (-10)
 
 /* ---- Event flags returned by tcp_poll --------------------------------- */
 #define TCP_EV_READABLE     (1u << 0)
@@ -86,18 +90,26 @@ int32_t tcp_connect(TcpStreamHandle* handle, uint64_t now_ms);
 /* Passive open (CLOSED / TIME_WAIT -> LISTEN). Requires tcp_set_secret (or
  * tcp_set_cookie_secret) first: TCP_ERR_INVALID_STATE otherwise. The listener
  * holds one half-open handshake statefully and answers SYNs from other peers
- * with SYN cookies while that slot is busy; a valid cookie ACK takes the slot
- * over. Those replies go to other peers than the half-open's: route outbound
- * packets by their destination address, not by handle. A listener takes
- * cookie ACKs only within 128 s of its own last cookie, so deliver all of a
- * handshake's packets (one 4-tuple) to the same listener. */
+ * with SYN cookies while that slot is busy. Those replies go to other peers
+ * than the half-open's: route outbound packets by their destination address,
+ * not by handle. A valid cookie ACK is answered TCP_ERR_LISTENER_BUSY while
+ * the half-open is live: inject that datagram into a fresh listener set up
+ * like this one, which becomes the cookie peer's connection (a half-open
+ * whose SYN-ACK went unanswered for an RTO yields its slot to it instead).
+ * A listener that completes a handshake becomes that connection: set up the
+ * next listener with the same secrets, and it takes the cookie ACKs its
+ * predecessor's cookies draw. Within 128 s of rotating a cookie key, give a
+ * new listener the previous key, then the current one (after tcp_listen,
+ * which sets its clock). */
 int32_t tcp_listen (TcpStreamHandle* handle, uint64_t now_ms);
 int32_t tcp_close  (TcpStreamHandle* handle, uint64_t now_ms);
-/* Abort the connection: queues a TCP RST+ACK in the TX ring, transitions
- * the handle to CLOSED, drops all buffered send/recv/OOO bytes, and
- * surfaces ConnectionReset via tcp_poll()'s ERROR flag. After calling
- * this, drain the TX ring once with tcp_extract_packet to emit the RST,
- * then call tcp_destroy. Idempotent on CLOSED; no wire effect in
+/* Abort the connection: queues a TCP RST+ACK in the TX ring behind anything
+ * still staged (so it reaches the peer at its RCV.NXT; with the ring full, it
+ * is staged as soon as you extract a packet), transitions the handle to
+ * CLOSED, drops all buffered send/recv/OOO bytes, and surfaces
+ * ConnectionReset via tcp_poll()'s ERROR flag. After calling this, drain the
+ * TX ring with tcp_extract_packet until it returns 0 to emit the RST, then
+ * call tcp_destroy. Idempotent on CLOSED; no wire effect in
  * LISTEN/SYN_SENT. */
 int32_t tcp_abort  (TcpStreamHandle* handle, uint64_t now_ms);
 int32_t tcp_tick   (TcpStreamHandle* handle, uint64_t now_ms);
@@ -147,17 +159,24 @@ int32_t tcp_set_secret(TcpStreamHandle* handle, const uint8_t* secret);
  * the connection has left CLOSED / LISTEN. Default 1500. */
 int32_t tcp_set_mtu(TcpStreamHandle* handle, uint16_t mtu);
 
-/* Report a reduced path MTU mid-connection (e.g. from an ICMP "fragmentation
- * needed" quoting this connection's 4-tuple; its quoted sequence number is
- * not checked). Shrinks the segment size and retransmits in-flight segments
- * that no longer fit. Like a route's learned PMTU in Linux, the report holds
- * for 10 minutes; then one segment probes the old size, which is restored if
- * it arrives (a fresh report of the smaller size holds it 10 more minutes).
- * Without ICMP the stack still clamps the MSS after repeated timeouts of
- * large segments (path-MTU black-hole fallback), then probes the larger size
- * again (after 10 s, backing off to 10 min) and restores it once a probe
- * arrives. */
+/* Report a reduced path MTU mid-connection. Shrinks the segment size and
+ * retransmits in-flight segments that no longer fit. Like a route's learned
+ * PMTU in Linux, the report holds for 10 minutes; then one segment probes the
+ * old size, which is restored if it arrives (a fresh report of the smaller
+ * size holds it 10 more minutes; a later, larger report caps the probe for
+ * 10 minutes, after which the full size is probed again). Without ICMP the
+ * stack still clamps the MSS after repeated timeouts of large segments
+ * (path-MTU black-hole fallback), then probes the larger size again (after
+ * 10 s, backing off to 10 min) and restores it once a probe arrives.
+ * tcp_update_pmtu takes the MTU alone (for a host that knows the path
+ * changed); for an ICMP "fragmentation needed" quoting this connection's
+ * 4-tuple, use tcp_update_pmtu_icmp with the sequence number of the quoted
+ * TCP header: the report is applied only if that sequence number is in flight
+ * (as Linux checks), TCP_ERR_NOT_FOR_US otherwise. Each smaller report
+ * resends what no longer fits, so an unchecked forged one costs a flight. */
 int32_t tcp_update_pmtu(TcpStreamHandle* handle, uint64_t now_ms, uint16_t mtu);
+int32_t tcp_update_pmtu_icmp(TcpStreamHandle* handle, uint64_t now_ms,
+                             uint16_t mtu, uint32_t quoted_seq);
 
 /* FIN_WAIT_2 timeout (0 disables; default 60 s): after our FIN is ACKed the
  * peer must send its FIN within this long, otherwise the connection is reset.
@@ -191,6 +210,8 @@ int32_t tcp_recv(TcpStreamHandle* handle,
                  uint8_t* buf, size_t cap, size_t* out_read);
 
 /* ---- TCP ⇄ WireGuard datagrams ---------------------------------------- */
+/* NOT_FOR_US / MALFORMED_PACKET / INVALID_STATE: drop the datagram and go on.
+ * LISTENER_BUSY: give it to a fresh listener (see tcp_listen). */
 int32_t tcp_inject_packet (TcpStreamHandle* handle,
                            const uint8_t* packet, size_t len, uint64_t now_ms);
 int32_t tcp_extract_packet(TcpStreamHandle* handle,

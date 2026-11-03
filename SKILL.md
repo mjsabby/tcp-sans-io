@@ -77,17 +77,22 @@ pump loop*. The non-obvious rules that bindings get wrong:
   `now_ms` of the next timer, `UINT64_MAX` if none) — RTO / TLP /
   TIME_WAIT / persist / delayed-ACK only fire there. Without deadline
   tracking, a ~10 ms periodic tick is adequate.
+- **Read until `recv` returns 0** (or the application is full) before
+  sleeping: unread bytes keep `READABLE` set but wake nothing — no
+  datagram or timer is owed for them.
 - Treat `NOT_FOR_US` / `MALFORMED_PACKET` from `inject` as drop-and-continue,
-  `WOULD_BLOCK` from `send` as backpressure, `CONNECTION_CLOSED` from `recv`
-  as EOF.
+  `LISTENER_BUSY` as "inject this datagram into a fresh listener" (a valid
+  SYN-cookie ACK a busy listener cannot take), `WOULD_BLOCK` from `send` as
+  backpressure, `CONNECTION_CLOSED` from `recv` as EOF.
 - After `close`, keep pumping until `tcp_state` is `CLOSED`, `recv` any bytes
   still `READABLE` (the peer's data before its FIN or RST), then `destroy`.
   After a peer's RST, `recv` returns the bytes already received first and
   `CONNECTION_RESET` after the last of them (as Linux).
 - Route each outbound packet by its own destination address: a listener
   answers *other* peers (SYN cookies) while its half-open slot is busy.
-  Inbound, deliver all of a handshake's packets (one 4-tuple) to the same
-  listener: it takes cookie ACKs only within 128 s of its own last cookie.
+  A listener that completes a handshake becomes that connection: set up
+  the next listener with the same secret, and it takes the cookie ACKs its
+  predecessor's cookies draw.
 - One handle is single-threaded — the stack has no internal locking. If
   your language can call into one handle from several threads (e.g. ctypes
   releases the GIL), serialize the calls per handle in the wrapper.

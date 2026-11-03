@@ -137,7 +137,7 @@ impl Lab {
             mtu: 1500,
         };
         Lab {
-            sut: stacks::build(spec, &opts),
+            sut: stacks::build_host(spec, &opts),
             now: 0,
             got: VecDeque::new(),
             peer,

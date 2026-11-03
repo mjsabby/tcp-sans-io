@@ -58,7 +58,7 @@ impl<const BUF: usize> Tcb<BUF> {
     /// discards, it would have been lost.
     #[inline]
     pub(super) fn send_recovery(&mut self) -> Result<(), TcpError> {
-        if self.frto_new || self.rtx.lost_bytes() > 0 {
+        if self.frto_new || self.rtx.unresent_lost_bytes() > 0 {
             self.send_data(true)?;
         }
         Ok(())
@@ -659,6 +659,19 @@ impl<const BUF: usize> Tcb<BUF> {
     /// Option-less control segment to the connected peer (RST / RST+ACK).
     pub(super) fn emit_ctl(&mut self, fl: u8, seq: u32, ack: u32) -> Result<bool, TcpError> {
         self.emit_segment(fl, seq, ack, &TcpOptions::NONE, NO_PAYLOAD, false)
+    }
+
+    /// The RST that ends the connection (abort, FIN_WAIT_2 timeout,
+    /// keepalive give-up). It goes behind what the host has yet to extract,
+    /// so it reaches the peer after those segments, at its RCV.NXT (RFC
+    /// 5961 resets on nothing else). A full egress ring used to lose it;
+    /// now it is owed and staged as soon as the host takes a packet out.
+    pub(super) fn emit_final_rst(&mut self) -> Result<(), TcpError> {
+        let (seq, ack) = (self.snd_nxt, self.rcv_nxt);
+        if !self.emit_ctl(flags::RST | flags::ACK, seq, ack)? {
+            self.owed_rst = Some((seq, ack));
+        }
+        Ok(())
     }
 
     /// RST addressed to the *sender* of `seg` (used where the TCB has no or

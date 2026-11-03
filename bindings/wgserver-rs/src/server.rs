@@ -242,6 +242,14 @@ impl Server {
                                 | Err(TcpError::InvalidState) => {
                                     self.stats.parse_rejects += 1;
                                 }
+                                // A cookie ACK the busy listener hands back:
+                                // one TCB per port leaves no fresh listener
+                                // to give it to, so the client's next
+                                // segment is taken once the half-open in the
+                                // slot has gone unanswered for an RTO.
+                                Err(TcpError::ListenerBusy) => {
+                                    self.stats.parse_rejects += 1;
+                                }
                                 Err(e) => {
                                     if !self.cfg.quiet {
                                         eprintln!(

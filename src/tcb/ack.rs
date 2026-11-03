@@ -9,7 +9,10 @@
 //! congestion control react: PRR during a reduction, slow start /
 //! congestion avoidance otherwise.
 
-use super::{seq_ge, seq_gt, seq_le, seq_lt, Deadline, Tcb, TLP_MIN_PTO_MS, TLP_WC_DELACK_MS};
+use super::{
+    seq_ge, seq_gt, seq_le, seq_lt, Deadline, Tcb, PMTU_PROBE_MAX_MS, TLP_MIN_PTO_MS,
+    TLP_WC_DELACK_MS,
+};
 use crate::congestion::{CaState, UndoSeed};
 use crate::error::TcpError;
 use crate::rtx_queue::seg_flags;
@@ -120,7 +123,8 @@ impl<const BUF: usize> Tcb<BUF> {
                         self.rack.on_dsack(self.snd_una, self.snd_nxt);
                     }
                     let before = self.cc.ssthresh;
-                    if self.cc.on_dsack(l0, r0, mss) {
+                    let resent = self.dsack_resent_segs(l0, r0, ack, mss);
+                    if self.cc.on_dsack_segs(l0, r0, resent) {
                         // Spurious episode: restore the window (done) and drop
                         // loss marks that were never acted on.
                         self.withdraw_cwr(before);
@@ -166,7 +170,7 @@ impl<const BUF: usize> Tcb<BUF> {
             if core::mem::take(&mut self.rack.advanced) {
                 self.rack_detect();
             }
-            if self.rtx.lost_bytes() > 0 && !self.cc.in_loss_recovery() {
+            if self.rtx.unresent_lost_bytes() > 0 && !self.cc.in_loss_recovery() {
                 self.enter_fast_recovery();
             }
             if self.cc.in_reduction() {
@@ -384,7 +388,10 @@ impl<const BUF: usize> Tcb<BUF> {
             delivered = delivered.saturating_add(mss);
         }
         self.reno_sacked = self.reno_sacked.min(reno_limit);
-        if self.rtx.lost_bytes() > 0 && !self.cc.in_loss_recovery() {
+        // Only a segment still awaiting its resend starts recovery: after an
+        // undo, resends in flight keep their loss marks here (Linux clears
+        // them, `tcp_undo_cwnd_reduction`), and must not restart it.
+        if self.rtx.unresent_lost_bytes() > 0 && !self.cc.in_loss_recovery() {
             self.enter_fast_recovery();
         }
 
@@ -482,10 +489,18 @@ impl<const BUF: usize> Tcb<BUF> {
         }
         self.pmtu_probe_inflight = false;
         self.pmtu_mss = self.pmtu_mss.max(self.pmtu_probe_mss);
-        if self.pmtu_mss >= self.pmtu_restore_mss {
-            self.pmtu_restore_mss = 0;
-        } else {
+        if self.pmtu_mss < self.pmtu_restore_mss {
             self.pmtu_probe_at = self.now_ms;
+        } else if self.pmtu_mss < self.local_mss {
+            // Restored only to a size a later report capped the search at
+            // (reports can arrive out of order, or be forged): try the full
+            // size again in 10 minutes, as Linux re-probes
+            // (`tcp_mtu_check_reprobe`) and a learned route MTU expires.
+            self.pmtu_restore_mss = self.local_mss;
+            self.pmtu_probe_backoff_ms = PMTU_PROBE_MAX_MS;
+            self.pmtu_probe_at = self.now_ms.saturating_add(u64::from(PMTU_PROBE_MAX_MS));
+        } else {
+            self.pmtu_restore_mss = 0;
         }
     }
 
@@ -542,6 +557,40 @@ impl<const BUF: usize> Tcb<BUF> {
         }
         self.dsack_segs = total;
         true
+    }
+
+    /// The needless retransmissions a valid D-SACK `[l, r)` shows, for the
+    /// undo count. Of data still queued, only segments we resent count
+    /// (Linux `tcp_sacktag_one`): a duplicate of one sent once (the network
+    /// copied it, or the peer forged the block) says nothing of our
+    /// retransmissions. Of data acknowledged before this ACK, each MSS
+    /// counts (Linux `tcp_check_dsack`), as nothing records what was resent
+    /// there. A block straddling the cumulative ACK counts for nothing
+    /// (`tcp_is_sackblock_valid`).
+    fn dsack_resent_segs(&self, l: u32, r: u32, ack: u32, mss: u32) -> u32 {
+        if seq_le(r, self.snd_una) {
+            return r.wrapping_sub(l).div_ceil(mss.max(1)).max(1);
+        }
+        if seq_lt(l, ack) && seq_gt(r, ack) {
+            return 0;
+        }
+        let from = if seq_lt(l, self.snd_una) {
+            self.snd_una
+        } else {
+            l
+        };
+        let mut n = 0u32;
+        let mut i = self.rtx.find(from);
+        while let Some(s) = i.and_then(|i| self.rtx.get(i)) {
+            if !seq_lt(s.start, r) {
+                break;
+            }
+            if s.has(seg_flags::EVER_RETRANS) {
+                n = n.saturating_add(1);
+            }
+            i = i.map(|i| i + 1);
+        }
+        n
     }
 
     /// Undo a loss episode an ACK that advanced `SND.UNA` shows was

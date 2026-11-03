@@ -127,6 +127,21 @@ impl OooList {
 
     /// Record `[start, end)` (all strictly above `rcv_nxt`) as held.
     pub fn insert(&mut self, start: u32, end: u32, rcv_nxt: u32) -> Insert {
+        self.insert_with(start, end, rcv_nxt, |_, _| {})
+    }
+
+    /// [`Self::insert`], calling `new(l, r)` for each run of `[start, end)`
+    /// that was not held before (none if the list is full), so only those
+    /// bytes are stored: a byte already held keeps its first copy (RFC 9293
+    /// §3.10.7.4 keeps just the new data; Linux `tcp_data_queue_ofo` drops
+    /// a wholly duplicate segment).
+    pub fn insert_with(
+        &mut self,
+        start: u32,
+        end: u32,
+        rcv_nxt: u32,
+        mut new: impl FnMut(u32, u32),
+    ) -> Insert {
         let (s, e) = (off(start, rcv_nxt), off(end, rcv_nxt));
         if s == 0 || e <= s {
             return Insert::NEW;
@@ -147,6 +162,7 @@ impl OooList {
             if self.len == OOO_MAX_RANGES {
                 return Insert::Full;
             }
+            new(start, end);
             // Shift `lo..len` up one slot (the spare slot at `len` rotates
             // to `lo` and is overwritten).
             if let Some(t) = self.ranges.get_mut(lo..=self.len) {
@@ -168,13 +184,23 @@ impl OooList {
         };
         let mut dup = None;
         let mut dup_bytes = 0u32;
+        // `cur`: how far `[s, e)` is accounted for, held or reported new.
+        let mut cur = s;
         for r in self.slice().get(lo..hi).unwrap_or(&[]) {
-            let is = off(r.start, rcv_nxt).max(s);
-            let ie = off(r.end, rcv_nxt).min(e);
+            let (rs, re) = (off(r.start, rcv_nxt), off(r.end, rcv_nxt));
+            let is = rs.max(s);
+            let ie = re.min(e);
             if is < ie {
                 dup.get_or_insert((rcv_nxt.wrapping_add(is), rcv_nxt.wrapping_add(ie)));
                 dup_bytes += ie - is;
             }
+            if rs > cur {
+                new(rcv_nxt.wrapping_add(cur), rcv_nxt.wrapping_add(rs.min(e)));
+            }
+            cur = cur.max(re);
+        }
+        if cur < e {
+            new(rcv_nxt.wrapping_add(cur), end);
         }
         let m_start = if off(first.start, rcv_nxt) < s {
             first.start
@@ -501,5 +527,26 @@ mod tests {
         assert!(l.debug_valid(base));
         assert_eq!(l.first_start(), Some(base.wrapping_add(10)));
         assert_eq!(l.advance(base.wrapping_add(10)), base.wrapping_add(20));
+    }
+    /// Only the runs not held before are reported new, across several
+    /// held ranges, and none when the list is full.
+    #[test]
+    fn insert_with_reports_only_new_runs() {
+        let mut l = OooList::new();
+        l.insert(110, 120, 100);
+        l.insert(130, 140, 100);
+        let mut new = std::vec::Vec::new();
+        let r = l.insert_with(105, 145, 100, |a, b| new.push((a, b)));
+        assert_eq!(new, [(105, 110), (120, 130), (140, 145)]);
+        assert_eq!(
+            r,
+            Insert::Stored {
+                dup: Some((110, 120)),
+                dup_bytes: 20
+            }
+        );
+        new.clear();
+        l.insert_with(112, 118, 100, |a, b| new.push((a, b)));
+        assert!(new.is_empty(), "a wholly held run reported new: {new:?}");
     }
 }

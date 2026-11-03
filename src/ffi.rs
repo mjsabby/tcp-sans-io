@@ -269,6 +269,8 @@ pub unsafe extern "C" fn tcp_set_mtu(handle: *mut TcpStreamHandle, mtu: u16) -> 
 /// "fragmentation needed" quoting this connection's 4-tuple). Shrinks the
 /// segment size and retransmits in-flight segments that no longer fit; the
 /// report holds for 10 minutes, then one segment probes the old size.
+/// Prefer [`tcp_update_pmtu_icmp`] for ICMP: it also checks the quoted
+/// sequence number.
 ///
 /// # Safety
 /// `handle` must be NULL or a live handle from [`tcp_init`].
@@ -284,6 +286,29 @@ pub unsafe extern "C" fn tcp_update_pmtu(
             h.set_now(now_ms);
             h.update_pmtu(mtu);
             Ok(())
+        })
+    }
+}
+
+/// [`tcp_update_pmtu`] for an ICMP "fragmentation needed" whose quoted TCP
+/// header carries `quoted_seq`: applied only if that sequence number is in
+/// flight (`[SND.UNA, SND.NXT]`, as Linux checks), `TCP_ERR_NOT_FOR_US`
+/// otherwise.
+///
+/// # Safety
+/// `handle` must be NULL or a live handle from [`tcp_init`].
+#[no_mangle]
+pub unsafe extern "C" fn tcp_update_pmtu_icmp(
+    handle: *mut TcpStreamHandle,
+    now_ms: u64,
+    mtu: u16,
+    quoted_seq: u32,
+) -> i32 {
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        with_handle(handle, |h| {
+            h.set_now(now_ms);
+            h.update_pmtu_icmp(mtu, quoted_seq)
         })
     }
 }

@@ -80,7 +80,7 @@ bold purple = the SYN_RCVD → LISTEN revert, green = SYN-cookie promotion):
 | SYN_SENT | ESTABLISHED | recv SYN-ACK | send ACK | `complete_active_open` |
 | SYN_SENT | SYN_RCVD | recv SYN (simultaneous open) | send SYN-ACK | `simultaneous_open` |
 | SYN_SENT | CLOSED | recv RST / SYN retries spent / `abort()` | surface `ConnectionReset` | `on_syn_sent` / `syn_sent_timer` |
-| SYN_RCVD | ESTABLISHED | recv 3rd ACK — or, while the slot is busy, another peer's valid cookie ACK (it takes over the slot) | — | `complete_passive_open` / `on_busy_listener` |
+| SYN_RCVD | ESTABLISHED | recv 3rd ACK — or another peer's valid cookie ACK once the half-open's SYN-ACK went unanswered (a live half-open hands it back as `ListenerBusy`) | — | `complete_passive_open` / `on_busy_listener` |
 | SYN_RCVD | CLOSE_WAIT | 3rd ACK carrying a FIN | send ACK | `complete_passive_open` + `advance_state_on_remote_fin` |
 | SYN_RCVD | LISTEN | SYN-ACK retransmit budget exhausted, or exact-match RST | recycle the half-open slot | `syn_rcvd_timer` / `on_syn_rcvd` → `reset_to_listen_or_closed` |
 | SYN_RCVD | FIN_WAIT_1 | `close()` | send FIN | `Tcb::close` |
@@ -112,11 +112,13 @@ bold purple = the SYN_RCVD → LISTEN revert, green = SYN-cookie promotion):
 - **Hybrid SYN cookies** (green). The free slot is always used statefully, so
   a client keeps window scaling and SACK even without timestamps. While the
   slot is busy, SYNs from other peers are answered with cookie SYN-ACKs (no
-  state); a valid cookie ACK establishes directly from LISTEN, or from
-  SYN_RCVD by taking over the pending half-open — a peer that proved it
-  receives our packets beats one that has not, so spoofed SYNs cannot lock
-  the listener. `listen()` requires a secret, and the cookie key is derived
-  from it unless one is installed explicitly.
+  state); a valid cookie ACK establishes directly from LISTEN. A busy
+  listener hands it back (`ListenerBusy`) while its half-open is live, for
+  the host to give to a fresh listener, so both handshakes complete; it
+  takes over a half-open whose SYN-ACK went unanswered for an RTO (SYN_RCVD
+  → ESTABLISHED), so spoofed SYNs cannot lock the listener out of a host
+  that does not hand off. `listen()` requires a secret, and the cookie key
+  is derived from it unless one is installed explicitly.
 - **FIN_WAIT_1 → TIME_WAIT** (direct). When a single segment both ACKs our FIN
   and carries the peer's FIN, the two single-step edges collapse into one. The
   oracle's `allowed_transition` permits it explicitly.

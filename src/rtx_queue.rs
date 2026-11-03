@@ -171,6 +171,13 @@ impl RtxQueue {
     pub fn retrans_bytes(&self) -> u32 {
         self.retrans
     }
+    /// Bytes marked lost and not yet resent (`RETRANS` implies `LOST`): what
+    /// Linux's `lost_out` counts once an undo has cleared the loss marks of
+    /// resends still in flight.
+    #[inline]
+    pub fn unresent_lost_bytes(&self) -> u32 {
+        self.lost.saturating_sub(self.retrans)
+    }
 
     /// RFC 6675 `pipe` given the total outstanding sequence span.
     #[inline]

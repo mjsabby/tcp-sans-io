@@ -2,8 +2,9 @@
 //! well-formed (valid checksums) with SEQ/ACK chosen relative to the TCB's
 //! live state, from one of three peers, so the fuzzer reaches LISTEN /
 //! SYN_RCVD, hybrid SYN cookies (a busy half-open slot answered with
-//! cookies, cookie ACKs taking the slot over, key rotation), simultaneous
-//! open and every closing state — instead of dying in the parser.
+//! cookies, cookie ACKs handed back or taking a stale slot over, key
+//! rotation), simultaneous open and every closing state — instead of dying
+//! in the parser.
 //!
 //! Oracles: internal errors never escape; `debug_validate_invariants` and
 //! `debug_check_liveness` hold; transitions are ones

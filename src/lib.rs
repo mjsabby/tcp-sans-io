@@ -56,16 +56,21 @@
 //!
 //! 5. **Understand the listener's SYN cookies.** A listener holds one
 //!    half-open handshake statefully (keeping every option the client offers)
-//!    and answers SYNs with RFC 4987 cookies while that slot is busy; a valid
-//!    cookie ACK takes the slot over, so spoofed SYNs cannot lock it. The
+//!    and answers SYNs with RFC 4987 cookies while that slot is busy. A valid
+//!    cookie ACK comes back as [`TcpError::ListenerBusy`] while the half-open
+//!    is live: inject it into a fresh listener, which becomes that peer's
+//!    connection. A half-open whose SYN-ACK went unanswered for an RTO yields
+//!    its slot to the ACK, so spoofed SYNs cannot lock a listener out. The
 //!    cookie key derives from the host secret; [`Tcb::set_cookie_secret`]
 //!    installs an explicit one instead. Rotating it keeps the previous key
 //!    valid, so cookies survive one rotation (rotate no more often than every
-//!    ~2 minutes). A predictable or leaked secret defeats the protection.
+//!    ~2 minutes; within 128 s of a rotation, give a new listener the old key,
+//!    then the new). A predictable or leaked secret defeats the protection.
 //!    Busy-listener replies go to *other* peers than the half-open's: route
 //!    every outbound packet by its own destination address, never by the TCB.
-//!    Inbound, deliver all of a handshake's packets (one 4-tuple) to the same
-//!    listener: it takes cookie ACKs only within 128 s of its own last cookie.
+//!    A listener that completes a handshake becomes that connection: set up
+//!    the next listener with the same secret, and it takes the cookie ACKs
+//!    its predecessor's cookies draw.
 //!
 //! 6. **Act on lifecycle signals and release the TCB.** Read [`Tcb::poll`] and
 //!    react: on `PEER_CLOSED` (peer FIN → `CLOSE_WAIT`) the host **must**
