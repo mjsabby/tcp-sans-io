@@ -1454,8 +1454,13 @@ put packets on the path — is hostile.
   processing, SACK and D-SACK handling, and out-of-order insertion are
   bounded per segment; a SACK block that reaches past `SND.NXT` or not
   above `SND.UNA` is ignored (Linux `tcp_is_sackblock_valid`), so a forged
-  block cannot mark unsent or acknowledged data delivered; nothing SACKed
-  is ever retransmitted and nothing received is ever reneged; repeated
+  block cannot mark unsent or acknowledged data delivered; a block splits a
+  segment only at whole multiples of the MSS (Linux
+  `tcp_match_skb_to_sack`), so blocks of a few bytes cannot shatter the
+  retransmission queue (Linux CVE-2019-11478); nothing SACKed is
+  retransmitted — but for the newest two segments, merged when a full
+  queue needs a record to split its head — and nothing received is ever
+  reneged; repeated
   SACK blocks over an already-SACKed
   queue cost a binary search and a bitmap skip, not a walk over every
   segment (≈ 0.1 µs instead of 2 µs per ACK with 1024 segments in flight).
