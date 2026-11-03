@@ -9,7 +9,7 @@
 
 use std::time::Instant as Clock;
 
-use crate::net::LinkCfg;
+use crate::net::{Host, LinkCfg};
 use crate::report::{mbps, Table};
 use crate::sim::{self, App, ClosePolicy, Goal, Scenario, MIB, MS, SEC};
 use crate::stacks::{self, Opts, Pkt, Recv, Spec, St, Stack, Time};
@@ -30,6 +30,8 @@ pub struct Profile {
     /// Data segments `[lo, hi)` (by link-entry index) are dropped.
     pub burst: (u64, u64),
     pub mib: u64,
+    /// How the sender's host feeds the bottleneck queue.
+    pub host: Host,
 }
 
 const fn prof(
@@ -50,6 +52,7 @@ const fn prof(
         reorder_us: 4 * MS,
         burst: (0, 0),
         mib,
+        host: Host::Push,
     }
 }
 
@@ -69,13 +72,22 @@ pub const PROFILES: &[Profile] = &[
         burst: (300, 340),
         ..prof("burst-40", 20 * MS, 100, 0, 1000, 4)
     },
-    // Virtual links (VMs or containers on one host): sub-millisecond RTTs.
-    prof("virt", 100, 10_000, 0, 256, 64),
+    // Virtual links (VMs or containers on one host): sub-millisecond RTTs,
+    // and a device queue (a TUN queue, a virtio ring) that holds the
+    // sending host back when full, as the host contract asks.
+    Profile {
+        host: Host::Ring,
+        ..prof("virt", 100, 10_000, 0, 256, 64)
+    },
     Profile {
         reorder_ppm: 10_000,
         reorder_us: 100,
+        host: Host::Ring,
         ..prof("virt-reorder", 100, 10_000, 0, 256, 32)
     },
+    // The same link behind a router's tail-drop queue (or a host that
+    // ignores the device queue): every overshoot is dropped.
+    prof("virt-droptail", 100, 10_000, 0, 256, 64),
 ];
 
 /// `us` in milliseconds, as short as exact ("40", "0.1").
@@ -90,7 +102,8 @@ impl Profile {
             .delay_us(half)
             .loss(self.loss_ppm)
             .reorder_us(self.reorder_ppm, self.reorder_us)
-            .drop_data(self.burst.0, self.burst.1);
+            .drop_data(self.burst.0, self.burst.1)
+            .host(self.host);
         // Above 1 Gbit/s a 1500 B packet no longer takes a whole number of
         // µs; slower profiles keep the whole-µs model (exact for their
         // full-size packets).
@@ -102,10 +115,14 @@ impl Profile {
     }
     pub fn describe(&self) -> String {
         let mut s = format!(
-            "{} ms, {} Mbit/s, {}-pkt queue",
+            "{} ms, {} Mbit/s, {}-pkt {}",
             ms(self.rtt_us),
             self.mbit,
-            self.queue
+            self.queue,
+            match self.host {
+                Host::Push => "queue",
+                Host::Ring => "device queue holding the host back",
+            }
         );
         if self.loss_ppm > 0 {
             s += &format!(", {}% loss", f64::from(self.loss_ppm) / 1e4);

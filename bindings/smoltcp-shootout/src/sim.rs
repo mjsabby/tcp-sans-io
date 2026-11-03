@@ -384,6 +384,7 @@ impl Sim {
             for p in side.out.drain(..) {
                 link.send(self.now, p);
             }
+            side.stack.set_tx_room(link.room(self.now));
         }
     }
 
@@ -470,6 +471,8 @@ impl Sim {
     fn advance(&mut self, goal: Goal, limit: Time) -> Result<bool, String> {
         let mut stuck = 0u32;
         loop {
+            // Time moved on: the device queues may have room again.
+            self.pump_out();
             for side in [&mut self.client, &mut self.server] {
                 side.app(self.now, &mut self.scratch);
                 if let Some(off) = side.corrupt {
@@ -512,11 +515,15 @@ impl Sim {
                     _ => None,
                 })
                 .min();
+            let now = self.now;
+            let held = (self.client.stack.holds_tx(), self.server.stack.holds_tx());
             let next = [
-                self.client.stack.next_wake(self.now),
-                self.server.stack.next_wake(self.now),
+                self.client.stack.next_wake(now),
+                self.server.stack.next_wake(now),
                 self.fwd.next_delivery(),
                 self.rev.next_delivery(),
+                self.fwd.next_room(now, held.0),
+                self.rev.next_room(now, held.1),
                 reader,
                 closer,
             ]
@@ -614,6 +621,7 @@ pub fn run(sc: &Scenario, goal: Goal) -> Outcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::net::Host;
 
     /// 64 bytes client → server over a 10 Gbit/s link with 100 µs each
     /// way; both sides keep the connection open.
@@ -655,5 +663,33 @@ mod tests {
             "{:?} {st:?}",
             o.fwd
         );
+    }
+
+    /// A device queue that holds its host back never drops: each stack
+    /// keeps what finds no room (tcp-sans-io in its egress ring, smoltcp in
+    /// its socket when the device refuses a token) and is woken when the
+    /// queue frees a slot. Pushed into the same queue, slow start overflows
+    /// it.
+    #[test]
+    fn a_device_queue_that_holds_the_host_back_drops_nothing() {
+        for spec in [Spec::Ours, Spec::SMOL] {
+            for host in [Host::Push, Host::Ring] {
+                let link = LinkCfg::new(0, 10_000, 32).delay_us(50).exact_rate();
+                let mut sc = Scenario::new(spec, spec, link.host(host));
+                sc.rev = LinkCfg::new(0, 0, 1 << 20).delay_us(50);
+                sc.client_app = App::sender(8 * MIB);
+                sc.client_app.close = ClosePolicy::Never;
+                sc.server_app.close = ClosePolicy::Never;
+                let o = run(&sc, Goal::Delivered);
+                assert!(o.ok(), "{spec:?} {host:?}: {:?}", o.error);
+                assert_eq!(o.fwd_bytes, 8 * MIB, "{spec:?} {host:?}");
+                if host == Host::Ring {
+                    assert_eq!(o.fwd.drops, 0, "{spec:?}: the queue overflowed");
+                    assert_eq!(o.fwd.retx_pkts, 0, "{spec:?} retransmitted");
+                } else {
+                    assert!(o.fwd.drops > 0, "{spec:?}: the queue never filled");
+                }
+            }
+        }
     }
 }

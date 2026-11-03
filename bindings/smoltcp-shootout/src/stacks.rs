@@ -11,7 +11,6 @@ use smoltcp::socket::tcp;
 use smoltcp::time::Instant;
 use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address};
 use tcp_sans_io::tcb::events;
-use tcp_sans_io::tx_ring::TX_RING_CAP;
 use tcp_sans_io::{Endpoint, State, Tcb, TcbConfig, TcbStats, TcpError};
 
 /// Microseconds (virtual time in simulations).
@@ -150,6 +149,11 @@ pub trait Stack {
     fn poll(&mut self, now: Time);
     /// Move out every datagram the stack has emitted.
     fn drain(&mut self, out: &mut Vec<Pkt>);
+    /// How many more datagrams the device queue takes before the next
+    /// `drain` (`usize::MAX`: all); the stack holds the rest back.
+    fn set_tx_room(&mut self, room: usize);
+    /// The stack is holding output back for want of room.
+    fn holds_tx(&self) -> bool;
     /// When `poll` next has timer work (`None`: only input can wake it).
     fn next_wake(&mut self, now: Time) -> Option<Time>;
     fn send(&mut self, data: &[u8]) -> usize;
@@ -318,6 +322,8 @@ pub struct Ours<const B: usize> {
     out: Vec<Pkt>,
     /// `flush` hit `FULL_RING_GUARD` (reported by `invariants`).
     runaway: bool,
+    /// Datagrams the device queue can still take before the next `drain`.
+    room: usize,
 }
 
 impl<const B: usize> Ours<B> {
@@ -352,6 +358,7 @@ impl<const B: usize> Ours<B> {
             tcb,
             out: Vec::new(),
             runaway: false,
+            room: usize::MAX,
         }
     }
 
@@ -359,13 +366,18 @@ impl<const B: usize> Ours<B> {
         self.tcb.set_now(now / 1000);
     }
 
-    /// Move out every staged datagram. The TCB stops staging when its
-    /// egress ring (`TX_RING_CAP` datagrams) is full, and no timer resumes
-    /// it, so whenever a drain finds the ring full, tick and drain again
-    /// until one comes up short, as the host contract asks.
+    /// Move out every staged datagram the device queue has room for. The
+    /// TCB stops staging when its egress ring (`TX_RING_CAP` datagrams) is
+    /// full, and no timer resumes it, so whenever a drain takes from a full
+    /// ring, tick and drain again, as the host contract asks; what finds no
+    /// room stays in the ring.
     fn flush(&mut self) {
         let mut full = 0;
-        while self.drain_ring() >= TX_RING_CAP {
+        loop {
+            let was_full = self.tcb.debug_egress_full();
+            if self.drain_ring() == 0 || !was_full {
+                return;
+            }
             full += 1;
             if full > FULL_RING_GUARD {
                 self.runaway = true;
@@ -377,8 +389,12 @@ impl<const B: usize> Ours<B> {
 
     fn drain_ring(&mut self) -> usize {
         let mut n = 0;
-        while let Some(p) = self.tcb.extract_packet_with(Pkt::from_slice) {
+        while self.room > 0 {
+            let Some(p) = self.tcb.extract_packet_with(Pkt::from_slice) else {
+                break;
+            };
             self.out.push(p);
+            self.room -= 1;
             n += 1;
         }
         n
@@ -416,6 +432,12 @@ impl<const B: usize> Stack for Ours<B> {
     }
     fn drain(&mut self, out: &mut Vec<Pkt>) {
         out.append(&mut self.out);
+    }
+    fn set_tx_room(&mut self, room: usize) {
+        self.room = room;
+    }
+    fn holds_tx(&self) -> bool {
+        self.tcb.debug_snapshot().tx_len > 0
     }
     fn next_wake(&mut self, _now: Time) -> Option<Time> {
         self.tcb.next_deadline().map(|ms| ms.saturating_mul(1000))
@@ -491,10 +513,14 @@ pub struct Dev {
     rx: VecDeque<Pkt>,
     tx: Vec<Pkt>,
     mtu: usize,
+    /// Datagrams the device queue can still take before the next drain.
+    room: usize,
+    /// The last poll found the device queue full (smoltcp keeps the data).
+    refused: bool,
 }
 
 pub struct RxTok(Pkt);
-pub struct TxTok<'a>(&'a mut Vec<Pkt>);
+pub struct TxTok<'a>(&'a mut Vec<Pkt>, &'a mut usize);
 
 impl phy::RxToken for RxTok {
     fn consume<R, F: FnOnce(&[u8]) -> R>(self, f: F) -> R {
@@ -508,6 +534,7 @@ impl phy::TxToken for TxTok<'_> {
         p.set_len(len);
         let r = f(p.bytes_mut());
         self.0.push(p);
+        *self.1 = self.1.saturating_sub(1);
         r
     }
 }
@@ -518,10 +545,14 @@ impl Device for Dev {
 
     fn receive(&mut self, _: Instant) -> Option<(RxTok, TxTok<'_>)> {
         let p = self.rx.pop_front()?;
-        Some((RxTok(p), TxTok(&mut self.tx)))
+        Some((RxTok(p), TxTok(&mut self.tx, &mut self.room)))
     }
     fn transmit(&mut self, _: Instant) -> Option<TxTok<'_>> {
-        Some(TxTok(&mut self.tx))
+        if self.room == 0 {
+            self.refused = true;
+            return None;
+        }
+        Some(TxTok(&mut self.tx, &mut self.room))
     }
     fn capabilities(&self) -> DeviceCapabilities {
         let mut c = DeviceCapabilities::default();
@@ -553,6 +584,8 @@ impl Smol {
             rx: VecDeque::new(),
             tx: Vec::new(),
             mtu: usize::from(o.mtu),
+            room: usize::MAX,
+            refused: false,
         };
         let mut cfg = Config::new(HardwareAddress::Ip);
         cfg.random_seed = splitmix(o.seed ^ 0x5EED);
@@ -640,6 +673,7 @@ impl Stack for Smol {
     }
     fn poll(&mut self, now: Time) {
         SMOL_CLOCK_MS.with(|c| c.set(now / 1000));
+        self.dev.refused = false;
         self.iface
             .poll(smol_now(now), &mut self.dev, &mut self.sockets);
         self.track();
@@ -647,10 +681,24 @@ impl Stack for Smol {
     fn drain(&mut self, out: &mut Vec<Pkt>) {
         out.append(&mut self.dev.tx);
     }
+    fn set_tx_room(&mut self, room: usize) {
+        self.dev.room = room;
+    }
+    fn holds_tx(&self) -> bool {
+        self.dev.refused
+    }
     fn next_wake(&mut self, now: Time) -> Option<Time> {
-        self.iface
+        let at = self
+            .iface
             .poll_at(smol_now(now), &self.sockets)
-            .map(|t| (t.total_micros().max(0) as u64).max(now))
+            .map(|t| (t.total_micros().max(0) as u64).max(now));
+        // A socket with output the device refused asks to be polled now;
+        // the device queue's next free slot wakes it instead.
+        if self.dev.refused {
+            at.filter(|&t| t > now)
+        } else {
+            at
+        }
     }
     fn send(&mut self, data: &[u8]) -> usize {
         self.sock_mut().send_slice(data).unwrap_or(0)

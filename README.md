@@ -343,7 +343,7 @@ sender and as a receiver:
 | Shallow bottleneck buffers | Slightly above Linux Reno, about 10 % below Linux CUBIC. |
 | Slow-start exit | Overshoots like Linux Reno (no HyStart): a queue's worth of drops, repaired by SACK + RACK without a timeout. CUBIC's HyStart avoids most of them. |
 | Reordering | Learned via D-SACK (via timestamps from receivers that send none); spurious reductions are undone. |
-| Virtual links (VMM ring, TUN; sub-ms RTT) | No retransmission, probe or timeout on a clean link; a lost tail is repaired by the probe in milliseconds, not a 200 ms timeout. Throughput over a TUN device is bound by the host's per-packet cost (one syscall per packet in the harness), not the protocol: 10 Gbit/s in simulation. |
+| Virtual links (VMM ring, TUN; sub-ms RTT) | No retransmission, probe or timeout on a clean link whose device queue holds the host back (as the host contract asks); behind a tail-drop queue, one window halving per overflow. A lost tail is repaired by the probe in milliseconds, not a 200 ms timeout. Throughput over a TUN device is bound by the host's per-packet cost (one syscall per packet in the harness), not the protocol: 10 Gbit/s in simulation. |
 | As a receiver | Linux CUBIC reaches the same goodput sending to tcp-sans-io as to Linux. |
 | Long fat pipes | Capped by `BUF_CAP` (1 MiB per RTT ≈ 168 Mbit/s at 50 ms) and Reno's linear growth; CUBIC would help here. |
 
@@ -496,8 +496,8 @@ scenario):
 | 2 % reordering (+4 ms), no loss | 5.67 MB/s (94 % of line rate) | 1 / 0 | 0 | 0 | 1 (reduction undone; D-SACK widens RACK's window) |
 | The same, receiver sends no D-SACK | 5.66 MB/s (94 % of line rate) | 36 / 0 | 0 | 0 | 36 (each reduction undone via timestamps) |
 | Virtual link: 10 Gbit/s, 100 µs RTT, 1 % reordering (+100 µs) | 1187.9 MB/s | 2 / 0 | 0 | 0 | 2 |
-| The same through a 256-packet queue | 1043.5 MB/s | 388 / 386 | 0 | 0 | 2 |
-| The same both ways through a 64-packet queue | 583.9 MB/s each way | 481 / 479 | 0 | 0 | 2 |
+| The same through a 256-packet tail-drop queue | 1043.5 MB/s | 388 / 386 | 0 | 0 | 2 |
+| The same both ways through a 64-packet tail-drop queue | 583.9 MB/s each way | 481 / 479 | 0 | 0 | 2 |
 | The same with host backpressure (the queue never overflows), 4 MiB each way | 1028.0 MB/s each way | 4 / 0 | 0 | 0 | 4 (the first reordering) |
 | The same without reordering | 1076.0 MB/s each way | 0 / 0 | 0 | 0 | 0 |
 | 20 % ACK loss | 5.43 MB/s | 0 / 0 | 0 | 0 | 0 |
@@ -563,7 +563,7 @@ tracker and no timestamps.
 | RFC probes (33) | 33 pass | 21 pass, 6 warnings, 4 failures, 2 informational |
 | Interop: 16 cases × 4 client/server pairings | 48 / 48 runs involving it pass | 48 / 48 runs involving it pass |
 | 1 M fuzzed segments | no panics, no invariant violations | no panics |
-| Goodput as a sender | 1.6–19× smoltcp's with tcp-sans-io receiving, 1.4–19× with smoltcp receiving; near line rate on clean paths, 10 Gbit/s virtual links included | every loss its single fast retransmit cannot repair costs a ≥ 1 s RTO and a go-back-N resend |
+| Goodput as a sender | 1.0–19× smoltcp's with tcp-sans-io receiving, 1.2–19× with smoltcp receiving; near line rate on clean paths, 10 Gbit/s virtual links included | every loss its single fast retransmit cannot repair costs a ≥ 1 s RTO and a go-back-N resend; 8 Gbit/s on a virtual link that never drops |
 | CPU, bulk transfer, one packet per call (Gbit/s per core) | 33.9 sending, 41.6 receiving | 36.1 sending, 36.8 receiving |
 | CPU, 64 B request/response (transactions per core-second) | 1.44 M | 1.56 M |
 | State per connection besides the data buffers | 78 KiB | 960 B (+ 184 B per interface) |
@@ -702,12 +702,18 @@ any in-window RST, tcp-sans-io only one at exactly RCV.NXT.
 The profiles of *Benchmarks* in the shootout's discrete-event link (data
 path: delay, rate-limited tail-drop queue, loss or reordering; ACK path:
 delay only), plus *virt-reorder*, the virtual link with 1 % of packets
-0.1 ms late. Upload goodput in Mbit/s, median (min–max) of 5 seeds; the
-columns pair a sender with a receiver, so each stack is compared as a
-sender against the same receiver and vice versa. The sender keeps its
-connection open (a FIN queued behind the data would switch smoltcp's
-Nagle off for the rest of the transfer), and with the same seed both
-senders meet the same random losses.
+0.1 ms late. On the virtual links the queue is the device's (a TUN queue,
+a virtio ring), which holds the sending host back when full, as the host
+contract asks (*Hold back what the device queue cannot take*): the host
+hands it a packet only while it has room, and the rest waits in the stack
+(in tcp-sans-io's egress ring, or in smoltcp's socket while its device
+refuses a transmit token). *virt-droptail* is the same link behind a
+router's tail-drop queue instead. Upload goodput in Mbit/s, median
+(min–max) of 5 seeds; the columns pair a sender with a receiver, so each
+stack is compared as a sender against the same receiver and vice versa.
+The sender keeps its connection open (a FIN queued behind the data would
+switch smoltcp's Nagle off for the rest of the transfer), and with the
+same seed both senders meet the same random losses.
 
 | Profile (sender → receiver) | tcp-sans-io → tcp-sans-io | smoltcp → smoltcp | smoltcp/reno → smoltcp/reno | smoltcp → tcp-sans-io | tcp-sans-io → smoltcp |
 |---|---|---|---|---|---|
@@ -720,8 +726,9 @@ senders meet the same random losses.
 | **shallow**: 20 ms, 100 Mbit/s, 16-pkt queue; 32 MiB | 62.4 | 35.9 | 36.0 | 36.4 | 62.2 |
 | **reorder-2**: 20 ms, 50 Mbit/s, 1000-pkt queue, 2% +4 ms reorder; 8 MiB | 46.0 (45.3–46.3) | 6.9 (6.2–7.9) | 6.6 (6.1–6.9) | 7.3 (6.1–7.9) | 45.4 (45.1–46.1) |
 | **burst-40**: 20 ms, 100 Mbit/s, 1000-pkt queue, 40 consecutive drops; 4 MiB | 76.7 | 12.0 | 11.9 | 12.3 | 76.6 |
-| **virt**: 0.1 ms, 10000 Mbit/s, 256-pkt queue; 64 MiB | 9604.8 | 499.6 | 499.7 | 500.4 | 9536.7 |
-| **virt-reorder**: 0.1 ms, 10000 Mbit/s, 256-pkt queue, 1% +0.1 ms reorder; 32 MiB | 8315.1 (8161.1–8653.1) | 953.7 (884.4–987.3) | 927.8 (879.2–946.2) | 1068.0 (885.9–1095.8) | 7804.7 (7439.8–9541.3) |
+| **virt**: 0.1 ms, 10000 Mbit/s, 256-pkt device queue holding the host back; 64 MiB | 9604.8 | 8052.3 | 8052.3 | 9515.6 | 9604.5 |
+| **virt-reorder**: 0.1 ms, 10000 Mbit/s, 256-pkt device queue holding the host back, 1% +0.1 ms reorder; 32 MiB | 9512.9 (9494.1–9556.6) | 953.7 (884.4–987.3) | 927.8 (879.2–946.2) | 1068.0 (885.9–1095.8) | 7804.7 (7439.8–9541.3) |
+| **virt-droptail**: 0.1 ms, 10000 Mbit/s, 256-pkt queue; 64 MiB | 9604.8 | 499.6 | 499.7 | 500.4 | 9536.7 |
 
 Retransmitted segments / data segments the link dropped / retransmissions
 of data the link had already delivered (medians; a receiver may have
@@ -740,8 +747,9 @@ settles after delivery (both links idle, nothing unacknowledged; at most
 | shallow | 25 / 25 / 0 | 34 / 12 / 22 | 37 / 12 / 25 | 34 / 12 / 22 | 24 / 24 / 0 |
 | reorder-2 | 1 / 0 / 1 | 29 / 0 / 29 | 31 / 0 / 31 | 31 / 0 / 31 | 33 / 0 / 33 |
 | burst-40 | 40 / 40 / 0 | 78 / 40 / 38 | 78 / 40 / 38 | 78 / 40 / 38 | 40 / 40 / 0 |
-| virt | 344 / 344 / 0 | 508 / 172 / 336 | 508 / 172 / 336 | 503 / 173 / 330 | 621 / 344 / 277 |
-| virt-reorder | 383 / 382 / 1 | 188 / 0 / 188 | 178 / 0 / 178 | 196 / 0 / 196 | 6 / 0 / 6 |
+| virt | 0 / 0 / 0 | 0 / 0 / 0 | 0 / 0 / 0 | 0 / 0 / 0 | 0 / 0 / 0 |
+| virt-reorder | 1 / 0 / 1 | 188 / 0 / 188 | 178 / 0 / 178 | 196 / 0 / 196 | 6 / 0 / 6 |
+| virt-droptail | 344 / 344 / 0 | 508 / 172 / 336 | 508 / 172 / 336 | 503 / 173 / 330 | 621 / 344 / 277 |
 
 Reading the numbers:
 
@@ -768,14 +776,22 @@ Reading the numbers:
   retransmissions per 8 MiB against smoltcp's receiver, and one against
   tcp-sans-io's.
 - **Virtual links** (*virt*, *virt-reorder*: 0.1 ms RTT, 10 Gbit/s, a
-  256-packet queue): both stacks overflow the queue when slow start ends.
-  tcp-sans-io repairs that with SACK and RACK and runs at 96 % of the link,
-  smoltcp's go-back-N resend after a 1 s timeout holds it to 0.5 Gbit/s.
-  Reordering below the millisecond clock's resolution costs tcp-sans-io one
-  needless retransmission per 32 MiB; its other retransmissions repair
-  queue overflows, each answered by one halving of the window.
+  256-packet device queue that holds the host back): the queue never
+  overflows, so on *virt* neither stack retransmits anything; tcp-sans-io
+  runs at 96 % of the link and smoltcp at 8.1 Gbit/s. Reordering below the
+  millisecond clock's resolution costs tcp-sans-io one needless
+  retransmission per 32 MiB (the D-SACK undoes it and widens RACK's
+  window); smoltcp takes about 190 reordered segments for losses, cutting
+  its window each time, and falls to 0.95 Gbit/s. Behind a router's
+  tail-drop queue (*virt-droptail*) both overflow it when slow start ends:
+  tcp-sans-io repairs that with SACK and RACK, one halving of the window
+  per overflow, and still runs at 96 % of the link, while smoltcp's
+  go-back-N resend after a 1 s timeout holds it to 0.5 Gbit/s.
 - **As receivers** the two are close: with tcp-sans-io sending, smoltcp's
-  receiver costs at most 3 % (7 % on *virt-reorder*).
+  receiver costs at most 3 %, except under reordering below the clock's
+  resolution (18 % on *virt-reorder*): it sends no D-SACK, so RACK's
+  window never widens, and 6 late segments per 32 MiB instead of 1 are
+  resent, each entering fast recovery.
 
 ### CPU cost
 

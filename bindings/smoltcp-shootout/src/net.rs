@@ -1,8 +1,9 @@
 //! A seeded discrete-event link and a stack-independent wire observer.
 //!
 //! The link models what `bindings/netem/bench.sh` builds with namespaces:
-//! one-way delay, a rate-limited bottleneck with a tail-drop queue, random
-//! loss, reordering, duplication and corruption. The observer counts, from
+//! one-way delay, a rate-limited bottleneck with a tail-drop queue (or a
+//! device queue that holds its host back, see [`Host`]), random loss,
+//! reordering, duplication and corruption. The observer counts, from
 //! the bytes on the wire alone, what each stack retransmitted and how much
 //! of that the receiver already had — the same yardstick for both stacks.
 
@@ -38,6 +39,19 @@ impl Rng {
     }
 }
 
+/// How the sending host hands its stack's packets to the bottleneck queue.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Host {
+    /// Every packet at once; the queue tail-drops what does not fit, as a
+    /// router's does.
+    Push,
+    /// A packet only while the queue has room, as a device queue (a TUN
+    /// queue, a virtio ring) holds back its host: the rest waits in the
+    /// stack, in tcp-sans-io's egress ring (which stops the TCB once full)
+    /// or in smoltcp's socket (its device refuses a transmit token).
+    Ring,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct LinkCfg {
     pub delay_us: u64,
@@ -47,7 +61,8 @@ pub struct LinkCfg {
     /// takes a whole number of µs, rounded up: right for 1500 B at 1 Gbit/s
     /// (12 µs), but at 10 Gbit/s their 1.2 µs would become 2 µs.
     pub exact_rate: bool,
-    /// Bottleneck queue in packets (tail drop).
+    /// Bottleneck queue in packets (tail drop, unless the host holds back
+    /// what it cannot take).
     pub queue: usize,
     pub loss_ppm: u32,
     pub reorder_ppm: u32,
@@ -58,6 +73,8 @@ pub struct LinkCfg {
     pub drop_data: (u64, u64),
     /// Drop the first `n` SYN-carrying packets.
     pub drop_syns: u32,
+    /// How the sender's host feeds the bottleneck queue.
+    pub host: Host,
 }
 
 impl LinkCfg {
@@ -74,6 +91,7 @@ impl LinkCfg {
             corrupt_ppm: 0,
             drop_data: (0, 0),
             drop_syns: 0,
+            host: Host::Push,
         }
     }
     pub const fn delay_us(mut self, us: u64) -> Self {
@@ -110,6 +128,10 @@ impl LinkCfg {
     }
     pub const fn drop_syns(mut self, n: u32) -> Self {
         self.drop_syns = n;
+        self
+    }
+    pub const fn host(mut self, host: Host) -> Self {
+        self.host = host;
         self
     }
 }
@@ -420,6 +442,37 @@ impl Link {
 
     pub fn next_delivery(&self) -> Option<Time> {
         self.flight.peek().map(|f| f.at)
+    }
+
+    /// Packets in the bottleneck queue (or leaving it) at `now`.
+    fn backlog(&mut self, now: Time) -> usize {
+        while self.departures.front().is_some_and(|&d| d <= now) {
+            self.departures.pop_front();
+        }
+        self.departures.len()
+    }
+
+    /// How many more packets the host hands the queue at `now`: all of them
+    /// if it pushes (the queue drops what does not fit) or the link has no
+    /// bottleneck.
+    pub fn room(&mut self, now: Time) -> usize {
+        if self.cfg.host == Host::Push || self.cfg.rate_bps == 0 {
+            usize::MAX
+        } else {
+            self.cfg.queue.saturating_sub(self.backlog(now))
+        }
+    }
+
+    /// When the host can hand the queue more, if its stack holds packets
+    /// back for want of room.
+    pub fn next_room(&mut self, now: Time, held: bool) -> Option<Time> {
+        if !held || self.room(now) == usize::MAX {
+            None
+        } else if self.room(now) > 0 {
+            Some(now)
+        } else {
+            self.departures.front().copied()
+        }
     }
 
     pub fn pop_due(&mut self, now: Time) -> Option<Pkt> {
