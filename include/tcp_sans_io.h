@@ -88,7 +88,9 @@ int32_t tcp_connect(TcpStreamHandle* handle, uint64_t now_ms);
  * holds one half-open handshake statefully and answers SYNs from other peers
  * with SYN cookies while that slot is busy; a valid cookie ACK takes the slot
  * over. Those replies go to other peers than the half-open's: route outbound
- * packets by their destination address, not by handle. */
+ * packets by their destination address, not by handle. A listener takes
+ * cookie ACKs only within 128 s of its own last cookie, so deliver all of a
+ * handshake's packets (one 4-tuple) to the same listener. */
 int32_t tcp_listen (TcpStreamHandle* handle, uint64_t now_ms);
 int32_t tcp_close  (TcpStreamHandle* handle, uint64_t now_ms);
 /* Abort the connection: queues a TCP RST+ACK in the TX ring, transitions

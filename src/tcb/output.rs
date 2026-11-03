@@ -662,7 +662,9 @@ impl<const BUF: usize> Tcb<BUF> {
     }
 
     /// RST addressed to the *sender* of `seg` (used where the TCB has no or
-    /// a different pinned peer, e.g. LISTEN and SYN-SENT).
+    /// a different pinned peer, e.g. LISTEN, SYN-SENT and CLOSED). IP ID 0,
+    /// as Linux's control-socket RSTs: a counter bumped by packets to anyone
+    /// would let a prober count them (an idle scan).
     pub(super) fn emit_rst_to(
         &mut self,
         seg: &Segment<'_>,
@@ -670,7 +672,7 @@ impl<const BUF: usize> Tcb<BUF> {
         ack: u32,
         fl: u8,
     ) -> Result<(), TcpError> {
-        let (lip, lport, ip_id) = (self.local.ip, self.local.port, self.ip_id);
+        let (lip, lport) = (self.local.ip, self.local.port);
         let (rip, rport) = (seg.src_ip, seg.src_port);
         let full_csum = !self.tx_csum_offload;
         let queued = self.tx_ring.push_with(|buf| {
@@ -687,13 +689,12 @@ impl<const BUF: usize> Tcb<BUF> {
                 &TcpOptions::NONE,
                 0,
                 |_| true,
-                ip_id,
+                0,
                 wire::ecn::NOT_ECT,
                 full_csum,
             )
         })?;
         if queued {
-            self.ip_id = self.ip_id.wrapping_add(1);
             self.stats.segs_out = self.stats.segs_out.saturating_add(1);
         }
         Ok(())
@@ -734,7 +735,11 @@ impl<const BUF: usize> Tcb<BUF> {
         };
         let (src_ip, dst_ip) = (self.local.ip, self.remote.ip);
         let (src_port, dst_port) = (self.local.port, self.remote.port);
-        let ip_id = self.ip_id;
+        // A SYN-ACK carries IP ID 0, as Linux's (its listener numbers no
+        // packet it sends to a would-be peer); the connection's own
+        // segments, from the SYN on, count from its ISS-seeded counter.
+        let syn_ack = flag_bits & (flags::SYN | flags::ACK) == flags::SYN | flags::ACK;
+        let ip_id = if syn_ack { 0 } else { self.ip_id };
         let full_csum = !self.tx_csum_offload;
         // The payload goes straight from the send ring into the slot.
         let ring = &self.send_ring;
@@ -758,7 +763,9 @@ impl<const BUF: usize> Tcb<BUF> {
             )
         })?;
         if queued {
-            self.ip_id = self.ip_id.wrapping_add(1);
+            if !syn_ack {
+                self.ip_id = self.ip_id.wrapping_add(1);
+            }
             self.stats.segs_out = self.stats.segs_out.saturating_add(1);
             if flag_bits & flags::ACK != 0 && flag_bits & flags::RST == 0 {
                 self.last_ack_sent = ack;

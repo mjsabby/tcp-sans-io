@@ -86,6 +86,8 @@ pump loop*. The non-obvious rules that bindings get wrong:
   `CONNECTION_RESET` after the last of them (as Linux).
 - Route each outbound packet by its own destination address: a listener
   answers *other* peers (SYN cookies) while its half-open slot is busy.
+  Inbound, deliver all of a handshake's packets (one 4-tuple) to the same
+  listener: it takes cookie ACKs only within 128 s of its own last cookie.
 - One handle is single-threaded — the stack has no internal locking. If
   your language can call into one handle from several threads (e.g. ctypes
   releases the GIL), serialize the calls per handle in the wrapper.

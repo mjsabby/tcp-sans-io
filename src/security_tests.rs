@@ -94,6 +94,11 @@ struct Out {
 }
 
 fn drain(t: &mut Tcb) -> Vec<Out> {
+    drain_with_ip_id(t).into_iter().map(|(o, _)| o).collect()
+}
+
+/// [`drain`], with each datagram's IP ID.
+fn drain_with_ip_id(t: &mut Tcb) -> Vec<(Out, u16)> {
     let mut v = Vec::new();
     let mut buf = [0u8; MAX_PACKET];
     loop {
@@ -102,7 +107,7 @@ fn drain(t: &mut Tcb) -> Vec<Out> {
             break;
         }
         let s = wire::parse(&buf[..n]).expect("stack emitted an unparsable packet");
-        v.push(Out {
+        let out = Out {
             dst: (s.dst_ip, s.dst_port),
             seq: s.seq,
             ack: s.ack,
@@ -111,7 +116,8 @@ fn drain(t: &mut Tcb) -> Vec<Out> {
             len: s.payload.len(),
             total_len: n,
             opts: s.options,
-        });
+        };
+        v.push((out, u16::from_be_bytes([buf[4], buf[5]])));
     }
     v
 }
@@ -6594,4 +6600,192 @@ fn paws_relaxes_for_a_microsecond_peer_after_a_long_idle() {
     .unwrap();
     drain(&mut c);
     assert_eq!(c.recv(&mut buf), Ok(1), "dropped by PAWS after 40 min idle");
+}
+
+// ---------------------------------------------------------------------------
+// Security review (public exposure)
+// ---------------------------------------------------------------------------
+
+/// A listener keyed like its siblings whose half-open slot is taken, so it
+/// answers `from`'s SYN (with `opts`) at `now` with a cookie SYN-ACK.
+fn cookie_listener(now: u64, from: ([u8; 4], u16), opts: &TcpOptions) -> (Box<Tcb>, Out) {
+    let mut s = new_tcb(SRV, ([0; 4], 0), 1);
+    s.set_secret(&[4; 16]);
+    s.set_now(now);
+    s.listen().unwrap();
+    let mss = TcpOptions {
+        mss: Some(1460),
+        ..TcpOptions::NONE
+    };
+    s.inject_packet(&pkt(ATTACKER, SRV, 9, 0, flags::SYN, 65535, &mss, &[]))
+        .unwrap();
+    drain(&mut s);
+    s.inject_packet(&pkt(from, SRV, 500, 0, flags::SYN, 65535, opts, &[]))
+        .unwrap();
+    let synack = drain(&mut s).remove(0);
+    (s, synack)
+}
+
+/// The handshake's third ACK, answering `synack`.
+fn third_ack(from: ([u8; 4], u16), synack: &Out) -> Vec<u8> {
+    let ack = synack.seq.wrapping_add(1);
+    pkt(
+        from,
+        SRV,
+        501,
+        ack,
+        flags::ACK,
+        65535,
+        &TcpOptions::NONE,
+        &[],
+    )
+}
+
+/// A listener takes cookie ACKs only within two buckets of a cookie it sent
+/// itself (Linux `tcp_synq_no_recent_overflow`). Every listener used to take
+/// them, so blind guesses counted against listeners that never needed
+/// cookies.
+#[test]
+fn a_cookie_ack_needs_a_recent_cookie_from_this_listener() {
+    let mss = TcpOptions {
+        mss: Some(1460),
+        ..TcpOptions::NONE
+    };
+    let (mut issuer, synack) = cookie_listener(10_000, CLI, &mss);
+    let mut idle = new_tcb(SRV, ([0; 4], 0), 1);
+    idle.set_secret(&[4; 16]);
+    idle.set_now(10_020);
+    idle.listen().unwrap();
+    let _ = idle.inject_packet(&third_ack(CLI, &synack));
+    assert_eq!(idle.state(), State::Listen, "took a cookie it never sent");
+    issuer.set_now(10_020);
+    issuer.inject_packet(&third_ack(CLI, &synack)).unwrap();
+    assert_eq!(issuer.state(), State::Established);
+
+    let peer = ([10, 0, 0, 9], 41000);
+    let (mut stale, _) = cookie_listener(10_000, CLI, &mss);
+    let (mut fresh, synack) = cookie_listener(138_000, peer, &mss);
+    stale.set_now(138_020);
+    let _ = stale.inject_packet(&third_ack(peer, &synack));
+    assert_ne!(
+        stale.state(),
+        State::Established,
+        "took a cookie 128 s after its last"
+    );
+    fresh.set_now(138_020);
+    fresh.inject_packet(&third_ack(peer, &synack)).unwrap();
+    assert_eq!(fresh.state(), State::Established);
+}
+
+/// A blind forger needs one of the cookies the listener would take for its
+/// ACK: those it could have sent the SYN, with any options, in the two live
+/// buckets. Linux has 8 of 2^32 (2⁻²⁹ a guess); ours were 32 (2⁻²⁷): eight
+/// MSS values, and the SYN's timestamps chose between two MACs. Now the MSS
+/// index takes 2 bits and the bucket's parity a third, and timestamps are
+/// no dimension at all: a cookie offered with them still connects without
+/// them (a BSD peer drops options from its fourth SYN), as on Linux.
+#[test]
+fn a_syn_has_at_most_eight_valid_cookies() {
+    let mut cookies = Vec::new();
+    for now in [10_000, 70_000] {
+        for mss in [536, 1000, 1300, 1380, 1440, 1452, 1460, 8960, 65495] {
+            for offer_ts in [false, true] {
+                let o = TcpOptions {
+                    mss: Some(mss),
+                    wscale: offer_ts.then_some(7),
+                    ts: offer_ts.then_some((100, 0)),
+                    sack_permitted: offer_ts,
+                    ..TcpOptions::NONE
+                };
+                cookies.push(cookie_listener(now, CLI, &o).1.seq);
+            }
+        }
+    }
+    cookies.sort_unstable();
+    cookies.dedup();
+    assert!(
+        cookies.len() <= 8,
+        "{} valid cookies per SYN",
+        cookies.len()
+    );
+
+    let o = TcpOptions {
+        mss: Some(1460),
+        wscale: Some(7),
+        ts: Some((100, 0)),
+        sack_permitted: true,
+        ..TcpOptions::NONE
+    };
+    let (mut s, synack) = cookie_listener(70_000, CLI, &o);
+    assert!(synack.opts.ts.is_some());
+    s.set_now(70_020);
+    s.inject_packet(&third_ack(CLI, &synack)).unwrap();
+    assert_eq!(s.state(), State::Established, "options lost on the ACK");
+    assert_eq!(s.stats().mss, 1460, "timestamps on");
+    assert_eq!(s.debug_snapshot().snd_wnd, 65535, "window scaling on");
+}
+
+/// What a listener sends would-be peers (SYN-ACKs, stateful, retransmitted
+/// or cookie, and RSTs) carries IP ID 0, as Linux's: our datagrams are all
+/// DF (RFC 6864 §4.1). One counter used to number every packet the TCB
+/// sent anyone, so a prober reading it could count the listener's other
+/// traffic (an idle scan). A connection numbers only its own segments, so
+/// what the listener sent others before does not move them.
+#[test]
+fn listener_packets_carry_ip_id_zero_and_connections_count_their_own() {
+    let mss = TcpOptions {
+        mss: Some(1460),
+        ..TcpOptions::NONE
+    };
+    let run = |strangers: bool| {
+        let mut s = new_tcb(SRV, ([0; 4], 0), 0x1234_5678);
+        s.set_secret(&[4; 16]);
+        s.set_now(10_000);
+        s.listen().unwrap();
+        s.inject_packet(&pkt(CLI, SRV, 500, 0, flags::SYN, 65535, &mss, &[]))
+            .unwrap();
+        let mut sent = drain_with_ip_id(&mut s);
+        if strangers {
+            s.inject_packet(&pkt(ATTACKER, SRV, 9, 0, flags::SYN, 65535, &mss, &[]))
+                .unwrap();
+            let stray = pkt(
+                ([7; 4], 7),
+                SRV,
+                1,
+                2,
+                flags::ACK,
+                65535,
+                &TcpOptions::NONE,
+                &[],
+            );
+            let _ = s.inject_packet(&stray);
+            sent.extend(drain_with_ip_id(&mut s));
+        }
+        s.set_now(11_100);
+        s.tick().unwrap();
+        sent.extend(drain_with_ip_id(&mut s));
+        s.inject_packet(&third_ack(CLI, &sent[0].0)).unwrap();
+        assert_eq!(s.state(), State::Established);
+        s.send(b"hello").unwrap();
+        s.tick().unwrap();
+        (sent, drain_with_ip_id(&mut s))
+    };
+    let (quiet_sent, quiet_data) = run(false);
+    let (sent, data) = run(true);
+    let to_cli = sent.iter().filter(|(o, _)| o.dst == CLI).count();
+    assert!(to_cli >= 2, "the SYN-ACK was not retransmitted");
+    assert!(sent.iter().any(|(o, _)| o.dst == ATTACKER), "no cookie");
+    assert!(
+        sent.iter().any(|(o, _)| o.flags & flags::RST != 0),
+        "no RST"
+    );
+    for (o, id) in quiet_sent.iter().chain(&sent) {
+        assert_eq!(*id, 0, "flags {:#x} to {:?} numbered", o.flags, o.dst);
+    }
+    assert!(!data.is_empty());
+    assert_eq!(
+        data.first().map(|d| d.1),
+        quiet_data.first().map(|d| d.1),
+        "packets to others moved the connection's numbering"
+    );
 }

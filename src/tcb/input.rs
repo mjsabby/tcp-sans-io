@@ -165,6 +165,7 @@ impl<const BUF: usize> Tcb<BUF> {
             port: seg.src_port,
         };
         self.iss = self.passive_iss(self.remote, seg.seq);
+        self.seed_ip_id();
         self.snd_una = self.iss;
         self.snd_acked = 0;
         self.snd_nxt = self.iss;

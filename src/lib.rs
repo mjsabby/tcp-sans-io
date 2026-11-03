@@ -64,6 +64,8 @@
 //!    ~2 minutes). A predictable or leaked secret defeats the protection.
 //!    Busy-listener replies go to *other* peers than the half-open's: route
 //!    every outbound packet by its own destination address, never by the TCB.
+//!    Inbound, deliver all of a handshake's packets (one 4-tuple) to the same
+//!    listener: it takes cookie ACKs only within 128 s of its own last cookie.
 //!
 //! 6. **Act on lifecycle signals and release the TCB.** Read [`Tcb::poll`] and
 //!    react: on `PEER_CLOSED` (peer FIN → `CLOSE_WAIT`) the host **must**

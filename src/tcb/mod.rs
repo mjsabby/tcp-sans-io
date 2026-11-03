@@ -518,6 +518,9 @@ pub struct Tcb<const BUF: usize = BUF_CAP> {
     cookie_secret_explicit: bool,
     /// A cookie SYN-ACK was sent under the current key.
     cookie_secret_used: bool,
+    /// Cookie ACKs are accepted until then: two time buckets after the last
+    /// cookie SYN-ACK (Linux `tcp_synq_no_recent_overflow`); 0 = never.
+    cookies_valid_until_ms: u64,
     /// The key before the last rotation, kept while cookies issued under it
     /// can still be valid (until `prev_cookie_until_ms`).
     prev_cookie_secret: [u8; 16],
@@ -637,6 +640,7 @@ impl<const BUF: usize> Tcb<BUF> {
         self.cookie_secret_set = false;
         self.cookie_secret_explicit = false;
         self.cookie_secret_used = false;
+        self.cookies_valid_until_ms = 0;
         self.prev_cookie_secret = [0; 16];
         self.prev_cookie_secret_set = false;
         self.prev_cookie_until_ms = 0;
@@ -648,7 +652,6 @@ impl<const BUF: usize> Tcb<BUF> {
         self.send_lent = 0;
         self.send_lent_conn = 0;
         self.conn_gen = 0;
-        self.ip_id = (cfg.iss >> 16) as u16 ^ cfg.iss as u16;
         self.keepalive_idle_ms = DEFAULT_KEEPALIVE_IDLE_MS;
         self.keepalive_intvl_ms = DEFAULT_KEEPALIVE_INTVL_MS;
         self.keepalive_count = DEFAULT_KEEPALIVE_COUNT;
@@ -666,11 +669,21 @@ impl<const BUF: usize> Tcb<BUF> {
         self.setup(cfg);
     }
 
+    /// Start this connection's IP ID counter from its ISS (keyed per 4-tuple
+    /// on passive opens, drawn by the host from a CSPRNG on active ones):
+    /// each connection numbers only its own packets, as Linux's per-socket
+    /// `inet_id` (random at connect and accept), never sharing a counter
+    /// across peers.
+    pub(super) fn seed_ip_id(&mut self) {
+        self.ip_id = (self.iss >> 16) as u16 ^ self.iss as u16;
+    }
+
     /// Reset all per-connection state, keeping the endpoints, knobs and
     /// secrets. Used by `connect`, `listen` and the passive-open paths.
     fn reset_connection_state(&mut self) {
         self.conn_gen = self.conn_gen.wrapping_add(1);
         self.iss = self.cfg_iss;
+        self.seed_ip_id();
         self.snd_una = self.iss;
         self.snd_nxt = self.iss;
         self.snd_wnd = 0;
@@ -1252,7 +1265,11 @@ impl<const BUF: usize> Tcb<BUF> {
     /// from other peers are answered with SYN cookies (no state); a valid
     /// cookie ACK replaces the pending half-open, so spoofed SYNs cannot lock
     /// the listener. A half-open whose SYN-ACK already needed a retransmit
-    /// also yields its slot to a SYN from a new peer.
+    /// also yields its slot to a SYN from a new peer. Cookie ACKs are taken
+    /// only within 128 s of this listener's last cookie (Linux
+    /// `tcp_synq_no_recent_overflow`), so a host running several listeners
+    /// on one port must deliver all of a handshake's packets (one 4-tuple)
+    /// to the same one.
     pub fn listen(&mut self) -> Result<(), TcpError> {
         match self.state {
             State::Closed | State::Listen | State::TimeWait => {}
