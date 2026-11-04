@@ -39,7 +39,7 @@
 //!    connection.
 //!
 //! 3. **Bound the number of connections.** Only the host can: each TCB is
-//!    independent and unaware of the others, and costs ≈ 2.08 MiB by default
+//!    independent and unaware of the others, and costs ≈ 2.07 MiB by default
 //!    (136 KiB under the `small-buffers` feature) — including the 60–120 s it
 //!    spends in `TIME_WAIT`. The per-connection timers bound how long a
 //!    *stalled or vanished* peer, or one the host has closed on, holds a

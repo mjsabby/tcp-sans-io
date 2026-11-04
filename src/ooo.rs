@@ -13,6 +13,11 @@
 //! retransmits it. Nothing that has been SACKed is ever discarded (no
 //! reneging). Lookups are binary searches; per-segment cost stays O(log n)
 //! for the common append and O(n) word moves only when a hole closes.
+//!
+//! The blocks to SACK are kept beside the ranges, as Linux keeps
+//! `selective_acks`: the four most recently changed, updated as segments
+//! arrive and `RCV.NXT` advances, so an ACK reports them in O(1) however
+//! many ranges are held.
 
 use crate::wire::SackBlocks;
 
@@ -33,9 +38,21 @@ pub const OOO_MAX_RANGES: usize = {
 struct Range {
     start: u32,
     end: u32,
-    /// Recency stamp: SACK blocks are reported most-recent first (RFC 2018 §4).
-    tag: u32,
 }
+
+/// An entry of the SACK list: a held range, or the FIN the TCB holds out of
+/// order apart from the ranges. `repr(u8)` with a range as 0, so a
+/// zero-filled TCB (`Tcb::init_in_place`) holds valid entries.
+#[repr(u8)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Block {
+    Range(u32, u32) = 0,
+    Fin = 1,
+}
+
+/// Blocks the SACK list remembers (Linux `TCP_NUM_SACKS`): as many as an
+/// ACK can carry.
+const SACK_LIST: usize = 4;
 
 /// Outcome of [`OooList::insert`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -64,7 +81,11 @@ impl Insert {
 pub struct OooList {
     ranges: [Range; OOO_MAX_RANGES],
     len: usize,
-    next_tag: u32,
+    /// The blocks to SACK, most recently changed first (Linux
+    /// `selective_acks`, kept by `tcp_sack_new_ofo_skb` and
+    /// `tcp_sack_remove`). Each range in it is a held range, whole.
+    sacks: [Block; SACK_LIST],
+    n_sacks: usize,
 }
 
 impl Default for OooList {
@@ -81,19 +102,16 @@ fn off(seq: u32, base: u32) -> u32 {
 impl OooList {
     pub const fn new() -> Self {
         Self {
-            ranges: [Range {
-                start: 0,
-                end: 0,
-                tag: 0,
-            }; OOO_MAX_RANGES],
+            ranges: [Range { start: 0, end: 0 }; OOO_MAX_RANGES],
             len: 0,
-            next_tag: 1,
+            sacks: [Block::Fin; SACK_LIST],
+            n_sacks: 0,
         }
     }
 
     pub fn clear(&mut self) {
         self.len = 0;
-        self.next_tag = 1;
+        self.n_sacks = 0;
     }
 
     pub fn is_empty(&self) -> bool {
@@ -155,8 +173,6 @@ impl OooList {
                 .slice()
                 .get(lo..)
                 .map_or(0, |t| t.partition_point(|r| off(r.start, rcv_nxt) <= e));
-        let tag = self.next_tag;
-        self.next_tag = self.next_tag.wrapping_add(1);
         if hi == lo {
             // Disjoint from everything: insert a new range at `lo`.
             if self.len == OOO_MAX_RANGES {
@@ -168,10 +184,11 @@ impl OooList {
             if let Some(t) = self.ranges.get_mut(lo..=self.len) {
                 t.rotate_right(1);
                 if let Some(slot) = t.first_mut() {
-                    *slot = Range { start, end, tag };
+                    *slot = Range { start, end };
                 }
             }
             self.len += 1;
+            self.touch(Block::Range(start, end));
             return Insert::NEW;
         }
         // Merge ranges lo..hi with the new one.
@@ -216,7 +233,6 @@ impl OooList {
             *slot = Range {
                 start: m_start,
                 end: m_end,
-                tag,
             };
         }
         let removed = hi - lo - 1;
@@ -226,7 +242,48 @@ impl OooList {
             }
             self.len -= removed;
         }
+        // A duplicate moves its block to the front too (Linux
+        // `tcp_data_queue_ofo` reaches `tcp_sack_new_ofo_skb` for it).
+        self.touch(Block::Range(m_start, m_end));
         Insert::Stored { dup, dup_bytes }
+    }
+
+    /// `b` changed last: it goes to the front of the SACK list, and the
+    /// blocks it now covers leave it, as Linux `tcp_sack_new_ofo_skb` moves
+    /// the block a segment extends to the front and coalesces those it
+    /// reaches. A fifth block pushes out the oldest.
+    fn touch(&mut self, b: Block) {
+        let mut list = [b; SACK_LIST];
+        let mut n = 1;
+        for &old in self.sacks.get(..self.n_sacks).unwrap_or(&[]) {
+            let covered = match (b, old) {
+                (Block::Range(s, e), Block::Range(os, _)) => off(os, s) < off(e, s),
+                (Block::Fin, Block::Fin) => true,
+                _ => false,
+            };
+            if !covered {
+                if let Some(slot) = list.get_mut(n) {
+                    *slot = old;
+                    n += 1;
+                }
+            }
+        }
+        self.sacks = list;
+        self.n_sacks = n;
+    }
+
+    /// Keep the SACK list's blocks for which `keep` holds, in order.
+    fn retain_sacks(&mut self, keep: impl Fn(Block) -> bool) {
+        let mut n = 0;
+        for i in 0..self.n_sacks {
+            if let Some(b) = self.sacks.get(i).copied().filter(|&b| keep(b)) {
+                if let Some(slot) = self.sacks.get_mut(n) {
+                    *slot = b;
+                }
+                n += 1;
+            }
+        }
+        self.n_sacks = n;
     }
 
     /// Forget everything held at or beyond `limit` (> `rcv_nxt`), trimming a
@@ -245,12 +302,29 @@ impl OooList {
             }
         }
         self.len = self.len.min(keep);
+        self.retain_sacks(|b| !matches!(b, Block::Range(s, _) if off(s, rcv_nxt) >= lim));
+        for b in self.sacks.iter_mut().take(self.n_sacks) {
+            if let Block::Range(_, e) = b {
+                if off(*e, rcv_nxt) > lim {
+                    *e = limit;
+                }
+            }
+        }
     }
 
     /// `RCV.NXT` has advanced to `rcv_nxt`. Drop ranges now at or below it
     /// and, if a held range starts at or before `rcv_nxt`, consume it.
     /// Returns the new `RCV.NXT` (the end of the consumed contiguous run).
+    #[inline]
     pub fn advance(&mut self, rcv_nxt: u32) -> u32 {
+        // In-order data with nothing held: every segment of a clean transfer.
+        if self.len == 0 {
+            return rcv_nxt;
+        }
+        self.consume(rcv_nxt)
+    }
+
+    fn consume(&mut self, rcv_nxt: u32) -> u32 {
         let mut nxt = rcv_nxt;
         let mut drop = 0;
         for r in self.slice() {
@@ -269,65 +343,103 @@ impl OooList {
                 t.rotate_left(drop);
             }
             self.len -= drop;
+            // Linux `tcp_sack_remove`: blocks `RCV.NXT` reached are gone.
+            self.retain_sacks(
+                |b| !matches!(b, Block::Range(s, _) if (s.wrapping_sub(nxt) as i32) <= 0),
+            );
         }
         nxt
     }
 
-    /// A fresh recency stamp, for an out-of-order FIN reported alongside
-    /// the ranges (see [`Self::fill_sack_blocks`]).
-    pub fn take_tag(&mut self) -> u32 {
-        let tag = self.next_tag;
-        self.next_tag = self.next_tag.wrapping_add(1);
-        tag
+    /// The FIN the TCB holds out of order arrived (again): its block goes
+    /// first, as Linux reports a FIN segment's `end_seq`.
+    pub fn note_fin(&mut self) {
+        self.touch(Block::Fin);
     }
 
-    /// Whether a held range ends exactly at `seq`.
-    pub fn ends_at(&self, seq: u32) -> bool {
-        self.slice().iter().any(|r| r.end == seq)
+    /// The FIN held out of order is no longer held (text past it overrode
+    /// it).
+    pub fn forget_fin(&mut self) {
+        self.retain_sacks(|b| b != Block::Fin);
     }
 
-    /// Append up to `max` (≤ 4) SACK blocks, most recently changed first.
-    /// `fin`: an out-of-order FIN `(seq, tag)` held beyond `RCV.NXT`. Its
-    /// sequence number is SACKed too, as Linux reports a FIN segment's
-    /// `end_seq`: it extends the block of the data that ends at it, or is
-    /// a block of its own (a bare FIN).
-    pub fn fill_sack_blocks(&self, sack: &mut SackBlocks, max: usize, fin: Option<(u32, u32)>) {
-        // Single pass keeping the `k` youngest ranges. Ages are measured
-        // back from `next_tag`, so tag wrap-around is harmless.
-        let k = max.min(4);
-        let age = |tag: u32| self.next_tag.wrapping_sub(tag);
-        let keep = |top: &mut [Option<Range>; 4], mut cand: Range| {
-            for slot in top.iter_mut().take(k) {
-                match slot {
-                    None => {
-                        *slot = Some(cand);
-                        break;
+    /// The blocks of the SACK list, most recently changed first, to `each`
+    /// until it returns `false`. `fin`: the FIN held out of order beyond
+    /// `RCV.NXT`, whose sequence number is SACKed too: with the range that
+    /// ends at it, or as a block of its own (a bare FIN).
+    fn blocks(&self, fin: Option<u32>, mut each: impl FnMut(u32, u32) -> bool) {
+        let mut fin_done = false;
+        for &b in self.sacks.get(..self.n_sacks).unwrap_or(&[]) {
+            let (s, e) = match b {
+                Block::Range(s, e) if fin == Some(e) => {
+                    if fin_done {
+                        continue;
                     }
-                    Some(held) if age(cand.tag) < age(held.tag) => core::mem::swap(held, &mut cand),
-                    Some(_) => {}
+                    fin_done = true;
+                    (s, e.wrapping_add(1))
                 }
-            }
-        };
-        let mut top: [Option<Range>; 4] = [None; 4];
-        let mut fin_merged = false;
-        for &r in self.slice() {
-            let mut r = r;
-            if let Some((f, tag)) = fin.filter(|&(f, _)| f == r.end) {
-                r.end = f.wrapping_add(1);
-                if age(tag) < age(r.tag) {
-                    r.tag = tag;
+                Block::Range(s, e) => (s, e),
+                Block::Fin => {
+                    let Some(f) = fin.filter(|_| !fin_done) else {
+                        continue;
+                    };
+                    fin_done = true;
+                    (self.range_ending_at(f).unwrap_or(f), f.wrapping_add(1))
                 }
-                fin_merged = true;
+            };
+            if !each(s, e) {
+                return;
             }
-            keep(&mut top, r);
         }
-        if let Some((f, tag)) = fin.filter(|_| !fin_merged) {
-            let end = f.wrapping_add(1);
-            keep(&mut top, Range { start: f, end, tag });
+    }
+
+    /// Append up to `max` (≤ 4) SACK blocks, most recently changed first:
+    /// the SACK list, so the cost does not grow with the ranges held. Each
+    /// is a held range, whole (Linux reports only the part of a range its
+    /// latest segments covered once the range left its list). `fin`: see
+    /// [`Self::blocks`].
+    pub fn fill_sack_blocks(&self, sack: &mut SackBlocks, max: usize, fin: Option<u32>) {
+        let mut room = max.min(SACK_LIST);
+        self.blocks(fin, |s, e| {
+            if room == 0 {
+                return false;
+            }
+            sack.push(s, e);
+            room -= 1;
+            room > 0
+        });
+    }
+
+    /// How many blocks [`Self::fill_sack_blocks`] has to report (Linux
+    /// `num_sacks`).
+    #[inline]
+    pub fn sack_blocks(&self, fin: Option<u32>) -> usize {
+        // Asked for every data segment sent; usually nothing is held.
+        if self.n_sacks == 0 {
+            return 0;
         }
-        for r in top.iter().take(k).flatten() {
-            sack.push(r.start, r.end);
-        }
+        self.count_blocks(fin)
+    }
+
+    fn count_blocks(&self, fin: Option<u32>) -> usize {
+        let mut n = 0;
+        self.blocks(fin, |_, _| {
+            n += 1;
+            true
+        });
+        n
+    }
+
+    /// Start of the held range that ends at `seq`, if any.
+    fn range_ending_at(&self, seq: u32) -> Option<u32> {
+        let base = self.first_start()?;
+        let i = self
+            .slice()
+            .partition_point(|r| off(r.end, base) < off(seq, base));
+        self.slice()
+            .get(i)
+            .filter(|r| r.end == seq)
+            .map(|r| r.start)
     }
 
     /// Range containing `seq`, if any.
@@ -362,7 +474,8 @@ impl OooList {
         (first, total)
     }
 
-    /// Debug invariant: sorted, disjoint, non-adjacent, all above `rcv_nxt`.
+    /// Debug invariant: sorted, disjoint, non-adjacent, all above `rcv_nxt`;
+    /// the SACK list holds distinct blocks, each range a held range, whole.
     pub fn debug_valid(&self, rcv_nxt: u32) -> bool {
         let mut prev_end: Option<u32> = None;
         for r in self.slice() {
@@ -377,7 +490,15 @@ impl OooList {
             }
             prev_end = Some(e);
         }
-        true
+        let sacks = self.sacks.get(..self.n_sacks).unwrap_or(&[]);
+        sacks.iter().enumerate().all(|(i, b)| {
+            let distinct = !sacks.get(..i).is_some_and(|seen| seen.contains(b));
+            let held = match *b {
+                Block::Range(s, e) => self.slice().iter().any(|r| r.start == s && r.end == e),
+                Block::Fin => true,
+            };
+            distinct && held
+        })
     }
 }
 
@@ -468,14 +589,45 @@ mod tests {
         assert_eq!(blocks(&l, 3)[0].0, 2 * (k - 1) * mss, "newest first");
     }
 
+    /// Linux `selective_acks`: the four most recently changed blocks are
+    /// reported. One pushed out of the list stays unreported once the
+    /// blocks after it are consumed, rather than being found again by a
+    /// walk of every range held, which an ACK no longer pays for.
     #[test]
-    fn sack_block_order_survives_tag_wraparound() {
+    fn sack_list_keeps_the_four_most_recent_blocks() {
         let mut l = OooList::new();
-        l.next_tag = u32::MAX - 1;
-        l.insert(200, 300, 100);
-        l.insert(600, 700, 100); // tag wraps here
-        l.insert(400, 500, 100);
-        assert_eq!(blocks(&l, 3), [(400, 500), (600, 700), (200, 300)]);
+        for s in [700u32, 900, 1100, 500, 300] {
+            l.insert(s, s + 100, 100);
+        }
+        assert_eq!(
+            blocks(&l, 4),
+            [(300, 400), (500, 600), (1100, 1200), (900, 1000)]
+        );
+        // The holes below 300 and 500 fill: both blocks are consumed.
+        assert_eq!(l.advance(300), 400);
+        assert_eq!(l.advance(500), 600);
+        assert_eq!(blocks(&l, 3), [(1100, 1200), (900, 1000)]);
+        assert!(l.debug_valid(600));
+        // A repeat of the forgotten range brings it back, first.
+        l.insert(720, 760, 600);
+        assert_eq!(blocks(&l, 3), [(700, 800), (1100, 1200), (900, 1000)]);
+    }
+
+    /// A merge replaces the blocks of the ranges it joins, across the wrap
+    /// of the sequence space.
+    #[test]
+    fn sack_list_merges_blocks_across_sequence_wrap() {
+        let mut l = OooList::new();
+        let base = u32::MAX - 150;
+        let at = |o: u32| base.wrapping_add(o);
+        l.insert(at(100), at(140), base);
+        l.insert(at(200), at(240), base);
+        l.insert(at(300), at(340), base);
+        l.insert(at(140), at(200), base); // joins the first two, across the wrap
+        assert_eq!(blocks(&l, 4), [(at(100), at(240)), (at(300), at(340))]);
+        assert!(l.debug_valid(base));
+        assert_eq!(l.advance(at(100)), at(240));
+        assert_eq!(blocks(&l, 4), [(at(300), at(340))]);
     }
 
     #[test]

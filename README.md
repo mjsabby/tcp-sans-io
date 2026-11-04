@@ -42,7 +42,7 @@ that costs against Linux CUBIC on lossy long paths.
 | MSS; MTU / PMTU (`tcp_set_mtu`, `tcp_update_pmtu_icmp` checking the ICMP's quoted sequence number as Linux, black-hole clamp, probing back up); a reported MTU holds for 10 minutes, then the old size is probed (a later, larger report caps that probe for 10 minutes); what a smaller path MTU, or a probe that did not get through (a report of the size in use leaves it so), lost is resent without reducing the window | RFC 9293, RFC 1191, RFC 4821 (spirit), RFC 5927 | ✅ Linux `tcp_simple_retransmit` / `ip_rt_mtu_expires` / `tcp_v4_err` |
 | Timestamps: RTTM, PAWS (pure ACKs included, but for Linux's exemption of a reordered old ACK; `TS.Recent` trusted for 2147 s of idle, as Linux `TCP_PAWS_WRAP`, since a peer's clock may tick in microseconds), keyed per-connection offset | RFC 7323 §3–5 | ✅ Linux `tcp_paws_discard` / `tcp_disordered_ack` |
 | Window Scale | RFC 7323 §2 | ✅ |
-| SACK, both directions; receiver holds the whole window out of order, a FIN held out of order included; blocks beyond `SND.NXT` or not above `SND.UNA` ignored; blocks on an ACK reordered behind a newer one still count; a segment a block covers in part is split only at whole multiples of the MSS, never one of an MSS or less (blocks of a few bytes cannot shatter the retransmission queue); a receiver that reneges gets max(SRTT/2, 10 ms) before the timeout resends | RFC 2018 | ✅ Linux `tcp_is_sackblock_valid` / `tcp_match_skb_to_sack` / `tcp_check_sack_reneging` |
+| SACK, both directions; receiver holds the whole window out of order, a FIN held out of order included, and reports the four most recently changed blocks (Linux's list, kept as segments arrive, so an ACK costs the same however many ranges are held); blocks beyond `SND.NXT` or not above `SND.UNA` ignored; blocks on an ACK reordered behind a newer one still count; a segment a block covers in part is split only at whole multiples of the MSS, never one of an MSS or less (blocks of a few bytes cannot shatter the retransmission queue); a receiver that reneges gets max(SRTT/2, 10 ms) before the timeout resends | RFC 2018 | ✅ Linux `tcp_sack_new_ofo_skb` / `tcp_is_sackblock_valid` / `tcp_match_skb_to_sack` / `tcp_check_sack_reneging` |
 | D-SACK, both directions, for wholly or partly duplicated segments (drives RACK's reordering window) | RFC 2883, RFC 3708 | ✅ Linux `tcp_data_queue_ofo` |
 | Spurious fast recovery / RTO undone: D-SACKs for every retransmission (an unresolved tail loss probe included), an ACK whose timestamp echo predates the first one (receivers without D-SACK too), or a hole filled before anything was resent; after a timeout also F-RTO: data sent before it and never resent is (S)ACKed (without SACK, by an ACK that covers no resend), with new data sent after the first partial ACK to find out, Nagle aside and nothing resent until the next ACK; after a timeout during an ECN reduction too, keeping that reduction; never past an ECN-Echo | RFC 3708, RFC 3522, RFC 5682 | ✅ Linux-style (`tcp_try_undo_*`, `tcp_packet_delayed`, `tcp_process_loss`, `tcp_xmit_recovery`) |
 | RTO with Karn's algorithm; RTT samples from cumulatively ACKed and SACKed data never resent (an ACK inside a segment gives none); RTO = SRTT + max(4·RTTVAR, 200 ms), SRTT / RTTVAR in fixed point | RFC 6298 | ✅ Linux `tcp_ack_update_rtt` / `tcp_rtt_estimator` / `tcp_set_rto` |
@@ -94,6 +94,7 @@ known differences:
 | Loss reduction | Halves `min(cwnd, peer window)` | Halves `cwnd` | Slow start may grow `cwnd` to twice a flight the peer's window caps (as in Linux), and halving that would not slow the sender: with a 1 MiB window the first reduction after a slow-start overshoot would be a no-op. |
 | Send buffer | Fixed `BUF_CAP` ring, the same size as the largest window it can fill | Autotuned to about twice `cwnd` | Allocation-free. A bulk sender that keeps the peer's window full can drain the ring and send a short segment mid-stream; Nagle then holds the transfer's last short segment behind it for up to an RTT. `close()` (the FIN rides on it) or `set_nodelay(true)` ends a transfer without the wait. |
 | SACK on retransmissions | A retransmission keeps its size and carries the blocks only if they fit | Splits the segment to fit them (`__tcp_retransmit_skb`) | No re-segmentation of the retransmission queue. New data segments shrink to carry them, as in Linux, and pure ACKs always do. |
+| SACK block extent | The four most recently changed held ranges, as Linux's list, each reported whole | The same list (`selective_acks`), each block grown only by the segments that touch it (`tcp_sack_new_ofo_skb`): a segment joining a range that has left the list reports only part of the joined range | RFC 2018 §4 asks for the whole block holding the segment, and the joined range is known at no cost. |
 | Immediate ACKs | Go on their own, ahead of data leaving at the same time; so does one a full or paused egress held back, once the host resumes, and any ACK owed when a retransmission leaves | Ride on that data (`tcp_data_snd_check` before `tcp_ack_snd_check`); a retransmission carries an owed ACK too (`tcp_event_ack_sent`) | Only a data-less ACK counts as a duplicate (RFC 5681 §2): a sender that recovers by duplicate ACKs alone, such as smoltcp, otherwise stalls on its timeout in two-way lossy transfers. A peer drops a resend of data it already holds unread (`tcp_sequence`: older than its last ACK), so an ACK that rode only on it was lost, and the peer's own data waited for its tail loss probe (200 ms with one segment out). One extra packet when it happens. |
 | Partial ACK inside a segment | Restarts the retransmission timer (but gives no RTT sample) | Restarts it only once a whole segment is ACKed (`FLAG_SET_XMIT_TIMER` needs `FLAG_ACKED`) | A receiver that trims segments to its window ACKs them piecewise: each part is progress, and a timeout would resend data it is taking. |
 | New data while RACK's reordering timer runs | No tail loss probe is armed; the reordering timer stays | The probe timer replaces it (one timer per socket, RFC 8985 §8) | The hole the SACKs show is repaired when the reordering window ends, not after a probe a PTO later. |
@@ -129,8 +130,8 @@ known differences:
 
 ### Memory footprint
 
-Per connection, `tcp_handle_size()` is **2,177,008 bytes (≈ 2.08 MiB)** with
-default features, or **139,632 bytes (136 KiB)** with `small-buffers`:
+Per connection, `tcp_handle_size()` is **2,175,000 bytes (≈ 2.07 MiB)** with
+default features, or **139,544 bytes (136 KiB)** with `small-buffers`:
 
 - `BUF_CAP` send ring + receive ring (2 × 1 MiB; 2 × 32 KiB with
   `small-buffers`). Out-of-order data is parked inside the receive ring at
@@ -139,8 +140,8 @@ default features, or **139,632 bytes (136 KiB)** with `small-buffers`:
 - 48 KiB egress staging ring (32 × `MAX_PACKET`).
 - 24 KiB retransmission queue (1024 segment records, plus a 128-byte
   bitmap of the SACKed ones).
-- 6 KiB out-of-order range tracker (512 ranges; 384 B / 32 ranges with
-  `small-buffers`).
+- 4 KiB out-of-order range tracker (512 ranges, and the four SACK blocks
+  to report; 256 B / 32 ranges with `small-buffers`).
 - Under 1 KiB of scalar state.
 
 The 1 MiB default lets the receive window fill typical WAN paths (1 MiB per
@@ -194,7 +195,7 @@ mis-ordering, corruption, a panic, or an unbounded loop.
 | `OOO_MAX_RANGES` | 512 (32 w/ `small-buffers`) | `ooo.rs` | Disjoint out-of-order ranges held in the receive ring: one per two full segments of buffer, enough for a full window with every other segment lost. |
 | `RTX_QUEUE_CAP` | 1024 | `rtx_queue.rs` | Segments in flight. When full, new data waits for ACKs; nothing is evicted, so every in-flight segment keeps SACK/RACK coverage. One record stays free for the split a retransmission may need after the path MTU drops; when more are needed, the newest two segments merge. |
 | `TX_RING_CAP` | 32 | `tx_ring.rs` | Egress packets staged before the host must drain. |
-| SACK blocks emitted | ≤ 4 (≤ 3 with timestamps) | `tcb/output.rs` | Bounded by the 40-byte option area. New data segments shrink their payload to carry them (Linux `tcp_current_mss`); a full-sized retransmission carries only what fits. |
+| SACK blocks emitted | ≤ 4 (≤ 3 with timestamps) | `tcb/output.rs`, `ooo.rs` | Bounded by the 40-byte option area: the most recently changed blocks first, from a list of four kept as segments arrive (Linux `selective_acks`). New data segments shrink their payload to carry them (Linux `tcp_current_mss`, sized by that list); a full-sized retransmission carries only what fits. |
 | `INITIAL_WINDOW` | 10 × SMSS (14,480 B with timestamps) | `congestion.rs` | RFC 6928 initial cwnd. |
 | `MIN_PEER_MSS` | 64 B | `tcb/mod.rs` | Floor on a peer-requested MSS (bounds per-byte header and queue cost). |
 | `RTO_MIN` / `RTO_MAX` | 200 ms / 60 s | `tcb/mod.rs` | RTO = SRTT + max(4·RTTVAR, `RTO_MIN`) as Linux, so even a steady path keeps a 200 ms margin; exponential backoff is capped at `RTO_MAX`. |
@@ -501,7 +502,7 @@ scenario):
 | The same, receiver sends no D-SACK | 5.66 MB/s (94 % of line rate) | 36 / 0 | 0 | 0 | 36 (each reduction undone via timestamps) |
 | Virtual link: 10 Gbit/s, 100 µs RTT, 1 % reordering (+100 µs) | 1187.9 MB/s | 2 / 0 | 0 | 0 | 2 |
 | The same through a 256-packet tail-drop queue | 1043.5 MB/s | 388 / 386 | 0 | 0 | 2 |
-| The same both ways through a 64-packet tail-drop queue | 583.9 MB/s each way | 481 / 479 | 0 | 0 | 2 |
+| The same both ways through a 64-packet tail-drop queue | 641.2 MB/s each way | 480 / 478 | 0 | 0 | 2 |
 | The same with host backpressure (the queue never overflows), 4 MiB each way | 1028.0 MB/s each way | 4 / 0 | 0 | 0 | 4 (the first reordering) |
 | The same without reordering | 1076.0 MB/s each way | 0 / 0 | 0 | 0 | 0 |
 | 20 % ACK loss | 5.43 MB/s | 0 / 0 | 0 | 0 | 0 |
@@ -811,7 +812,9 @@ transaction in two builds that differed only in harness code. To compare
 two versions, build both with 64-byte function and block alignment
 (`RUSTFLAGS="-C llvm-args=-align-all-functions=6 -C
 llvm-args=-align-all-nofallthru-blocks=6"`), which removes most of that
-swing.
+swing. Data layout moves them too: shrinking the TCB by 2 KiB, which
+shifts the fields after the change, cost request/response 1–3 % until the
+bytes were padded back, with no change to the code it runs.
 
 | Bulk transfer, 1 GiB (sender → receiver) | Sender Gbit/s, per packet | Receiver Gbit/s, per packet | ACKs / 100 segments, per packet | Sender Gbit/s, batched | Receiver Gbit/s, batched | ACKs / 100 segments, batched |
 |---|---|---|---|---|---|---|
@@ -840,13 +843,13 @@ misses.
 
 | Per-connection state | Bytes | Of which data buffers |
 |---|---|---|
-| tcp-sans-io (1 MiB rings) | 2177000 | 2097152 |
-| tcp-sans-io (64 KiB rings, `Tcb<65536>`) | 210920 | 131072 |
+| tcp-sans-io (1 MiB rings) | 2174992 | 2097152 |
+| tcp-sans-io (64 KiB rings, `Tcb<65536>`) | 208912 | 131072 |
 | smoltcp socket | 960 | caller-supplied |
 | smoltcp `Interface` (per interface) | 184 | — |
 
-tcp-sans-io's 78 KiB beyond the rings is the 48 KiB egress staging ring,
-the 24 KiB retransmission queue and the 6 KiB out-of-order tracker; smoltcp
+tcp-sans-io's 76 KiB beyond the rings is the 48 KiB egress staging ring,
+the 24 KiB retransmission queue and the 4 KiB out-of-order tracker; smoltcp
 keeps no retransmission state (it resends from the send buffer) and
 tracks at most 32 out-of-order ranges.
 
@@ -1066,7 +1069,7 @@ free(mem);                             // you own the memory
 - After `tcp_close`, **keep pumping** until `tcp_state` is `CLOSED`; only
   then `tcp_destroy` + free.
 - **Bound the number of concurrent TCBs** and refuse/evict past that budget.
-  Each TCB is independent and costs `tcp_handle_size()` (~2.08 MiB default,
+  Each TCB is independent and costs `tcp_handle_size()` (~2.07 MiB default,
   136 KiB under `small-buffers`) — including for the 60–120 s it spends in
   `TIME_WAIT`; the per-connection reapers (R2 / USER TIMEOUT / keepalive /
   FIN_WAIT_2, all on by default) bound how long a stalled or vanished peer
@@ -1171,7 +1174,7 @@ loop {
 ```
 
 `Tcb<const BUF>` is generic over ring capacity (default `BUF_CAP` = 1 MiB).
-A `Tcb` is ~2.08 MiB, so build it in place in heap storage
+A `Tcb` is ~2.07 MiB, so build it in place in heap storage
 (`Tcb::init_in_place`, as `tcp_init` does) or box it, rather than holding it
 as a stack local (or use `small-buffers` for many idle TCBs) — see *Memory
 footprint*. Event-driven Rust hosts sleep until `tcb.next_deadline()`.
@@ -1544,7 +1547,7 @@ put packets on the path — is hostile.
   traps (`ud2` / `udf`) instead of spinning or unwinding across the FFI.
 
 Residual risks the host owns: the number of concurrent TCBs and their
-memory (≈ 2.08 MiB each by default, held through `TIME_WAIT`), how long a
+memory (≈ 2.07 MiB each by default, held through `TIME_WAIT`), how long a
 live but slow peer may hold a connection the application keeps open, CPU
 spent per inbound packet (bounded per segment, but proportional to packet
 rate), and secret management (keep `tcp_set_secret` secret; rotate an

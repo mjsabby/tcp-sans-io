@@ -530,7 +530,7 @@ impl<const BUF: usize> Tcb<BUF> {
         };
         // A FIN held out of order is SACKed with the data (Linux reports
         // its sequence number as part of the segment's `end_seq`).
-        let fin = self.ooo_fin.map(|h| (h.seq, h.tag));
+        let fin = self.ooo_fin.map(|h| h.seq);
         if self.sack_enabled && (self.dsack.is_some() || !self.ooo.is_empty() || fin.is_some()) {
             let cap = u32::from(self.local_mss.min(self.peer_mss).min(self.pmtu_mss));
             let budget = cap.saturating_sub(payload_len).min(40);

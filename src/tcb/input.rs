@@ -994,6 +994,7 @@ impl<const BUF: usize> Tcb<BUF> {
             // of the stream (Linux drops such a FIN as fully covered).
             if self.ooo_fin.is_some_and(|h| seq_gt(self.rcv_nxt, h.seq)) {
                 self.ooo_fin = None;
+                self.ooo.forget_fin();
             }
             return self.absorb_ooo(seg_fin) || ack_now || held;
         }
@@ -1024,6 +1025,7 @@ impl<const BUF: usize> Tcb<BUF> {
                     .is_some_and(|h| seq_le(seq, h.start) && seq_gt(end, h.seq))
                 {
                     self.ooo_fin = None;
+                    self.ooo.forget_fin();
                 }
             }
             Insert::Full => {
@@ -1089,17 +1091,10 @@ impl<const BUF: usize> Tcb<BUF> {
                 Some(h) if seq_lt(h.seq, fin) => {}
                 // Again: its block is the newest, reported first (RFC 2018
                 // §4; Linux `tcp_sack_new_ofo_skb` for a duplicate too).
-                Some(h) if h.seq == fin && seq_le(h.start, start) => {
-                    let tag = self.ooo.take_tag();
-                    self.ooo_fin = Some(HeldFin { tag, ..h });
-                }
+                Some(h) if h.seq == fin && seq_le(h.start, start) => self.ooo.note_fin(),
                 _ => {
-                    let tag = self.ooo.take_tag();
-                    self.ooo_fin = Some(HeldFin {
-                        start,
-                        seq: fin,
-                        tag,
-                    });
+                    self.ooo.note_fin();
+                    self.ooo_fin = Some(HeldFin { start, seq: fin });
                 }
             }
         }

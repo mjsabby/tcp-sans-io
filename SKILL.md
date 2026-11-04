@@ -43,7 +43,7 @@ calling thread's stack for <1 ms.)
 
 ## Step 1 — Provide the six host responsibilities
 
-1. **Storage**: `tcp_handle_size()` bytes (≈ 2.08 MiB by default, 136 KiB
+1. **Storage**: `tcp_handle_size()` bytes (≈ 2.07 MiB by default, 136 KiB
    with `small-buffers`) at `tcp_handle_align()` alignment, one block per
    connection, owned and freed by you. `tcp_init` builds the TCB in place
    and needs only a few KiB of the calling thread's stack; it rejects

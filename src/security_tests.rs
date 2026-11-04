@@ -2384,6 +2384,41 @@ fn data_segments_carry_sack_blocks_while_data_is_out_of_order() {
     }
 }
 
+/// Linux sizes data segments by the SACK blocks it reports (`num_sacks`),
+/// not by the ranges it holds: with three ranges held but two of them on
+/// the SACK list (the third was pushed out before the blocks after it were
+/// consumed), a full segment leaves room for two blocks and carries them.
+#[test]
+fn data_segments_leave_room_for_the_sack_blocks_reported() {
+    let (mut c, sseq, iss) = established(1000, true, false);
+    ts_ack(&mut c, sseq, 1020, iss + 1, 0, &[]); // open the scaled window
+    c.set_now(1021);
+    let deliver = |c: &mut Tcb, off: u32, len: usize| {
+        let p = pkt(
+            SRV,
+            CLI,
+            sseq + off,
+            iss + 1,
+            flags::ACK,
+            0xffff,
+            &ts(7, 0),
+            &vec![1u8; len],
+        );
+        c.inject_packet(&p).unwrap();
+    };
+    for off in [700, 900, 1100, 500, 300] {
+        deliver(&mut c, off, 100);
+    }
+    deliver(&mut c, 0, 300); // the block at 300 is consumed
+    deliver(&mut c, 400, 100); // and the one at 500
+    drain(&mut c);
+    c.send(&[0x5a; 3 * 1448]).unwrap();
+    c.tick().unwrap();
+    let data: Vec<Out> = drain(&mut c).into_iter().filter(|o| o.len > 0).collect();
+    assert_eq!(data[0].opts.sack.len(), 2);
+    assert_eq!(data[0].len, 1448 - 2 * 8);
+}
+
 /// A third ACK with a "future" sequence number (inside the window, not at
 /// RCV.NXT) must not become SND.WL1: the peer's genuine window updates at
 /// RCV.NXT used to be ignored as older, freezing the window at its zero.

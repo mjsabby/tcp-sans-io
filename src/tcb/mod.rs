@@ -563,13 +563,11 @@ pub(crate) fn seq_in_range(x: u32, lo: u32, hi_exclusive: u32) -> bool {
 
 /// A FIN that arrived beyond `RCV.NXT`, with the first sequence number of
 /// the segment that carried it (the FIN itself for a bare FIN), which is
-/// its place in SEG.SEQ processing order, and its recency among the
-/// out-of-order ranges for SACK reporting.
+/// its place in SEG.SEQ processing order.
 #[derive(Clone, Copy, Debug)]
 struct HeldFin {
     start: u32,
     seq: u32,
-    tag: u32,
 }
 
 impl<const BUF: usize> Tcb<BUF> {
@@ -603,10 +601,11 @@ impl<const BUF: usize> Tcb<BUF> {
         // `Self`. Zero-filling makes every field a valid value except the
         // ones written explicitly below: every other field is an integer,
         // bool, byte array, `Deadline` (zero = disarmed) or an all-integer
-        // struct, and the `State`/`CaState` enums use 0 for their initial
-        // variant. `Option` fields, and the structs holding one (`Rack`,
-        // `Reno`), are written explicitly (the `None` encoding is not
-        // guaranteed to be all-zero). Only then is a reference created.
+        // struct, and the `State`/`CaState` enums and the out-of-order
+        // list's SACK entries (`repr(u8)`) use 0 for a variant. `Option`
+        // fields, and the structs holding one (`Rack`, `Reno`), are written
+        // explicitly (the `None` encoding is not guaranteed to be
+        // all-zero). Only then is a reference created.
         unsafe {
             core::ptr::write_bytes(p, 0, 1);
             core::ptr::addr_of_mut!((*p).state).write(State::Closed);
@@ -1693,17 +1692,15 @@ impl<const BUF: usize> Tcb<BUF> {
     }
 
     /// Payload of a full-sized new segment: the MSS less the room of the
-    /// SACK blocks owed to the peer (Linux `tcp_current_mss`), so data
-    /// segments carry them too, not only pure ACKs. Encoded, timestamps
-    /// plus n blocks take 12 + 8n bytes (timestamps alone 12), n blocks
-    /// alone 4 + 8n, within the 40-byte option space.
+    /// SACK blocks owed to the peer (Linux `tcp_current_mss`, from
+    /// `num_sacks`), so data segments carry them too, not only pure ACKs.
+    /// Encoded, timestamps plus n blocks take 12 + 8n bytes (timestamps
+    /// alone 12), n blocks alone 4 + 8n, within the 40-byte option space.
     #[inline]
     fn data_mss(&self) -> u32 {
         let mss = self.mss_payload();
         let owed = if self.sack_enabled {
-            usize::from(self.dsack.is_some())
-                + self.ooo.len()
-                + usize::from(self.ooo_fin.is_some_and(|h| !self.ooo.ends_at(h.seq)))
+            usize::from(self.dsack.is_some()) + self.ooo.sack_blocks(self.ooo_fin.map(|h| h.seq))
         } else {
             0
         };
