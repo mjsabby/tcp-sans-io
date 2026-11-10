@@ -11,11 +11,12 @@
 //! TSval the SYN-ACK could have carried; a TSopt the SYN-ACK did not offer
 //! echoes nothing of ours and is ignored (RFC 7323 §3.2).
 //!
-//! Listeners are hybrid: the single half-open slot is used statefully
-//! (keeping every option), and cookies answer SYNs while that slot is busy.
-//! The slot's own SYN-ACK is a cookie as well, so a half-open that loses
-//! the slot (to another peer's cookie ACK, or to a new SYN once its SYN-ACK
-//! went unanswered) still completes from its ACK alone, at whichever
+//! Listeners are hybrid: the slot and the backlog (see `backlog.rs`) hold
+//! half-opens statefully (keeping every option), and cookies answer SYNs
+//! once those are taken. A stateful SYN-ACK is a cookie as well, so a
+//! half-open that loses its place (to another peer's cookie ACK, to a new
+//! SYN once its SYN-ACK went unanswered, or left behind in a listener that
+//! became a connection) still completes from its ACK alone, at whichever
 //! listener gets it. Only a client that offered window scaling, SACK or ECN
 //! without timestamps cannot: nothing carries those options, so its ISN
 //! says so (MSS index 3) and its ACK is refused with a RST instead of

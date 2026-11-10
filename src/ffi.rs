@@ -190,8 +190,10 @@ pub unsafe extern "C" fn tcp_connect(handle: *mut TcpStreamHandle, now_ms: u64) 
 
 /// Passive open (`CLOSED` → `LISTEN`); the remote is wildcarded until a SYN
 /// arrives. Requires [`tcp_set_secret`] (or [`tcp_set_cookie_secret`]) first;
-/// `InvalidState` otherwise. While the single half-open slot is busy, SYNs
-/// from other peers are answered with SYN cookies.
+/// `InvalidState` otherwise. The listener holds up to nine handshakes at
+/// once and becomes the connection of whichever completes first (then call
+/// [`tcp_adopt_half_opens`] on the next listener); beyond that, SYNs are
+/// answered with SYN cookies.
 ///
 /// # Safety
 /// `handle` must be NULL or a live handle from [`tcp_init`].
@@ -374,8 +376,11 @@ pub unsafe extern "C" fn tcp_adopt_half_opens(
     listener: *mut TcpStreamHandle,
     from: *mut TcpStreamHandle,
 ) -> i32 {
-    if listener.is_null() || from.is_null() || core::ptr::eq(listener, from) {
+    if listener.is_null() || from.is_null() {
         return TcpError::NullPointer.as_code();
+    }
+    if core::ptr::eq(listener, from) {
+        return TcpError::InvalidState.as_code();
     }
     // SAFETY: both non-null (checked) and initialised (caller contract).
     if unsafe { magic(listener) } != MAGIC_LIVE || unsafe { magic(from) } != MAGIC_LIVE {

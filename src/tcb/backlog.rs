@@ -114,12 +114,25 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
         if held < limit {
             return self.backlog.iter().position(|h| !h.used);
         }
+        self.backlog_stale().map(|(i, _)| i)
+    }
+
+    /// Whether a half-open with this ISS completes from its ACK alone if
+    /// its record is lost: its SYN-ACK was a cookie (see `cookie.rs`).
+    fn cookie_carried(&self, iss: u32) -> bool {
+        self.cookie_secret_set && (iss >> 30) as u8 != super::cookie::COOKIE_STATEFUL_ONLY
+    }
+
+    /// The record to give up for a new half-open: one whose SYN-ACK already
+    /// went unanswered (at least one retransmission), preferring one that
+    /// still completes by its cookie, then the most retransmissions.
+    fn backlog_stale(&self) -> Option<(usize, HalfOpen)> {
         self.backlog
             .iter()
             .enumerate()
             .filter(|(_, h)| h.used && h.retries >= 1)
-            .max_by_key(|(_, h)| h.retries)
-            .map(|(i, _)| i)
+            .max_by_key(|(_, h)| (self.cookie_carried(h.iss), h.retries))
+            .map(|(i, h)| (i, *h))
     }
 
     fn backlog_put(&mut self, i: usize, h: HalfOpen) {
@@ -306,8 +319,14 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
         let i = match self.backlog_find(remote) {
             Some(i) => {
                 // Its SYN again: our SYN-ACK was lost. With another ISN the
-                // client started over, and so does its record.
-                if let Some(h) = self.backlog.get(i).copied().filter(|h| h.irs == seg.seq) {
+                // client may have started over, or the SYN is spoofed (it
+                // takes only the 4-tuple): while the SYN-ACK has not gone
+                // unanswered, the record stands and the SYN-ACK is repeated.
+                // A client that did start over answers it with a RST, which
+                // frees the record for its next SYN; a spoofer cannot.
+                // After an unanswered RTO the new SYN starts the record over.
+                let fresh = |h: &HalfOpen| h.irs == seg.seq || h.retries == 0;
+                if let Some(h) = self.backlog.get(i).copied().filter(fresh) {
                     self.emit_half_open_synack(&h)?;
                     return Ok(true);
                 }
@@ -326,7 +345,7 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
 
     /// A RST from a peer other than the slot's: at exactly its half-open's
     /// `RCV.NXT` (RFC 5961 §3.2, as in `SYN_RCVD`) it ends that half-open.
-    pub(super) fn backlog_rst(&mut self, seg: &Segment<'_>) {
+    pub(super) fn backlog_rst(&mut self, seg: &Segment<'_>) -> bool {
         let remote = Endpoint {
             ip: seg.src_ip,
             port: seg.src_port,
@@ -335,9 +354,11 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
             if let Some(h) = self.backlog.get_mut(i) {
                 if seg.seq == h.irs.wrapping_add(1) {
                     h.used = false;
+                    return true;
                 }
             }
         }
+        false
     }
 
     /// An ACK of a table half-open's SYN-ACK: move that half-open into the
@@ -371,8 +392,15 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
             self.backlog_put(i, HalfOpen::UNUSED);
         }
         if self.state == State::SynRcvd && self.is_listener {
-            if let Some(i) = self.backlog.iter().position(|h| !h.used) {
-                let slot = self.slot_as_half_open();
+            let slot = self.slot_as_half_open();
+            // An unused record, or a stale one in its place: but never a
+            // half-open that needs its record for one that does not.
+            let room = self.backlog.iter().position(|h| !h.used).or_else(|| {
+                self.backlog_stale()
+                    .filter(|(_, h)| self.cookie_carried(h.iss) || !self.cookie_carried(slot.iss))
+                    .map(|(i, _)| i)
+            });
+            if let Some(i) = room {
                 self.backlog_put(i, slot);
             }
         }
@@ -436,10 +464,16 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
     /// become a connection (or closed) — into this listener, which goes on
     /// serving them: their SYN-ACK retransmissions, and their ACKs when the
     /// host routes them here. Returns how many were taken (those that find
-    /// no room stay in `from`). Call it when setting up the listener that
-    /// replaces `from`, after [`Tcb::listen`]; both must share the local
-    /// endpoint and secrets. Nothing is taken from a TCB that is still
-    /// listening.
+    /// no room within this listener's backlog stay in `from`; one for a
+    /// peer either TCB already has is dropped). Call it when setting up the
+    /// listener that replaces `from`, right after [`Tcb::listen`] and
+    /// before routing packets to it; both must share the local endpoint and
+    /// secrets. Nothing is taken from a TCB that is still listening.
+    ///
+    /// Hosts should always call this: a pending client left behind has only
+    /// its cookie, which completes the handshake only if the client's first
+    /// segment arrives first and intact, and not at all for a client that
+    /// offered window scaling, SACK or ECN without timestamps.
     pub fn adopt_half_opens(&mut self, from: &mut Self) -> usize {
         let listening = |t: &Self| matches!(t.state, State::Listen | State::SynRcvd);
         if !self.is_listener
@@ -450,15 +484,42 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
             return 0;
         }
         let mut taken = 0;
-        for h in from.backlog.iter_mut().filter(|h| h.used) {
-            let Some(i) = self.backlog.iter().position(|s| !s.used) else {
-                break;
-            };
-            self.backlog_put(i, *h);
-            h.used = false;
-            taken += 1;
+        let limit = usize::from(self.backlog_limit);
+        // Oldest first; each round frees a record of `from` or stops.
+        while let Some((fi, h)) = from
+            .backlog
+            .iter()
+            .enumerate()
+            .filter(|(_, h)| h.used)
+            .min_by_key(|(_, h)| h.syn_ms)
+            .map(|(i, h)| (i, *h))
+        {
+            // A half-open for a peer `from` is connected to, or one this
+            // listener already holds, is stale: drop it.
+            let known = h.remote == from.remote
+                || (self.state == State::SynRcvd && h.remote == self.remote)
+                || self.backlog_find(h.remote).is_some();
+            if !known {
+                if self.state == State::Listen {
+                    self.load_half_open(h);
+                } else {
+                    let held = self.backlog.iter().filter(|s| s.used).count();
+                    let Some(i) = self
+                        .backlog
+                        .iter()
+                        .position(|s| !s.used)
+                        .filter(|_| held < limit)
+                    else {
+                        break;
+                    };
+                    self.backlog_put(i, h);
+                }
+                taken += 1;
+            }
+            if let Some(rec) = from.backlog.get_mut(fi) {
+                rec.used = false;
+            }
         }
-        self.backlog_refill_slot();
         taken
     }
 }

@@ -1239,16 +1239,19 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
     /// listener accepts would get the same ISN and a TSval equal to the host
     /// clock.
     ///
-    /// The listener holds one half-open connection at a time, statefully, so
-    /// it keeps every option the client offers. While that slot is busy, SYNs
-    /// from other peers are answered with SYN cookies (no state); a valid
-    /// cookie ACK replaces the pending half-open, so spoofed SYNs cannot lock
-    /// the listener. A half-open whose SYN-ACK already needed a retransmit
-    /// also yields its slot to a SYN from a new peer. Either way the
-    /// half-open is not lost: its SYN-ACK is a cookie too, and its ACK
-    /// completes at the listener the host sets up next (unless it offered
-    /// window scaling, SACK or ECN without timestamps, which no cookie
-    /// carries: then its ACK is reset).
+    /// The listener holds up to nine half-opens statefully (one in its own
+    /// state, the slot, and [`Tcb::set_listen_backlog`] records beside it),
+    /// keeping every option each client offers, and becomes the connection
+    /// of whichever completes first; the host then sets up its next
+    /// listener and moves the rest to it with [`Tcb::adopt_half_opens`].
+    /// Once they are taken, a new SYN recycles a half-open whose SYN-ACK
+    /// already needed a retransmission and is otherwise answered with a
+    /// SYN cookie (no state); a valid cookie ACK takes the slot, so spoofed
+    /// SYNs cannot lock the listener. A half-open that loses its place is
+    /// not lost if a cookie can carry what its client offered: its SYN-ACK
+    /// is a cookie too, and its ACK completes at the next listener
+    /// (otherwise, window scaling, SACK or ECN without timestamps, its ACK
+    /// is reset).
     pub fn listen(&mut self) -> Result<(), TcpError> {
         match self.state {
             State::Closed | State::Listen | State::TimeWait => {}

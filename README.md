@@ -558,10 +558,11 @@ to put on the wire and hands you back the bytes the peer sent.
    it became). When that happens, set up your next listener and call
    `tcp_adopt_half_opens(next, became_connection)`: the handshakes still
    pending move to it and go on being served, options and SYN-ACK
-   retransmissions included. Skip that call and they fall back to their
-   cookies: a pending client's ACK still completes at the next listener,
-   as every SYN-ACK is a cookie, except for clients that offered window
-   scaling, SACK or ECN without timestamps, which are reset. Set up each listener with
+   retransmissions included. Do this every time, before routing packets to
+   the new listener: a pending handshake left behind has only its cookie
+   to complete by, which works only if the client's first segment arrives
+   first and intact, and not at all for clients that offered window
+   scaling, SACK or ECN without timestamps (they are reset). Set up each listener with
    the same secrets. A `CLOSED` TCB answers its former peer's segments
    with a RST (rate limited), so keeping one routed for a while tells a
    peer that kept sending; route a new SYN to your listener instead, as a
@@ -1061,10 +1062,14 @@ put packets on the path — is hostile.
   unanswered for an RTO) completes from its ACK at the host's next
   listener. The exception is a client that offered window scaling, SACK or
   ECN without timestamps: no cookie carries those, so after losing the slot
-  its ACK is reset and it reconnects. While the slot is busy such clients
+  its ACK is reset and it reconnects. Once the backlog is full such clients
   (Windows by default) connect through cookies without window scaling or
-  SACK: one half-open per listener TCB is the limit here, and a host that
-  wants every option kept under load runs several listeners per port. As on
+  SACK, as on Linux with a full SYN queue. A cookie completes a handshake
+  only from the client's first segment (the one at IRS+1): if a later one
+  overtakes it, the listener cannot tell it from a stray ACK and resets
+  the client, as Linux in cookie mode. The backlog keeps ordinary
+  handshakes off that path, provided the host adopts the pending ones
+  (`tcp_adopt_half_opens`) each time a listener becomes a connection. As on
   Linux a blind forgery succeeds with probability 2⁻²⁹ per attempt (2⁻²⁸
   for 128 s after a key rotation) and delivers the forged segment's payload
   from a spoofed address; unlike Linux, at any time, not only within two

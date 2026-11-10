@@ -79,13 +79,10 @@ fn pending_half_opens_are_retransmitted_and_expire() {
     let sb = first.iter().find(|o| o.dst == B).unwrap().seq;
     assert_eq!(s.next_deadline(), Some(1000));
 
-    // The same SYN again: the same SYN-ACK. A new ISN starts over.
+    // The same SYN again: the same SYN-ACK.
     s.inject_packet(&win_syn(B, 200)).unwrap();
     let again = drain(&mut s);
     assert_eq!((again.len(), again[0].seq, again[0].ack), (1, sb, 201));
-    s.inject_packet(&win_syn(B, 900)).unwrap();
-    let anew = drain(&mut s);
-    assert_eq!((anew.len(), anew[0].ack), (1, 901));
     assert_eq!(s.pending_half_opens(), 1);
 
     let mut to_b = 0;
@@ -352,4 +349,183 @@ fn two_hundred_overlapping_clients_all_connect_with_their_options() {
         good < 150,
         "without a backlog only {good} keep their options"
     );
+}
+
+/// Half-opens whose budgets run out in the same tick used to leave a
+/// deadline in the past: the record that refilled the slot was already due
+/// and nothing served it until the next tick.
+#[test]
+fn no_deadline_is_left_in_the_past_when_half_opens_expire_together() {
+    for n in [1u32, 2, 3, 9] {
+        let mut s = backlog_listener();
+        for k in 0..n {
+            s.inject_packet(&win_syn(([198, 18, 5, k as u8], 7000), k))
+                .unwrap();
+        }
+        drain(&mut s);
+        let mut now = 0u64;
+        let mut ticks = 0;
+        while let Some(due) = s.next_deadline() {
+            assert!(due > now, "{n} half-opens: deadline {due} at {now}");
+            now = due;
+            s.set_now(now);
+            s.tick().unwrap();
+            drain(&mut s);
+            ticks += 1;
+            assert!(ticks < 100);
+        }
+        assert_eq!((s.state(), s.pending_half_opens()), (State::Listen, 0));
+    }
+}
+
+/// A SYN with another ISN from a half-open's address used to replace its
+/// record at once (in the backlog) or be ignored for the whole retry
+/// budget (in the slot). Spoofing one takes only the 4-tuple, so while the
+/// SYN-ACK has not gone unanswered the half-open stands and its SYN-ACK is
+/// repeated; after an unanswered RTO the new SYN starts it over, slot or
+/// backlog alike.
+#[test]
+fn a_new_isn_restarts_a_half_open_only_after_an_unanswered_rto() {
+    for in_slot in [true, false] {
+        let mut s = backlog_listener();
+        if !in_slot {
+            s.inject_packet(&win_syn(A, 100)).unwrap();
+        }
+        s.inject_packet(&win_syn(B, 200)).unwrap();
+        let sb = drain(&mut s).into_iter().find(|o| o.dst == B).unwrap();
+
+        // Spoofed restart: the SYN-ACK is repeated, the half-open stands.
+        s.set_now(600);
+        s.inject_packet(&win_syn(B, 5000)).unwrap();
+        let out = drain(&mut s);
+        assert_eq!((out.len(), out[0].seq, out[0].ack), (1, sb.seq, 201));
+        // ... so the real client still completes, with its options.
+        let mut t = backlog_listener();
+        if !in_slot {
+            t.inject_packet(&win_syn(A, 100)).unwrap();
+        }
+        t.inject_packet(&win_syn(B, 200)).unwrap();
+        let tb = drain(&mut t).into_iter().find(|o| o.dst == B).unwrap();
+        t.set_now(600);
+        t.inject_packet(&win_syn(B, 5000)).unwrap();
+        drain(&mut t);
+        t.inject_packet(&bare_ack(B, 201, tb.seq + 1, 300)).unwrap();
+        assert_eq!((t.state(), t.remote()), (State::Established, Some(ep(B))));
+        assert_eq!(t.stats().snd_wnd, 300 << 7, "in_slot {in_slot}");
+
+        // After the SYN-ACK went unanswered for an RTO, a new ISN starts over.
+        s.set_now(1100);
+        s.tick().unwrap();
+        drain(&mut s);
+        s.inject_packet(&win_syn(B, 5000)).unwrap();
+        let out = drain(&mut s);
+        assert_eq!((out.len(), out[0].ack), (1, 5001), "in_slot {in_slot}");
+        s.inject_packet(&bare_ack(B, 5001, out[0].seq + 1, 300))
+            .unwrap();
+        assert_eq!((s.state(), s.remote()), (State::Established, Some(ep(B))));
+    }
+}
+
+/// When a full backlog gives up a record, it is one whose client can still
+/// complete by cookie (it used timestamps or offered no options), not one
+/// that needs its record; and a cookie ACK taking the slot moves the slot's
+/// half-open into a stale record instead of dropping it.
+#[test]
+fn eviction_spares_half_opens_that_need_their_record() {
+    let mut s = backlog_listener();
+    // Slot: a filler. Backlog: W (needs its record) and seven with timestamps.
+    s.inject_packet(&win_syn(X, 1)).unwrap();
+    s.inject_packet(&win_syn(A, 100)).unwrap();
+    for k in 0..7u32 {
+        let src = ([198, 18, 6, k as u8], 7000);
+        s.inject_packet(&syn(src, k, &syn_opts(Some(9), true, Some(7))))
+            .unwrap();
+    }
+    let sa = drain(&mut s).into_iter().find(|o| o.dst == A).unwrap();
+    assert_eq!(s.pending_half_opens(), 8);
+    // Every SYN-ACK goes unanswered once.
+    s.set_now(1000);
+    s.tick().unwrap();
+    drain(&mut s);
+    // Seven new clients: each takes the record of a timestamp half-open.
+    for k in 0..7u32 {
+        let src = ([198, 18, 7, k as u8], 7000);
+        s.inject_packet(&win_syn(src, k)).unwrap();
+    }
+    drain(&mut s);
+    assert_eq!(s.pending_half_opens(), 8);
+    s.inject_packet(&bare_ack(A, 101, sa.seq + 1, 900)).unwrap();
+    assert_eq!((s.state(), s.remote()), (State::Established, Some(ep(A))));
+    assert_eq!(s.stats().snd_wnd, 900 << 7, "A kept its record");
+
+    // A cookie ACK takes the slot: its half-open goes to a stale record.
+    let mut s = backlog_listener();
+    s.inject_packet(&win_syn(A, 100)).unwrap(); // slot, needs its record
+    for k in 0..8u32 {
+        let src = ([198, 18, 8, k as u8], 7000);
+        s.inject_packet(&syn(src, k, &syn_opts(Some(9), true, Some(7))))
+            .unwrap();
+    }
+    let sa = drain(&mut s).into_iter().find(|o| o.dst == A).unwrap();
+    s.inject_packet(&syn(B, 200, &syn_opts(Some(900), true, Some(7))))
+        .unwrap();
+    let sb = drain(&mut s).remove(0); // a cookie: the backlog is full
+    s.set_now(1000);
+    s.tick().unwrap();
+    drain(&mut s);
+    s.inject_packet(&pkt(
+        B,
+        SRV,
+        201,
+        sb.seq + 1,
+        flags::ACK,
+        65535,
+        &ts(901, sb.opts.ts.unwrap().0),
+        &[],
+    ))
+    .unwrap();
+    assert_eq!((s.state(), s.remote()), (State::Established, Some(ep(B))));
+    let mut n = backlog_listener();
+    n.set_now(1001);
+    assert_eq!(n.adopt_half_opens(&mut s), 8);
+    n.inject_packet(&bare_ack(A, 101, sa.seq + 1, 400)).unwrap();
+    assert_eq!((n.state(), n.remote()), (State::Established, Some(ep(A))));
+    assert_eq!(n.stats().snd_wnd, 400 << 7);
+}
+
+/// Adoption drops a half-open for a peer either TCB already has, instead of
+/// leaving two records for it (and later a stale half-open for a peer that
+/// is connected), and respects the adopting listener's backlog limit.
+#[test]
+fn adoption_skips_peers_already_known_and_respects_the_limit() {
+    let mut s = backlog_listener();
+    s.inject_packet(&win_syn(A, 100)).unwrap();
+    s.inject_packet(&win_syn(B, 200)).unwrap();
+    s.inject_packet(&win_syn(X, 300)).unwrap();
+    let out = drain(&mut s);
+    let sb = out.iter().find(|o| o.dst == B).unwrap().seq;
+    s.inject_packet(&bare_ack(B, 201, sb + 1, 100)).unwrap();
+    assert_eq!((s.state(), s.pending_half_opens()), (State::Established, 2));
+
+    // The next listener has taken A's retransmitted SYN before adopting.
+    let mut n = backlog_listener();
+    n.inject_packet(&win_syn(A, 100)).unwrap();
+    drain(&mut n);
+    assert_eq!(n.adopt_half_opens(&mut s), 1, "X; A is already held");
+    assert_eq!((n.remote(), n.pending_half_opens()), (Some(ep(A)), 1));
+    assert_eq!(s.pending_half_opens(), 0);
+    assert_eq!(n.adopt_half_opens(&mut s), 0);
+
+    // With no backlog, only the slot is filled; the rest stays behind.
+    let mut s = backlog_listener();
+    s.inject_packet(&win_syn(A, 100)).unwrap();
+    s.inject_packet(&win_syn(B, 200)).unwrap();
+    s.inject_packet(&win_syn(X, 300)).unwrap();
+    let out = drain(&mut s);
+    let sb = out.iter().find(|o| o.dst == B).unwrap().seq;
+    s.inject_packet(&bare_ack(B, 201, sb + 1, 100)).unwrap();
+    let mut n = listener(); // backlog 0
+    assert_eq!(n.adopt_half_opens(&mut s), 1);
+    assert_eq!((n.state(), n.pending_half_opens()), (State::SynRcvd, 0));
+    assert_eq!(s.pending_half_opens(), 1);
 }

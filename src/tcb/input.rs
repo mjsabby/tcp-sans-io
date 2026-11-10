@@ -112,8 +112,11 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
             return Err(TcpError::NotForUs);
         }
         if seg.has(flags::RST) {
-            self.backlog_rst(seg);
-            return Err(TcpError::NotForUs);
+            return if self.backlog_rst(seg) {
+                Ok(())
+            } else {
+                Err(TcpError::NotForUs)
+            };
         }
         if seg.has(flags::ACK) {
             if !seg.has(flags::SYN) {
@@ -373,8 +376,17 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
                 }
                 return Ok(());
             }
-            // Retransmitted SYN: our SYN-ACK was lost.
-            if seg.seq == self.irs && self.oow_allowed() {
+            // A SYN with another ISN once our SYN-ACK went unanswered for an
+            // RTO: the client started over, and so does the half-open (as
+            // for one in the backlog, see `backlog_syn`).
+            if seg.seq != self.irs && self.is_listener && self.syn_rcvd_retries >= 1 {
+                return self.accept_syn_stateful(seg);
+            }
+            // The SYN again: our SYN-ACK was lost. With another ISN before
+            // that, the client restarted or the SYN is spoofed: the
+            // SYN-ACK is repeated, which a restarted client answers with
+            // the RST that frees the slot.
+            if (seg.seq == self.irs || self.is_listener) && self.oow_allowed() {
                 let _ = self.emit_synack()?;
             }
             return Ok(());

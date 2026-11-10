@@ -33,7 +33,19 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
             State::SynSent => self.syn_sent_timer()?,
             State::SynRcvd => {
                 self.syn_rcvd_timer()?;
-                if self.is_listener {
+                // A half-open that takes over a slot whose budget ran out
+                // may be due as well: serve it now, so no deadline is left
+                // in the past (each round retransmits, or ends a half-open).
+                let mut rounds = 0;
+                while self.state == State::SynRcvd
+                    && self.is_listener
+                    && self.rto_deadline.due(now)
+                    && rounds <= super::backlog::BACKLOG
+                {
+                    self.syn_rcvd_timer()?;
+                    rounds += 1;
+                }
+                if self.state == State::SynRcvd && self.is_listener {
                     self.backlog_timers()?;
                 }
             }

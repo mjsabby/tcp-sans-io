@@ -102,8 +102,10 @@ int32_t tcp_set_listen_backlog(TcpStreamHandle* handle, uint32_t n);
  * connection, or closed) into `listener`, which goes on serving them. Call it
  * when setting up the listener that replaces `from`, after tcp_listen; both
  * need the same local endpoint and secrets. Returns how many were taken
- * (>= 0), or a negative error for an invalid handle. Without this call the
- * pending clients fall back to their SYN cookies. */
+ * (>= 0), or a negative error for an invalid handle. Call it every time,
+ * before routing packets to the new listener: a pending client left behind
+ * has only its SYN cookie, which completes only from the client's first
+ * segment and not at all without timestamps if it offered options. */
 int32_t tcp_adopt_half_opens(TcpStreamHandle* listener, TcpStreamHandle* from);
 /* Graceful close: FIN after queued data; the host is done with the connection
  * in both directions. Once the FIN is acknowledged the peer has the
