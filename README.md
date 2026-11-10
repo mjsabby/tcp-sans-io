@@ -174,8 +174,8 @@ mis-ordering, corruption, a panic, or an unbounded loop.
 | `RTO_MIN` / `RTO_MAX` | 200 ms / 60 s | `tcb/mod.rs` | RTO clamp; exponential backoff is capped at `RTO_MAX`. |
 | TLP PTO floor / delayed ACK / `TIME_WAIT` | 10 ms / 40 ms / 60 s (≤ 120 s) | `tcb/mod.rs` | Probe timeout floor, delayed-ACK timer, 2·MSL; a retransmitted FIN restarts 2·MSL, at most 120 s after entry. |
 | `MAX_SYN_RETRIES` / `MAX_SYN_RCVD_RETRIES` | 6 / 5 | `tcb/mod.rs` | SYN retransmissions before an active open fails; SYN-ACK retransmissions before a half-open reverts to `LISTEN`. |
-| `MAX_RETRANSMITS` | 10 | `tcb/mod.rs` | RFC 9293 §3.8.3 "R2": consecutive timeouts (data, FIN or unanswered zero-window probes) with no proof of life before abort. |
-| USER TIMEOUT | 300 s | `tcb/mod.rs` | Max time with outstanding send work but less than one full segment acknowledged; reaps stalled, zero-window and sub-MSS-trickle peers. A reader acknowledging a full segment per period is live progress, not a stall (see *Threat model*). `set_user_timeout(0)` disables. |
+| `MAX_RETRANSMITS` | 10 | `tcb/mod.rs` | RFC 9293 §3.8.3 "R2": consecutive timeouts (data or FIN) without an ACK of new data, or zero-window probes without any answer, before abort. The peer's own traffic does not restart the timeout count (as Linux), so a path that black-holes our segments is still detected. |
+| USER TIMEOUT | 300 s | `tcb/mod.rs` | Max time with outstanding send work but less than one full segment acknowledged; reaps stalled, zero-window and sub-MSS-trickle peers, whatever window they advertise. When less than a segment was waiting to be acknowledged, any acknowledgment counts, so an application trickling tiny records is not aborted. A reader acknowledging a full segment per period is live progress, not a stall (see *Threat model*). `set_user_timeout(0)` disables. |
 | Keepalive | 600 s idle / 60 s / 4 probes | `tcb/mod.rs` | Reaps a vanished peer on an idle connection: `ESTABLISHED`, or half-closed (`CLOSE_WAIT`, `FIN_WAIT_2`), as in Linux. `set_keepalive(0, …)` disables. |
 | FIN_WAIT_2 timeout | 60 s | `tcb/mod.rs` | Time a peer may leave its half open after ACKing our FIN; restarted only when the application reads, never by the peer's data alone. |
 | Black-hole MSS clamp / probe | 3, 5 RTOs → 1024, 536 / 10 s … 10 min | `tcb/mod.rs` | Consecutive timeouts of a large segment clamp the MSS; one probe segment at the next larger size (first after 10 s, doubling up to 10 min on failure) restores it once it arrives. |
@@ -993,8 +993,8 @@ put packets on the path — is hostile.
 
 - **Connection pinning.** A peer that *stops making progress* cannot hold
   a TCB: R2 (10 unanswered timeouts), USER TIMEOUT (300 s without a full
-  segment of progress — defeats zero-window and sub-segment-trickle
-  "Sockstress" stalls, which a proof-of-life-based timer cannot), keepalive
+  segment of progress, unless less than a segment was waiting — defeats
+  zero-window and sub-segment-trickle "Sockstress" stalls, which a proof-of-life-based timer cannot), keepalive
   (reaps vanished idle peers) and bounded SYN / SYN-ACK retransmission.
   Once the host has closed and our FIN is acknowledged, the peer cannot
   extend the TCB's life either: FIN_WAIT_2 lasts 60 s unless the

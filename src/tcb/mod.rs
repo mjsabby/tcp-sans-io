@@ -101,13 +101,16 @@ const MAX_SYN_RCVD_RETRIES: u8 = 5;
 /// SYN retransmissions in `SYN_SENT` before giving up (Linux `tcp_syn_retries`).
 const MAX_SYN_RETRIES: u8 = 6;
 /// RFC 9293 §3.8.3 "R2": consecutive retransmission timeouts (or unanswered
-/// zero-window probes) with no proof of life before the connection aborts.
-/// Reset by any acceptable ACK. No RST is sent: the peer is presumed gone.
+/// zero-window probes) before the connection aborts. Timeouts restart on an
+/// ACK of new data, probes on any acceptable ACK. No RST is sent: the peer
+/// is presumed gone.
 const MAX_RETRANSMITS: u8 = 10;
 /// Default RFC 9293 §3.8.3 USER TIMEOUT: maximum time without *meaningful*
 /// forward progress (at least one full segment acknowledged) while send work
-/// is outstanding. Window-starved trickles and zero-window persist do not
-/// count as progress, which bounds slow-reader / "Sockstress" pinning.
+/// is outstanding. Sub-segment trickles and zero-window persist do not
+/// count as progress, which bounds slow-reader / "Sockstress" pinning; any
+/// acknowledgment does when less than a segment was waiting for one (an
+/// application may write less than a segment in that time).
 const DEFAULT_USER_TIMEOUT_MS: u32 = 300_000;
 /// Default keepalive (RFC 9293 §3.8.4) for fully idle connections.
 const DEFAULT_KEEPALIVE_IDLE_MS: u32 = 600_000;
@@ -283,6 +286,8 @@ pub struct Tcb<
     iss: u32,
     /// Host-provided ISS from the config (restored on reset).
     cfg_iss: u32,
+    /// `cfg_iss` has started an active open (see [`Tcb::connect`]).
+    iss_used: bool,
 
     // ---- Receive sequence space.
     rcv_nxt: u32,
@@ -389,8 +394,12 @@ pub struct Tcb<
     rttvar_ms: u32,
     rtt_first_sample: bool,
     rto_deadline: Deadline,
-    /// Consecutive RTOs / unanswered probes with no proof of life (R2).
+    /// Consecutive timeouts (SYN or data) without an ACK of new data (R2;
+    /// Linux `icsk_retransmits`): what black-hole detection counts too.
     rtx_count: u8,
+    /// Consecutive window probes without any answer (Linux
+    /// `icsk_probes_out`): persist probes, and timeouts into a zero window.
+    probes_out: u8,
 
     // ---- Delayed ACK.
     pending_ack: bool,
@@ -562,6 +571,7 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
         self.local = cfg.local;
         self.remote = cfg.remote;
         self.cfg_iss = cfg.iss;
+        self.iss_used = false;
         self.iss = cfg.iss;
         self.init_rto_ms = cfg.initial_rto_ms.clamp(RTO_MIN_MS, RTO_MAX_MS);
         self.mtu = MAX_MTU;
@@ -678,6 +688,7 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
         self.rtt_first_sample = false;
         self.rto_deadline = Deadline::OFF;
         self.rtx_count = 0;
+        self.probes_out = 0;
         self.pending_ack = false;
         self.delayed_ack_count = 0;
         self.ack_deadline = Deadline::OFF;
@@ -994,7 +1005,8 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
     /// Set the RFC 9293 §3.8.3 USER TIMEOUT (`0` disables): the connection
     /// aborts after this long without a full segment's worth of data being
     /// acknowledged while send work is outstanding. Zero-window persist and
-    /// sub-MSS trickles do not count as progress.
+    /// sub-MSS trickles do not count as progress; any acknowledgment does
+    /// when less than a segment was waiting for one.
     pub fn set_user_timeout(&mut self, ms: u32) {
         self.user_timeout_ms = ms;
         self.ut_progress = 0;
@@ -1109,7 +1121,7 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
         self.secret = *secret;
         self.secret_set = true;
         if !self.cookie_secret_explicit {
-            self.install_cookie_key(cookie::derive_cookie_key(secret));
+            self.install_cookie_key(cookie::derive_cookie_key(secret), false);
         }
     }
 
@@ -1118,19 +1130,26 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
     /// answers further SYNs with cookies while that slot is busy. Cookies
     /// issued under the previous key stay valid for their normal 64–128 s
     /// lifetime, so rotating no more often than every ~2 minutes never breaks
-    /// a handshake in progress. Also used as the host secret if
+    /// a handshake in progress. A listener set up within 128 s of a rotation
+    /// takes those cookies too if given the previous key first, then the
+    /// current one. Also used as the host secret if
     /// [`Tcb::set_secret`] was not called.
     pub fn set_cookie_secret(&mut self, secret: &[u8; 16]) {
-        self.install_cookie_key(*secret);
+        self.install_cookie_key(*secret, true);
         self.cookie_secret_explicit = true;
     }
 
     /// Make `key` the current cookie key. The old one keeps validating for
     /// the lifetime of the cookies issued under it (two time buckets from
-    /// now) — and only if any were: otherwise every forged cookie ACK would
-    /// pay for a second key for nothing.
-    fn install_cookie_key(&mut self, key: [u8; 16]) {
-        if self.cookie_secret_set && self.cookie_secret != key && self.cookie_secret_used {
+    /// now).
+    fn install_cookie_key(&mut self, key: [u8; 16], explicit: bool) {
+        // A key of the same kind replaces one that may have issued cookies
+        // on another listener (the host gives a new listener the previous
+        // key, then the current one). Only a derived key that an explicit
+        // one replaces before any cookie went out under it is forgotten
+        // (the usual setup order, `set_secret` then `set_cookie_secret`).
+        let rotation = self.cookie_secret_used || self.cookie_secret_explicit == explicit;
+        if self.cookie_secret_set && self.cookie_secret != key && rotation {
             self.prev_cookie_secret = self.cookie_secret;
             self.prev_cookie_secret_set = true;
             self.prev_cookie_until_ms = self
@@ -1149,21 +1168,37 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
     // ---------------------------------------------------------------------
 
     /// Active open: `CLOSED` → `SYN_SENT`. The SYN offers MSS, Window Scale,
-    /// Timestamps, SACK-permitted and ECN (RFC 3168 §6.1.1).
+    /// Timestamps, SACK-permitted and ECN (RFC 3168 §6.1.1). The configured
+    /// `iss` starts the TCB's first connection; one opened later without
+    /// [`Tcb::reinit`] draws a fresh ISS keyed by the host secret, and
+    /// returns `InvalidState` if none is installed (as it does unless the
+    /// TCB is `CLOSED`): then `reinit` it with a new CSPRNG `iss`.
     pub fn connect(&mut self) -> Result<(), TcpError> {
         if self.state != State::Closed {
             return Err(TcpError::InvalidState);
         }
         self.is_listener = false;
+        // The configured ISS serves one connection: a TCB connected again
+        // without `reinit` draws a fresh one from the host secret
+        // (RFC 6528), so the new connection neither repeats a sequence
+        // space its peer may still hold segments of nor starts from a
+        // number seen on the wire. Without a secret there is nothing
+        // unpredictable to draw from: the host must `reinit` with a new
+        // ISS.
+        if self.iss_used {
+            self.cfg_iss = self.next_active_iss().ok_or(TcpError::InvalidState)?;
+        }
+        self.iss_used = true;
         self.reset_connection_state();
         self.ts_offset = self.ts_offset_for(self.remote);
         self.state = State::SynSent;
         self.syn_xmit_ms = self.now_ms;
-        if self.emit_syn()? {
-            self.snd_nxt = self.iss.wrapping_add(1);
-            self.syn_unacked = true;
-            self.arm_rto();
-        }
+        // With the egress ring full the SYN is not staged; the timer below
+        // sends it (as a retransmission) once the host has drained.
+        let _ = self.emit_syn()?;
+        self.snd_nxt = self.iss.wrapping_add(1);
+        self.syn_unacked = true;
+        self.arm_rto();
         Ok(())
     }
 

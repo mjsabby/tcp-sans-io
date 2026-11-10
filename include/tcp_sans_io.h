@@ -82,6 +82,10 @@ int32_t tcp_init(TcpStreamHandle* storage,
 int32_t tcp_destroy(TcpStreamHandle* handle);
 
 /* ---- Connection control ----------------------------------------------- */
+/* Active open from CLOSED. The `iss` given to tcp_init starts the handle's
+ * first connection. A later tcp_connect on the same handle draws a fresh ISS
+ * from the host secret (tcp_set_secret); without one it returns
+ * TCP_ERR_INVALID_STATE: tcp_init the storage again with a new CSPRNG iss. */
 int32_t tcp_connect(TcpStreamHandle* handle, uint64_t now_ms);
 /* Passive open (CLOSED / TIME_WAIT -> LISTEN). Requires tcp_set_secret (or
  * tcp_set_cookie_secret) first: TCP_ERR_INVALID_STATE otherwise. The listener
@@ -122,7 +126,8 @@ int32_t tcp_set_keepalive(TcpStreamHandle* handle, uint64_t now_ms,
                           uint32_t idle_ms, uint32_t intvl_ms, uint8_t count);
 
 /* Set the RFC 9293 3.8.3 USER TIMEOUT: max time the connection may go without
- * forward progress (a full segment acknowledged) while it still has send
+ * forward progress (a full segment acknowledged, or anything at all when less
+ * than a segment was waiting) while it still has send
  * data, before it aborts (ConnectionReset via tcp_poll ERROR / tcp_recv, no
  * RST). ON BY DEFAULT (5 min) — bounds the zero-window / dribbled-ACK DoS (an
  * alive-but-stalling peer answering probes while never opening its window).

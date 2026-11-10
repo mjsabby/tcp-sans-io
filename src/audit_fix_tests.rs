@@ -685,3 +685,218 @@ fn icmp_pmtu_report_is_checked_and_expires() {
     assert_eq!(round(&mut c, now + 100, &mut una, &mut tsv), 1500);
     assert_eq!(c.stats().mss, 1448, "restored once the probe arrived");
 }
+
+/// Any acceptable ACK used to restart the retransmission count, so a peer
+/// that kept sending (its own data, keepalives) kept a path-MTU black hole
+/// from ever being detected and the R2 abort from ever firing: the transfer
+/// stalled until the USER TIMEOUT, or for good with that off. Only an ACK
+/// of new data restarts it now.
+#[test]
+fn reverse_traffic_does_not_hide_a_black_hole_or_block_r2() {
+    let (mut c, iss) = established_ts();
+    c.set_user_timeout(0);
+    c.send(&[7u8; 20_000]).unwrap();
+    let (mut sseq, mut tsv) = (5001u32, 2u32);
+    let mut clamped_at = None;
+    let mut now = 20u64;
+    while now < 900_000 && c.state() != State::Closed {
+        c.set_now(now);
+        c.tick().unwrap();
+        drain(&mut c);
+        if (now - 20) % 500 == 0 {
+            // The peer's own data: acknowledges nothing of ours.
+            tsv += 1;
+            let _ = c.inject_packet(&pkt(
+                SRV,
+                A,
+                sseq,
+                iss + 1,
+                flags::ACK,
+                8192,
+                &ts(tsv, 0),
+                &[1u8; 10],
+            ));
+            sseq += 10;
+            drain(&mut c);
+            let mut buf = [0u8; 64];
+            let _ = c.recv(&mut buf);
+        }
+        if clamped_at.is_none() && c.stats().mss < 1448 {
+            clamped_at = Some(now);
+        }
+        now += 50;
+    }
+    assert!(
+        clamped_at.is_some_and(|t| t < 30_000),
+        "black-hole clamp after a few timeouts, got {clamped_at:?}"
+    );
+    assert_eq!(
+        c.state(),
+        State::Closed,
+        "R2 gives up on unacknowledged data"
+    );
+    assert!(now < 600_000, "aborted at {now} ms");
+}
+
+/// The USER TIMEOUT used to count progress only in whole segments, so an
+/// application trickling tiny records (always something in flight, under
+/// one MSS acknowledged in 5 minutes) was aborted although every byte was
+/// acknowledged promptly. Against an open window any acknowledgment counts.
+#[test]
+fn user_timeout_spares_a_healthy_trickle() {
+    let (mut c, iss) = established_ts();
+    let mut sent: Vec<(u64, u32)> = Vec::new();
+    let (mut una, mut tsv) = (iss + 1, 2u32);
+    let mut now = 20u64;
+    while now < 400_000 {
+        c.set_now(now);
+        if (now - 20) % 250 == 0 {
+            c.send(&[0x55]).unwrap();
+        }
+        c.tick().unwrap();
+        for o in drain(&mut c) {
+            if o.total_len > 52 {
+                sent.push((now, o.seq.wrapping_add(o.total_len as u32 - 52)));
+            }
+        }
+        // The peer acknowledges 300 ms after each segment left.
+        let due = sent
+            .iter()
+            .filter(|&&(t, e)| t + 300 <= now && (e.wrapping_sub(una) as i32) > 0)
+            .map(|&(_, e)| e)
+            .last();
+        if let Some(e) = due {
+            una = e;
+            tsv += 1;
+            c.inject_packet(&pkt(SRV, A, 5001, una, flags::ACK, 8192, &ts(tsv, 0), &[]))
+                .unwrap();
+            drain(&mut c);
+        }
+        assert_eq!(c.state(), State::Established, "aborted at {now} ms");
+        now += 50;
+    }
+    assert!(una.wrapping_sub(iss) > 1200, "the trickle was acknowledged");
+}
+
+/// The previous cookie key used to be kept only by a TCB that had itself
+/// issued a cookie under it, so the host's next listener, given the old key
+/// and then the new, forgot the old one and reset every client whose
+/// handshake straddled the rotation.
+#[test]
+fn cookie_survives_a_rotation_at_the_next_listener() {
+    let (k1, k2) = ([0x11u8; 16], [0x22u8; 16]);
+    let mut s = listener();
+    s.set_cookie_secret(&k1);
+    s.inject_packet(&syn(A, 100, &syn_opts(None, false, None)))
+        .unwrap();
+    drain(&mut s);
+    s.set_now(5);
+    s.inject_packet(&syn(B, 200, &syn_opts(Some(900), true, Some(7))))
+        .unwrap();
+    let sb = drain(&mut s).remove(0);
+
+    let mut f: Box<Tcb> = Box::new(
+        Tcb::new(TcbConfig {
+            local: ep(SRV),
+            remote: ep(([0; 4], 0)),
+            iss: 78,
+            initial_rto_ms: 1000,
+        })
+        .unwrap(),
+    );
+    f.set_now(1000);
+    f.set_secret(&[0x42; 16]);
+    f.set_cookie_secret(&k1);
+    f.set_cookie_secret(&k2);
+    f.listen().unwrap();
+    let ack = ts(901, sb.opts.ts.unwrap().0);
+    f.inject_packet(&pkt(B, SRV, 201, sb.seq + 1, flags::ACK, 65535, &ack, &[]))
+        .unwrap();
+    assert_eq!(f.state(), State::Established);
+    assert_eq!(f.remote(), Some(ep(B)));
+}
+
+/// `connect()` with the egress ring full used to stage no SYN and arm no
+/// timer: SYN_SENT with nothing to wake it. The timer now sends the SYN.
+#[test]
+fn connect_with_a_full_egress_ring_still_sends_its_syn() {
+    let mut s = listener();
+    s.inject_packet(&syn(A, 100, &syn_opts(None, false, None)))
+        .unwrap();
+    drain(&mut s);
+    for k in 0..200u32 {
+        let src = ([198, 18, 2, (k % 250) as u8], 3000 + k as u16);
+        s.inject_packet(&syn(src, k, &syn_opts(None, false, None)))
+            .unwrap();
+    }
+    s.abort().unwrap();
+    s.set_now(10);
+    s.connect().unwrap();
+    assert_eq!(s.state(), State::SynSent);
+    let due = s.next_deadline().expect("a timer is armed");
+    let out = drain(&mut s);
+    assert!(out
+        .iter()
+        .all(|o| o.flags & flags::SYN == 0 || o.flags & flags::ACK != 0));
+    s.set_now(due);
+    s.tick().unwrap();
+    let out = drain(&mut s);
+    assert_eq!(out.len(), 1);
+    assert_eq!(
+        (out[0].dst, out[0].flags & (flags::SYN | flags::ACK)),
+        (A, flags::SYN)
+    );
+    s.debug_validate_invariants().unwrap();
+}
+
+/// A TCB connected again without `reinit` used to repeat its configured
+/// ISS on every connection (RFC 6528 asks for a fresh one). It now draws
+/// one from the host secret, and refuses without a secret.
+#[test]
+fn reconnect_draws_a_fresh_iss_or_is_refused() {
+    let (mut c, iss) = client();
+    assert_eq!(drain(&mut c)[0].seq, iss);
+    c.abort().unwrap();
+    drain(&mut c);
+    assert_eq!(c.connect(), Err(TcpError::InvalidState));
+    assert_eq!(c.state(), State::Closed);
+    assert!(drain(&mut c).is_empty());
+
+    c.set_secret(&[9; 16]);
+    let mut seen = vec![iss];
+    for k in 1..4u64 {
+        c.set_now(k * 7);
+        c.connect().unwrap();
+        let s = drain(&mut c);
+        assert_eq!(s[0].flags & flags::SYN, flags::SYN);
+        assert!(!seen.contains(&s[0].seq), "ISS {:#x} reused", s[0].seq);
+        seen.push(s[0].seq);
+        c.abort().unwrap();
+        drain(&mut c);
+    }
+}
+
+/// The other side of the rule: with a full segment or more waiting, a peer
+/// that acknowledges a byte now and then is not making progress, whatever
+/// window it advertises, and the USER TIMEOUT still reaps it.
+#[test]
+fn user_timeout_reaps_a_byte_at_a_time_acker_with_an_open_window() {
+    let (mut c, iss) = established_ts();
+    c.send(&[7u8; 20_000]).unwrap();
+    let (mut una, mut tsv) = (iss + 1, 2u32);
+    let mut now = 20u64;
+    while now < 400_000 && c.state() != State::Closed {
+        c.set_now(now);
+        c.tick().unwrap();
+        drain(&mut c);
+        if (now - 20) % 60_000 == 0 {
+            una += 1;
+            tsv += 1;
+            let _ = c.inject_packet(&pkt(SRV, A, 5001, una, flags::ACK, 8192, &ts(tsv, 0), &[]));
+            drain(&mut c);
+        }
+        now += 50;
+    }
+    assert_eq!(c.state(), State::Closed);
+    assert!((300_000..=301_000).contains(&now), "aborted at {now} ms");
+}

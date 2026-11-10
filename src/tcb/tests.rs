@@ -789,6 +789,7 @@ fn connect_after_reset_starts_clean() {
     .unwrap();
     assert_eq!(t.state(), State::Closed);
     t.set_now(1_000);
+    t.set_secret(&[7; 16]);
     t.connect().unwrap();
     assert_eq!(t.error, None);
     assert_eq!(t.send_ring.len(), 0);

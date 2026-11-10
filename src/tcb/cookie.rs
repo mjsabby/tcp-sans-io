@@ -154,6 +154,16 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
         }
     }
 
+    /// ISS for an active open after the first on this TCB (the host's
+    /// `iss` served that one): keyed like [`Self::passive_iss`], so it is
+    /// unpredictable and never repeats the previous connection's. `None`
+    /// without a secret.
+    pub(super) fn next_active_iss(&self) -> Option<u32> {
+        let k = self.host_key()?;
+        let h = Self::tuple_hash(k, self.local, self.remote, b'A', self.cfg_iss) as u32;
+        Some(h.wrapping_add((self.now_ms as u32).wrapping_mul(250)))
+    }
+
     /// 32-bit cookie: top 2 bits = MSS index, then the parity of `bucket`,
     /// then a 29-bit MAC.
     pub(super) fn compute_cookie(

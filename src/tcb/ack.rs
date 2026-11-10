@@ -34,11 +34,16 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
     /// Process the ACK field of a segment that passed [`Self::ack_acceptable`].
     pub(super) fn process_ack(&mut self, seg: &Segment<'_>) -> Result<(), TcpError> {
         let ack = seg.ack;
-        // Any acceptable ACK is proof of life (RFC 9293 §3.8.3 R2).
-        self.rtx_count = 0;
         if seq_lt(ack, self.snd_una) {
             return Ok(()); // old ACK: ignore the field
         }
+        // The peer answers, so window probes start over (Linux
+        // `icsk_probes_out`). The retransmission count, which black-hole
+        // detection reads too, restarts only on an ACK of new data (below,
+        // Linux `icsk_retransmits`): reverse traffic proves the path in one
+        // direction only, and must not keep a black hole from being found
+        // or the R2 abort from firing.
+        self.probes_out = 0;
 
         let prior_una = self.snd_una;
         // FlightSize before this ACK. A reduction this ACK starts (loss or
@@ -93,6 +98,12 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
         // ---- Cumulative ACK --------------------------------------------
         let acked = ack.wrapping_sub(prior_una);
         if acked > 0 {
+            self.rtx_count = 0;
+            // What the peer could have acknowledged: in flight plus queued.
+            let backlog = self
+                .snd_nxt
+                .wrapping_sub(self.data_una())
+                .saturating_add(self.unsent_bytes());
             let syn_acked = self.syn_outstanding();
             let fin_acked =
                 self.fin_sent && seq_le(prior_una, self.fin_seq) && seq_gt(ack, self.fin_seq);
@@ -153,7 +164,7 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
                     self.update_rtt(r);
                 }
             }
-            self.note_progress(data_acked.saturating_add(u32::from(fin_acked)));
+            self.note_progress(data_acked.saturating_add(u32::from(fin_acked)), backlog);
         }
         self.pmtu_probe_on_ack();
 
@@ -316,7 +327,7 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
 
     /// Re-arm the USER TIMEOUT only on meaningful progress: at least one
     /// full segment acknowledged since the last re-arm (or all work done).
-    fn note_progress(&mut self, acked: u32) {
+    fn note_progress(&mut self, acked: u32, backlog: u32) {
         self.persist_backoff_ms = 0;
         if self.user_timeout_ms == 0 {
             return;
@@ -327,7 +338,14 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
             return;
         }
         self.ut_progress = self.ut_progress.saturating_add(acked);
-        if self.ut_progress >= self.mss_payload() || !self.user_timeout_deadline.is_armed() {
+        // Progress is a full segment acknowledged, so a peer cannot hold
+        // the connection by acknowledging a byte now and then, whatever
+        // window it advertises. Unless less than a segment was there to
+        // acknowledge (`backlog`, in flight plus queued before this ACK):
+        // then the application is the slow one, and a trickle of tiny
+        // records it writes must not be aborted.
+        let mss = self.mss_payload();
+        if backlog < mss || self.ut_progress >= mss || !self.user_timeout_deadline.is_armed() {
             self.ut_progress = 0;
             self.user_timeout_deadline =
                 Deadline::at(self.now_ms.saturating_add(u64::from(self.user_timeout_ms)));
