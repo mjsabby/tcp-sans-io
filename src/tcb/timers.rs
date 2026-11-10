@@ -31,7 +31,12 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
         }
         match self.state {
             State::SynSent => self.syn_sent_timer()?,
-            State::SynRcvd => self.syn_rcvd_timer()?,
+            State::SynRcvd => {
+                self.syn_rcvd_timer()?;
+                if self.is_listener {
+                    self.backlog_timers()?;
+                }
+            }
             _ => {}
         }
         // A due tail-loss probe goes first: it re-arms the RTO (RFC 8985 §7.3).
@@ -102,6 +107,7 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
         if self.syn_rcvd_retries > MAX_SYN_RCVD_RETRIES {
             if self.is_listener {
                 self.reset_to_listen_or_closed();
+                self.backlog_refill_slot();
             } else {
                 self.abort_local();
             }

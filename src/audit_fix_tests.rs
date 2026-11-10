@@ -104,6 +104,9 @@ fn listener() -> Box<Tcb> {
         .unwrap(),
     );
     t.set_secret(&[0x42; 16]);
+    // No backlog beside the slot: these tests pin the cookie path, which
+    // overlapping handshakes take once the backlog is full.
+    t.set_listen_backlog(0);
     t.set_now(0);
     t.listen().unwrap();
     t
@@ -1117,3 +1120,6 @@ fn half_close_is_not_timed_until_the_host_closes() {
     let out = drain(&mut c);
     assert_eq!(out.last().unwrap().flags & flags::RST, flags::RST);
 }
+
+#[path = "backlog_tests.rs"]
+mod backlog;

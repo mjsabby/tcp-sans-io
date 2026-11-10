@@ -16,6 +16,7 @@
 //! * `cookie` — SYN cookies, keyed hashing, timestamp offsets.
 
 mod ack;
+mod backlog;
 mod cookie;
 mod input;
 mod output;
@@ -437,6 +438,10 @@ pub struct Tcb<
     // ---- Passive open.
     is_listener: bool,
     syn_rcvd_retries: u8,
+    /// Half-opens pending beside the one in the slot (see `backlog.rs`),
+    /// and how many of the records may be used.
+    backlog: [backlog::HalfOpen; backlog::BACKLOG],
+    backlog_limit: u8,
 
     // ---- Keepalive (RFC 9293 §3.8.4).
     keepalive_idle_ms: u32,
@@ -604,6 +609,8 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
         self.keepalive_count = DEFAULT_KEEPALIVE_COUNT;
         self.user_timeout_ms = DEFAULT_USER_TIMEOUT_MS;
         self.fin_wait2_timeout_ms = DEFAULT_FIN_WAIT2_TIMEOUT_MS;
+        self.backlog_clear();
+        self.backlog_limit = backlog::BACKLOG as u8;
         // Not per connection: what is staged may be for other peers (a
         // listener's cookie SYN-ACKs and RSTs), and the limit on replies to
         // stray segments must survive listener transitions.
@@ -926,6 +933,7 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
         ]
         .into_iter()
         .filter_map(Deadline::get)
+        .chain(self.backlog_deadline())
         .min()
     }
 
@@ -1198,6 +1206,7 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
             return Err(TcpError::InvalidState);
         }
         self.is_listener = false;
+        self.backlog_clear();
         // The configured ISS serves one connection: a TCB connected again
         // without `reinit` draws a fresh one from the host secret
         // (RFC 6528), so the new connection neither repeats a sequence
@@ -1256,6 +1265,7 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
             port: 0,
         };
         self.is_listener = true;
+        self.backlog_clear();
         self.reset_connection_state();
         self.state = State::Listen;
         Ok(())
@@ -1409,6 +1419,7 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
             State::SynRcvd => {
                 self.emit_final_rst()?;
                 self.is_listener = false;
+                self.backlog_clear();
                 self.close_clean();
                 return Ok(());
             }
@@ -1420,6 +1431,7 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
             | State::LastAck => return Ok(()),
             State::SynSent | State::Listen => {
                 self.is_listener = false;
+                self.backlog_clear();
                 self.reset_connection_state();
                 self.state = State::Closed;
                 return Ok(());
@@ -1437,8 +1449,15 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
             State::Closed => return Ok(()),
             State::Listen | State::SynSent => {
                 self.is_listener = false;
+                self.backlog_clear();
             }
             _ => {
+                // A listener aborted mid-handshake stops listening; a
+                // connection keeps its pending half-opens for the host's
+                // next listener to adopt.
+                if self.state == State::SynRcvd {
+                    self.backlog_clear();
+                }
                 self.emit_final_rst()?;
             }
         }

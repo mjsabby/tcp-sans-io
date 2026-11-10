@@ -360,6 +360,51 @@ pub unsafe extern "C" fn tcp_close(handle: *mut TcpStreamHandle, now_ms: u64) ->
     }
 }
 
+/// Move the handshakes still pending in `from` (a listener that has become a
+/// connection, or closed) into `listener`, which goes on serving them: call
+/// it when setting up the listener that replaces `from`, after
+/// [`tcp_listen`]. Returns how many were taken (>= 0), or a negative error
+/// for an invalid handle. See [`Tcb::adopt_half_opens`].
+///
+/// # Safety
+/// Both handles must be NULL or live handles from [`tcp_init`], distinct,
+/// and not in use by another thread.
+#[no_mangle]
+pub unsafe extern "C" fn tcp_adopt_half_opens(
+    listener: *mut TcpStreamHandle,
+    from: *mut TcpStreamHandle,
+) -> i32 {
+    if listener.is_null() || from.is_null() || core::ptr::eq(listener, from) {
+        return TcpError::NullPointer.as_code();
+    }
+    // SAFETY: both non-null (checked) and initialised (caller contract).
+    if unsafe { magic(listener) } != MAGIC_LIVE || unsafe { magic(from) } != MAGIC_LIVE {
+        return TcpError::NullPointer.as_code();
+    }
+    // SAFETY: live, distinct handles the caller owns exclusively.
+    let (Some(l), Some(f)) = (unsafe { listener.as_mut() }, unsafe { from.as_mut() }) else {
+        return TcpError::NullPointer.as_code();
+    };
+    i32::try_from(l.inner.adopt_half_opens(&mut f.inner)).unwrap_or(i32::MAX)
+}
+
+/// How many handshakes a listener may hold pending beside the one in its
+/// slot (default and most: 8; 0 answers every overlapping SYN with a SYN
+/// cookie).
+///
+/// # Safety
+/// `handle` must be NULL or a live handle from [`tcp_init`].
+#[no_mangle]
+pub unsafe extern "C" fn tcp_set_listen_backlog(handle: *mut TcpStreamHandle, n: u32) -> i32 {
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        with_handle(handle, |h| {
+            h.set_listen_backlog(n as usize);
+            Ok(())
+        })
+    }
+}
+
 /// Half-close: FIN after queued data, while the host keeps reading (as
 /// `shutdown(SHUT_WR)`). Unlike [`tcp_close`], the FIN_WAIT_2 timeout does
 /// not run until the host calls [`tcp_close`]. Idempotent.

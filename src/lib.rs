@@ -54,10 +54,13 @@
 //!    internet-facing active opens, and set the path MTU with [`Tcb::set_mtu`]
 //!    (1420 behind a default WireGuard interface).
 //!
-//! 5. **Understand the listener's SYN cookies.** A listener holds one
-//!    half-open handshake statefully (keeping every option the client offers)
-//!    and answers SYNs with RFC 4987 cookies while that slot is busy; a valid
-//!    cookie ACK takes the slot over, so spoofed SYNs cannot lock it. The
+//! 5. **Understand the listener's backlog and SYN cookies.** A listener
+//!    holds up to nine half-open handshakes statefully (keeping every option
+//!    the client offers) and becomes the connection of whichever completes
+//!    first: move the rest to your next listener with
+//!    [`Tcb::adopt_half_opens`]. Once those are taken it answers SYNs with
+//!    RFC 4987 cookies; a valid cookie ACK takes the listener's slot, so
+//!    spoofed SYNs cannot lock it. The
 //!    cookie key derives from the host secret; [`Tcb::set_cookie_secret`]
 //!    installs an explicit one instead. Rotating it keeps the previous key
 //!    valid, so cookies survive one rotation (rotate no more often than every

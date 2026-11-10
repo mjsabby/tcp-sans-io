@@ -833,8 +833,10 @@ const COOKIE_SECRET: [u8; 16] = [
     0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe, 0xef, 0xcd, 0xab, 0x89, 0x67, 0x45, 0x23, 0x01,
 ];
 
-/// Fill the listener's half-open slot with a SYN that is never completed.
+/// Fill the listener's half-open slot with a SYN that is never completed,
+/// with no backlog beside it, so further SYNs are answered with cookies.
 fn occupy_slot(s: &mut Tcb) {
+    s.set_listen_backlog(0);
     let syn = build_in_from(
         ATTACKER_IP,
         ATTACKER_PORT,

@@ -89,11 +89,22 @@ int32_t tcp_destroy(TcpStreamHandle* handle);
 int32_t tcp_connect(TcpStreamHandle* handle, uint64_t now_ms);
 /* Passive open (CLOSED / TIME_WAIT -> LISTEN). Requires tcp_set_secret (or
  * tcp_set_cookie_secret) first: TCP_ERR_INVALID_STATE otherwise. The listener
- * holds one half-open handshake statefully and answers SYNs from other peers
- * with SYN cookies while that slot is busy; a valid cookie ACK takes the slot
- * over. Those replies go to other peers than the half-open's: route outbound
+ * holds up to nine handshakes at once (see tcp_set_listen_backlog) and
+ * becomes the connection of whichever completes first; once they are taken,
+ * further SYNs are answered with SYN cookies, and a valid cookie ACK takes
+ * the listener's slot. Its replies go to several peers: route outbound
  * packets by their destination address, not by handle. */
 int32_t tcp_listen (TcpStreamHandle* handle, uint64_t now_ms);
+/* Handshakes a listener may hold pending beside the one in its slot (default
+ * and most: 8; 0 answers every overlapping SYN with a SYN cookie). */
+int32_t tcp_set_listen_backlog(TcpStreamHandle* handle, uint32_t n);
+/* Move the handshakes still pending in `from` (a listener that has become a
+ * connection, or closed) into `listener`, which goes on serving them. Call it
+ * when setting up the listener that replaces `from`, after tcp_listen; both
+ * need the same local endpoint and secrets. Returns how many were taken
+ * (>= 0), or a negative error for an invalid handle. Without this call the
+ * pending clients fall back to their SYN cookies. */
+int32_t tcp_adopt_half_opens(TcpStreamHandle* listener, TcpStreamHandle* from);
 /* Graceful close: FIN after queued data; the host is done with the connection
  * in both directions. Once the FIN is acknowledged the peer has the
  * FIN_WAIT_2 timeout (60 s; reading restarts it) to send its own. */
