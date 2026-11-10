@@ -11,6 +11,9 @@ use crate::state::State;
 impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
     pub(super) fn run_timers(&mut self) -> Result<(), TcpError> {
         let now = self.now_ms;
+        if self.prev_cookie_pending {
+            self.settle_cookie_rotation();
+        }
         if self.time_wait_deadline.due(now) {
             // 2·MSL over. Unread received data stays readable. Segments the
             // peer sent during TIME_WAIT may have re-armed keepalive, so

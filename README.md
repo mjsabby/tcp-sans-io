@@ -56,7 +56,7 @@ shows what that costs against Linux CUBIC on lossy long paths.
 | Zero-window persist probes | RFC 9293 §3.8.6.1 | ✅ Linux-style probe at `SND.UNA − 1` |
 | Delayed ACK (2nd full segment / 40 ms; immediate for out-of-order and duplicates) | RFC 1122 §4.2.3.2, RFC 5681 §4.2 | ✅ |
 | R2 retransmission limit, USER TIMEOUT, keepalive | RFC 9293 §3.8.3–3.8.4 | ✅ on by default |
-| FIN_WAIT_2 timeout | Linux `tcp_fin_timeout` | ✅ 60 s, restarted only by the application reading |
+| FIN_WAIT_2 timeout | Linux `tcp_fin_timeout` | ✅ 60 s after `tcp_close`, restarted only by the application reading; not run after a half-close (`tcp_shutdown_write`) until the host closes |
 | TIME_WAIT, re-ACK and restart on a retransmitted FIN | RFC 9293 §3.10.7.4 | ✅ 60 s; restarts capped at 120 s after entry |
 
 ### Deliberately deferred
@@ -177,7 +177,7 @@ mis-ordering, corruption, a panic, or an unbounded loop.
 | `MAX_RETRANSMITS` | 10 | `tcb/mod.rs` | RFC 9293 §3.8.3 "R2": consecutive timeouts (data or FIN) without an ACK of new data, or zero-window probes without any answer, before abort. The peer's own traffic does not restart the timeout count (as Linux), so a path that black-holes our segments is still detected. |
 | USER TIMEOUT | 300 s | `tcb/mod.rs` | Max time with outstanding send work but less than one full segment acknowledged; reaps stalled, zero-window and sub-MSS-trickle peers, whatever window they advertise. When less than a segment was waiting to be acknowledged, any acknowledgment counts, so an application trickling tiny records is not aborted. A reader acknowledging a full segment per period is live progress, not a stall (see *Threat model*). `set_user_timeout(0)` disables. |
 | Keepalive | 600 s idle / 60 s / 4 probes | `tcb/mod.rs` | Reaps a vanished peer on an idle connection: `ESTABLISHED`, or half-closed (`CLOSE_WAIT`, `FIN_WAIT_2`), as in Linux. `set_keepalive(0, …)` disables. |
-| FIN_WAIT_2 timeout | 60 s | `tcb/mod.rs` | Time a peer may leave its half open after ACKing our FIN; restarted only when the application reads, never by the peer's data alone. |
+| FIN_WAIT_2 timeout | 60 s | `tcb/mod.rs` | Time a peer may leave its half open after ACKing our FIN, once the host has closed (`tcp_close`); restarted only when the application reads, never by the peer's data alone. A host that half-closes with `tcp_shutdown_write` and keeps reading is not timed until it calls `tcp_close`. |
 | Black-hole MSS clamp / probe | 3, 5 RTOs → 1024, 536 / 10 s … 10 min | `tcb/mod.rs` | Consecutive timeouts of a large segment clamp the MSS; one probe segment at the next larger size (first after 10 s, doubling up to 10 min on failure) restores it once it arrives. |
 | Out-of-window reply rate | 1 per 500 ms | `tcb/mod.rs` | Challenge ACKs, dup ACKs for unacceptable segments and RSTs to stray segments, per connection. Exempt: one immediate ACK (D-SACK) per data / FIN segment that could be the peer's own retransmission — acceptable ACK, plus a timestamp when negotiated — since the peer's loss recovery depends on it. |
 | Cookie validity | 64–128 s | `tcb/cookie.rs` | Two 64 s buckets (the cookie names its own by parity), under the current key and, for 128 s after a rotation, the previous one. 29-bit SipHash MAC: 2⁻²⁹ blind forgery per attempt (2⁻²⁸ after a rotation), as Linux. A listener takes a valid cookie ACK at any time, not only while under load. |
@@ -668,7 +668,11 @@ free(mem);                             // you own the memory
   or mis-routed wire, not fatal.
 - Treat `WOULD_BLOCK` from `send` as backpressure (the send ring is full);
   retry after a later turn drains it. Treat `CONNECTION_CLOSED` from `recv`
-  as EOF and `CONNECTION_RESET` as an aborted peer.
+  as EOF and `CONNECTION_RESET` as an aborted connection (after a peer's RST
+  or a timeout, `recv` first returns the bytes that had already arrived, as
+  Linux). To end only your sending side and keep reading, call
+  `tcp_shutdown_write`, then `tcp_close` when done: `tcp_close` alone gives
+  the peer 60 s to finish once your FIN is acknowledged.
 - Drive `tick()` *event-driven*: right after a batch of injects or sends,
   and when `tcp_next_deadline()` comes due.
 
@@ -697,7 +701,7 @@ inspecting state directly:
 | `PEER_CLOSED` | Peer sent FIN — keep draining `recv`, then `close` your side. |
 | `CLOSED` | Fully torn down; safe to `destroy`. After a clean close, bytes the peer sent before its FIN stay readable (`READABLE`) until `recv` drains them and reports EOF. |
 | `TX_PENDING` | Egress ring non-empty — you must `extract_packet`. |
-| `ERROR` | A terminal error latched; `recv` surfaces the code (`RESET`/`CLOSED`). |
+| `ERROR` | A terminal error latched; `recv` surfaces the code (`RESET`/`CLOSED`), after a peer's RST or a timeout only once it has returned the bytes already received. |
 | `LISTENING` / `HALF_OPEN` | Server: in `LISTEN` / mid-handshake (`SYN_RCVD`). |
 
 ### Using it from Rust (no FFI)

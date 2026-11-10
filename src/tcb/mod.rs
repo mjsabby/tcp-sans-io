@@ -418,6 +418,9 @@ pub struct Tcb<
     time_wait_since_ms: u64,
     fin_wait2_timeout_ms: u32,
     fin_wait2_deadline: Deadline,
+    /// The host half-closed with [`Tcb::shutdown_write`] and still reads:
+    /// FIN_WAIT_2 is not timed until it calls [`Tcb::close`].
+    half_closed: bool,
     error: Option<TcpError>,
     /// `(SEQ, ACK)` of the connection's final RST, owed while the egress
     /// ring was full: staged as soon as the host takes a packet out.
@@ -466,6 +469,9 @@ pub struct Tcb<
     prev_cookie_secret: [u8; 16],
     prev_cookie_secret_set: bool,
     prev_cookie_until_ms: u64,
+    /// The previous key was installed since the clock was last set: its
+    /// lifetime has yet to start.
+    prev_cookie_pending: bool,
     secret: [u8; 16],
     secret_set: bool,
 
@@ -584,6 +590,7 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
         self.prev_cookie_secret = [0; 16];
         self.prev_cookie_secret_set = false;
         self.prev_cookie_until_ms = 0;
+        self.prev_cookie_pending = false;
         self.secret = [0; 16];
         self.secret_set = false;
         self.now_ms = 0;
@@ -699,6 +706,7 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
         self.time_wait_deadline = Deadline::OFF;
         self.time_wait_since_ms = 0;
         self.fin_wait2_deadline = Deadline::OFF;
+        self.half_closed = false;
         self.error = None;
         self.owed_rst = None;
         self.syn_rcvd_retries = 0;
@@ -1023,7 +1031,7 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
     /// (the host still wants the peer's half); the peer's data alone does not.
     pub fn set_fin_wait2_timeout(&mut self, ms: u32) {
         self.fin_wait2_timeout_ms = ms;
-        self.fin_wait2_deadline = if ms != 0 && self.state == State::FinWait2 {
+        self.fin_wait2_deadline = if ms != 0 && self.state == State::FinWait2 && !self.half_closed {
             Deadline::at(self.now_ms.saturating_add(u64::from(ms)))
         } else {
             Deadline::OFF
@@ -1152,15 +1160,27 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
         if self.cookie_secret_set && self.cookie_secret != key && rotation {
             self.prev_cookie_secret = self.cookie_secret;
             self.prev_cookie_secret_set = true;
-            self.prev_cookie_until_ms = self
-                .now_ms
-                .saturating_add(2 * cookie::COOKIE_TIME_BUCKET_MS);
+            // The setters take no clock (a new or idle listener's `now_ms`
+            // is zero or stale): the old key's lifetime starts at the next
+            // call that brings one (see `settle_cookie_rotation`).
+            self.prev_cookie_pending = true;
         }
         if self.cookie_secret != key {
             self.cookie_secret_used = false;
         }
         self.cookie_secret = key;
         self.cookie_secret_set = true;
+    }
+
+    /// Start the previous cookie key's lifetime (two time buckets) from
+    /// the current clock, on the first clocked call after a rotation.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn settle_cookie_rotation(&mut self) {
+        self.prev_cookie_pending = false;
+        self.prev_cookie_until_ms = self
+            .now_ms
+            .saturating_add(2 * cookie::COOKIE_TIME_BUCKET_MS);
     }
 
     // ---------------------------------------------------------------------
@@ -1227,6 +1247,9 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
         }
         if !self.secret_set && !self.cookie_secret_set {
             return Err(TcpError::InvalidState);
+        }
+        if self.prev_cookie_pending {
+            self.settle_cookie_rotation();
         }
         self.remote = Endpoint {
             ip: [0u8; 4],
@@ -1302,15 +1325,22 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
     }
 
     /// Copy received in-order data out. Returns `ConnectionClosed` once the
-    /// ring is empty and the peer has FINned, `ConnectionReset` after an
-    /// abort. In `FIN_WAIT_2`, consuming data restarts the FIN_WAIT_2 timeout.
+    /// ring is empty and the peer has FINned, `ConnectionReset` after a
+    /// reset, a timeout or an abort (after a reset or a timeout, only once
+    /// the bytes received before it are read). In `FIN_WAIT_2`, consuming data restarts the FIN_WAIT_2 timeout.
     pub fn recv(&mut self, dst: &mut [u8]) -> Result<usize, TcpError> {
         if let Some(e) = self.error {
+            // A reset or a timeout keeps the bytes already received
+            // readable; the error follows the last of them.
+            if self.state == State::Closed && !self.recv_ring.is_empty() {
+                return Ok(self.recv_ring.read(dst));
+            }
             return Err(e);
         }
         let n = self.recv_ring.read(dst);
         if n > 0 {
-            if self.state == State::FinWait2 && self.fin_wait2_timeout_ms != 0 {
+            if self.state == State::FinWait2 && self.fin_wait2_timeout_ms != 0 && !self.half_closed
+            {
                 self.fin_wait2_deadline = Deadline::at(
                     self.now_ms
                         .saturating_add(u64::from(self.fin_wait2_timeout_ms)),
@@ -1331,8 +1361,42 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
         Ok(n)
     }
 
-    /// Begin a graceful close (FIN after all queued data). Idempotent.
+    /// Half-close: end our side of the stream (FIN after all queued data)
+    /// while the host keeps reading the peer's, as `shutdown(SHUT_WR)`.
+    /// Like [`Tcb::close`], except that the FIN_WAIT_2 timeout does not run:
+    /// the host still wants the peer's half, however long the peer takes
+    /// (keepalive still reaps a peer that vanished). Call [`Tcb::close`]
+    /// once done reading; the timeout starts then.
+    pub fn shutdown_write(&mut self) -> Result<(), TcpError> {
+        if matches!(
+            self.state,
+            State::Established | State::FinWait1 | State::FinWait2
+        ) {
+            self.half_closed = true;
+            self.fin_wait2_deadline = Deadline::OFF;
+        }
+        self.close_inner()
+    }
+
+    /// Begin a graceful close (FIN after all queued data): the host is done
+    /// with the connection, sending and receiving. Idempotent. Once our FIN
+    /// is acknowledged the peer has the FIN_WAIT_2 timeout to send its own
+    /// (reading received data restarts it); a host that only ends its
+    /// sending side and goes on reading uses [`Tcb::shutdown_write`].
     pub fn close(&mut self) -> Result<(), TcpError> {
+        if core::mem::take(&mut self.half_closed)
+            && self.state == State::FinWait2
+            && self.fin_wait2_timeout_ms != 0
+        {
+            self.fin_wait2_deadline = Deadline::at(
+                self.now_ms
+                    .saturating_add(u64::from(self.fin_wait2_timeout_ms)),
+            );
+        }
+        self.close_inner()
+    }
+
+    fn close_inner(&mut self) -> Result<(), TcpError> {
         match self.state {
             State::Established => self.state = State::FinWait1,
             State::CloseWait => self.state = State::LastAck,
@@ -1378,16 +1442,20 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
                 self.emit_final_rst()?;
             }
         }
+        // The application's own abort discards what it has not read.
+        self.recv_ring.clear();
         self.abort_local();
         Ok(())
     }
 
     /// Tear the connection down locally (no RST): R2 / USER TIMEOUT /
-    /// keepalive aborts, and the tail of `abort`. Surfaces `ConnectionReset`.
+    /// keepalive aborts, a peer's RST, and the tail of `abort`. Surfaces
+    /// `ConnectionReset` once the bytes already received are read: Linux
+    /// `tcp_done` purges only the write queue, and `tcp_recvmsg` returns
+    /// queued data ahead of the error.
     fn abort_local(&mut self) {
         self.state = State::Closed;
         self.error = Some(TcpError::ConnectionReset);
-        self.recv_ring.clear();
         self.release_buffers_and_timers();
     }
 

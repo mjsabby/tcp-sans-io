@@ -900,3 +900,220 @@ fn user_timeout_reaps_a_byte_at_a_time_acker_with_an_open_window() {
     assert_eq!(c.state(), State::Closed);
     assert!((300_000..=301_000).contains(&now), "aborted at {now} ms");
 }
+
+/// The key setters take no clock, so the previous key's 128 s used to be
+/// counted from a new listener's zero clock (or an idle one's stale clock)
+/// and had expired before the first packet: a rotation reset the handshakes
+/// in flight. Its lifetime now starts at the next clocked call.
+#[test]
+fn cookie_rotation_does_not_depend_on_the_clock_at_the_setter() {
+    let (k1, k2) = ([0x11u8; 16], [0x22u8; 16]);
+    let t0 = 10_000_000u64;
+    let mut s = listener();
+    s.set_cookie_secret(&k1);
+    // An idle listener holding K1, last touched at time 0.
+    let mut idle = listener();
+    idle.set_cookie_secret(&k1);
+
+    s.set_now(t0);
+    s.inject_packet(&syn(A, 100, &syn_opts(None, false, None)))
+        .unwrap();
+    drain(&mut s);
+    s.inject_packet(&syn(B, 200, &syn_opts(Some(900), true, Some(7))))
+        .unwrap();
+    let sb = drain(&mut s).remove(0);
+    let ack = pkt(
+        B,
+        SRV,
+        201,
+        sb.seq + 1,
+        flags::ACK,
+        65535,
+        &ts(901, sb.opts.ts.unwrap().0),
+        &[],
+    );
+
+    // A new listener set up in the documented order, clock first seen at
+    // `listen`.
+    let mut f: Box<Tcb> = Box::new(
+        Tcb::new(TcbConfig {
+            local: ep(SRV),
+            remote: ep(([0; 4], 0)),
+            iss: 79,
+            initial_rto_ms: 1000,
+        })
+        .unwrap(),
+    );
+    f.set_secret(&[0x42; 16]);
+    f.set_cookie_secret(&k1);
+    f.set_cookie_secret(&k2);
+    f.set_now(t0 + 100);
+    f.listen().unwrap();
+    f.inject_packet(&ack).unwrap();
+    assert_eq!(f.state(), State::Established, "new listener");
+
+    // The idle one is rotated without a clock, then gets the packet.
+    idle.set_cookie_secret(&k2);
+    idle.set_now(t0 + 100);
+    idle.inject_packet(&ack).unwrap();
+    assert_eq!(idle.state(), State::Established, "idle listener");
+
+    // The old key still lapses: 128 s after the rotation was first clocked.
+    let mut late = listener();
+    late.set_cookie_secret(&k1);
+    late.set_cookie_secret(&k2);
+    late.set_now(t0);
+    late.tick().unwrap();
+    late.set_now(t0 + 129_000);
+    late.inject_packet(&ack).unwrap();
+    assert_eq!(late.state(), State::Listen);
+}
+
+/// Bytes received and acknowledged, but not yet read, used to be discarded
+/// when a RST (or a local timeout) followed in the same batch of packets.
+/// They stay readable; the error follows the last of them, as on Linux.
+#[test]
+fn received_bytes_stay_readable_after_a_reset() {
+    let (mut c, iss) = established_ts();
+    c.set_now(30);
+    c.inject_packet(&pkt(
+        SRV,
+        A,
+        5001,
+        iss + 1,
+        flags::ACK,
+        8192,
+        &ts(2, 0),
+        b"last words",
+    ))
+    .unwrap();
+    c.inject_packet(&pkt(
+        SRV,
+        A,
+        5011,
+        iss + 1,
+        flags::RST,
+        0,
+        &TcpOptions::NONE,
+        &[],
+    ))
+    .unwrap();
+    assert_eq!(c.state(), State::Closed);
+    let mut buf = [0u8; 32];
+    let n = c.recv(&mut buf).unwrap();
+    assert_eq!(&buf[..n], b"last words");
+    assert_eq!(c.recv(&mut buf), Err(TcpError::ConnectionReset));
+
+    // The application's own abort discards what it has not read.
+    let (mut c, iss) = established_ts();
+    c.inject_packet(&pkt(
+        SRV,
+        A,
+        5001,
+        iss + 1,
+        flags::ACK,
+        8192,
+        &ts(2, 0),
+        b"unread",
+    ))
+    .unwrap();
+    c.abort().unwrap();
+    assert_eq!(c.recv(&mut buf), Err(TcpError::ConnectionReset));
+}
+
+/// After a tail loss probe, the peer's own data carrying the same ACK used
+/// to pass for "the probe repaired a loss" and halve the window, with
+/// nothing lost: a tax on every two-way connection.
+#[test]
+fn peer_data_after_a_tail_loss_probe_is_not_a_loss() {
+    let (mut c, iss) = established_ts();
+    c.send(&[7u8; 3 * 1448]).unwrap();
+    let mut now = 20u64;
+    c.set_now(now);
+    c.tick().unwrap();
+    assert_eq!(drain(&mut c).len(), 3);
+    while c.stats().tlp_count == 0 {
+        now += 5;
+        assert!(now < 2_000, "no tail loss probe");
+        c.set_now(now);
+        c.tick().unwrap();
+        drain(&mut c);
+    }
+    // The (delayed) ACK of everything, then the peer's next data segment.
+    let end = iss + 1 + 3 * 1448;
+    c.set_now(now + 1);
+    c.inject_packet(&pkt(SRV, A, 5001, end, flags::ACK, 8192, &ts(2, 0), &[]))
+        .unwrap();
+    let cwnd = c.stats().cwnd;
+    c.inject_packet(&pkt(
+        SRV,
+        A,
+        5001,
+        end,
+        flags::ACK,
+        8192,
+        &ts(3, 0),
+        &[1u8; 10],
+    ))
+    .unwrap();
+    assert_eq!(c.stats().cwnd, cwnd, "no loss, no reduction");
+    assert_eq!(c.stats().segs_retrans, 1, "just the probe");
+}
+
+/// `close()` was the only way to send a FIN, so a host that ended its
+/// sending side and kept reading was reset when the peer stayed silent for
+/// the 60 s FIN_WAIT_2 timeout. `shutdown_write()` half-closes without
+/// that timer; `close()` then starts it.
+#[test]
+fn half_close_is_not_timed_until_the_host_closes() {
+    let (mut c, iss) = established_ts();
+    c.set_keepalive(0, 0, 0);
+    c.set_now(20);
+    c.shutdown_write().unwrap();
+    let fin = drain(&mut c).remove(0);
+    assert_eq!(fin.flags & flags::FIN, flags::FIN);
+    c.set_now(30);
+    c.inject_packet(&pkt(
+        SRV,
+        A,
+        5001,
+        iss + 2,
+        flags::ACK,
+        8192,
+        &ts(2, 0),
+        &[],
+    ))
+    .unwrap();
+    assert_eq!(c.state(), State::FinWait2);
+    assert_eq!(c.next_deadline(), None, "nothing times the peer's half");
+    c.set_now(200_000);
+    c.tick().unwrap();
+    assert_eq!(c.state(), State::FinWait2);
+    c.inject_packet(&pkt(
+        SRV,
+        A,
+        5001,
+        iss + 2,
+        flags::ACK,
+        8192,
+        &ts(3, 0),
+        b"late data",
+    ))
+    .unwrap();
+    let mut buf = [0u8; 32];
+    assert_eq!(c.recv(&mut buf).unwrap(), 9);
+    c.set_now(200_100);
+    c.tick().unwrap(); // the delayed ACK
+    drain(&mut c);
+    assert_eq!(c.next_deadline(), None);
+
+    // Done reading: the usual FIN_WAIT_2 timeout applies from here.
+    c.set_now(300_000);
+    c.close().unwrap();
+    assert_eq!(c.next_deadline(), Some(360_000));
+    c.set_now(360_000);
+    c.tick().unwrap();
+    assert_eq!(c.state(), State::Closed);
+    let out = drain(&mut c);
+    assert_eq!(out.last().unwrap().flags & flags::RST, flags::RST);
+}

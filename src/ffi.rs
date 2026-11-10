@@ -360,6 +360,23 @@ pub unsafe extern "C" fn tcp_close(handle: *mut TcpStreamHandle, now_ms: u64) ->
     }
 }
 
+/// Half-close: FIN after queued data, while the host keeps reading (as
+/// `shutdown(SHUT_WR)`). Unlike [`tcp_close`], the FIN_WAIT_2 timeout does
+/// not run until the host calls [`tcp_close`]. Idempotent.
+///
+/// # Safety
+/// `handle` must be NULL or a live handle from [`tcp_init`].
+#[no_mangle]
+pub unsafe extern "C" fn tcp_shutdown_write(handle: *mut TcpStreamHandle, now_ms: u64) -> i32 {
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        with_handle(handle, |h| {
+            h.set_now(now_ms);
+            h.shutdown_write()
+        })
+    }
+}
+
 /// Reconfigure or disable (`idle_ms == 0`) keepalive. On by default
 /// (10 min idle / 60 s interval / 4 probes).
 ///

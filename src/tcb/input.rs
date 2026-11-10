@@ -34,6 +34,9 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
         {
             return Err(TcpError::MalformedPacket);
         }
+        if self.prev_cookie_pending {
+            self.settle_cookie_rotation();
+        }
         let from_remote = seg.src_ip == self.remote.ip && seg.src_port == self.remote.port;
         if self.state != State::Listen && !from_remote {
             if self.may_replace_half_open(seg) {

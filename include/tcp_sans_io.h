@@ -94,7 +94,14 @@ int32_t tcp_connect(TcpStreamHandle* handle, uint64_t now_ms);
  * over. Those replies go to other peers than the half-open's: route outbound
  * packets by their destination address, not by handle. */
 int32_t tcp_listen (TcpStreamHandle* handle, uint64_t now_ms);
+/* Graceful close: FIN after queued data; the host is done with the connection
+ * in both directions. Once the FIN is acknowledged the peer has the
+ * FIN_WAIT_2 timeout (60 s; reading restarts it) to send its own. */
 int32_t tcp_close  (TcpStreamHandle* handle, uint64_t now_ms);
+/* Half-close, as shutdown(SHUT_WR): FIN after queued data while the host keeps
+ * reading. The FIN_WAIT_2 timeout does not run until tcp_close is called
+ * (keepalive still reaps a vanished peer). */
+int32_t tcp_shutdown_write(TcpStreamHandle* handle, uint64_t now_ms);
 /* Abort the connection: queues a TCP RST+ACK in the TX ring, transitions
  * the handle to CLOSED, drops all buffered send/recv/OOO bytes, and
  * surfaces ConnectionReset via tcp_poll()'s ERROR flag. After calling
@@ -106,7 +113,10 @@ int32_t tcp_tick   (TcpStreamHandle* handle, uint64_t now_ms);
 
 /* Install (or rotate to) an explicit 16-byte SYN-cookie key (RFC 4987) from a
  * CSPRNG; without it the key is derived from tcp_set_secret. Cookies issued
- * under the previous key stay valid, so rotate at most every ~2 minutes.
+ * under the previous key stay valid for 128 s (counted from the handle's next
+ * call that takes now_ms), so rotate at most every ~2 minutes. Give a
+ * listener created within 128 s of a rotation the previous key, then the
+ * current one, and it takes those cookies too.
  * `secret` must point to exactly 16 readable bytes. */
 int32_t tcp_set_cookie_secret(TcpStreamHandle* handle, const uint8_t* secret);
 
