@@ -406,10 +406,18 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
             } else {
                 None
             },
-            ts: if self.ts_enabled {
-                Some((self.ts_val(), self.ts_recent))
-            } else {
+            ts: if !self.ts_enabled {
                 None
+            } else if self.is_listener && self.state == State::SynRcvd {
+                // A listener's SYN-ACK is a cookie (see
+                // `accept_syn_stateful`): its TSval carries the options, so
+                // the ACK's echo restores them if the slot is lost.
+                let ws = self.ws_ok.then_some(self.snd_wscale);
+                let tsval =
+                    self.cookie_tsval(self.ts_offset, ws, self.sack_enabled, self.ecn_enabled);
+                Some((tsval, self.ts_recent))
+            } else {
+                Some((self.ts_val(), self.ts_recent))
             },
             sack_permitted: self.sack_enabled,
             sack: SackBlocks::EMPTY,
@@ -423,8 +431,22 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
         self.emit_segment(fl, seq, ack, &TcpOptions::NONE, NO_PAYLOAD, false)
     }
 
+    /// The RST that ends the connection (abort, FIN_WAIT_2 timeout,
+    /// keepalive give-up, close of a half-open). It goes behind what the
+    /// host has yet to extract; with the egress ring full it is owed and
+    /// staged as soon as the host takes a packet out.
+    pub(super) fn emit_final_rst(&mut self) -> Result<(), TcpError> {
+        let (seq, ack) = (self.snd_nxt, self.rcv_nxt);
+        if !self.emit_ctl(flags::RST | flags::ACK, seq, ack)? {
+            self.owed_rst = Some((seq, ack));
+        }
+        Ok(())
+    }
+
     /// RST addressed to the *sender* of `seg` (used where the TCB has no or
-    /// a different pinned peer, e.g. LISTEN and SYN-SENT).
+    /// a different pinned peer, e.g. LISTEN, SYN-SENT and CLOSED). IP ID 0,
+    /// as Linux's control-socket RSTs: a counter bumped by packets to anyone
+    /// would let a prober count them (an idle scan).
     pub(super) fn emit_rst_to(
         &mut self,
         seg: &Segment<'_>,
@@ -432,7 +454,7 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
         ack: u32,
         fl: u8,
     ) -> Result<(), TcpError> {
-        let (lip, lport, ip_id) = (self.local.ip, self.local.port, self.ip_id);
+        let (lip, lport) = (self.local.ip, self.local.port);
         let (rip, rport) = (seg.src_ip, seg.src_port);
         let full_csum = !self.tx_csum_offload;
         let queued = self.tx_ring.push_with(|buf| {
@@ -449,13 +471,12 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
                 &TcpOptions::NONE,
                 0,
                 |_| true,
-                ip_id,
+                0,
                 wire::ecn::NOT_ECT,
                 full_csum,
             )
         })?;
         if queued {
-            self.ip_id = self.ip_id.wrapping_add(1);
             self.stats.segs_out = self.stats.segs_out.saturating_add(1);
         }
         Ok(())
@@ -496,7 +517,11 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
         };
         let (src_ip, dst_ip) = (self.local.ip, self.remote.ip);
         let (src_port, dst_port) = (self.local.port, self.remote.port);
-        let ip_id = self.ip_id;
+        // A SYN-ACK carries IP ID 0, as Linux's (its listener numbers no
+        // packet it sends to a would-be peer); the connection's own
+        // segments, from the SYN on, count from its ISS-seeded counter.
+        let syn_ack = flag_bits & (flags::SYN | flags::ACK) == flags::SYN | flags::ACK;
+        let ip_id = if syn_ack { 0 } else { self.ip_id };
         let full_csum = !self.tx_csum_offload;
         // The payload goes straight from the send ring into the slot.
         let ring = &self.send_ring;
@@ -520,7 +545,9 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
             )
         })?;
         if queued {
-            self.ip_id = self.ip_id.wrapping_add(1);
+            if !syn_ack {
+                self.ip_id = self.ip_id.wrapping_add(1);
+            }
             self.stats.segs_out = self.stats.segs_out.saturating_add(1);
             if flag_bits & flags::ACK != 0 && flag_bits & flags::RST == 0 {
                 self.last_ack_sent = ack;

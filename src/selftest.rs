@@ -24,10 +24,10 @@ use crate::tcb::{Endpoint, Tcb, TcbConfig};
 use crate::State;
 use crate::MAX_PACKET;
 
-/// Per-direction ring size used by the self-test. 16 KiB keeps the two
+/// Per-direction ring size used by the self-test. 8 KiB keeps the two
 /// TCBs cheap on the stack while still exercising window-limited flow,
 /// delayed ACKs, and multi-segment bursts.
-const SELFTEST_BUF: usize = 16 * 1024;
+const SELFTEST_BUF: usize = 8 * 1024;
 
 /// Bytes transferred in each direction. Comfortably more than one window,
 /// so the loop exercises ACK-clocked flow control rather than a single
@@ -139,7 +139,7 @@ fn run(cli: &mut Tcb<SELFTEST_BUF>, srv: &mut Tcb<SELFTEST_BUF>) -> i32 {
     let mut chunk = [0u8; 4096];
     let mut rbuf = [0u8; 4096];
 
-    // Generously bounded: a clean 128 KiB transfer over a 16 KiB window
+    // Generously bounded: a clean 128 KiB transfer over an 8 KiB window
     // converges in a few thousand iterations. The cap turns any wedge into
     // a deterministic NO_CONVERGENCE rather than a hang.
     for _ in 0..4_000_000u32 {

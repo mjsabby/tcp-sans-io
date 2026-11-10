@@ -7,7 +7,6 @@ use super::{
 use crate::error::TcpError;
 use crate::rtx_queue::seg_flags;
 use crate::state::State;
-use crate::wire::flags;
 
 impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
     pub(super) fn run_timers(&mut self) -> Result<(), TcpError> {
@@ -23,7 +22,7 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
         if self.state == State::FinWait2 && self.fin_wait2_deadline.due(now) {
             // The peer ACKed our FIN but never sent its own: reset it so it
             // cannot pin this TCB (Linux tcp_fin_timeout behaviour).
-            let _ = self.emit_ctl(flags::RST | flags::ACK, self.snd_nxt, self.rcv_nxt)?;
+            self.emit_final_rst()?;
             self.abort_local();
             return Ok(());
         }
@@ -277,10 +276,13 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
             return Ok(());
         }
         if self.keepalive_probes >= self.keepalive_count {
-            // The peer vanished. In CLOSE_WAIT its stream is complete and
-            // nothing of ours is in flight (we only probe when idle), so
-            // nothing was lost: close, keeping unread bytes readable before
-            // EOF, as Linux delivers them. Anywhere else, abort.
+            // The peer vanished: reset it in case it comes back, as Linux
+            // `tcp_keepalive_timer` does. In CLOSE_WAIT its stream is
+            // complete and nothing of ours is in flight (we only probe when
+            // idle), so nothing was lost: close, keeping unread bytes
+            // readable before EOF, as Linux delivers them. Anywhere else,
+            // abort.
+            self.emit_final_rst()?;
             if self.state == State::CloseWait {
                 self.close_clean();
             } else {

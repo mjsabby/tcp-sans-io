@@ -71,7 +71,7 @@
 //!    if the peer has since vanished (the connection then closes, unread bytes
 //!    still readable); a live peer keeps answering, so an un-closed connection
 //!    stays pinned until the host acts. On `ERROR` / `CLOSED` (including the
-//!    RST-less local aborts from R2 / USER TIMEOUT / keepalive) drop the TCB or
+//!    local aborts from R2 / USER TIMEOUT / keepalive) drop the TCB or
 //!    [`Tcb::reinit`] it for reuse; the slot is reclaimed only when the host
 //!    releases it. After a clean close, first `recv` any bytes the peer sent
 //!    before its FIN (`READABLE` stays set until they are drained).
@@ -233,6 +233,9 @@ pub(crate) fn loop_budget_exhausted(iters: &mut u32, cap: u32, _what: &str) -> b
         true
     }
 }
+
+#[cfg(test)]
+mod audit_fix_tests;
 
 #[cfg(test)]
 mod loopback_tests;

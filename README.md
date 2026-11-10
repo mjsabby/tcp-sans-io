@@ -36,9 +36,9 @@ shows what that costs against Linux CUBIC on lossy long paths.
 |---|---|---|
 | State machine, active + passive open, simultaneous open | RFC 9293 | ✅ |
 | Half-open replacement (a new SYN recycles a stalled `SYN_RCVD` slot) | — (single-slot listener policy) | ✅ |
-| SYN cookies while the half-open slot is busy (a valid cookie ACK takes the slot over); WS / SACK / ECN kept via timestamp bits; key derived from the host secret or set explicitly, surviving one rotation | RFC 4987 | ✅ |
+| SYN cookies while the half-open slot is busy (a valid cookie ACK takes the slot over; the slot's own SYN-ACK is a cookie too, so a displaced half-open still completes); WS / SACK / ECN kept via timestamp bits; key derived from the host secret or set explicitly, surviving one rotation | RFC 4987 | ✅ |
 | ISN selection | RFC 6528 | ✅ keyed by `tcp_set_secret` on passive opens (`tcp_listen` requires a secret); host-supplied `iss` on active |
-| MSS; MTU / PMTU (`tcp_set_mtu`, `tcp_update_pmtu`, black-hole clamp, probing back up) | RFC 9293, RFC 1191, RFC 4821 (spirit) | ✅ |
+| MSS; MTU / PMTU (`tcp_set_mtu`, `tcp_update_pmtu_icmp` checked against the flight, reductions re-probed after 10 min, black-hole clamp, probing back up) | RFC 9293, RFC 1191, RFC 4821 (spirit) | ✅ |
 | Timestamps: RTTM, PAWS, keyed per-connection offset | RFC 7323 §3–5 | ✅ |
 | Window Scale | RFC 7323 §2 | ✅ |
 | SACK, both directions; receiver holds the whole window out of order | RFC 2018 | ✅ |
@@ -142,8 +142,11 @@ keeps at most one half-open slot and recycles it after a bounded SYN-ACK
 retransmit budget (or an exact RST), rather than leaking it. Green edges are
 SYN-cookie promotions: while the slot is busy, other peers get cookie
 SYN-ACKs, and a valid cookie ACK establishes directly — from SYN_RCVD by
-taking the slot over. Dashed grey edges are aborts (RST / `abort()` /
-timeouts). See
+taking the slot over. The half-open it displaces is not lost: the slot's
+SYN-ACK is a cookie as well, so its ACK completes at the host's next
+listener. Dashed grey edges are aborts (RST / `abort()` / timeouts;
+`close()` in SYN_RCVD resets the half-open rather than queueing a FIN
+behind an unacknowledged SYN-ACK). See
 [`docs/state-machine.md`](docs/state-machine.md) for a live-rendering Mermaid
 copy, the full transition table with code citations, and how to regenerate the
 SVG from [`docs/state-machine.dot`](docs/state-machine.dot).
@@ -177,7 +180,7 @@ mis-ordering, corruption, a panic, or an unbounded loop.
 | FIN_WAIT_2 timeout | 60 s | `tcb/mod.rs` | Time a peer may leave its half open after ACKing our FIN; restarted only when the application reads, never by the peer's data alone. |
 | Black-hole MSS clamp / probe | 3, 5 RTOs → 1024, 536 / 10 s … 10 min | `tcb/mod.rs` | Consecutive timeouts of a large segment clamp the MSS; one probe segment at the next larger size (first after 10 s, doubling up to 10 min on failure) restores it once it arrives. |
 | Out-of-window reply rate | 1 per 500 ms | `tcb/mod.rs` | Challenge ACKs, dup ACKs for unacceptable segments and RSTs to stray segments, per connection. Exempt: one immediate ACK (D-SACK) per data / FIN segment that could be the peer's own retransmission — acceptable ACK, plus a timestamp when negotiated — since the peer's loss recovery depends on it. |
-| Cookie validity | 64–128 s | `tcb/cookie.rs` | Two 64 s buckets, under the current and the previous key (one rotation); 29-bit SipHash MAC (2⁻²⁹ blind forgery per attempt). |
+| Cookie validity | 64–128 s | `tcb/cookie.rs` | Two 64 s buckets (the cookie names its own by parity), under the current key and, for 128 s after a rotation, the previous one. 29-bit SipHash MAC: 2⁻²⁹ blind forgery per attempt (2⁻²⁸ after a rotation), as Linux. A listener takes a valid cookie ACK at any time, not only while under load. |
 
 ### Why the bounds are sound
 
@@ -538,13 +541,25 @@ to put on the wire and hands you back the bytes the peer sent.
    an explicit, rotatable cookie key (cookies survive one rotation).
 6. **The path MTU** — `tcp_set_mtu` before the handshake when the tunnel
    MTU is below 1500 (1420 for a default WireGuard interface), and
-   `tcp_update_pmtu` if you receive ICMP "fragmentation needed".
+   `tcp_update_pmtu_icmp` with the MTU and the quoted TCP header's sequence
+   number if you receive ICMP "fragmentation needed" quoting the
+   connection's 4-tuple (a report quoting nothing in flight is ignored, as
+   Linux; one taken holds for 10 minutes, then the old size is probed
+   again).
 7. **5-tuple demux** — route each inbound datagram to the TCB that owns
    its 4-tuple. The stack rejects mismatches with `NOT_FOR_US`, but you
    shouldn't rely on that for routing N connections. A listener may also
    accept SYNs and cookie ACKs from *other* peers while its half-open slot
    is busy, and its replies are addressed to them: route every outbound
    packet by its own destination address, not by the TCB that emitted it.
+   A cookie ACK turns the listener into that peer's connection whatever
+   half-open it held (`tcp_remote` tells you whose it became); the
+   displaced client's ACK then reaches your next listener, which takes it
+   too, as every listener's SYN-ACK is a cookie. Set up each listener with
+   the same secrets. A `CLOSED` TCB answers its former peer's segments
+   with a RST (rate limited), so keeping one routed for a while tells a
+   peer that kept sending; route a new SYN to your listener instead, as a
+   `CLOSED` TCB ignores it.
 8. **Admission control** — a cap on concurrent TCBs (including those in
    `TIME_WAIT`, which hold their storage for 60–120 s) and on half-open
    listeners per source; the stack bounds how long a stalled or vanished
@@ -1006,9 +1021,12 @@ put packets on the path — is hostile.
   are dropped unanswered. Replies to unacceptable segments (challenge ACKs,
   dup ACKs for out-of-window data, RSTs to stray ACKs or SYN-ACKs) are
   limited to one per 500 ms per connection, each a single header-only packet
-  of at most 80 bytes; a SYN-ACK to a listener draws at most one such RST,
-  addressed to the segment's source, and a bare ACK that is not a valid
-  cookie draws nothing. Only data or a FIN that could be the peer's own
+  of at most 80 bytes; an ACK to a listener (busy with a half-open or not)
+  that is not a valid cookie, a SYN-ACK included, draws at most one such
+  RST, addressed to the segment's source, as RFC 9293 §3.10.7.2 and Linux
+  answer it, so a peer stranded with a connection the host no longer holds
+  learns of it at once. A `CLOSED` TCB answers its former peer the same
+  way. Only data or a FIN that could be the peer's own
   retransmission — an acceptable ACK and, when negotiated, a timestamp — is
   answered outside that budget (one ACK per segment, with a D-SACK that never
   names sequence space the connection cannot have received), because the
@@ -1024,9 +1042,35 @@ put packets on the path — is hostile.
   explicitly) that keeps window scaling, SACK and ECN when the client uses
   timestamps. A valid cookie ACK takes the half-open slot over, so spoofed
   SYNs at any rate cannot lock a listener out, and a cookie survives one
-  key rotation.
+  key rotation. The half-open's own SYN-ACK is a cookie too: a client that
+  loses the slot (to that ACK, or to a new SYN once its SYN-ACK went
+  unanswered for an RTO) completes from its ACK at the host's next
+  listener. The exception is a client that offered window scaling, SACK or
+  ECN without timestamps: no cookie carries those, so after losing the slot
+  its ACK is reset and it reconnects. While the slot is busy such clients
+  (Windows by default) connect through cookies without window scaling or
+  SACK: one half-open per listener TCB is the limit here, and a host that
+  wants every option kept under load runs several listeners per port. As on
+  Linux a blind forgery succeeds with probability 2⁻²⁹ per attempt (2⁻²⁸
+  for 128 s after a key rotation) and delivers the forged segment's payload
+  from a spoofed address; unlike Linux, at any time, not only within two
+  minutes of an overflow (one SYN would open that window on a single-slot
+  listener anyway): do not treat a source address as authenticated.
+- **Side channels.** Every datagram is DF. What a listener sends would-be
+  peers (SYN-ACKs, cookie or not, and RSTs) carries IP ID 0, and a
+  connection numbers only its own segments, from a start derived from its
+  ISS: no counter spans peers, so a TCB cannot serve as an idle-scan
+  zombie.
 - **Malformed and adversarial segments.** Every parser path is
-  bounds-checked and returns `Result`; peer MSS is floored at 64 B; option
+  bounds-checked and returns `Result`; segments from sources no host sends
+  from (`0.0.0.0/8`, multicast, the limited broadcast, loopback toward a
+  non-loopback address, or this endpoint itself) are dropped, as Linux's
+  routing drops martians, so a listener never aims a SYN-ACK at a group; a
+  SACK block splits a segment only at whole multiples of the MSS (Linux
+  `tcp_match_skb_to_sack`), so blocks of a few bytes cannot shatter the
+  retransmission queue (Linux CVE-2019-11478); TS.Recent follows only
+  segments whose ACK is not older than `SND.UNA`, as Linux; peer MSS is
+  floored at 64 B; option
   processing, SACK and D-SACK handling, and out-of-order insertion are
   bounded per segment; nothing SACKed is ever retransmitted and nothing
   received is ever reneged; repeated SACK blocks over an already-SACKed

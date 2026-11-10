@@ -84,7 +84,7 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
                     // last in-order segment (RFC 7323 §4.3), never that of
                     // the segment it SACKs, so TSecr cannot disambiguate a
                     // SACKed retransmission; RACK falls back to min_rtt.
-                    let n = rtx.sack(l, r, |s| rack.on_delivered(s, now, None));
+                    let n = rtx.sack(l, r, mss, |s| rack.on_delivered(s, now, None));
                     delivered = delivered.saturating_add(n);
                 }
             }

@@ -111,7 +111,8 @@ int32_t tcp_set_cookie_secret(TcpStreamHandle* handle, const uint8_t* secret);
  * ESTABLISHED, or half-closed in CLOSE_WAIT or FIN_WAIT_2 as in Linux, up
  * to `count` probes are sent `intvl_ms` apart; if none is answered the
  * connection aborts as a vanished peer (ConnectionReset via tcp_poll ERROR /
- * tcp_recv), no RST emitted. In CLOSE_WAIT the peer's stream is complete, so
+ * tcp_recv) and a RST is staged in case the peer comes back, as Linux sends
+ * one: drain it. In CLOSE_WAIT the peer's stream is complete, so
  * it closes instead (tcp_poll CLOSED) and unread bytes stay readable until
  * EOF. Any inbound segment resets the idle timer.
  * ON BY DEFAULT (10 min idle / 60 s interval / 4 probes ~= 14 min to reap),
@@ -121,7 +122,7 @@ int32_t tcp_set_keepalive(TcpStreamHandle* handle, uint64_t now_ms,
                           uint32_t idle_ms, uint32_t intvl_ms, uint8_t count);
 
 /* Set the RFC 9293 3.8.3 USER TIMEOUT: max time the connection may go without
- * forward progress (snd_una advancing) while it still has unacknowledged send
+ * forward progress (a full segment acknowledged) while it still has send
  * data, before it aborts (ConnectionReset via tcp_poll ERROR / tcp_recv, no
  * RST). ON BY DEFAULT (5 min) — bounds the zero-window / dribbled-ACK DoS (an
  * alive-but-stalling peer answering probes while never opening its window).
@@ -144,13 +145,30 @@ int32_t tcp_set_secret(TcpStreamHandle* handle, const uint8_t* secret);
  * the connection has left CLOSED / LISTEN. Default 1500. */
 int32_t tcp_set_mtu(TcpStreamHandle* handle, uint16_t mtu);
 
-/* Report a reduced path MTU mid-connection (e.g. from an ICMP "fragmentation
- * needed" the host received). Shrinks the segment size for the rest of the
- * connection and retransmits in-flight segments that no longer fit. Without
- * ICMP the stack still clamps the MSS after repeated timeouts of large
- * segments (path-MTU black-hole fallback), then probes the larger size again
- * (after 10 s, backing off to 10 min) and restores it once a probe arrives. */
+/* Report a reduced path MTU mid-connection. Shrinks the segment size and
+ * retransmits in-flight segments that no longer fit; the report holds for 10
+ * minutes, then one segment probes the old size (a larger MTU is ignored).
+ * For an ICMP "fragmentation needed" use tcp_update_pmtu_icmp, which checks
+ * what the ICMP quotes: unchecked, anyone who knows the 4-tuple can shrink
+ * the connection's segments. Without ICMP the stack still clamps the MSS
+ * after repeated timeouts of large segments (path-MTU black-hole fallback),
+ * then probes the larger size again (after 10 s, backing off to 10 min) and
+ * restores it once a probe arrives. */
 int32_t tcp_update_pmtu(TcpStreamHandle* handle, uint64_t now_ms, uint16_t mtu);
+
+/* tcp_update_pmtu for an ICMP "fragmentation needed" quoting this
+ * connection's 4-tuple: `quoted_seq` is the sequence number of the TCP header
+ * the ICMP quotes. Applied only if it is in flight ([SND.UNA, SND.NXT], as
+ * Linux checks); TCP_ERR_NOT_FOR_US otherwise. */
+int32_t tcp_update_pmtu_icmp(TcpStreamHandle* handle, uint64_t now_ms,
+                             uint16_t mtu, uint32_t quoted_seq);
+
+/* The peer this handle is connected (or connecting) to: its four IPv4 octets
+ * to out_ip[4], its port to *out_port. A listener reports the client whose
+ * SYN or cookie ACK it took, so the host can route that 4-tuple to it.
+ * TCP_ERR_INVALID_STATE while there is none (LISTEN). */
+int32_t tcp_remote(const TcpStreamHandle* handle, uint8_t* out_ip,
+                   uint16_t* out_port);
 
 /* FIN_WAIT_2 timeout (0 disables; default 60 s): after our FIN is ACKed the
  * peer must send its FIN within this long, otherwise the connection is reset.

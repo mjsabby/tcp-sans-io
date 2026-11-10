@@ -410,6 +410,9 @@ pub struct Tcb<
     fin_wait2_timeout_ms: u32,
     fin_wait2_deadline: Deadline,
     error: Option<TcpError>,
+    /// `(SEQ, ACK)` of the connection's final RST, owed while the egress
+    /// ring was full: staged as soon as the host takes a packet out.
+    owed_rst: Option<(u32, u32)>,
 
     // ---- Egress staging.
     tx_ring: TxRing<TXQ>,
@@ -534,6 +537,7 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
             core::ptr::write_bytes(p, 0, 1);
             core::ptr::addr_of_mut!((*p).state).write(State::Closed);
             core::ptr::addr_of_mut!((*p).error).write(None);
+            core::ptr::addr_of_mut!((*p).owed_rst).write(None);
             core::ptr::addr_of_mut!((*p).tlp_end_seq).write(None);
             core::ptr::addr_of_mut!((*p).ooo_fin).write(None);
             core::ptr::addr_of_mut!((*p).dsack).write(None);
@@ -578,12 +582,16 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
         self.send_lent = 0;
         self.send_lent_conn = 0;
         self.conn_gen = 0;
-        self.ip_id = (cfg.iss >> 16) as u16 ^ cfg.iss as u16;
         self.keepalive_idle_ms = DEFAULT_KEEPALIVE_IDLE_MS;
         self.keepalive_intvl_ms = DEFAULT_KEEPALIVE_INTVL_MS;
         self.keepalive_count = DEFAULT_KEEPALIVE_COUNT;
         self.user_timeout_ms = DEFAULT_USER_TIMEOUT_MS;
         self.fin_wait2_timeout_ms = DEFAULT_FIN_WAIT2_TIMEOUT_MS;
+        // Not per connection: what is staged may be for other peers (a
+        // listener's cookie SYN-ACKs and RSTs), and the limit on replies to
+        // stray segments must survive listener transitions.
+        self.tx_ring.clear();
+        self.last_oow_ms = Deadline::OFF;
         self.reset_connection_state();
         self.state = State::Closed;
     }
@@ -595,11 +603,20 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
         self.setup(cfg);
     }
 
+    /// Start this connection's IP ID counter from its ISS (keyed per 4-tuple
+    /// on passive opens, drawn by the host from a CSPRNG on active ones):
+    /// each connection numbers only its own packets, as Linux's per-socket
+    /// `inet_id`, never sharing a counter across peers.
+    pub(super) fn seed_ip_id(&mut self) {
+        self.ip_id = (self.iss >> 16) as u16 ^ self.iss as u16;
+    }
+
     /// Reset all per-connection state, keeping the endpoints, knobs and
     /// secrets. Used by `connect`, `listen` and the passive-open paths.
     fn reset_connection_state(&mut self) {
         self.conn_gen = self.conn_gen.wrapping_add(1);
         self.iss = self.cfg_iss;
+        self.seed_ip_id();
         self.snd_una = self.iss;
         self.snd_nxt = self.iss;
         self.snd_wnd = 0;
@@ -672,13 +689,12 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
         self.time_wait_since_ms = 0;
         self.fin_wait2_deadline = Deadline::OFF;
         self.error = None;
-        self.tx_ring.clear();
+        self.owed_rst = None;
         self.syn_rcvd_retries = 0;
         self.keepalive_probes = 0;
         self.keepalive_deadline = Deadline::OFF;
         self.user_timeout_deadline = Deadline::OFF;
         self.ut_progress = 0;
-        self.last_oow_ms = Deadline::OFF;
         self.stats = TcbStats::default();
     }
 
@@ -1017,22 +1033,34 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
         Ok(())
     }
 
-    /// Report a smaller path MTU (e.g. from an ICMP "fragmentation needed"
-    /// the host received, or out-of-band knowledge). Lowers the segment
-    /// size for the rest of the connection and retransmits in-flight
-    /// segments that no longer fit (they were most likely dropped).
+    /// Report a smaller path MTU the host knows of. Lowers the segment size
+    /// and retransmits in-flight segments that no longer fit (they were
+    /// most likely dropped). Like a route's learned PMTU (Linux
+    /// `ip_rt_mtu_expires`), a reduction holds for 10 minutes; then one
+    /// segment probes the size before it (the black-hole probe machinery),
+    /// so a path that grew back, or a forged report, does not cap the
+    /// segment size for good. Reporting the size in use again renews it; a
+    /// larger one is ignored. A link MTU that never changes belongs in
+    /// [`Tcb::set_mtu`]. For an ICMP "fragmentation needed" use
+    /// [`Tcb::update_pmtu_icmp`], which also checks what the ICMP quotes.
     pub fn update_pmtu(&mut self, mtu: u16) {
         let mss = mtu.clamp(MIN_MTU, MAX_MTU) - HDR_LEN;
-        // A reported MTU also bounds black-hole recovery: never probe above it.
-        self.pmtu_restore_mss = self.pmtu_restore_mss.min(mss);
-        if self.pmtu_restore_mss <= self.pmtu_mss.min(mss) {
-            self.pmtu_restore_mss = 0;
-            self.pmtu_probe_inflight = false;
-        }
-        if mss >= self.pmtu_mss {
+        if mss > self.pmtu_mss {
             return;
         }
+        let expires = self.now_ms.saturating_add(u64::from(PMTU_PROBE_MAX_MS));
+        if mss == self.pmtu_mss {
+            if self.pmtu_restore_mss != 0 {
+                self.pmtu_probe_backoff_ms = PMTU_PROBE_MAX_MS;
+                self.pmtu_probe_at = expires;
+            }
+            return;
+        }
+        self.pmtu_restore_mss = self.pmtu_restore_mss.max(self.pmtu_mss);
         self.pmtu_mss = mss;
+        self.pmtu_probe_inflight = false;
+        self.pmtu_probe_backoff_ms = PMTU_PROBE_MAX_MS;
+        self.pmtu_probe_at = expires;
         if self.state.is_synchronized() {
             let limit = self.mss_payload();
             for i in 0..self.rtx.len() {
@@ -1044,6 +1072,30 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
             }
             let _ = self.maybe_send_data();
         }
+    }
+
+    /// [`Self::update_pmtu`] for an ICMP "fragmentation needed": taken only
+    /// if the sequence number the ICMP quotes from our segment lies in
+    /// `[SND.UNA, SND.NXT]` (Linux `tcp_v4_err`, RFC 5927 §4.1), so an
+    /// off-path forger who knows the 4-tuple must also hit the flight.
+    /// `NotForUs` otherwise, or before the handshake started.
+    pub fn update_pmtu_icmp(&mut self, mtu: u16, quoted_seq: u32) -> Result<(), TcpError> {
+        let in_flight =
+            quoted_seq.wrapping_sub(self.snd_una) <= self.snd_nxt.wrapping_sub(self.snd_una);
+        if matches!(self.state, State::Closed | State::Listen) || !in_flight {
+            return Err(TcpError::NotForUs);
+        }
+        self.update_pmtu(mtu);
+        Ok(())
+    }
+
+    /// The peer this TCB is connected (or connecting) to: the client whose
+    /// SYN or cookie ACK a listener took, or the configured remote of an
+    /// active open. `None` in `LISTEN` (and on a TCB that never had one),
+    /// so a host can build the 4-tuple demultiplexing it owns without
+    /// parsing packets itself.
+    pub fn remote(&self) -> Option<Endpoint> {
+        (self.state != State::Listen && self.remote.port != 0).then_some(self.remote)
     }
 
     /// Install a 128-bit host secret (from a CSPRNG). Keys the per-connection
@@ -1128,7 +1180,11 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
     /// from other peers are answered with SYN cookies (no state); a valid
     /// cookie ACK replaces the pending half-open, so spoofed SYNs cannot lock
     /// the listener. A half-open whose SYN-ACK already needed a retransmit
-    /// also yields its slot to a SYN from a new peer.
+    /// also yields its slot to a SYN from a new peer. Either way the
+    /// half-open is not lost: its SYN-ACK is a cookie too, and its ACK
+    /// completes at the listener the host sets up next (unless it offered
+    /// window scaling, SACK or ECN without timestamps, which no cookie
+    /// carries: then its ACK is reset).
     pub fn listen(&mut self) -> Result<(), TcpError> {
         match self.state {
             State::Closed | State::Listen | State::TimeWait => {}
@@ -1171,12 +1227,16 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
     /// the ring. Fill a prefix (the first slice first), then call
     /// [`Self::send_commit`].
     ///
-    /// The lent bytes stay the host's until that commit, whatever happens to
-    /// the connection meanwhile: the TCB neither reads nor writes them, and
-    /// `send` returns `WouldBlock` (`poll` drops `WRITABLE`). An asynchronous
-    /// host may therefore hold raw pointers to them across other calls, but
-    /// must commit before it calls `reinit` or drops the TCB. One loan at a
-    /// time: `InvalidState` while one is out or when the connection cannot
+    /// Write the slices while you hold them: they borrow the TCB. Until the
+    /// commit the loan stays out across other calls, whatever happens to
+    /// the connection meanwhile: the TCB neither reads nor writes the lent
+    /// bytes, and `send` returns `WouldBlock` (`poll` drops `WRITABLE`), so
+    /// what was written stays as written. Do not keep raw pointers into them
+    /// to write after another call, though: every call takes `&mut self`,
+    /// which Rust's aliasing rules let assume nothing else writes the TCB,
+    /// rings included, so such a write is undefined behavior even though
+    /// the TCB never looks. Commit, with 0 if need be, before `reinit` or
+    /// dropping the TCB. One loan at a time: `InvalidState` while one is out or when the connection cannot
     /// send, `WouldBlock` when the ring is full or `max` is 0. (Rust API
     /// only.)
     pub fn send_reserve(&mut self, max: usize) -> Result<(&mut [u8], &mut [u8]), TcpError> {
@@ -1241,9 +1301,18 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
         match self.state {
             State::Established => self.state = State::FinWait1,
             State::CloseWait => self.state = State::LastAck,
-            // RFC 9293 §3.10.4: CLOSE in SYN-RECEIVED with nothing queued
-            // sends a FIN and enters FIN-WAIT-1.
-            State::SynRcvd => self.state = State::FinWait1,
+            // The handshake is not complete, so there is no stream to end:
+            // the half-open is reset and the TCB closed (a listener stops
+            // listening), as for `SYN_SENT`. RFC 9293 §3.10.4 would send a
+            // FIN and enter FIN-WAIT-1, but the peer has not acknowledged
+            // our SYN-ACK: that FIN waited behind a SYN-ACK nothing
+            // retransmitted, holding the TCB until the USER TIMEOUT.
+            State::SynRcvd => {
+                self.emit_final_rst()?;
+                self.is_listener = false;
+                self.close_clean();
+                return Ok(());
+            }
             State::Closed
             | State::FinWait1
             | State::FinWait2
@@ -1260,8 +1329,10 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
         self.maybe_send_data()
     }
 
-    /// Abort: queue `RST+ACK` (seq = SND.NXT, ack = RCV.NXT) and drop all
-    /// state. Local-only in `LISTEN` / `SYN_SENT`. Idempotent on `CLOSED`.
+    /// Abort: queue `RST+ACK` (seq = SND.NXT, ack = RCV.NXT) behind whatever
+    /// is still staged (with the egress ring full, as soon as the host
+    /// extracts a packet) and drop all state. Local-only in `LISTEN` /
+    /// `SYN_SENT`. Idempotent on `CLOSED`.
     pub fn abort(&mut self) -> Result<(), TcpError> {
         match self.state {
             State::Closed => return Ok(()),
@@ -1269,11 +1340,7 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
                 self.is_listener = false;
             }
             _ => {
-                let _ = self.emit_ctl(
-                    wire::flags::RST | wire::flags::ACK,
-                    self.snd_nxt,
-                    self.rcv_nxt,
-                )?;
+                self.emit_final_rst()?;
             }
         }
         self.abort_local();
@@ -1368,13 +1435,36 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
     /// Pop one staged outbound datagram into `out` (0 when none pending).
     /// `out` must hold at least [`crate::MAX_PACKET`] bytes.
     pub fn extract_packet(&mut self, out: &mut [u8]) -> Result<usize, TcpError> {
-        self.tx_ring.pop_into(out)
+        let n = self.tx_ring.pop_into(out)?;
+        if self.owed_rst.is_some() {
+            self.stage_owed_rst();
+        }
+        Ok(n)
+    }
+
+    /// Stage the final RST a full egress ring held back, now that a packet
+    /// left it.
+    #[cold]
+    #[inline(never)]
+    fn stage_owed_rst(&mut self) {
+        if let Some((seq, ack)) = self.owed_rst {
+            if !matches!(
+                self.emit_ctl(wire::flags::RST | wire::flags::ACK, seq, ack),
+                Ok(false)
+            ) {
+                self.owed_rst = None;
+            }
+        }
     }
 
     /// Pop one staged outbound datagram and lend it to `f` instead of
     /// copying it out (`None` when none is pending).
     pub fn extract_packet_with<R>(&mut self, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
-        self.tx_ring.pop_with(f)
+        let r = self.tx_ring.pop_with(f);
+        if self.owed_rst.is_some() {
+            self.stage_owed_rst();
+        }
+        r
     }
 
     /// Feed an inbound IPv4+TCP datagram (checksums verified).
