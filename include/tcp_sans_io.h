@@ -104,8 +104,11 @@ int32_t tcp_set_listen_backlog(TcpStreamHandle* handle, uint32_t n);
  * need the same local endpoint and secrets. Returns how many were taken
  * (>= 0), or a negative error for an invalid handle. Call it every time,
  * before routing packets to the new listener: a pending client left behind
- * has only its SYN cookie, which completes only from the client's first
- * segment and not at all without timestamps if it offered options. */
+ * has only its SYN cookie, which a listener takes only if it adopted or was
+ * told cookies are in play (tcp_accept_cookies_until), and which completes
+ * only from the client's first segment, and not at all without timestamps if
+ * it offered options. (A handle that calls tcp_listen again itself goes on
+ * serving the handshakes it still holds.) */
 int32_t tcp_adopt_half_opens(TcpStreamHandle* listener, TcpStreamHandle* from);
 /* A listener takes SYN-cookie ACKs only for 128 s after a handshake had to
  * rely on its cookie (its backlog was full, or a pending handshake lost its

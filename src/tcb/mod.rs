@@ -1314,14 +1314,22 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
         if self.prev_cookie_pending {
             self.settle_cookie_rotation();
         }
+        // A listener that became a connection and listens again goes on
+        // serving the half-opens it still holds (a host with one TCB per
+        // port has no next listener to adopt them).
+        if self.is_listener {
+            self.backlog_resume(self.remote);
+        } else {
+            self.backlog_clear();
+        }
         self.remote = Endpoint {
             ip: [0u8; 4],
             port: 0,
         };
         self.is_listener = true;
-        self.backlog_clear();
         self.reset_connection_state();
         self.state = State::Listen;
+        self.backlog_refill_slot();
         Ok(())
     }
 

@@ -13,10 +13,15 @@
 //!
 //! When a handshake completes, the TCB becomes that connection and the
 //! half-opens still pending in it stop being served: the host moves them to
-//! its next listener with [`Tcb::adopt_half_opens`]. A host that does not
-//! loses nothing it had before the backlog existed: every SYN-ACK is a
-//! cookie (see `cookie.rs`), so such a client's ACK completes statelessly
-//! at the next listener, unless it offered options no cookie carries.
+//! its next listener with [`Tcb::adopt_half_opens`]. A TCB that listens
+//! again itself (one TCB per port) simply goes on serving them. A host
+//! that sets up a new listener without adopting leaves them only their
+//! cookies (every SYN-ACK is one, see `cookie.rs`): the listener must then
+//! at least be told that cookies are in play
+//! ([`Tcb::accept_cookies_until`], which adoption does too), or it resets
+//! them; and a cookie completes a handshake only from the client's first
+//! segment, and not at all if the client offered options no cookie
+//! carries.
 
 use super::{
     Deadline, Endpoint, Tcb, DEFAULT_PEER_MSS, MAX_SYN_RCVD_RETRIES, MIN_PEER_MSS, RTO_MAX_MS,
@@ -417,27 +422,68 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
         }
         if self.state == State::SynRcvd && self.is_listener {
             let slot = self.slot_as_half_open();
-            // An unused record; else, for a half-open that needs one (no
-            // cookie carries its options), the record of one that does not,
-            // of any age; else a stale one, but never a half-open that
-            // needs its record for one that does not.
-            let needs = !self.cookie_carried(slot.iss);
-            let room = self
-                .backlog
-                .iter()
-                .position(|h| !h.used)
-                .or_else(|| needs.then(|| self.backlog_carried()).flatten())
-                .or_else(|| {
-                    self.backlog_stale()
-                        .filter(|(_, h)| self.cookie_carried(h.iss) || needs)
-                        .map(|(i, _)| i)
-                });
+            let room = self.backlog_place_for(&slot);
             // Whichever half-open loses its place has its cookie left.
             if room.is_none_or(|i| self.backlog.get(i).is_some_and(|h| h.used)) {
                 self.note_cookie_pressure();
             }
             if let Some(i) = room {
                 self.backlog_put(i, slot);
+            }
+        }
+    }
+
+    /// Where a half-open displaced from the slot can go: an unused record;
+    /// else, for one that needs a record (no cookie carries its options),
+    /// the record of one that does not, of any age; else a stale one, but
+    /// never a half-open that needs its record for one that does not.
+    fn backlog_place_for(&self, slot: &HalfOpen) -> Option<usize> {
+        let needs = !self.cookie_carried(slot.iss);
+        self.backlog
+            .iter()
+            .position(|h| !h.used)
+            .or_else(|| needs.then(|| self.backlog_carried()).flatten())
+            .or_else(|| {
+                self.backlog_stale()
+                    .filter(|(_, h)| self.cookie_carried(h.iss) || needs)
+                    .map(|(i, _)| i)
+            })
+    }
+
+    /// Giving the slot to a cookie connection now would destroy a
+    /// handshake that is neither stale nor able to complete by cookie:
+    /// the slot's half-open is within its first RTO, no cookie carries its
+    /// options, and no record can take it.
+    pub(super) fn slot_cannot_be_displaced(&self) -> bool {
+        if self.state != State::SynRcvd || !self.is_listener || self.syn_rcvd_retries != 0 {
+            return false;
+        }
+        let slot = self.slot_as_half_open();
+        !self.cookie_carried(slot.iss) && self.backlog_place_for(&slot).is_none()
+    }
+
+    /// The TCB is becoming a connection: the half-opens still in its
+    /// backlog are no longer served here. Until the host's next listener
+    /// adopts them they have only their cookies, so cookie ACKs are taken
+    /// from now (the next listener learns it through adoption, or
+    /// [`Tcb::accept_cookies_until`]).
+    pub(super) fn backlog_left_behind(&mut self) {
+        if self.is_listener && self.backlog.iter().any(|h| h.used) {
+            self.note_cookie_pressure();
+        }
+    }
+
+    /// The TCB listens again: the half-opens it still holds from before it
+    /// became a connection go on being served, except those past their
+    /// SYN-ACK budget and any for the peer it was connected to.
+    pub(super) fn backlog_resume(&mut self, was_connected_to: Endpoint) {
+        let lifetime = (0..=MAX_SYN_RCVD_RETRIES)
+            .map(|r| self.backoff_for(r))
+            .fold(0u64, u64::saturating_add);
+        let now = self.now_ms;
+        for h in self.backlog.iter_mut().filter(|h| h.used) {
+            if h.remote == was_connected_to || now.saturating_sub(h.syn_ms) > lifetime {
+                h.used = false;
             }
         }
     }

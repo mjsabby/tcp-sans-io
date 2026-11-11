@@ -678,10 +678,131 @@ fn cookie_acks_are_taken_only_while_a_handshake_depends_on_one() {
     let mut next = listener();
     next.set_now(3000);
     next.adopt_half_opens(&mut s);
-    assert_eq!(next.cookies_accepted_until(), 129_000);
+    // (The takeover at 2 s left A's half-open behind: 128 s from then.)
+    assert_eq!(next.cookies_accepted_until(), 130_000);
     let mut late = listener();
     late.accept_cookies_until(129_000);
     late.set_now(129_000);
     late.inject_packet(&ack).unwrap();
     assert_eq!(late.state(), State::Listen);
+}
+
+/// Handshakes still pending when a listener becomes a connection used to
+/// be reset by a host that did not adopt them: nothing had opened the
+/// cookie window, so the next listener refused their cookies, and a TCB
+/// listening again had dropped their records. Leaving them behind now
+/// opens the window, and a TCB that listens again goes on serving the
+/// half-opens it holds.
+#[test]
+fn half_opens_left_behind_are_not_reset() {
+    let ts_syn = |src: Ep, seq: u32| syn(src, seq, &syn_opts(Some(9), true, Some(7)));
+    // One TCB per port: it listens again after its connection ends.
+    let mut s = backlog_listener();
+    s.inject_packet(&win_syn(A, 100)).unwrap();
+    s.inject_packet(&win_syn(B, 200)).unwrap();
+    let out = drain(&mut s);
+    let (sa, sb) = (out[0].seq, out[1].seq);
+    s.set_now(20);
+    s.inject_packet(&bare_ack(A, 101, sa + 1, 100)).unwrap();
+    assert_eq!((s.state(), s.remote()), (State::Established, Some(ep(A))));
+    s.set_now(500);
+    s.abort().unwrap();
+    drain(&mut s);
+    s.listen().unwrap();
+    assert_eq!((s.state(), s.remote()), (State::SynRcvd, Some(ep(B))));
+    s.inject_packet(&bare_ack(B, 201, sb + 1, 300)).unwrap();
+    assert_eq!((s.state(), s.remote()), (State::Established, Some(ep(B))));
+    assert_eq!(s.stats().snd_wnd, 300 << 7, "B kept its options");
+    assert!(drain(&mut s).iter().all(|o| o.flags & flags::RST == 0));
+
+    // A new listener that does not adopt, but is told the window: a
+    // pending client whose options a cookie carries completes by it.
+    let mut s = backlog_listener();
+    s.inject_packet(&win_syn(A, 100)).unwrap();
+    s.inject_packet(&ts_syn(B, 200)).unwrap();
+    let out = drain(&mut s);
+    let (sa, sb) = (out[0].seq, out[1].clone());
+    assert_eq!(s.cookies_accepted_until(), 0);
+    s.set_now(20);
+    s.inject_packet(&bare_ack(A, 101, sa + 1, 100)).unwrap();
+    assert_eq!(s.cookies_accepted_until(), 128_020, "B was left behind");
+    let mut n = backlog_listener();
+    n.set_now(30);
+    n.accept_cookies_until(s.cookies_accepted_until());
+    n.inject_packet(&pkt(
+        B,
+        SRV,
+        201,
+        sb.seq + 1,
+        flags::ACK,
+        65535,
+        &ts(10, sb.opts.ts.unwrap().0),
+        &[],
+    ))
+    .unwrap();
+    assert_eq!((n.state(), n.remote()), (State::Established, Some(ep(B))));
+
+    // Half-opens past their SYN-ACK budget are not resumed.
+    let mut s = backlog_listener();
+    s.inject_packet(&win_syn(A, 100)).unwrap();
+    s.inject_packet(&win_syn(B, 200)).unwrap();
+    let sa = drain(&mut s)[0].seq;
+    s.inject_packet(&bare_ack(A, 101, sa + 1, 100)).unwrap();
+    s.set_now(120_000);
+    s.abort().unwrap();
+    drain(&mut s);
+    s.listen().unwrap();
+    assert_eq!((s.state(), s.pending_half_opens()), (State::Listen, 0));
+}
+
+/// With the slot and backlog full of handshakes within their first RTO
+/// that no cookie can carry, another client's cookie ACK used to take the
+/// slot and the slot's client, 20 ms into its handshake, was reset. The
+/// cookie ACK is dropped instead: its sender retransmits, and Linux with a
+/// full SYN queue resets nobody either.
+#[test]
+fn cookie_ack_does_not_destroy_a_fresh_handshake_that_needs_its_record() {
+    let mut s = backlog_listener();
+    for k in 0..9u32 {
+        s.inject_packet(&win_syn(([198, 18, 11, k as u8], 7000), 100 + k))
+            .unwrap();
+    }
+    let slot = drain(&mut s).remove(0);
+    let slot_peer = slot.dst;
+    assert_eq!(s.remote(), Some(ep(slot_peer)));
+    // A tenth client is answered by cookie and completes.
+    s.inject_packet(&syn(B, 200, &syn_opts(Some(900), true, Some(7))))
+        .unwrap();
+    let sb = drain(&mut s).remove(0);
+    let b_ack = pkt(
+        B,
+        SRV,
+        201,
+        sb.seq + 1,
+        flags::ACK,
+        65535,
+        &ts(901, sb.opts.ts.unwrap().0),
+        &[],
+    );
+    s.set_now(10);
+    s.inject_packet(&b_ack).unwrap();
+    assert!(drain(&mut s).is_empty(), "dropped, not answered");
+    assert_eq!(
+        (s.state(), s.remote()),
+        (State::SynRcvd, Some(ep(slot_peer)))
+    );
+    assert_eq!(s.pending_half_opens(), 8);
+    // The slot's client completes, with its options.
+    s.set_now(20);
+    s.inject_packet(&bare_ack(slot_peer, 101, slot.seq + 1, 500))
+        .unwrap();
+    assert_eq!(s.state(), State::Established);
+    assert_eq!(s.stats().snd_wnd, 500 << 7);
+    // B's retransmitted ACK then completes at the next listener.
+    let mut n = backlog_listener();
+    n.set_now(30);
+    assert_eq!(n.adopt_half_opens(&mut s), 8);
+    n.set_now(210);
+    n.inject_packet(&b_ack).unwrap();
+    assert_eq!((n.state(), n.remote()), (State::Established, Some(ep(B))));
 }

@@ -560,10 +560,15 @@ to put on the wire and hands you back the bytes the peer sent.
    `tcp_adopt_half_opens(next, became_connection)`: the handshakes still
    pending move to it and go on being served, options and SYN-ACK
    retransmissions included. Do this every time, before routing packets to
-   the new listener: a pending handshake left behind has only its cookie
-   to complete by, which works only if the client's first segment arrives
-   first and intact, and not at all for clients that offered window
-   scaling, SACK or ECN without timestamps (they are reset). Set up each listener with
+   the new listener. A pending handshake left behind has only its cookie
+   to complete by, and only at a listener that knows cookies are in play:
+   one that adopted, or was given `tcp_cookies_accepted_until` of the old
+   listener through `tcp_accept_cookies_until`; any other resets it. Even
+   then the cookie works only if the client's first segment arrives first
+   and intact, and not at all for clients that offered window scaling,
+   SACK or ECN without timestamps (they are reset). A host that keeps one
+   TCB per port and calls `tcp_listen` on it again needs none of this: the
+   TCB goes on serving the handshakes it still holds. Set up each listener with
    the same secrets. A `CLOSED` TCB answers its former peer's segments
    with a RST (rate limited), so keeping one routed for a while tells a
    peer that kept sending; route a new SYN to your listener instead, as a

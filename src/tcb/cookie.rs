@@ -427,6 +427,7 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
         let cookie = seg.ack.wrapping_sub(1);
         let peer_seq = seg.seq.wrapping_sub(1);
 
+        self.backlog_left_behind();
         self.reset_connection_state();
         self.remote = remote;
         // Keep the SYN-ACK's offset, or our TSvals would jump and the

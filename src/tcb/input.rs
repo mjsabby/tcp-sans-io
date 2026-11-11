@@ -127,6 +127,13 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
                     return self.on_syn_rcvd(seg);
                 }
                 if let Some(opts) = self.validate_cookie(seg) {
+                    // Not at the price of a live handshake that has no
+                    // cookie to fall back on and nowhere to go: the cookie
+                    // client's next (re)transmission validates as well, as
+                    // Linux with a full SYN queue resets nobody.
+                    if self.slot_cannot_be_displaced() {
+                        return Ok(());
+                    }
                     self.backlog_keep_slot(Endpoint {
                         ip: seg.src_ip,
                         port: seg.src_port,
@@ -419,6 +426,7 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
     }
 
     fn complete_passive_open(&mut self, seg: &Segment<'_>) -> Result<(), TcpError> {
+        self.backlog_left_behind();
         let is_syn = seg.has(flags::SYN);
         self.snd_una = seg.ack;
         self.snd_acked = u64::from(seg.ack.wrapping_sub(self.iss));
