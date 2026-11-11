@@ -275,10 +275,24 @@ impl Reno {
         self.recovery_point = snd_nxt;
     }
 
-    /// End the episode once `SND.UNA` passes the recovery point. Returns
+    /// End the episode once `SND.UNA` reaches the recovery point. Returns
     /// `true` if an episode ended on this call.
-    pub fn maybe_exit(&mut self, snd_una: u32) -> bool {
+    ///
+    /// `hold_loss_at_point` (a peer without SACK): a timeout's episode ends
+    /// only once something beyond the point is acknowledged, as Linux holds
+    /// Reno state at `high_seq` (RFC 6582 §3.2, "avoid multiple fast
+    /// retransmits"). A timeout resends the flight go-back-N, and the
+    /// duplicate ACKs its copies draw arrive right at the point: with the
+    /// episode over they started a fast retransmit, in which every ACK is
+    /// partial and resends one more segment the receiver holds. Fast
+    /// recovery's own episodes are not held: its retransmissions were
+    /// needed, so they draw no duplicate ACKs, and holding them only cost
+    /// timeouts for losses that followed.
+    pub fn maybe_exit(&mut self, snd_una: u32, hold_loss_at_point: bool) -> bool {
         if self.state == CaState::Open || !seq_ge(snd_una, self.recovery_point) {
+            return false;
+        }
+        if hold_loss_at_point && self.state == CaState::Loss && snd_una == self.recovery_point {
             return false;
         }
         if self.in_reduction() {
@@ -333,8 +347,8 @@ mod tests {
         r.prr_update(M, 17 * M, M, false);
         // ceil(2000*10000/20000) - 1000 = 0, and nothing is forced again.
         assert_eq!(r.cwnd, 17 * M);
-        assert!(!r.maybe_exit(4999));
-        assert!(r.maybe_exit(5000));
+        assert!(!r.maybe_exit(4999, false));
+        assert!(r.maybe_exit(5000, false));
         assert_eq!(r.cwnd, 10 * M);
         assert_eq!(r.state(), CaState::Open);
     }
@@ -375,7 +389,7 @@ mod tests {
         let mut r = Reno::new(20 * M);
         r.enter_recovery(20 * M, 1000, 21_000, M);
         r.on_retransmit();
-        assert!(r.maybe_exit(21_000));
+        assert!(r.maybe_exit(21_000, false));
         assert_eq!(r.cwnd, 10 * M);
         r.on_retransmit(); // outside the episode: not counted
         assert!(r.on_dsack(1000, 2000, M));
@@ -405,7 +419,7 @@ mod tests {
         assert_eq!((r.cwnd, r.ssthresh, r.state()), (M, 20 * M, CaState::Loss));
         r.on_rto(40 * M, 100, 9000, M); // backoff of the same episode
         assert_eq!(r.ssthresh, 20 * M, "not halved again");
-        assert!(r.maybe_exit(9000));
+        assert!(r.maybe_exit(9000, false));
         assert_eq!(r.cwnd, M, "slow start continues after RTO recovery");
     }
 

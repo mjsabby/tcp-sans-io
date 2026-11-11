@@ -159,14 +159,17 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
             } else {
                 oldest_ts.and_then(|x| u32::try_from(now.saturating_sub(x)).ok())
             };
-            match sample {
-                Some(r) if r < 60_000 => self.update_rtt(r),
-                // New data acknowledged, but Karn's rule (and no usable
-                // echo) gives no sample: the path works again, so the
-                // backoff ends (RFC 6298 §5.7 allows it; BSD does it).
-                // Without timestamps it otherwise compounded across every
-                // lost retransmission, up to the 60 s cap.
-                _ => self.rto_ms = self.base_rto(),
+            // No sample (Karn's rule, and no usable echo): the timeout
+            // keeps its backoff until a segment sent once is acknowledged
+            // and measured, as in Linux. When the path has become slower
+            // than the timeout, every segment is resent before its ACK
+            // arrives, and the backoff is the only way to send one that is
+            // not; dropping it on any ACK of new data left the timeout at
+            // its stale value for good.
+            if let Some(r) = sample {
+                if r < 60_000 {
+                    self.update_rtt(r);
+                }
             }
             self.note_progress(data_acked.saturating_add(u32::from(fin_acked)), backlog);
         }
@@ -229,7 +232,7 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
         self.tlp_on_ack(ack, dsack, pure_dupack);
 
         // ---- Congestion control ----------------------------------------
-        if self.cc.maybe_exit(self.snd_una) {
+        if self.cc.maybe_exit(self.snd_una, !self.sack_enabled) {
             self.rack.on_recovery_exit();
         }
         let limited = self.take_cwnd_limited();
