@@ -1243,3 +1243,6 @@ fn ack_of_retransmitted_data_ends_the_rto_backoff() {
 
 #[path = "backlog_tests.rs"]
 mod backlog;
+
+#[path = "reno_tests.rs"]
+mod reno;

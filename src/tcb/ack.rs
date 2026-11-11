@@ -195,7 +195,15 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
         if !sack_present {
             let (lost, dup) = self.newreno_detect(seg, acked, wnd_before);
             newly_lost |= lost;
-            if dup && !self.sack_enabled {
+            // A duplicate ACK vouches for one more segment received (Linux
+            // "reno SACK"). Not during a timeout's recovery until new data
+            // has gone out beyond it (Linux `tcp_process_loss`): the
+            // duplicate ACKs arriving then are for segments sent before the
+            // timeout, and crediting them clocked out copies of data the
+            // receiver already holds.
+            let reno_credit =
+                self.cc.state() != CaState::Loss || seq_gt(self.snd_nxt, self.cc.recovery_point());
+            if dup && !self.sack_enabled && reno_credit {
                 let outstanding = self.snd_nxt.wrapping_sub(self.data_una());
                 if self.reno_sacked.saturating_add(mss) <= outstanding {
                     self.reno_sacked += mss;
@@ -230,7 +238,19 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
             self.cc
                 .prr_update(delivered, pipe, mss, acked > 0 && !newly_lost);
         } else {
-            self.cc.on_ack(delivered, mss, limited);
+            // RFC 3465 §2.3: in the slow start that follows a timeout, an
+            // ACK grows the window by one segment at most, however much it
+            // acknowledges. Without SACK such an ACK often jumps over data
+            // the receiver held all along, and counting those bytes sent a
+            // burst of copies of segments it holds too (everything was
+            // marked lost at the timeout). With SACK only what is missing
+            // is resent, so the bytes count in full.
+            let credit = if self.cc.state() == CaState::Loss && !self.sack_enabled {
+                delivered.min(mss)
+            } else {
+                delivered
+            };
+            self.cc.on_ack(credit, mss, limited);
         }
 
         // ---- Timers (RFC 6298 §5.2/5.3) ---------------------------------
