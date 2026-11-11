@@ -79,6 +79,10 @@ const TIME_WAIT_MS: u64 = 60_000;
 const TIME_WAIT_MAX_MS: u64 = 2 * TIME_WAIT_MS;
 const RTO_MAX_MS: u32 = 60_000;
 const RTO_MIN_MS: u32 = 200;
+/// The data RTO when there is no RTT sample to compute one from (a SYN or
+/// SYN-ACK resent without timestamps, a cookie): Linux
+/// `TCP_TIMEOUT_FALLBACK`, RFC 6298 §5.7.
+const RTO_FALLBACK_MS: u32 = 3_000;
 /// Delayed-ACK quantum (Linux default is 40 ms; RFC 5681 caps at 500 ms).
 const DELAYED_ACK_MS: u64 = 40;
 /// Peer MSS assumed when the SYN carries no MSS option (RFC 9293 §3.7.1).
@@ -455,6 +459,8 @@ pub struct Tcb<
     user_timeout_deadline: Deadline,
     /// Bytes acknowledged since the USER TIMEOUT was last re-armed.
     ut_progress: u32,
+    /// The application queued data since then.
+    ut_wrote: bool,
 
     // ---- Abuse resistance.
     /// Time of the last rate-limited response (0 bit pattern = never).
@@ -721,6 +727,7 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
         self.keepalive_deadline = Deadline::OFF;
         self.user_timeout_deadline = Deadline::OFF;
         self.ut_progress = 0;
+        self.ut_wrote = false;
         self.stats = TcbStats::default();
     }
 
@@ -905,12 +912,16 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
     /// drained, and resuming after [`Self::set_egress_paused`] (output owed
     /// while paused — an ACK, a keepalive probe — is not reported here).
     pub fn next_deadline(&self) -> Option<u64> {
-        let ack = if self.pending_ack && !self.egress_paused {
+        // ACKs and keepalives wait for egress room: while it is paused or
+        // the ring is full (the host drains, then ticks), they are not a
+        // reason to wake.
+        let blocked = self.egress_full();
+        let ack = if self.pending_ack && !blocked {
             self.ack_deadline
         } else {
             Deadline::OFF
         };
-        let keepalive = if self.egress_paused {
+        let keepalive = if blocked {
             Deadline::OFF
         } else {
             self.keepalive_deadline
@@ -1022,7 +1033,8 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
     /// aborts after this long without a full segment's worth of data being
     /// acknowledged while send work is outstanding. Zero-window persist and
     /// sub-MSS trickles do not count as progress; any acknowledgment does
-    /// when less than a segment was waiting for one.
+    /// when less than a segment was waiting for one and the application has
+    /// written since.
     pub fn set_user_timeout(&mut self, ms: u32) {
         self.user_timeout_ms = ms;
         self.ut_progress = 0;
@@ -1142,8 +1154,8 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
     }
 
     /// Install (or rotate to) an explicit 128-bit SYN-cookie key (RFC 4987),
-    /// from a CSPRNG. A listener holds one half-open handshake statefully and
-    /// answers further SYNs with cookies while that slot is busy. Cookies
+    /// from a CSPRNG. A listener holds up to nine half-opens statefully and
+    /// answers further SYNs with cookies. Cookies
     /// issued under the previous key stay valid for their normal 64–128 s
     /// lifetime, so rotating no more often than every ~2 minutes never breaks
     /// a handshake in progress. A listener set up within 128 s of a rotation
@@ -1288,6 +1300,7 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
         if written == 0 && !data.is_empty() {
             return Err(TcpError::WouldBlock);
         }
+        self.ut_wrote |= written > 0;
         Ok(written)
     }
 
@@ -1334,7 +1347,9 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
         if lent == 0 || self.send_lent_conn != self.conn_gen || !self.state.can_send() {
             return Err(TcpError::InvalidState);
         }
-        Ok(self.send_ring.commit(n.min(lent)))
+        let n = self.send_ring.commit(n.min(lent));
+        self.ut_wrote |= n > 0;
+        Ok(n)
     }
 
     /// Copy received in-order data out. Returns `ConnectionClosed` once the
@@ -1709,6 +1724,17 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
     }
 
     /// RFC 6298 §2 SRTT/RTTVAR/RTO update.
+    /// The RTO the estimator gives, without any backoff: from SRTT and
+    /// RTTVAR, or the fallback before the first sample.
+    pub(super) fn base_rto(&self) -> u32 {
+        if !self.rtt_first_sample {
+            return RTO_FALLBACK_MS.max(self.init_rto_ms).min(RTO_MAX_MS);
+        }
+        self.srtt_ms
+            .saturating_add(core::cmp::max(1, self.rttvar_ms.saturating_mul(4)))
+            .clamp(RTO_MIN_MS, RTO_MAX_MS)
+    }
+
     fn update_rtt(&mut self, r_ms: u32) {
         let r = r_ms.max(1);
         if !self.rtt_first_sample {
@@ -1720,10 +1746,7 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
             self.rttvar_ms = (3u32.saturating_mul(self.rttvar_ms).saturating_add(diff)) / 4;
             self.srtt_ms = (7u32.saturating_mul(self.srtt_ms).saturating_add(r)) / 8;
         }
-        let rto = self
-            .srtt_ms
-            .saturating_add(core::cmp::max(1, self.rttvar_ms.saturating_mul(4)));
-        self.rto_ms = rto.clamp(RTO_MIN_MS, RTO_MAX_MS);
+        self.rto_ms = self.base_rto();
         self.rack.sample_rtt(self.now_ms, r);
     }
 

@@ -348,6 +348,7 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
             return;
         }
         if !self.user_timeout_deadline.is_armed() {
+            self.ut_wrote = false;
             self.user_timeout_deadline =
                 Deadline::at(self.now_ms.saturating_add(u64::from(self.user_timeout_ms)));
         } else if self.user_timeout_deadline.due(self.now_ms) {

@@ -150,7 +150,7 @@ int32_t tcp_set_keepalive(TcpStreamHandle* handle, uint64_t now_ms,
 
 /* Set the RFC 9293 3.8.3 USER TIMEOUT: max time the connection may go without
  * forward progress (a full segment acknowledged, or anything at all when less
- * than a segment was waiting) while it still has send
+ * than a segment was waiting and the application is still writing) while it still has send
  * data, before it aborts (ConnectionReset via tcp_poll ERROR / tcp_recv, no
  * RST). ON BY DEFAULT (5 min) — bounds the zero-window / dribbled-ACK DoS (an
  * alive-but-stalling peer answering probes while never opening its window).

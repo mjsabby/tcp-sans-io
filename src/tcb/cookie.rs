@@ -243,10 +243,7 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
             ip: seg.src_ip,
             port: seg.src_port,
         };
-        let ecn = seg.has(flags::ECE) && seg.has(flags::CWR);
-        let carried = seg.options.ts.is_some()
-            || (seg.options.wscale.is_none() && !seg.options.sack_permitted && !ecn);
-        let mss_idx = if carried {
+        let mss_idx = if cookie_can_carry(seg) {
             let peer_mss = seg
                 .options
                 .mss
@@ -467,6 +464,15 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
         self.on_established();
         self.on_synchronized(seg)
     }
+}
+
+/// Whether a cookie can carry what this SYN offers: its options ride in the
+/// timestamp, so anything can with timestamps, and nothing but the MSS
+/// without (window scaling, SACK and ECN then need a stateful half-open).
+pub(super) fn cookie_can_carry(seg: &Segment<'_>) -> bool {
+    let ecn = seg.has(flags::ECE) && seg.has(flags::CWR);
+    seg.options.ts.is_some()
+        || (seg.options.wscale.is_none() && !seg.options.sack_permitted && !ecn)
 }
 
 /// SYN-cookie key derived from the host secret (domain-separated from the

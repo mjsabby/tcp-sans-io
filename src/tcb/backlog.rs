@@ -123,6 +123,18 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
         self.cookie_secret_set && (iss >> 30) as u8 != super::cookie::COOKIE_STATEFUL_ONLY
     }
 
+    /// A record whose half-open completes by its cookie without it (of any
+    /// age; the most retransmitted, then the oldest), to give to one that
+    /// cannot.
+    fn backlog_carried(&self) -> Option<usize> {
+        self.backlog
+            .iter()
+            .enumerate()
+            .filter(|(_, h)| h.used && self.cookie_carried(h.iss))
+            .max_by_key(|(_, h)| (h.retries, core::cmp::Reverse(h.syn_ms)))
+            .map(|(i, _)| i)
+    }
+
     /// The record to give up for a new half-open: one whose SYN-ACK already
     /// went unanswered (at least one retransmission), preferring one that
     /// still completes by its cookie, then the most retransmissions.
@@ -332,7 +344,13 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
                 }
                 i
             }
-            None => match self.backlog_room() {
+            // No unused or stale record: a client no cookie can carry
+            // takes the record of one that completes by its cookie anyway.
+            None => match self.backlog_room().or_else(|| {
+                (!super::cookie::cookie_can_carry(seg))
+                    .then(|| self.backlog_carried())
+                    .flatten()
+            }) {
                 Some(i) => i,
                 None => return Ok(false),
             },
@@ -393,13 +411,21 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
         }
         if self.state == State::SynRcvd && self.is_listener {
             let slot = self.slot_as_half_open();
-            // An unused record, or a stale one in its place: but never a
-            // half-open that needs its record for one that does not.
-            let room = self.backlog.iter().position(|h| !h.used).or_else(|| {
-                self.backlog_stale()
-                    .filter(|(_, h)| self.cookie_carried(h.iss) || !self.cookie_carried(slot.iss))
-                    .map(|(i, _)| i)
-            });
+            // An unused record; else, for a half-open that needs one (no
+            // cookie carries its options), the record of one that does not,
+            // of any age; else a stale one, but never a half-open that
+            // needs its record for one that does not.
+            let needs = !self.cookie_carried(slot.iss);
+            let room = self
+                .backlog
+                .iter()
+                .position(|h| !h.used)
+                .or_else(|| needs.then(|| self.backlog_carried()).flatten())
+                .or_else(|| {
+                    self.backlog_stale()
+                        .filter(|(_, h)| self.cookie_carried(h.iss) || needs)
+                        .map(|(i, _)| i)
+                });
             if let Some(i) = room {
                 self.backlog_put(i, slot);
             }

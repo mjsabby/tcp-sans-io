@@ -529,3 +529,61 @@ fn adoption_skips_peers_already_known_and_respects_the_limit() {
     assert_eq!((n.state(), n.pending_half_opens()), (State::SynRcvd, 0));
     assert_eq!(s.pending_half_opens(), 1);
 }
+
+/// With the backlog full of fresh half-opens, a cookie ACK taking the slot
+/// used to drop the slot's half-open, and a client without timestamps was
+/// then reset after its connect had succeeded. A half-open that needs its
+/// record now takes the record of one that completes by its cookie anyway,
+/// whatever its age; so does a new SYN no cookie can carry.
+#[test]
+fn half_opens_that_need_a_record_take_one_from_those_that_do_not() {
+    let ts_syn = |src: Ep, seq: u32| syn(src, seq, &syn_opts(Some(9), true, Some(7)));
+    let mut s = backlog_listener();
+    s.inject_packet(&win_syn(A, 100)).unwrap(); // the slot: needs its record
+    for k in 0..8u32 {
+        s.inject_packet(&ts_syn(([198, 18, 9, k as u8], 7000), k))
+            .unwrap();
+    }
+    let sa = drain(&mut s).into_iter().find(|o| o.dst == A).unwrap();
+    // The backlog is full and fresh: B gets a cookie and completes first.
+    s.inject_packet(&ts_syn(B, 200)).unwrap();
+    let sb = drain(&mut s).remove(0);
+    assert_eq!(s.pending_half_opens(), 8);
+    s.set_now(5);
+    s.inject_packet(&pkt(
+        B,
+        SRV,
+        201,
+        sb.seq + 1,
+        flags::ACK,
+        65535,
+        &ts(901, sb.opts.ts.unwrap().0),
+        &[],
+    ))
+    .unwrap();
+    assert_eq!((s.state(), s.remote()), (State::Established, Some(ep(B))));
+    let mut n = backlog_listener();
+    n.set_now(6);
+    assert_eq!(n.adopt_half_opens(&mut s), 8);
+    n.inject_packet(&bare_ack(A, 101, sa.seq + 1, 400)).unwrap();
+    let out = drain(&mut n);
+    assert!(out.iter().all(|o| o.flags & flags::RST == 0), "A was reset");
+    assert_eq!((n.state(), n.remote()), (State::Established, Some(ep(A))));
+    assert_eq!(n.stats().snd_wnd, 400 << 7);
+
+    // A new SYN no cookie can carry, into a full and fresh backlog of
+    // half-opens that cookies can: it is held statefully.
+    let mut s = backlog_listener();
+    for k in 0..9u32 {
+        s.inject_packet(&ts_syn(([198, 18, 10, k as u8], 7000), k))
+            .unwrap();
+    }
+    drain(&mut s);
+    s.inject_packet(&win_syn(A, 100)).unwrap();
+    let sa = drain(&mut s).remove(0);
+    assert!(sa.opts.wscale.is_some(), "kept its options");
+    assert_eq!(s.pending_half_opens(), 8);
+    s.inject_packet(&bare_ack(A, 101, sa.seq + 1, 600)).unwrap();
+    assert_eq!((s.state(), s.remote()), (State::Established, Some(ep(A))));
+    assert_eq!(s.stats().snd_wnd, 600 << 7);
+}

@@ -453,7 +453,8 @@ pub unsafe extern "C" fn tcp_set_keepalive(
 /// Set the RFC 9293 §3.8.3 USER TIMEOUT (`0` disables; default 5 min):
 /// abort after this long without a full segment acknowledged while send work
 /// is outstanding (zero-window persist and sub-MSS trickles do not count;
-/// any acknowledgment does when less than a segment was waiting for one).
+/// any acknowledgment does when less than a segment was waiting for one
+/// and the application has written since).
 ///
 /// # Safety
 /// `handle` must be NULL or a live handle from [`tcp_init`].

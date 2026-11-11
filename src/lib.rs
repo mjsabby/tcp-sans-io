@@ -7,7 +7,7 @@
 //! Both **active** opens (`connect`) and **passive** opens (`listen`) are
 //! supported. The passive path implements the canonical RFC 793 server
 //! states (LISTEN and SYN_RECEIVED) plus RFC 4987 SYN cookies, used while
-//! the listener's single half-open slot is busy, for flood resistance.
+//! the listener's backlog of pending handshakes is full, for flood resistance.
 //!
 //! Design constraints:
 //! * `#![no_std]`, no heap allocation, no panics, no threads, no syscalls.

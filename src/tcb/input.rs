@@ -452,6 +452,11 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
         self.cwnd_limited_seq = self.snd_nxt;
         self.pipe_hiwat = 0;
         self.last_data_send_ms = self.now_ms;
+        // No RTT sample from the handshake: not the handshake timer's
+        // backoff (up to 60 s after a few lost SYNs), but the fallback.
+        if !self.rtt_first_sample {
+            self.rto_ms = self.base_rto();
+        }
         if !seq_gt(self.rcv_adv_edge, self.rcv_nxt) {
             self.rcv_adv_edge = self.rcv_nxt;
         }

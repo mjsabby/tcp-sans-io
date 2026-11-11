@@ -91,8 +91,8 @@ shows what that costs against Linux CUBIC on lossy long paths.
 
 ### Memory footprint
 
-Per connection, `tcp_handle_size()` is **2,176,896 bytes (≈ 2.08 MiB)** with
-default features, or **139,520 bytes (136 KiB)** with `small-buffers`:
+Per connection, `tcp_handle_size()` is **2,177,296 bytes (≈ 2.08 MiB)** with
+default features, or **139,920 bytes (137 KiB)** with `small-buffers`:
 
 - `BUF_CAP` send ring + receive ring (2 × 1 MiB; 2 × 32 KiB with
   `small-buffers`). Out-of-order data is parked inside the receive ring at
@@ -138,7 +138,8 @@ the code cannot drift apart.
 ![TCP connection state machine](docs/state-machine.svg)
 
 Bold purple is the non-textbook **SYN_RCVD → LISTEN** revert: a listener
-keeps at most one half-open slot and recycles it after a bounded SYN-ACK
+keeps one half-open in its own state (the slot, with eight more in a backlog
+beside it) and recycles it after a bounded SYN-ACK
 retransmit budget (or an exact RST), rather than leaking it. Green edges are
 SYN-cookie promotions: while the slot is busy, other peers get cookie
 SYN-ACKs, and a valid cookie ACK establishes directly — from SYN_RCVD by
@@ -175,7 +176,7 @@ mis-ordering, corruption, a panic, or an unbounded loop.
 | TLP PTO floor / delayed ACK / `TIME_WAIT` | 10 ms / 40 ms / 60 s (≤ 120 s) | `tcb/mod.rs` | Probe timeout floor, delayed-ACK timer, 2·MSL; a retransmitted FIN restarts 2·MSL, at most 120 s after entry. |
 | `MAX_SYN_RETRIES` / `MAX_SYN_RCVD_RETRIES` | 6 / 5 | `tcb/mod.rs` | SYN retransmissions before an active open fails; SYN-ACK retransmissions before a half-open reverts to `LISTEN`. |
 | `MAX_RETRANSMITS` | 10 | `tcb/mod.rs` | RFC 9293 §3.8.3 "R2": consecutive timeouts (data or FIN) without an ACK of new data, or zero-window probes without any answer, before abort. The peer's own traffic does not restart the timeout count (as Linux), so a path that black-holes our segments is still detected. |
-| USER TIMEOUT | 300 s | `tcb/mod.rs` | Max time with outstanding send work but less than one full segment acknowledged; reaps stalled, zero-window and sub-MSS-trickle peers, whatever window they advertise. When less than a segment was waiting to be acknowledged, any acknowledgment counts, so an application trickling tiny records is not aborted. A reader acknowledging a full segment per period is live progress, not a stall (see *Threat model*). `set_user_timeout(0)` disables. |
+| USER TIMEOUT | 300 s | `tcb/mod.rs` | Max time with outstanding send work but less than one full segment acknowledged; reaps stalled, zero-window and sub-MSS-trickle peers, whatever window they advertise. When less than a segment was waiting and the application is still writing, any acknowledgment counts, so an application trickling tiny records is not aborted; a small tail nobody adds to must be acknowledged whole. A reader acknowledging a full segment per period is live progress, not a stall (see *Threat model*). `set_user_timeout(0)` disables. |
 | Keepalive | 600 s idle / 60 s / 4 probes | `tcb/mod.rs` | Reaps a vanished peer on an idle connection: `ESTABLISHED`, or half-closed (`CLOSE_WAIT`, `FIN_WAIT_2`), as in Linux. `set_keepalive(0, …)` disables. |
 | FIN_WAIT_2 timeout | 60 s | `tcb/mod.rs` | Time a peer may leave its half open after ACKing our FIN, once the host has closed (`tcp_close`); restarted only when the application reads, never by the peer's data alone. A host that half-closes with `tcp_shutdown_write` and keeps reading is not timed until it calls `tcp_close`. |
 | Black-hole MSS clamp / probe | 3, 5 RTOs → 1024, 536 / 10 s … 10 min | `tcb/mod.rs` | Consecutive timeouts of a large segment clamp the MSS; one probe segment at the next larger size (first after 10 s, doubling up to 10 min on failure) restores it once it arrives. |
@@ -481,7 +482,7 @@ tables. `TSB_PCAP=dir` captures each run's packet headers at the receiver;
 
 ```sh
 cargo build --release --lib       # cdylib + staticlib + rlib
-cargo test  --release --lib       # 253 tests: unit, conformance, loopback, property, server, security regressions, link simulation, smoltcp interop
+cargo test  --release --lib       # 304 tests: unit, conformance, loopback, property, server, security regressions, link simulation, smoltcp interop
 cargo clippy --release --lib --no-deps -- -D warnings
 ```
 
@@ -1004,7 +1005,8 @@ put packets on the path — is hostile.
 
 - **Connection pinning.** A peer that *stops making progress* cannot hold
   a TCB: R2 (10 unanswered timeouts), USER TIMEOUT (300 s without a full
-  segment of progress, unless less than a segment was waiting — defeats
+  segment of progress, unless less than a segment was waiting and the
+  application is still writing — defeats
   zero-window and sub-segment-trickle "Sockstress" stalls, which a proof-of-life-based timer cannot), keepalive
   (reaps vanished idle peers) and bounded SYN / SYN-ACK retransmission.
   Once the host has closed and our FIN is acknowledged, the peer cannot
@@ -1073,7 +1075,7 @@ put packets on the path — is hostile.
   Linux a blind forgery succeeds with probability 2⁻²⁹ per attempt (2⁻²⁸
   for 128 s after a key rotation) and delivers the forged segment's payload
   from a spoofed address; unlike Linux, at any time, not only within two
-  minutes of an overflow (one SYN would open that window on a single-slot
+  minutes of an overflow (a handful of SYNs would open that window on a nine-handshake
   listener anyway): do not treat a source address as authenticated.
 - **Side channels.** Every datagram is DF. What a listener sends would-be
   peers (SYN-ACKs, cookie or not, and RSTs) carries IP ID 0, and a

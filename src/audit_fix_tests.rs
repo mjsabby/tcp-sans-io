@@ -1121,5 +1121,125 @@ fn half_close_is_not_timed_until_the_host_closes() {
     assert_eq!(out.last().unwrap().flags & flags::RST, flags::RST);
 }
 
+/// A backlog nobody adds to (the tail of a closed connection) used to be
+/// kept alive by a peer acknowledging a byte every few minutes, because
+/// with less than a segment waiting any ACK counted as progress. That now
+/// holds only while the application keeps writing.
+#[test]
+fn user_timeout_reaps_a_byte_at_a_time_acker_of_a_small_tail() {
+    let (mut c, iss) = established_ts();
+    c.send(&[7u8; 400]).unwrap();
+    c.set_now(20);
+    c.close().unwrap();
+    let (mut una, mut tsv) = (iss + 1, 2u32);
+    let mut acks = 0;
+    let mut now = 20u64;
+    while now < 2_000_000 && c.state() != State::Closed {
+        c.set_now(now);
+        c.tick().unwrap();
+        drain(&mut c);
+        if (now - 20) % 200_000 == 100_000 {
+            una += 1;
+            tsv += 1;
+            acks += 1;
+            let _ = c.inject_packet(&pkt(SRV, A, 5001, una, flags::ACK, 8192, &ts(tsv, 0), &[]));
+            drain(&mut c);
+        }
+        now += 50;
+    }
+    assert!(acks >= 1, "the scripted ACKs fired");
+    assert_eq!(c.state(), State::Closed);
+    assert!(now <= 301_000, "aborted at {now} ms after {acks} ACKs");
+}
+
+/// A handshake that needed retransmissions and gave no RTT sample (no
+/// timestamps) used to carry its backed-off timeout into the data phase:
+/// 4 s after two lost SYNs, up to 60 s after more. It starts from the 3 s
+/// fallback instead.
+#[test]
+fn handshake_backoff_does_not_carry_into_the_data_phase() {
+    let (mut c, iss) = client();
+    drain(&mut c);
+    let mut now = 0u64;
+    let mut syns = 0;
+    while syns < 4 {
+        now = c.next_deadline().unwrap();
+        c.set_now(now);
+        c.tick().unwrap();
+        syns += drain(&mut c).len();
+    }
+    assert!(now >= 15_000, "four SYN retransmissions by {now} ms");
+    c.set_now(now + 10);
+    c.inject_packet(&pkt(
+        SRV,
+        A,
+        5000,
+        iss + 1,
+        flags::SYN | flags::ACK,
+        8192,
+        &syn_opts(None, false, None),
+        &[],
+    ))
+    .unwrap();
+    assert_eq!(c.state(), State::Established);
+    assert_eq!(c.stats().rto_ms, 3000);
+}
+
+/// Without timestamps an ACK of retransmitted data gives no RTT sample
+/// (Karn), and the backed-off timeout used to stay: every later loss then
+/// waited the doubled timeout, compounding to tens of seconds. An ACK of
+/// new data now ends the backoff.
+#[test]
+fn ack_of_retransmitted_data_ends_the_rto_backoff() {
+    let (mut c, iss) = client();
+    drain(&mut c);
+    c.set_now(10);
+    c.inject_packet(&pkt(
+        SRV,
+        A,
+        5000,
+        iss + 1,
+        flags::SYN | flags::ACK,
+        8192,
+        &syn_opts(None, false, None),
+        &[],
+    ))
+    .unwrap();
+    drain(&mut c);
+    let base = c.stats().rto_ms;
+    assert!(base <= 400, "a 10 ms handshake sample: {base}");
+    c.send(&[1u8; 1000]).unwrap();
+    c.set_now(20);
+    c.tick().unwrap();
+    drain(&mut c);
+    // Four timeouts go unanswered.
+    let mut now = 20u64;
+    while c.stats().rto_count < 4 {
+        now = c.next_deadline().unwrap();
+        c.set_now(now);
+        c.tick().unwrap();
+        drain(&mut c);
+    }
+    assert!(
+        c.stats().rto_ms >= 8 * base,
+        "backed off: {}",
+        c.stats().rto_ms
+    );
+    // The retransmission is acknowledged: no sample, but the path works.
+    c.set_now(now + 10);
+    c.inject_packet(&pkt(
+        SRV,
+        A,
+        5001,
+        iss + 1001,
+        flags::ACK,
+        8192,
+        &TcpOptions::NONE,
+        &[],
+    ))
+    .unwrap();
+    assert_eq!(c.stats().rto_ms, base);
+}
+
 #[path = "backlog_tests.rs"]
 mod backlog;
