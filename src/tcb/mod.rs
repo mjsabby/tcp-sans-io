@@ -16,6 +16,7 @@
 //! * `cookie` — SYN cookies, keyed hashing, timestamp offsets.
 
 mod ack;
+mod backlog;
 mod cookie;
 mod input;
 mod output;
@@ -78,6 +79,10 @@ const TIME_WAIT_MS: u64 = 60_000;
 const TIME_WAIT_MAX_MS: u64 = 2 * TIME_WAIT_MS;
 const RTO_MAX_MS: u32 = 60_000;
 const RTO_MIN_MS: u32 = 200;
+/// The data RTO when there is no RTT sample to compute one from (a SYN or
+/// SYN-ACK resent without timestamps, a cookie): Linux
+/// `TCP_TIMEOUT_FALLBACK`, RFC 6298 §5.7.
+const RTO_FALLBACK_MS: u32 = 3_000;
 /// Delayed-ACK quantum (Linux default is 40 ms; RFC 5681 caps at 500 ms).
 const DELAYED_ACK_MS: u64 = 40;
 /// Peer MSS assumed when the SYN carries no MSS option (RFC 9293 §3.7.1).
@@ -437,6 +442,10 @@ pub struct Tcb<
     // ---- Passive open.
     is_listener: bool,
     syn_rcvd_retries: u8,
+    /// Half-opens pending beside the one in the slot (see `backlog.rs`),
+    /// and how many of the records may be used.
+    backlog: [backlog::HalfOpen; backlog::BACKLOG],
+    backlog_limit: u8,
 
     // ---- Keepalive (RFC 9293 §3.8.4).
     keepalive_idle_ms: u32,
@@ -450,6 +459,8 @@ pub struct Tcb<
     user_timeout_deadline: Deadline,
     /// Bytes acknowledged since the USER TIMEOUT was last re-armed.
     ut_progress: u32,
+    /// The application queued data since then.
+    ut_wrote: bool,
 
     // ---- Abuse resistance.
     /// Time of the last rate-limited response (0 bit pattern = never).
@@ -472,6 +483,10 @@ pub struct Tcb<
     /// The previous key was installed since the clock was last set: its
     /// lifetime has yet to start.
     prev_cookie_pending: bool,
+    /// Cookie ACKs are taken until this time (0: never): two time buckets
+    /// after a handshake last had to rely on its cookie (see
+    /// [`Tcb::accept_cookies_until`]).
+    cookie_until_ms: u64,
     secret: [u8; 16],
     secret_set: bool,
 
@@ -591,6 +606,7 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
         self.prev_cookie_secret_set = false;
         self.prev_cookie_until_ms = 0;
         self.prev_cookie_pending = false;
+        self.cookie_until_ms = 0;
         self.secret = [0; 16];
         self.secret_set = false;
         self.now_ms = 0;
@@ -604,6 +620,8 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
         self.keepalive_count = DEFAULT_KEEPALIVE_COUNT;
         self.user_timeout_ms = DEFAULT_USER_TIMEOUT_MS;
         self.fin_wait2_timeout_ms = DEFAULT_FIN_WAIT2_TIMEOUT_MS;
+        self.backlog_clear();
+        self.backlog_limit = backlog::BACKLOG as u8;
         // Not per connection: what is staged may be for other peers (a
         // listener's cookie SYN-ACKs and RSTs), and the limit on replies to
         // stray segments must survive listener transitions.
@@ -714,6 +732,7 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
         self.keepalive_deadline = Deadline::OFF;
         self.user_timeout_deadline = Deadline::OFF;
         self.ut_progress = 0;
+        self.ut_wrote = false;
         self.stats = TcbStats::default();
     }
 
@@ -898,12 +917,16 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
     /// drained, and resuming after [`Self::set_egress_paused`] (output owed
     /// while paused — an ACK, a keepalive probe — is not reported here).
     pub fn next_deadline(&self) -> Option<u64> {
-        let ack = if self.pending_ack && !self.egress_paused {
+        // ACKs and keepalives wait for egress room: while it is paused or
+        // the ring is full (the host drains, then ticks), they are not a
+        // reason to wake.
+        let blocked = self.egress_full();
+        let ack = if self.pending_ack && !blocked {
             self.ack_deadline
         } else {
             Deadline::OFF
         };
-        let keepalive = if self.egress_paused {
+        let keepalive = if blocked {
             Deadline::OFF
         } else {
             self.keepalive_deadline
@@ -926,6 +949,7 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
         ]
         .into_iter()
         .filter_map(Deadline::get)
+        .chain(self.backlog_deadline())
         .min()
     }
 
@@ -1014,7 +1038,8 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
     /// aborts after this long without a full segment's worth of data being
     /// acknowledged while send work is outstanding. Zero-window persist and
     /// sub-MSS trickles do not count as progress; any acknowledgment does
-    /// when less than a segment was waiting for one.
+    /// when less than a segment was waiting for one and the application has
+    /// written since.
     pub fn set_user_timeout(&mut self, ms: u32) {
         self.user_timeout_ms = ms;
         self.ut_progress = 0;
@@ -1134,8 +1159,8 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
     }
 
     /// Install (or rotate to) an explicit 128-bit SYN-cookie key (RFC 4987),
-    /// from a CSPRNG. A listener holds one half-open handshake statefully and
-    /// answers further SYNs with cookies while that slot is busy. Cookies
+    /// from a CSPRNG. A listener holds up to nine half-opens statefully and
+    /// answers further SYNs with cookies. Cookies
     /// issued under the previous key stay valid for their normal 64–128 s
     /// lifetime, so rotating no more often than every ~2 minutes never breaks
     /// a handshake in progress. A listener set up within 128 s of a rotation
@@ -1172,6 +1197,40 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
         self.cookie_secret_set = true;
     }
 
+    /// A handshake now depends on its cookie (a SYN was answered
+    /// statelessly, or a half-open that can complete by cookie lost its
+    /// place): cookie ACKs are taken for the lifetime of a cookie from now.
+    pub(super) fn note_cookie_pressure(&mut self) {
+        let until = self
+            .now_ms
+            .saturating_add(2 * cookie::COOKIE_TIME_BUCKET_MS);
+        self.cookie_until_ms = self.cookie_until_ms.max(until);
+    }
+
+    /// Until when (on the host clock, ms) this listener takes SYN-cookie
+    /// ACKs; 0 if it never has reason to. A listener takes them only for
+    /// 128 s after a handshake had to rely on its cookie (the backlog was
+    /// full, or a pending handshake lost its place), as Linux does only
+    /// shortly after its SYN queue overflowed. Otherwise an ACK that
+    /// carries a valid cookie, such as a delayed or replayed third ACK of a
+    /// connection since closed, is answered as a stray ACK: every SYN-ACK
+    /// is a cookie, so without this a copy of any handshake's third ACK
+    /// re-created the connection and delivered its payload again.
+    ///
+    /// [`Tcb::adopt_half_opens`] carries the time to the next listener. A
+    /// host that runs several listeners on one port at once passes it
+    /// between them with [`Tcb::accept_cookies_until`].
+    pub fn cookies_accepted_until(&self) -> u64 {
+        self.cookie_until_ms
+    }
+
+    /// Take SYN-cookie ACKs until at least `until_ms` (see
+    /// [`Tcb::cookies_accepted_until`]): for a listener that shares its
+    /// port, and its cookie key, with one that issued cookies.
+    pub fn accept_cookies_until(&mut self, until_ms: u64) {
+        self.cookie_until_ms = self.cookie_until_ms.max(until_ms);
+    }
+
     /// Start the previous cookie key's lifetime (two time buckets) from
     /// the current clock, on the first clocked call after a rotation.
     #[cold]
@@ -1198,6 +1257,7 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
             return Err(TcpError::InvalidState);
         }
         self.is_listener = false;
+        self.backlog_clear();
         // The configured ISS serves one connection: a TCB connected again
         // without `reinit` draws a fresh one from the host secret
         // (RFC 6528), so the new connection neither repeats a sequence
@@ -1230,16 +1290,19 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
     /// listener accepts would get the same ISN and a TSval equal to the host
     /// clock.
     ///
-    /// The listener holds one half-open connection at a time, statefully, so
-    /// it keeps every option the client offers. While that slot is busy, SYNs
-    /// from other peers are answered with SYN cookies (no state); a valid
-    /// cookie ACK replaces the pending half-open, so spoofed SYNs cannot lock
-    /// the listener. A half-open whose SYN-ACK already needed a retransmit
-    /// also yields its slot to a SYN from a new peer. Either way the
-    /// half-open is not lost: its SYN-ACK is a cookie too, and its ACK
-    /// completes at the listener the host sets up next (unless it offered
-    /// window scaling, SACK or ECN without timestamps, which no cookie
-    /// carries: then its ACK is reset).
+    /// The listener holds up to nine half-opens statefully (one in its own
+    /// state, the slot, and [`Tcb::set_listen_backlog`] records beside it),
+    /// keeping every option each client offers, and becomes the connection
+    /// of whichever completes first; the host then sets up its next
+    /// listener and moves the rest to it with [`Tcb::adopt_half_opens`].
+    /// Once they are taken, a new SYN recycles a half-open whose SYN-ACK
+    /// already needed a retransmission and is otherwise answered with a
+    /// SYN cookie (no state); a valid cookie ACK takes the slot, so spoofed
+    /// SYNs cannot lock the listener. A half-open that loses its place is
+    /// not lost if a cookie can carry what its client offered: its SYN-ACK
+    /// is a cookie too, and its ACK completes at the next listener
+    /// (otherwise, window scaling, SACK or ECN without timestamps, its ACK
+    /// is reset).
     pub fn listen(&mut self) -> Result<(), TcpError> {
         match self.state {
             State::Closed | State::Listen | State::TimeWait => {}
@@ -1256,6 +1319,7 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
             port: 0,
         };
         self.is_listener = true;
+        self.backlog_clear();
         self.reset_connection_state();
         self.state = State::Listen;
         Ok(())
@@ -1275,6 +1339,7 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
         if written == 0 && !data.is_empty() {
             return Err(TcpError::WouldBlock);
         }
+        self.ut_wrote |= written > 0;
         Ok(written)
     }
 
@@ -1321,7 +1386,9 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
         if lent == 0 || self.send_lent_conn != self.conn_gen || !self.state.can_send() {
             return Err(TcpError::InvalidState);
         }
-        Ok(self.send_ring.commit(n.min(lent)))
+        let n = self.send_ring.commit(n.min(lent));
+        self.ut_wrote |= n > 0;
+        Ok(n)
     }
 
     /// Copy received in-order data out. Returns `ConnectionClosed` once the
@@ -1409,6 +1476,7 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
             State::SynRcvd => {
                 self.emit_final_rst()?;
                 self.is_listener = false;
+                self.backlog_clear();
                 self.close_clean();
                 return Ok(());
             }
@@ -1420,6 +1488,7 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
             | State::LastAck => return Ok(()),
             State::SynSent | State::Listen => {
                 self.is_listener = false;
+                self.backlog_clear();
                 self.reset_connection_state();
                 self.state = State::Closed;
                 return Ok(());
@@ -1437,8 +1506,15 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
             State::Closed => return Ok(()),
             State::Listen | State::SynSent => {
                 self.is_listener = false;
+                self.backlog_clear();
             }
             _ => {
+                // A listener aborted mid-handshake stops listening; a
+                // connection keeps its pending half-opens for the host's
+                // next listener to adopt.
+                if self.state == State::SynRcvd {
+                    self.backlog_clear();
+                }
                 self.emit_final_rst()?;
             }
         }
@@ -1687,6 +1763,17 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
     }
 
     /// RFC 6298 §2 SRTT/RTTVAR/RTO update.
+    /// The RTO the estimator gives, without any backoff: from SRTT and
+    /// RTTVAR, or the fallback before the first sample.
+    pub(super) fn base_rto(&self) -> u32 {
+        if !self.rtt_first_sample {
+            return RTO_FALLBACK_MS.max(self.init_rto_ms).min(RTO_MAX_MS);
+        }
+        self.srtt_ms
+            .saturating_add(core::cmp::max(1, self.rttvar_ms.saturating_mul(4)))
+            .clamp(RTO_MIN_MS, RTO_MAX_MS)
+    }
+
     fn update_rtt(&mut self, r_ms: u32) {
         let r = r_ms.max(1);
         if !self.rtt_first_sample {
@@ -1698,10 +1785,7 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
             self.rttvar_ms = (3u32.saturating_mul(self.rttvar_ms).saturating_add(diff)) / 4;
             self.srtt_ms = (7u32.saturating_mul(self.srtt_ms).saturating_add(r)) / 8;
         }
-        let rto = self
-            .srtt_ms
-            .saturating_add(core::cmp::max(1, self.rttvar_ms.saturating_mul(4)));
-        self.rto_ms = rto.clamp(RTO_MIN_MS, RTO_MAX_MS);
+        self.rto_ms = self.base_rto();
         self.rack.sample_rtt(self.now_ms, r);
     }
 

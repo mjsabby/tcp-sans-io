@@ -39,11 +39,7 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
         }
         let from_remote = seg.src_ip == self.remote.ip && seg.src_port == self.remote.port;
         if self.state != State::Listen && !from_remote {
-            if self.may_replace_half_open(seg) {
-                self.reset_to_listen_or_closed();
-            } else {
-                return self.on_busy_listener(seg);
-            }
+            return self.on_busy_listener(seg);
         }
         self.stats.segs_in = self.stats.segs_in.saturating_add(1);
         match self.state {
@@ -79,42 +75,62 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
         }
     }
 
-    /// A stateful listener holds one half-open at a time. A half-open whose
-    /// SYN-ACK already needed a retransmission (its peer did not answer
-    /// within an RTO — typically a spoofed source) yields to a SYN from a
-    /// new peer, so one spoofed SYN cannot lock the listener for the whole
-    /// SYN-ACK retransmit budget.
-    fn may_replace_half_open(&self, seg: &Segment<'_>) -> bool {
-        self.state == State::SynRcvd
-            && self.is_listener
-            && seg.has(flags::SYN)
-            && !seg.has(flags::ACK)
-            && !seg.has(flags::RST)
-            && !seg.has(flags::FIN)
-            && self.syn_rcvd_retries >= 1
-    }
-
-    /// Segment from a peer other than the half-open's, while a listener's
-    /// only slot is busy (hybrid SYN cookies). SYNs are answered with a
-    /// cookie SYN-ACK, holding no state; a valid cookie ACK proves the peer
-    /// receives our packets — which a pending half-open has not yet shown —
-    /// so it takes over the slot. Spoofed SYNs therefore cannot lock a
-    /// listener out, however fast they arrive. The half-open it displaces
-    /// is not lost: its SYN-ACK was a cookie too (see
-    /// [`Self::accept_syn_stateful`]), so its ACK completes at whichever
-    /// listener the host routes it to. Any other ACK is answered as in
-    /// LISTEN (see [`Self::on_listen`]).
+    /// Segment from a peer other than the slot's, at a listener whose slot
+    /// holds a half-open.
+    ///
+    /// A SYN starts another half-open in the backlog (see `backlog.rs`),
+    /// which keeps every option the client offers and has its SYN-ACK
+    /// retransmitted. Only when the backlog is full of half-opens still
+    /// within their first RTO does the old policy apply: a slot whose
+    /// SYN-ACK already went unanswered (typically a spoofed source) yields
+    /// to the new SYN, and otherwise the SYN is answered with a stateless
+    /// cookie.
+    ///
+    /// An ACK completes the backlog half-open it acknowledges, which is
+    /// moved into the slot for that. A valid cookie ACK (the backlog was
+    /// full when its SYN came, or it was issued by another listener) proves
+    /// its peer receives our packets, so it takes the slot; the slot's
+    /// half-open moves to the backlog if there is room, and completes by
+    /// its own cookie otherwise. Any other ACK is answered as in LISTEN
+    /// (see [`Self::on_listen`]).
     fn on_busy_listener(&mut self, seg: &Segment<'_>) -> Result<(), TcpError> {
         if self.state != State::SynRcvd || !self.is_listener {
             return Err(TcpError::NotForUs);
         }
         let ctl = seg.has(flags::RST) || seg.has(flags::FIN);
-        if seg.has(flags::SYN) && !seg.has(flags::ACK) && !ctl && self.cookie_secret_set {
-            return self.emit_cookie_synack(seg);
+        if seg.has(flags::SYN) && !seg.has(flags::ACK) && !ctl {
+            if self.backlog_syn(seg)? {
+                return Ok(());
+            }
+            if self.syn_rcvd_retries >= 1 {
+                // The slot's half-open yields, with its cookie left.
+                self.note_cookie_pressure();
+                self.stats.segs_in = self.stats.segs_in.saturating_add(1);
+                return self.accept_syn_stateful(seg);
+            }
+            if self.cookie_secret_set {
+                return self.emit_cookie_synack(seg);
+            }
+            return Err(TcpError::NotForUs);
         }
-        if seg.has(flags::ACK) && !seg.has(flags::RST) {
+        if seg.has(flags::RST) {
+            return if self.backlog_rst(seg) {
+                Ok(())
+            } else {
+                Err(TcpError::NotForUs)
+            };
+        }
+        if seg.has(flags::ACK) {
             if !seg.has(flags::SYN) {
+                if self.backlog_take_for_ack(seg) {
+                    self.stats.segs_in = self.stats.segs_in.saturating_add(1);
+                    return self.on_syn_rcvd(seg);
+                }
                 if let Some(opts) = self.validate_cookie(seg) {
+                    self.backlog_keep_slot(Endpoint {
+                        ip: seg.src_ip,
+                        port: seg.src_port,
+                    });
                     self.reset_to_listen_or_closed();
                     return self.promote_via_cookie(seg, opts);
                 }
@@ -334,6 +350,7 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
             }
             if self.is_listener {
                 self.reset_to_listen_or_closed();
+                self.backlog_refill_slot();
             } else {
                 self.abort_local(); // active (simultaneous) open refused
             }
@@ -361,8 +378,17 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
                 }
                 return Ok(());
             }
-            // Retransmitted SYN: our SYN-ACK was lost.
-            if seg.seq == self.irs && self.oow_allowed() {
+            // A SYN with another ISN once our SYN-ACK went unanswered for an
+            // RTO: the client started over, and so does the half-open (as
+            // for one in the backlog, see `backlog_syn`).
+            if seg.seq != self.irs && self.is_listener && self.syn_rcvd_retries >= 1 {
+                return self.accept_syn_stateful(seg);
+            }
+            // The SYN again: our SYN-ACK was lost. With another ISN before
+            // that, the client restarted or the SYN is spoofed: the
+            // SYN-ACK is repeated, which a restarted client answers with
+            // the RST that frees the slot.
+            if (seg.seq == self.irs || self.is_listener) && self.oow_allowed() {
                 let _ = self.emit_synack()?;
             }
             return Ok(());
@@ -428,6 +454,11 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
         self.cwnd_limited_seq = self.snd_nxt;
         self.pipe_hiwat = 0;
         self.last_data_send_ms = self.now_ms;
+        // No RTT sample from the handshake: not the handshake timer's
+        // backoff (up to 60 s after a few lost SYNs), but the fallback.
+        if !self.rtt_first_sample {
+            self.rto_ms = self.base_rto();
+        }
         if !seq_gt(self.rcv_adv_edge, self.rcv_nxt) {
             self.rcv_adv_edge = self.rcv_nxt;
         }

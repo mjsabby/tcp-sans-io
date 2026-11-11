@@ -190,8 +190,10 @@ pub unsafe extern "C" fn tcp_connect(handle: *mut TcpStreamHandle, now_ms: u64) 
 
 /// Passive open (`CLOSED` → `LISTEN`); the remote is wildcarded until a SYN
 /// arrives. Requires [`tcp_set_secret`] (or [`tcp_set_cookie_secret`]) first;
-/// `InvalidState` otherwise. While the single half-open slot is busy, SYNs
-/// from other peers are answered with SYN cookies.
+/// `InvalidState` otherwise. The listener holds up to nine handshakes at
+/// once and becomes the connection of whichever completes first (then call
+/// [`tcp_adopt_half_opens`] on the next listener); beyond that, SYNs are
+/// answered with SYN cookies.
 ///
 /// # Safety
 /// `handle` must be NULL or a live handle from [`tcp_init`].
@@ -360,6 +362,90 @@ pub unsafe extern "C" fn tcp_close(handle: *mut TcpStreamHandle, now_ms: u64) ->
     }
 }
 
+/// Move the handshakes still pending in `from` (a listener that has become a
+/// connection, or closed) into `listener`, which goes on serving them: call
+/// it when setting up the listener that replaces `from`, after
+/// [`tcp_listen`]. Returns how many were taken (>= 0), or a negative error
+/// for an invalid handle. See [`Tcb::adopt_half_opens`].
+///
+/// # Safety
+/// Both handles must be NULL or live handles from [`tcp_init`], distinct,
+/// and not in use by another thread.
+#[no_mangle]
+pub unsafe extern "C" fn tcp_adopt_half_opens(
+    listener: *mut TcpStreamHandle,
+    from: *mut TcpStreamHandle,
+) -> i32 {
+    if listener.is_null() || from.is_null() {
+        return TcpError::NullPointer.as_code();
+    }
+    if core::ptr::eq(listener, from) {
+        return TcpError::InvalidState.as_code();
+    }
+    // SAFETY: both non-null (checked) and initialised (caller contract).
+    if unsafe { magic(listener) } != MAGIC_LIVE || unsafe { magic(from) } != MAGIC_LIVE {
+        return TcpError::NullPointer.as_code();
+    }
+    // SAFETY: live, distinct handles the caller owns exclusively.
+    let (Some(l), Some(f)) = (unsafe { listener.as_mut() }, unsafe { from.as_mut() }) else {
+        return TcpError::NullPointer.as_code();
+    };
+    i32::try_from(l.inner.adopt_half_opens(&mut f.inner)).unwrap_or(i32::MAX)
+}
+
+/// Until when (host clock, ms) this listener takes SYN-cookie ACKs; 0 if it
+/// has no reason to, or for an invalid handle. See
+/// [`Tcb::cookies_accepted_until`].
+///
+/// # Safety
+/// `handle` must be NULL or a live handle from [`tcp_init`].
+#[no_mangle]
+pub unsafe extern "C" fn tcp_cookies_accepted_until(handle: *const TcpStreamHandle) -> u64 {
+    // SAFETY: forwarded caller contract.
+    match unsafe { validate(handle) } {
+        Some(h) => h.inner.cookies_accepted_until(),
+        None => 0,
+    }
+}
+
+/// Take SYN-cookie ACKs until at least `until_ms`: for a listener sharing
+/// its port and cookie key with another that issued cookies (pass that
+/// one's [`tcp_cookies_accepted_until`]). [`tcp_adopt_half_opens`] does it
+/// for the listener that replaces one.
+///
+/// # Safety
+/// `handle` must be NULL or a live handle from [`tcp_init`].
+#[no_mangle]
+pub unsafe extern "C" fn tcp_accept_cookies_until(
+    handle: *mut TcpStreamHandle,
+    until_ms: u64,
+) -> i32 {
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        with_handle(handle, |h| {
+            h.accept_cookies_until(until_ms);
+            Ok(())
+        })
+    }
+}
+
+/// How many handshakes a listener may hold pending beside the one in its
+/// slot (default and most: 8; 0 answers every overlapping SYN with a SYN
+/// cookie).
+///
+/// # Safety
+/// `handle` must be NULL or a live handle from [`tcp_init`].
+#[no_mangle]
+pub unsafe extern "C" fn tcp_set_listen_backlog(handle: *mut TcpStreamHandle, n: u32) -> i32 {
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        with_handle(handle, |h| {
+            h.set_listen_backlog(n as usize);
+            Ok(())
+        })
+    }
+}
+
 /// Half-close: FIN after queued data, while the host keeps reading (as
 /// `shutdown(SHUT_WR)`). Unlike [`tcp_close`], the FIN_WAIT_2 timeout does
 /// not run until the host calls [`tcp_close`]. Idempotent.
@@ -403,7 +489,8 @@ pub unsafe extern "C" fn tcp_set_keepalive(
 /// Set the RFC 9293 §3.8.3 USER TIMEOUT (`0` disables; default 5 min):
 /// abort after this long without a full segment acknowledged while send work
 /// is outstanding (zero-window persist and sub-MSS trickles do not count;
-/// any acknowledgment does when less than a segment was waiting for one).
+/// any acknowledgment does when less than a segment was waiting for one
+/// and the application has written since).
 ///
 /// # Safety
 /// `handle` must be NULL or a live handle from [`tcp_init`].

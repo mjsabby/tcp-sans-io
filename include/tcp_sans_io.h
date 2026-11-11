@@ -89,11 +89,34 @@ int32_t tcp_destroy(TcpStreamHandle* handle);
 int32_t tcp_connect(TcpStreamHandle* handle, uint64_t now_ms);
 /* Passive open (CLOSED / TIME_WAIT -> LISTEN). Requires tcp_set_secret (or
  * tcp_set_cookie_secret) first: TCP_ERR_INVALID_STATE otherwise. The listener
- * holds one half-open handshake statefully and answers SYNs from other peers
- * with SYN cookies while that slot is busy; a valid cookie ACK takes the slot
- * over. Those replies go to other peers than the half-open's: route outbound
+ * holds up to nine handshakes at once (see tcp_set_listen_backlog) and
+ * becomes the connection of whichever completes first; once they are taken,
+ * further SYNs are answered with SYN cookies, and a valid cookie ACK takes
+ * the listener's slot. Its replies go to several peers: route outbound
  * packets by their destination address, not by handle. */
 int32_t tcp_listen (TcpStreamHandle* handle, uint64_t now_ms);
+/* Handshakes a listener may hold pending beside the one in its slot (default
+ * and most: 8; 0 answers every overlapping SYN with a SYN cookie). */
+int32_t tcp_set_listen_backlog(TcpStreamHandle* handle, uint32_t n);
+/* Move the handshakes still pending in `from` (a listener that has become a
+ * connection, or closed) into `listener`, which goes on serving them. Call it
+ * when setting up the listener that replaces `from`, after tcp_listen; both
+ * need the same local endpoint and secrets. Returns how many were taken
+ * (>= 0), or a negative error for an invalid handle. Call it every time,
+ * before routing packets to the new listener: a pending client left behind
+ * has only its SYN cookie, which completes only from the client's first
+ * segment and not at all without timestamps if it offered options. */
+int32_t tcp_adopt_half_opens(TcpStreamHandle* listener, TcpStreamHandle* from);
+/* A listener takes SYN-cookie ACKs only for 128 s after a handshake had to
+ * rely on its cookie (its backlog was full, or a pending handshake lost its
+ * place); otherwise an ACK carrying a valid cookie, such as a late copy of a
+ * closed connection's third ACK, is answered as a stray ACK.
+ * tcp_cookies_accepted_until returns that time on the host clock (0: none);
+ * tcp_adopt_half_opens carries it to the next listener. A host running
+ * several listeners on one port at once passes it between them with
+ * tcp_accept_cookies_until. */
+uint64_t tcp_cookies_accepted_until(const TcpStreamHandle* handle);
+int32_t tcp_accept_cookies_until(TcpStreamHandle* handle, uint64_t until_ms);
 /* Graceful close: FIN after queued data; the host is done with the connection
  * in both directions. Once the FIN is acknowledged the peer has the
  * FIN_WAIT_2 timeout (60 s; reading restarts it) to send its own. */
@@ -137,7 +160,7 @@ int32_t tcp_set_keepalive(TcpStreamHandle* handle, uint64_t now_ms,
 
 /* Set the RFC 9293 3.8.3 USER TIMEOUT: max time the connection may go without
  * forward progress (a full segment acknowledged, or anything at all when less
- * than a segment was waiting) while it still has send
+ * than a segment was waiting and the application is still writing) while it still has send
  * data, before it aborts (ConnectionReset via tcp_poll ERROR / tcp_recv, no
  * RST). ON BY DEFAULT (5 min) — bounds the zero-window / dribbled-ACK DoS (an
  * alive-but-stalling peer answering probes while never opening its window).

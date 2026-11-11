@@ -11,20 +11,24 @@
 //! TSval the SYN-ACK could have carried; a TSopt the SYN-ACK did not offer
 //! echoes nothing of ours and is ignored (RFC 7323 §3.2).
 //!
-//! Listeners are hybrid: the single half-open slot is used statefully
-//! (keeping every option), and cookies answer SYNs while that slot is busy.
-//! The slot's own SYN-ACK is a cookie as well, so a half-open that loses
-//! the slot (to another peer's cookie ACK, or to a new SYN once its SYN-ACK
-//! went unanswered) still completes from its ACK alone, at whichever
+//! Listeners are hybrid: the slot and the backlog (see `backlog.rs`) hold
+//! half-opens statefully (keeping every option), and cookies answer SYNs
+//! once those are taken. A stateful SYN-ACK is a cookie as well, so a
+//! half-open that loses its place (to another peer's cookie ACK, to a new
+//! SYN once its SYN-ACK went unanswered, or left behind in a listener that
+//! became a connection) still completes from its ACK alone, at whichever
 //! listener gets it. Only a client that offered window scaling, SACK or ECN
 //! without timestamps cannot: nothing carries those options, so its ISN
 //! says so (MSS index 3) and its ACK is refused with a RST instead of
 //! becoming a connection that disagrees with the client about them.
-//! Any listener holding the key takes a cookie ACK, whenever it comes
-//! (Linux only within two minutes of the listener's last overflow,
-//! `tcp_synq_no_recent_overflow`): one connection per TCB, so the listener
-//! that sent the cookie has often become a connection by then, and the
-//! host's next listener must take it. A cookie validates against the
+//! A listener takes cookie ACKs only for two time buckets after a
+//! handshake had to rely on its cookie (as Linux only within two minutes
+//! of the listener's last overflow, `tcp_synq_no_recent_overflow`):
+//! every SYN-ACK being a cookie, a copy of any handshake's third ACK would
+//! otherwise re-create its connection later. One connection per TCB, so
+//! the listener that sent a cookie has often become a connection when the
+//! ACK comes, and the host's next listener must take it: adoption carries
+//! that time over (`Tcb::cookies_accepted_until`). A cookie validates against the
 //! current key and, after a rotation, the previous one while cookies
 //! issued under it can still be valid. The key is either installed
 //! explicitly or derived from the host secret.
@@ -242,10 +246,7 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
             ip: seg.src_ip,
             port: seg.src_port,
         };
-        let ecn = seg.has(flags::ECE) && seg.has(flags::CWR);
-        let carried = seg.options.ts.is_some()
-            || (seg.options.wscale.is_none() && !seg.options.sack_permitted && !ecn);
-        let mss_idx = if carried {
+        let mss_idx = if cookie_can_carry(seg) {
             let peer_mss = seg
                 .options
                 .mss
@@ -342,6 +343,7 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
             )
         })?;
         if queued {
+            self.note_cookie_pressure();
             self.stats.segs_out = self.stats.segs_out.saturating_add(1);
             self.cookie_secret_used = true;
         }
@@ -353,7 +355,9 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
     /// half-open. One guess per key: the cookie names its time bucket (its
     /// parity).
     pub(super) fn validate_cookie(&self, seg: &Segment<'_>) -> Option<CookieOpts> {
-        if !self.cookie_secret_set {
+        // Only while a handshake may depend on its cookie (see
+        // `Tcb::cookies_accepted_until`).
+        if !self.cookie_secret_set || self.now_ms >= self.cookie_until_ms {
             return None;
         }
         let remote = Endpoint {
@@ -466,6 +470,15 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
         self.on_established();
         self.on_synchronized(seg)
     }
+}
+
+/// Whether a cookie can carry what this SYN offers: its options ride in the
+/// timestamp, so anything can with timestamps, and nothing but the MSS
+/// without (window scaling, SACK and ECN then need a stateful half-open).
+pub(super) fn cookie_can_carry(seg: &Segment<'_>) -> bool {
+    let ecn = seg.has(flags::ECE) && seg.has(flags::CWR);
+    seg.options.ts.is_some()
+        || (seg.options.wscale.is_none() && !seg.options.sack_permitted && !ecn)
 }
 
 /// SYN-cookie key derived from the host secret (domain-separated from the

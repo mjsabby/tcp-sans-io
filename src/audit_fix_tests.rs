@@ -104,6 +104,9 @@ fn listener() -> Box<Tcb> {
         .unwrap(),
     );
     t.set_secret(&[0x42; 16]);
+    // No backlog beside the slot: these tests pin the cookie path, which
+    // overlapping handshakes take once the backlog is full.
+    t.set_listen_backlog(0);
     t.set_now(0);
     t.listen().unwrap();
     t
@@ -180,6 +183,9 @@ fn displaced_half_open_completes_by_cookie_with_its_options() {
     assert_eq!(s.inject_packet(&a_ack), Err(TcpError::NotForUs));
     let mut f = listener();
     f.set_now(20);
+    // (Not adopting: A is to complete by its cookie alone. The listener is
+    // told cookies are in play, as adoption would tell it.)
+    f.accept_cookies_until(s.cookies_accepted_until());
     f.inject_packet(&a_ack).unwrap();
     assert_eq!(f.state(), State::Established);
     assert_eq!(f.remote(), Some(ep(A)));
@@ -248,9 +254,16 @@ fn displaced_half_open_without_options_completes() {
     s.inject_packet(&syn(A, 100, &syn_opts(None, false, None)))
         .unwrap();
     let sa = drain(&mut s).remove(0);
-    let mut f = listener();
-    f.set_now(30);
-    f.inject_packet(&pkt(
+    // Its SYN-ACK goes unanswered for an RTO; a spoofed SYN takes the slot.
+    s.set_now(1000);
+    s.tick().unwrap();
+    drain(&mut s);
+    s.inject_packet(&syn(X, 7, &syn_opts(None, false, None)))
+        .unwrap();
+    drain(&mut s);
+    assert_eq!(s.remote(), Some(ep(X)));
+    s.set_now(1030);
+    s.inject_packet(&pkt(
         A,
         SRV,
         101,
@@ -261,8 +274,8 @@ fn displaced_half_open_without_options_completes() {
         &[],
     ))
     .unwrap();
-    assert_eq!(f.state(), State::Established);
-    assert_eq!(f.stats().snd_wnd, 4096);
+    assert_eq!((s.state(), s.remote()), (State::Established, Some(ep(A))));
+    assert_eq!(s.stats().snd_wnd, 4096);
 }
 
 /// RFC 9293 §3.10.7.2: an ACK that is no cookie draws `<SEQ=SEG.ACK><RST>`
@@ -809,6 +822,7 @@ fn cookie_survives_a_rotation_at_the_next_listener() {
     f.set_cookie_secret(&k1);
     f.set_cookie_secret(&k2);
     f.listen().unwrap();
+    f.accept_cookies_until(s.cookies_accepted_until());
     let ack = ts(901, sb.opts.ts.unwrap().0);
     f.inject_packet(&pkt(B, SRV, 201, sb.seq + 1, flags::ACK, 65535, &ack, &[]))
         .unwrap();
@@ -949,12 +963,14 @@ fn cookie_rotation_does_not_depend_on_the_clock_at_the_setter() {
     f.set_cookie_secret(&k2);
     f.set_now(t0 + 100);
     f.listen().unwrap();
+    f.accept_cookies_until(s.cookies_accepted_until());
     f.inject_packet(&ack).unwrap();
     assert_eq!(f.state(), State::Established, "new listener");
 
     // The idle one is rotated without a clock, then gets the packet.
     idle.set_cookie_secret(&k2);
     idle.set_now(t0 + 100);
+    idle.accept_cookies_until(s.cookies_accepted_until());
     idle.inject_packet(&ack).unwrap();
     assert_eq!(idle.state(), State::Established, "idle listener");
 
@@ -962,6 +978,7 @@ fn cookie_rotation_does_not_depend_on_the_clock_at_the_setter() {
     let mut late = listener();
     late.set_cookie_secret(&k1);
     late.set_cookie_secret(&k2);
+    late.accept_cookies_until(u64::MAX); // only the key's age is at issue
     late.set_now(t0);
     late.tick().unwrap();
     late.set_now(t0 + 129_000);
@@ -1117,3 +1134,129 @@ fn half_close_is_not_timed_until_the_host_closes() {
     let out = drain(&mut c);
     assert_eq!(out.last().unwrap().flags & flags::RST, flags::RST);
 }
+
+/// A backlog nobody adds to (the tail of a closed connection) used to be
+/// kept alive by a peer acknowledging a byte every few minutes, because
+/// with less than a segment waiting any ACK counted as progress. That now
+/// holds only while the application keeps writing.
+#[test]
+fn user_timeout_reaps_a_byte_at_a_time_acker_of_a_small_tail() {
+    let (mut c, iss) = established_ts();
+    c.send(&[7u8; 400]).unwrap();
+    c.set_now(20);
+    c.close().unwrap();
+    let (mut una, mut tsv) = (iss + 1, 2u32);
+    let mut acks = 0;
+    let mut now = 20u64;
+    while now < 2_000_000 && c.state() != State::Closed {
+        c.set_now(now);
+        c.tick().unwrap();
+        drain(&mut c);
+        if (now - 20) % 200_000 == 100_000 {
+            una += 1;
+            tsv += 1;
+            acks += 1;
+            let _ = c.inject_packet(&pkt(SRV, A, 5001, una, flags::ACK, 8192, &ts(tsv, 0), &[]));
+            drain(&mut c);
+        }
+        now += 50;
+    }
+    assert!(acks >= 1, "the scripted ACKs fired");
+    assert_eq!(c.state(), State::Closed);
+    assert!(now <= 301_000, "aborted at {now} ms after {acks} ACKs");
+}
+
+/// A handshake that needed retransmissions and gave no RTT sample (no
+/// timestamps) used to carry its backed-off timeout into the data phase:
+/// 4 s after two lost SYNs, up to 60 s after more. It starts from the 3 s
+/// fallback instead.
+#[test]
+fn handshake_backoff_does_not_carry_into_the_data_phase() {
+    let (mut c, iss) = client();
+    drain(&mut c);
+    let mut now = 0u64;
+    let mut syns = 0;
+    while syns < 4 {
+        now = c.next_deadline().unwrap();
+        c.set_now(now);
+        c.tick().unwrap();
+        syns += drain(&mut c).len();
+    }
+    assert!(now >= 15_000, "four SYN retransmissions by {now} ms");
+    c.set_now(now + 10);
+    c.inject_packet(&pkt(
+        SRV,
+        A,
+        5000,
+        iss + 1,
+        flags::SYN | flags::ACK,
+        8192,
+        &syn_opts(None, false, None),
+        &[],
+    ))
+    .unwrap();
+    assert_eq!(c.state(), State::Established);
+    assert_eq!(c.stats().rto_ms, 3000);
+}
+
+/// Without timestamps an ACK of retransmitted data gives no RTT sample
+/// (Karn), and the backed-off timeout used to stay: every later loss then
+/// waited the doubled timeout, compounding to tens of seconds. An ACK of
+/// new data now ends the backoff.
+#[test]
+fn ack_of_retransmitted_data_ends_the_rto_backoff() {
+    let (mut c, iss) = client();
+    drain(&mut c);
+    c.set_now(10);
+    c.inject_packet(&pkt(
+        SRV,
+        A,
+        5000,
+        iss + 1,
+        flags::SYN | flags::ACK,
+        8192,
+        &syn_opts(None, false, None),
+        &[],
+    ))
+    .unwrap();
+    drain(&mut c);
+    let base = c.stats().rto_ms;
+    assert!(base <= 400, "a 10 ms handshake sample: {base}");
+    c.send(&[1u8; 1000]).unwrap();
+    c.set_now(20);
+    c.tick().unwrap();
+    drain(&mut c);
+    // Four timeouts go unanswered.
+    let mut now = 20u64;
+    while c.stats().rto_count < 4 {
+        now = c.next_deadline().unwrap();
+        c.set_now(now);
+        c.tick().unwrap();
+        drain(&mut c);
+    }
+    assert!(
+        c.stats().rto_ms >= 8 * base,
+        "backed off: {}",
+        c.stats().rto_ms
+    );
+    // The retransmission is acknowledged: no sample, but the path works.
+    c.set_now(now + 10);
+    c.inject_packet(&pkt(
+        SRV,
+        A,
+        5001,
+        iss + 1001,
+        flags::ACK,
+        8192,
+        &TcpOptions::NONE,
+        &[],
+    ))
+    .unwrap();
+    assert_eq!(c.stats().rto_ms, base);
+}
+
+#[path = "backlog_tests.rs"]
+mod backlog;
+
+#[path = "reno_tests.rs"]
+mod reno;

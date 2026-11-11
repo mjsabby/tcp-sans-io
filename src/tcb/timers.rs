@@ -31,7 +31,24 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
         }
         match self.state {
             State::SynSent => self.syn_sent_timer()?,
-            State::SynRcvd => self.syn_rcvd_timer()?,
+            State::SynRcvd => {
+                self.syn_rcvd_timer()?;
+                // A half-open that takes over a slot whose budget ran out
+                // may be due as well: serve it now, so no deadline is left
+                // in the past (each round retransmits, or ends a half-open).
+                let mut rounds = 0;
+                while self.state == State::SynRcvd
+                    && self.is_listener
+                    && self.rto_deadline.due(now)
+                    && rounds <= super::backlog::BACKLOG
+                {
+                    self.syn_rcvd_timer()?;
+                    rounds += 1;
+                }
+                if self.state == State::SynRcvd && self.is_listener {
+                    self.backlog_timers()?;
+                }
+            }
             _ => {}
         }
         // A due tail-loss probe goes first: it re-arms the RTO (RFC 8985 §7.3).
@@ -102,6 +119,7 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
         if self.syn_rcvd_retries > MAX_SYN_RCVD_RETRIES {
             if self.is_listener {
                 self.reset_to_listen_or_closed();
+                self.backlog_refill_slot();
             } else {
                 self.abort_local();
             }
@@ -330,6 +348,7 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
             return;
         }
         if !self.user_timeout_deadline.is_armed() {
+            self.ut_wrote = false;
             self.user_timeout_deadline =
                 Deadline::at(self.now_ms.saturating_add(u64::from(self.user_timeout_ms)));
         } else if self.user_timeout_deadline.due(self.now_ms) {

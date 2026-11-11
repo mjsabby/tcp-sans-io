@@ -159,10 +159,14 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
             } else {
                 oldest_ts.and_then(|x| u32::try_from(now.saturating_sub(x)).ok())
             };
-            if let Some(r) = sample {
-                if r < 60_000 {
-                    self.update_rtt(r);
-                }
+            match sample {
+                Some(r) if r < 60_000 => self.update_rtt(r),
+                // New data acknowledged, but Karn's rule (and no usable
+                // echo) gives no sample: the path works again, so the
+                // backoff ends (RFC 6298 §5.7 allows it; BSD does it).
+                // Without timestamps it otherwise compounded across every
+                // lost retransmission, up to the 60 s cap.
+                _ => self.rto_ms = self.base_rto(),
             }
             self.note_progress(data_acked.saturating_add(u32::from(fin_acked)), backlog);
         }
@@ -191,7 +195,15 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
         if !sack_present {
             let (lost, dup) = self.newreno_detect(seg, acked, wnd_before);
             newly_lost |= lost;
-            if dup && !self.sack_enabled {
+            // A duplicate ACK vouches for one more segment received (Linux
+            // "reno SACK"). Not during a timeout's recovery until new data
+            // has gone out beyond it (Linux `tcp_process_loss`): the
+            // duplicate ACKs arriving then are for segments sent before the
+            // timeout, and crediting them clocked out copies of data the
+            // receiver already holds.
+            let reno_credit =
+                self.cc.state() != CaState::Loss || seq_gt(self.snd_nxt, self.cc.recovery_point());
+            if dup && !self.sack_enabled && reno_credit {
                 let outstanding = self.snd_nxt.wrapping_sub(self.data_una());
                 if self.reno_sacked.saturating_add(mss) <= outstanding {
                     self.reno_sacked += mss;
@@ -226,7 +238,19 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
             self.cc
                 .prr_update(delivered, pipe, mss, acked > 0 && !newly_lost);
         } else {
-            self.cc.on_ack(delivered, mss, limited);
+            // RFC 3465 §2.3: in the slow start that follows a timeout, an
+            // ACK grows the window by one segment at most, however much it
+            // acknowledges. Without SACK such an ACK often jumps over data
+            // the receiver held all along, and counting those bytes sent a
+            // burst of copies of segments it holds too (everything was
+            // marked lost at the timeout). With SACK only what is missing
+            // is resent, so the bytes count in full.
+            let credit = if self.cc.state() == CaState::Loss && !self.sack_enabled {
+                delivered.min(mss)
+            } else {
+                delivered
+            };
+            self.cc.on_ack(credit, mss, limited);
         }
 
         // ---- Timers (RFC 6298 §5.2/5.3) ---------------------------------
@@ -349,11 +373,15 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
         // Progress is a full segment acknowledged, so a peer cannot hold
         // the connection by acknowledging a byte now and then, whatever
         // window it advertises. Unless less than a segment was there to
-        // acknowledge (`backlog`, in flight plus queued before this ACK):
-        // then the application is the slow one, and a trickle of tiny
-        // records it writes must not be aborted.
+        // acknowledge (`backlog`, in flight plus queued before this ACK)
+        // and the application has been writing: then it is the slow one,
+        // and its trickle of tiny records must not be aborted. A backlog
+        // nobody adds to (the tail of a closed connection, say) must be
+        // acknowledged whole within the timeout.
         let mss = self.mss_payload();
-        if backlog < mss || self.ut_progress >= mss || !self.user_timeout_deadline.is_armed() {
+        let trickle = backlog < mss && self.ut_wrote;
+        if trickle || self.ut_progress >= mss || !self.user_timeout_deadline.is_armed() {
+            self.ut_wrote = false;
             self.ut_progress = 0;
             self.user_timeout_deadline =
                 Deadline::at(self.now_ms.saturating_add(u64::from(self.user_timeout_ms)));

@@ -794,6 +794,7 @@ fn simultaneous_open_completes() {
 fn spoofed_syn_cannot_lock_stateful_listener() {
     let mut s = new_tcb(SRV, ([0; 4], 0), 4242);
     s.set_secret(&[3u8; 16]);
+    s.set_listen_backlog(0);
     s.set_now(0);
     s.listen().unwrap();
     let syn = TcpOptions {
@@ -853,6 +854,7 @@ fn cookie_connections_keep_window_scaling_and_sack() {
     let mut s = new_tcb(SRV, ([0; 4], 0), 4242);
     s.set_now(10_000);
     s.set_cookie_secret(&[7u8; 16]);
+    s.set_listen_backlog(0);
     s.listen().unwrap();
     // Occupy the half-open slot so the client is answered with a cookie.
     let mss = TcpOptions {
