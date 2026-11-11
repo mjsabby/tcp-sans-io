@@ -387,6 +387,16 @@ pub fn parse(packet: &[u8]) -> Result<Segment<'_>, TcpError> {
     parse_opts(packet, true)
 }
 
+/// A source address no host sends from, which Linux `ip_route_input_slow`
+/// drops as martian before TCP sees it: `0.0.0.0/8`, multicast
+/// (`224.0.0.0/4`), the limited broadcast, and loopback unless `local` is
+/// loopback too. A listener would otherwise answer it, aiming SYN-ACKs at a
+/// multicast group or the broadcast address.
+pub fn martian_source(src: [u8; 4], local: [u8; 4]) -> bool {
+    let [a, ..] = src;
+    a == 0 || (224..=239).contains(&a) || src == [255; 4] || (a == 127 && local[0] != 127)
+}
+
 /// [`parse`] with optional TCP checksum verification. `verify_l4 = false`
 /// is for callers that already vouch for L4 integrity (checksum offload);
 /// the IPv4 header checksum is always verified.

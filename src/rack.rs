@@ -327,7 +327,7 @@ mod tests {
         let mut r = Rack::new();
         // Segment 3 (sent t=101) is SACKed at t=120: RTT 19.
         let s3 = *q.get(3).unwrap();
-        q.sack(s3.start, s3.end, |_| ());
+        q.sack(s3.start, s3.end, 100, |_| ());
         r.on_delivered(&s3, 120, None);
         assert_eq!(r.rtt, 19);
         // Not in recovery, 1 segment SACKed: reo_wnd = srtt/4 without a min_rtt sample.
@@ -370,7 +370,7 @@ mod tests {
         let mut r = Rack::new();
         r.on_ack_start();
         let s3 = *q.get(3).unwrap();
-        q.sack(s3.start, s3.end, |s| r.on_delivered(s, 120, None));
+        q.sack(s3.start, s3.end, 100, |s| r.on_delivered(s, 120, None));
         q.ack_to(1200, |s, newly| {
             if newly {
                 r.on_delivered(s, 120, None);
@@ -408,7 +408,7 @@ mod tests {
         let mut r = Rack::new();
         for i in [1, 2, 3] {
             let s = *q.get(i).unwrap();
-            q.sack(s.start, s.end, |_| ());
+            q.sack(s.start, s.end, 100, |_| ());
             r.on_delivered(&s, 200, None);
         }
         let (m, _) = detect_loss(&r, &mut q, 200, 0);
@@ -429,7 +429,7 @@ mod tests {
         // Segment 2 (sent t=100) delivered: segment 0's retransmission was
         // sent *after* it, so it is not a loss candidate.
         let s2 = *q.get(2).unwrap();
-        q.sack(s2.start, s2.end, |_| ());
+        q.sack(s2.start, s2.end, 100, |_| ());
         r.on_delivered(&s2, 160, None);
         let (m, _) = detect_loss(&r, &mut q, 10_000, 0);
         assert!(m);

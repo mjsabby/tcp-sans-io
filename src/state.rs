@@ -103,7 +103,7 @@ impl State {
                     | (SynSent, Established | SynRcvd | Closed)
                     // Third ACK (or a cookie ACK taking over the slot),
                     // possibly with a FIN; close(); recycle; abort.
-                    | (SynRcvd, Established | CloseWait | FinWait1 | Listen | Closed)
+                    | (SynRcvd, Established | CloseWait | Listen | Closed)
                     | (Established, FinWait1 | CloseWait | Closed)
                     | (FinWait1, FinWait2 | Closing | TimeWait | Closed)
                     | (FinWait2, TimeWait | Closed)

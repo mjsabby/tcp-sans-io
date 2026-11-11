@@ -34,8 +34,7 @@ stateDiagram-v2
     SYN_RCVD --> ESTABLISHED: 3rd ACK, or another peer's valid cookie ACK
     SYN_RCVD --> CLOSE_WAIT: 3rd ACK carries FIN
     SYN_RCVD --> LISTEN: SYN-ACK budget spent / exact RST
-    SYN_RCVD --> FIN_WAIT_1: close() / send FIN
-    SYN_RCVD --> CLOSED: RST (non-listener) / abort()
+    SYN_RCVD --> CLOSED: RST (non-listener) / abort() / close()
 
     ESTABLISHED --> FIN_WAIT_1: close() / send FIN
     ESTABLISHED --> CLOSE_WAIT: recv FIN / send ACK
@@ -83,8 +82,7 @@ bold purple = the SYN_RCVD → LISTEN revert, green = SYN-cookie promotion):
 | SYN_RCVD | ESTABLISHED | recv 3rd ACK — or, while the slot is busy, another peer's valid cookie ACK (it takes over the slot) | — | `complete_passive_open` / `on_busy_listener` |
 | SYN_RCVD | CLOSE_WAIT | 3rd ACK carrying a FIN | send ACK | `complete_passive_open` + `advance_state_on_remote_fin` |
 | SYN_RCVD | LISTEN | SYN-ACK retransmit budget exhausted, or exact-match RST | recycle the half-open slot | `syn_rcvd_timer` / `on_syn_rcvd` → `reset_to_listen_or_closed` |
-| SYN_RCVD | FIN_WAIT_1 | `close()` | send FIN | `Tcb::close` |
-| SYN_RCVD | CLOSED | recv RST (non-listener) / `abort()` | surface `ConnectionReset` | `on_syn_rcvd` |
+| SYN_RCVD | CLOSED | recv RST (non-listener) / `abort()` / `close()` | surface `ConnectionReset` (RST, abort); `close()` resets the half-open | `on_syn_rcvd` / `Tcb::close` |
 | ESTABLISHED | FIN_WAIT_1 | `close()` | send FIN | `Tcb::close` |
 | ESTABLISHED | CLOSE_WAIT | recv FIN | send ACK | `advance_state_on_remote_fin` |
 | ESTABLISHED | CLOSED | recv RST / `abort()` / R2, USER TIMEOUT or keepalive | surface `ConnectionReset` | `on_reset_received` / `abort` / `tick` |

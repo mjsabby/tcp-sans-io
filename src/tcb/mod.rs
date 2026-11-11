@@ -101,13 +101,16 @@ const MAX_SYN_RCVD_RETRIES: u8 = 5;
 /// SYN retransmissions in `SYN_SENT` before giving up (Linux `tcp_syn_retries`).
 const MAX_SYN_RETRIES: u8 = 6;
 /// RFC 9293 §3.8.3 "R2": consecutive retransmission timeouts (or unanswered
-/// zero-window probes) with no proof of life before the connection aborts.
-/// Reset by any acceptable ACK. No RST is sent: the peer is presumed gone.
+/// zero-window probes) before the connection aborts. Timeouts restart on an
+/// ACK of new data, probes on any acceptable ACK. No RST is sent: the peer
+/// is presumed gone.
 const MAX_RETRANSMITS: u8 = 10;
 /// Default RFC 9293 §3.8.3 USER TIMEOUT: maximum time without *meaningful*
 /// forward progress (at least one full segment acknowledged) while send work
-/// is outstanding. Window-starved trickles and zero-window persist do not
-/// count as progress, which bounds slow-reader / "Sockstress" pinning.
+/// is outstanding. Sub-segment trickles and zero-window persist do not
+/// count as progress, which bounds slow-reader / "Sockstress" pinning; any
+/// acknowledgment does when less than a segment was waiting for one (an
+/// application may write less than a segment in that time).
 const DEFAULT_USER_TIMEOUT_MS: u32 = 300_000;
 /// Default keepalive (RFC 9293 §3.8.4) for fully idle connections.
 const DEFAULT_KEEPALIVE_IDLE_MS: u32 = 600_000;
@@ -283,6 +286,8 @@ pub struct Tcb<
     iss: u32,
     /// Host-provided ISS from the config (restored on reset).
     cfg_iss: u32,
+    /// `cfg_iss` has started an active open (see [`Tcb::connect`]).
+    iss_used: bool,
 
     // ---- Receive sequence space.
     rcv_nxt: u32,
@@ -389,8 +394,12 @@ pub struct Tcb<
     rttvar_ms: u32,
     rtt_first_sample: bool,
     rto_deadline: Deadline,
-    /// Consecutive RTOs / unanswered probes with no proof of life (R2).
+    /// Consecutive timeouts (SYN or data) without an ACK of new data (R2;
+    /// Linux `icsk_retransmits`): what black-hole detection counts too.
     rtx_count: u8,
+    /// Consecutive window probes without any answer (Linux
+    /// `icsk_probes_out`): persist probes, and timeouts into a zero window.
+    probes_out: u8,
 
     // ---- Delayed ACK.
     pending_ack: bool,
@@ -409,7 +418,13 @@ pub struct Tcb<
     time_wait_since_ms: u64,
     fin_wait2_timeout_ms: u32,
     fin_wait2_deadline: Deadline,
+    /// The host half-closed with [`Tcb::shutdown_write`] and still reads:
+    /// FIN_WAIT_2 is not timed until it calls [`Tcb::close`].
+    half_closed: bool,
     error: Option<TcpError>,
+    /// `(SEQ, ACK)` of the connection's final RST, owed while the egress
+    /// ring was full: staged as soon as the host takes a packet out.
+    owed_rst: Option<(u32, u32)>,
 
     // ---- Egress staging.
     tx_ring: TxRing<TXQ>,
@@ -454,6 +469,9 @@ pub struct Tcb<
     prev_cookie_secret: [u8; 16],
     prev_cookie_secret_set: bool,
     prev_cookie_until_ms: u64,
+    /// The previous key was installed since the clock was last set: its
+    /// lifetime has yet to start.
+    prev_cookie_pending: bool,
     secret: [u8; 16],
     secret_set: bool,
 
@@ -534,6 +552,7 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
             core::ptr::write_bytes(p, 0, 1);
             core::ptr::addr_of_mut!((*p).state).write(State::Closed);
             core::ptr::addr_of_mut!((*p).error).write(None);
+            core::ptr::addr_of_mut!((*p).owed_rst).write(None);
             core::ptr::addr_of_mut!((*p).tlp_end_seq).write(None);
             core::ptr::addr_of_mut!((*p).ooo_fin).write(None);
             core::ptr::addr_of_mut!((*p).dsack).write(None);
@@ -558,6 +577,7 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
         self.local = cfg.local;
         self.remote = cfg.remote;
         self.cfg_iss = cfg.iss;
+        self.iss_used = false;
         self.iss = cfg.iss;
         self.init_rto_ms = cfg.initial_rto_ms.clamp(RTO_MIN_MS, RTO_MAX_MS);
         self.mtu = MAX_MTU;
@@ -570,6 +590,7 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
         self.prev_cookie_secret = [0; 16];
         self.prev_cookie_secret_set = false;
         self.prev_cookie_until_ms = 0;
+        self.prev_cookie_pending = false;
         self.secret = [0; 16];
         self.secret_set = false;
         self.now_ms = 0;
@@ -578,12 +599,16 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
         self.send_lent = 0;
         self.send_lent_conn = 0;
         self.conn_gen = 0;
-        self.ip_id = (cfg.iss >> 16) as u16 ^ cfg.iss as u16;
         self.keepalive_idle_ms = DEFAULT_KEEPALIVE_IDLE_MS;
         self.keepalive_intvl_ms = DEFAULT_KEEPALIVE_INTVL_MS;
         self.keepalive_count = DEFAULT_KEEPALIVE_COUNT;
         self.user_timeout_ms = DEFAULT_USER_TIMEOUT_MS;
         self.fin_wait2_timeout_ms = DEFAULT_FIN_WAIT2_TIMEOUT_MS;
+        // Not per connection: what is staged may be for other peers (a
+        // listener's cookie SYN-ACKs and RSTs), and the limit on replies to
+        // stray segments must survive listener transitions.
+        self.tx_ring.clear();
+        self.last_oow_ms = Deadline::OFF;
         self.reset_connection_state();
         self.state = State::Closed;
     }
@@ -595,11 +620,20 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
         self.setup(cfg);
     }
 
+    /// Start this connection's IP ID counter from its ISS (keyed per 4-tuple
+    /// on passive opens, drawn by the host from a CSPRNG on active ones):
+    /// each connection numbers only its own packets, as Linux's per-socket
+    /// `inet_id`, never sharing a counter across peers.
+    pub(super) fn seed_ip_id(&mut self) {
+        self.ip_id = (self.iss >> 16) as u16 ^ self.iss as u16;
+    }
+
     /// Reset all per-connection state, keeping the endpoints, knobs and
     /// secrets. Used by `connect`, `listen` and the passive-open paths.
     fn reset_connection_state(&mut self) {
         self.conn_gen = self.conn_gen.wrapping_add(1);
         self.iss = self.cfg_iss;
+        self.seed_ip_id();
         self.snd_una = self.iss;
         self.snd_nxt = self.iss;
         self.snd_wnd = 0;
@@ -661,6 +695,7 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
         self.rtt_first_sample = false;
         self.rto_deadline = Deadline::OFF;
         self.rtx_count = 0;
+        self.probes_out = 0;
         self.pending_ack = false;
         self.delayed_ack_count = 0;
         self.ack_deadline = Deadline::OFF;
@@ -671,14 +706,14 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
         self.time_wait_deadline = Deadline::OFF;
         self.time_wait_since_ms = 0;
         self.fin_wait2_deadline = Deadline::OFF;
+        self.half_closed = false;
         self.error = None;
-        self.tx_ring.clear();
+        self.owed_rst = None;
         self.syn_rcvd_retries = 0;
         self.keepalive_probes = 0;
         self.keepalive_deadline = Deadline::OFF;
         self.user_timeout_deadline = Deadline::OFF;
         self.ut_progress = 0;
-        self.last_oow_ms = Deadline::OFF;
         self.stats = TcbStats::default();
     }
 
@@ -978,7 +1013,8 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
     /// Set the RFC 9293 §3.8.3 USER TIMEOUT (`0` disables): the connection
     /// aborts after this long without a full segment's worth of data being
     /// acknowledged while send work is outstanding. Zero-window persist and
-    /// sub-MSS trickles do not count as progress.
+    /// sub-MSS trickles do not count as progress; any acknowledgment does
+    /// when less than a segment was waiting for one.
     pub fn set_user_timeout(&mut self, ms: u32) {
         self.user_timeout_ms = ms;
         self.ut_progress = 0;
@@ -995,7 +1031,7 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
     /// (the host still wants the peer's half); the peer's data alone does not.
     pub fn set_fin_wait2_timeout(&mut self, ms: u32) {
         self.fin_wait2_timeout_ms = ms;
-        self.fin_wait2_deadline = if ms != 0 && self.state == State::FinWait2 {
+        self.fin_wait2_deadline = if ms != 0 && self.state == State::FinWait2 && !self.half_closed {
             Deadline::at(self.now_ms.saturating_add(u64::from(ms)))
         } else {
             Deadline::OFF
@@ -1017,22 +1053,34 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
         Ok(())
     }
 
-    /// Report a smaller path MTU (e.g. from an ICMP "fragmentation needed"
-    /// the host received, or out-of-band knowledge). Lowers the segment
-    /// size for the rest of the connection and retransmits in-flight
-    /// segments that no longer fit (they were most likely dropped).
+    /// Report a smaller path MTU the host knows of. Lowers the segment size
+    /// and retransmits in-flight segments that no longer fit (they were
+    /// most likely dropped). Like a route's learned PMTU (Linux
+    /// `ip_rt_mtu_expires`), a reduction holds for 10 minutes; then one
+    /// segment probes the size before it (the black-hole probe machinery),
+    /// so a path that grew back, or a forged report, does not cap the
+    /// segment size for good. Reporting the size in use again renews it; a
+    /// larger one is ignored. A link MTU that never changes belongs in
+    /// [`Tcb::set_mtu`]. For an ICMP "fragmentation needed" use
+    /// [`Tcb::update_pmtu_icmp`], which also checks what the ICMP quotes.
     pub fn update_pmtu(&mut self, mtu: u16) {
         let mss = mtu.clamp(MIN_MTU, MAX_MTU) - HDR_LEN;
-        // A reported MTU also bounds black-hole recovery: never probe above it.
-        self.pmtu_restore_mss = self.pmtu_restore_mss.min(mss);
-        if self.pmtu_restore_mss <= self.pmtu_mss.min(mss) {
-            self.pmtu_restore_mss = 0;
-            self.pmtu_probe_inflight = false;
-        }
-        if mss >= self.pmtu_mss {
+        if mss > self.pmtu_mss {
             return;
         }
+        let expires = self.now_ms.saturating_add(u64::from(PMTU_PROBE_MAX_MS));
+        if mss == self.pmtu_mss {
+            if self.pmtu_restore_mss != 0 {
+                self.pmtu_probe_backoff_ms = PMTU_PROBE_MAX_MS;
+                self.pmtu_probe_at = expires;
+            }
+            return;
+        }
+        self.pmtu_restore_mss = self.pmtu_restore_mss.max(self.pmtu_mss);
         self.pmtu_mss = mss;
+        self.pmtu_probe_inflight = false;
+        self.pmtu_probe_backoff_ms = PMTU_PROBE_MAX_MS;
+        self.pmtu_probe_at = expires;
         if self.state.is_synchronized() {
             let limit = self.mss_payload();
             for i in 0..self.rtx.len() {
@@ -1046,6 +1094,30 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
         }
     }
 
+    /// [`Self::update_pmtu`] for an ICMP "fragmentation needed": taken only
+    /// if the sequence number the ICMP quotes from our segment lies in
+    /// `[SND.UNA, SND.NXT]` (Linux `tcp_v4_err`, RFC 5927 §4.1), so an
+    /// off-path forger who knows the 4-tuple must also hit the flight.
+    /// `NotForUs` otherwise, or before the handshake started.
+    pub fn update_pmtu_icmp(&mut self, mtu: u16, quoted_seq: u32) -> Result<(), TcpError> {
+        let in_flight =
+            quoted_seq.wrapping_sub(self.snd_una) <= self.snd_nxt.wrapping_sub(self.snd_una);
+        if matches!(self.state, State::Closed | State::Listen) || !in_flight {
+            return Err(TcpError::NotForUs);
+        }
+        self.update_pmtu(mtu);
+        Ok(())
+    }
+
+    /// The peer this TCB is connected (or connecting) to: the client whose
+    /// SYN or cookie ACK a listener took, or the configured remote of an
+    /// active open. `None` in `LISTEN` (and on a TCB that never had one),
+    /// so a host can build the 4-tuple demultiplexing it owns without
+    /// parsing packets itself.
+    pub fn remote(&self) -> Option<Endpoint> {
+        (self.state != State::Listen && self.remote.port != 0).then_some(self.remote)
+    }
+
     /// Install a 128-bit host secret (from a CSPRNG). Keys the per-connection
     /// timestamp offset (so TSval does not reveal the host clock, RFC 7323
     /// §5.4) and per-SYN ISNs on listeners (RFC 6528). Unless
@@ -1057,7 +1129,7 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
         self.secret = *secret;
         self.secret_set = true;
         if !self.cookie_secret_explicit {
-            self.install_cookie_key(cookie::derive_cookie_key(secret));
+            self.install_cookie_key(cookie::derive_cookie_key(secret), false);
         }
     }
 
@@ -1066,24 +1138,32 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
     /// answers further SYNs with cookies while that slot is busy. Cookies
     /// issued under the previous key stay valid for their normal 64–128 s
     /// lifetime, so rotating no more often than every ~2 minutes never breaks
-    /// a handshake in progress. Also used as the host secret if
+    /// a handshake in progress. A listener set up within 128 s of a rotation
+    /// takes those cookies too if given the previous key first, then the
+    /// current one. Also used as the host secret if
     /// [`Tcb::set_secret`] was not called.
     pub fn set_cookie_secret(&mut self, secret: &[u8; 16]) {
-        self.install_cookie_key(*secret);
+        self.install_cookie_key(*secret, true);
         self.cookie_secret_explicit = true;
     }
 
     /// Make `key` the current cookie key. The old one keeps validating for
     /// the lifetime of the cookies issued under it (two time buckets from
-    /// now) — and only if any were: otherwise every forged cookie ACK would
-    /// pay for a second key for nothing.
-    fn install_cookie_key(&mut self, key: [u8; 16]) {
-        if self.cookie_secret_set && self.cookie_secret != key && self.cookie_secret_used {
+    /// now).
+    fn install_cookie_key(&mut self, key: [u8; 16], explicit: bool) {
+        // A key of the same kind replaces one that may have issued cookies
+        // on another listener (the host gives a new listener the previous
+        // key, then the current one). Only a derived key that an explicit
+        // one replaces before any cookie went out under it is forgotten
+        // (the usual setup order, `set_secret` then `set_cookie_secret`).
+        let rotation = self.cookie_secret_used || self.cookie_secret_explicit == explicit;
+        if self.cookie_secret_set && self.cookie_secret != key && rotation {
             self.prev_cookie_secret = self.cookie_secret;
             self.prev_cookie_secret_set = true;
-            self.prev_cookie_until_ms = self
-                .now_ms
-                .saturating_add(2 * cookie::COOKIE_TIME_BUCKET_MS);
+            // The setters take no clock (a new or idle listener's `now_ms`
+            // is zero or stale): the old key's lifetime starts at the next
+            // call that brings one (see `settle_cookie_rotation`).
+            self.prev_cookie_pending = true;
         }
         if self.cookie_secret != key {
             self.cookie_secret_used = false;
@@ -1092,26 +1172,53 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
         self.cookie_secret_set = true;
     }
 
+    /// Start the previous cookie key's lifetime (two time buckets) from
+    /// the current clock, on the first clocked call after a rotation.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn settle_cookie_rotation(&mut self) {
+        self.prev_cookie_pending = false;
+        self.prev_cookie_until_ms = self
+            .now_ms
+            .saturating_add(2 * cookie::COOKIE_TIME_BUCKET_MS);
+    }
+
     // ---------------------------------------------------------------------
     // Connection control
     // ---------------------------------------------------------------------
 
     /// Active open: `CLOSED` → `SYN_SENT`. The SYN offers MSS, Window Scale,
-    /// Timestamps, SACK-permitted and ECN (RFC 3168 §6.1.1).
+    /// Timestamps, SACK-permitted and ECN (RFC 3168 §6.1.1). The configured
+    /// `iss` starts the TCB's first connection; one opened later without
+    /// [`Tcb::reinit`] draws a fresh ISS keyed by the host secret, and
+    /// returns `InvalidState` if none is installed (as it does unless the
+    /// TCB is `CLOSED`): then `reinit` it with a new CSPRNG `iss`.
     pub fn connect(&mut self) -> Result<(), TcpError> {
         if self.state != State::Closed {
             return Err(TcpError::InvalidState);
         }
         self.is_listener = false;
+        // The configured ISS serves one connection: a TCB connected again
+        // without `reinit` draws a fresh one from the host secret
+        // (RFC 6528), so the new connection neither repeats a sequence
+        // space its peer may still hold segments of nor starts from a
+        // number seen on the wire. Without a secret there is nothing
+        // unpredictable to draw from: the host must `reinit` with a new
+        // ISS.
+        if self.iss_used {
+            self.cfg_iss = self.next_active_iss().ok_or(TcpError::InvalidState)?;
+        }
+        self.iss_used = true;
         self.reset_connection_state();
         self.ts_offset = self.ts_offset_for(self.remote);
         self.state = State::SynSent;
         self.syn_xmit_ms = self.now_ms;
-        if self.emit_syn()? {
-            self.snd_nxt = self.iss.wrapping_add(1);
-            self.syn_unacked = true;
-            self.arm_rto();
-        }
+        // With the egress ring full the SYN is not staged; the timer below
+        // sends it (as a retransmission) once the host has drained.
+        let _ = self.emit_syn()?;
+        self.snd_nxt = self.iss.wrapping_add(1);
+        self.syn_unacked = true;
+        self.arm_rto();
         Ok(())
     }
 
@@ -1128,7 +1235,11 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
     /// from other peers are answered with SYN cookies (no state); a valid
     /// cookie ACK replaces the pending half-open, so spoofed SYNs cannot lock
     /// the listener. A half-open whose SYN-ACK already needed a retransmit
-    /// also yields its slot to a SYN from a new peer.
+    /// also yields its slot to a SYN from a new peer. Either way the
+    /// half-open is not lost: its SYN-ACK is a cookie too, and its ACK
+    /// completes at the listener the host sets up next (unless it offered
+    /// window scaling, SACK or ECN without timestamps, which no cookie
+    /// carries: then its ACK is reset).
     pub fn listen(&mut self) -> Result<(), TcpError> {
         match self.state {
             State::Closed | State::Listen | State::TimeWait => {}
@@ -1136,6 +1247,9 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
         }
         if !self.secret_set && !self.cookie_secret_set {
             return Err(TcpError::InvalidState);
+        }
+        if self.prev_cookie_pending {
+            self.settle_cookie_rotation();
         }
         self.remote = Endpoint {
             ip: [0u8; 4],
@@ -1171,12 +1285,16 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
     /// the ring. Fill a prefix (the first slice first), then call
     /// [`Self::send_commit`].
     ///
-    /// The lent bytes stay the host's until that commit, whatever happens to
-    /// the connection meanwhile: the TCB neither reads nor writes them, and
-    /// `send` returns `WouldBlock` (`poll` drops `WRITABLE`). An asynchronous
-    /// host may therefore hold raw pointers to them across other calls, but
-    /// must commit before it calls `reinit` or drops the TCB. One loan at a
-    /// time: `InvalidState` while one is out or when the connection cannot
+    /// Write the slices while you hold them: they borrow the TCB. Until the
+    /// commit the loan stays out across other calls, whatever happens to
+    /// the connection meanwhile: the TCB neither reads nor writes the lent
+    /// bytes, and `send` returns `WouldBlock` (`poll` drops `WRITABLE`), so
+    /// what was written stays as written. Do not keep raw pointers into them
+    /// to write after another call, though: every call takes `&mut self`,
+    /// which Rust's aliasing rules let assume nothing else writes the TCB,
+    /// rings included, so such a write is undefined behavior even though
+    /// the TCB never looks. Commit, with 0 if need be, before `reinit` or
+    /// dropping the TCB. One loan at a time: `InvalidState` while one is out or when the connection cannot
     /// send, `WouldBlock` when the ring is full or `max` is 0. (Rust API
     /// only.)
     pub fn send_reserve(&mut self, max: usize) -> Result<(&mut [u8], &mut [u8]), TcpError> {
@@ -1207,15 +1325,22 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
     }
 
     /// Copy received in-order data out. Returns `ConnectionClosed` once the
-    /// ring is empty and the peer has FINned, `ConnectionReset` after an
-    /// abort. In `FIN_WAIT_2`, consuming data restarts the FIN_WAIT_2 timeout.
+    /// ring is empty and the peer has FINned, `ConnectionReset` after a
+    /// reset, a timeout or an abort (after a reset or a timeout, only once
+    /// the bytes received before it are read). In `FIN_WAIT_2`, consuming data restarts the FIN_WAIT_2 timeout.
     pub fn recv(&mut self, dst: &mut [u8]) -> Result<usize, TcpError> {
         if let Some(e) = self.error {
+            // A reset or a timeout keeps the bytes already received
+            // readable; the error follows the last of them.
+            if self.state == State::Closed && !self.recv_ring.is_empty() {
+                return Ok(self.recv_ring.read(dst));
+            }
             return Err(e);
         }
         let n = self.recv_ring.read(dst);
         if n > 0 {
-            if self.state == State::FinWait2 && self.fin_wait2_timeout_ms != 0 {
+            if self.state == State::FinWait2 && self.fin_wait2_timeout_ms != 0 && !self.half_closed
+            {
                 self.fin_wait2_deadline = Deadline::at(
                     self.now_ms
                         .saturating_add(u64::from(self.fin_wait2_timeout_ms)),
@@ -1236,14 +1361,57 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
         Ok(n)
     }
 
-    /// Begin a graceful close (FIN after all queued data). Idempotent.
+    /// Half-close: end our side of the stream (FIN after all queued data)
+    /// while the host keeps reading the peer's, as `shutdown(SHUT_WR)`.
+    /// Like [`Tcb::close`], except that the FIN_WAIT_2 timeout does not run:
+    /// the host still wants the peer's half, however long the peer takes
+    /// (keepalive still reaps a peer that vanished). Call [`Tcb::close`]
+    /// once done reading; the timeout starts then.
+    pub fn shutdown_write(&mut self) -> Result<(), TcpError> {
+        if matches!(
+            self.state,
+            State::Established | State::FinWait1 | State::FinWait2
+        ) {
+            self.half_closed = true;
+            self.fin_wait2_deadline = Deadline::OFF;
+        }
+        self.close_inner()
+    }
+
+    /// Begin a graceful close (FIN after all queued data): the host is done
+    /// with the connection, sending and receiving. Idempotent. Once our FIN
+    /// is acknowledged the peer has the FIN_WAIT_2 timeout to send its own
+    /// (reading received data restarts it); a host that only ends its
+    /// sending side and goes on reading uses [`Tcb::shutdown_write`].
     pub fn close(&mut self) -> Result<(), TcpError> {
+        if core::mem::take(&mut self.half_closed)
+            && self.state == State::FinWait2
+            && self.fin_wait2_timeout_ms != 0
+        {
+            self.fin_wait2_deadline = Deadline::at(
+                self.now_ms
+                    .saturating_add(u64::from(self.fin_wait2_timeout_ms)),
+            );
+        }
+        self.close_inner()
+    }
+
+    fn close_inner(&mut self) -> Result<(), TcpError> {
         match self.state {
             State::Established => self.state = State::FinWait1,
             State::CloseWait => self.state = State::LastAck,
-            // RFC 9293 §3.10.4: CLOSE in SYN-RECEIVED with nothing queued
-            // sends a FIN and enters FIN-WAIT-1.
-            State::SynRcvd => self.state = State::FinWait1,
+            // The handshake is not complete, so there is no stream to end:
+            // the half-open is reset and the TCB closed (a listener stops
+            // listening), as for `SYN_SENT`. RFC 9293 §3.10.4 would send a
+            // FIN and enter FIN-WAIT-1, but the peer has not acknowledged
+            // our SYN-ACK: that FIN waited behind a SYN-ACK nothing
+            // retransmitted, holding the TCB until the USER TIMEOUT.
+            State::SynRcvd => {
+                self.emit_final_rst()?;
+                self.is_listener = false;
+                self.close_clean();
+                return Ok(());
+            }
             State::Closed
             | State::FinWait1
             | State::FinWait2
@@ -1260,8 +1428,10 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
         self.maybe_send_data()
     }
 
-    /// Abort: queue `RST+ACK` (seq = SND.NXT, ack = RCV.NXT) and drop all
-    /// state. Local-only in `LISTEN` / `SYN_SENT`. Idempotent on `CLOSED`.
+    /// Abort: queue `RST+ACK` (seq = SND.NXT, ack = RCV.NXT) behind whatever
+    /// is still staged (with the egress ring full, as soon as the host
+    /// extracts a packet) and drop all state. Local-only in `LISTEN` /
+    /// `SYN_SENT`. Idempotent on `CLOSED`.
     pub fn abort(&mut self) -> Result<(), TcpError> {
         match self.state {
             State::Closed => return Ok(()),
@@ -1269,23 +1439,23 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
                 self.is_listener = false;
             }
             _ => {
-                let _ = self.emit_ctl(
-                    wire::flags::RST | wire::flags::ACK,
-                    self.snd_nxt,
-                    self.rcv_nxt,
-                )?;
+                self.emit_final_rst()?;
             }
         }
+        // The application's own abort discards what it has not read.
+        self.recv_ring.clear();
         self.abort_local();
         Ok(())
     }
 
     /// Tear the connection down locally (no RST): R2 / USER TIMEOUT /
-    /// keepalive aborts, and the tail of `abort`. Surfaces `ConnectionReset`.
+    /// keepalive aborts, a peer's RST, and the tail of `abort`. Surfaces
+    /// `ConnectionReset` once the bytes already received are read: Linux
+    /// `tcp_done` purges only the write queue, and `tcp_recvmsg` returns
+    /// queued data ahead of the error.
     fn abort_local(&mut self) {
         self.state = State::Closed;
         self.error = Some(TcpError::ConnectionReset);
-        self.recv_ring.clear();
         self.release_buffers_and_timers();
     }
 
@@ -1368,13 +1538,36 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
     /// Pop one staged outbound datagram into `out` (0 when none pending).
     /// `out` must hold at least [`crate::MAX_PACKET`] bytes.
     pub fn extract_packet(&mut self, out: &mut [u8]) -> Result<usize, TcpError> {
-        self.tx_ring.pop_into(out)
+        let n = self.tx_ring.pop_into(out)?;
+        if self.owed_rst.is_some() {
+            self.stage_owed_rst();
+        }
+        Ok(n)
+    }
+
+    /// Stage the final RST a full egress ring held back, now that a packet
+    /// left it.
+    #[cold]
+    #[inline(never)]
+    fn stage_owed_rst(&mut self) {
+        if let Some((seq, ack)) = self.owed_rst {
+            if !matches!(
+                self.emit_ctl(wire::flags::RST | wire::flags::ACK, seq, ack),
+                Ok(false)
+            ) {
+                self.owed_rst = None;
+            }
+        }
     }
 
     /// Pop one staged outbound datagram and lend it to `f` instead of
     /// copying it out (`None` when none is pending).
     pub fn extract_packet_with<R>(&mut self, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
-        self.tx_ring.pop_with(f)
+        let r = self.tx_ring.pop_with(f);
+        if self.owed_rst.is_some() {
+            self.stage_owed_rst();
+        }
+        r
     }
 
     /// Feed an inbound IPv4+TCP datagram (checksums verified).

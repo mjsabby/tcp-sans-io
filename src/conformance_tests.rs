@@ -274,7 +274,8 @@ fn handshake_with_ts<const B: usize, const R: usize, const X: usize>(
         flags::SYN,
         "first packet must be SYN (with optional ECN-Setup)"
     );
-    assert_eq!(syn.seq, ISS);
+    // The configured ISS on a TCB's first connection; a fresh one after.
+    let iss = syn.seq;
     assert_eq!(syn.ack, 0);
     assert_eq!(syn.mss, Some(1460), "SYN must carry MSS=1460");
     let (cli_tsval, _) = syn.ts.expect("SYN must offer Timestamps");
@@ -287,7 +288,7 @@ fn handshake_with_ts<const B: usize, const R: usize, const X: usize>(
     let synack = build_in_full(
         flags::SYN | flags::ACK,
         PSS,
-        ISS.wrapping_add(1),
+        iss.wrapping_add(1),
         PEER_WIN,
         Some(1460),
         Some((peer_ts, cli_tsval)),
@@ -303,7 +304,7 @@ fn handshake_with_ts<const B: usize, const R: usize, const X: usize>(
     tcb.tick().expect("tick");
     let (_, ack) = pop(tcb);
     assert_eq!(ack.flags, flags::ACK);
-    assert_eq!(ack.seq, ISS.wrapping_add(1));
+    assert_eq!(ack.seq, iss.wrapping_add(1));
     assert_eq!(ack.ack, PSS.wrapping_add(1));
     assert!(ack.payload.is_empty());
     let (_, tsecr) = ack.ts.expect("data segments must echo TS");
@@ -3247,6 +3248,7 @@ fn send_commit_after_reset_drops_the_bytes() {
     assert_eq!(tcb.state(), State::Closed);
 
     now += 10;
+    tcb.set_secret(&[7; 16]);
     let _ = handshake_with_ts(&mut tcb, &mut now);
     assert_eq!(tcb.send(b"fresh"), Err(TcpError::WouldBlock), "still lent");
     assert_eq!(tcb.send_commit(100), Err(TcpError::InvalidState));
@@ -3797,6 +3799,8 @@ fn connect_after_closed_connection_starts_clean() {
     // Re-open. The new incarnation must not inherit the error latch.
     now += 1;
     tcb.set_now(now);
+    // A second connection on the same TCB draws its ISS from the secret.
+    tcb.set_secret(&[7; 16]);
     tcb.connect().expect("re-connect from CLOSED");
     assert_eq!(tcb.state(), State::SynSent);
     assert_eq!(
@@ -3806,5 +3810,5 @@ fn connect_after_closed_connection_starts_clean() {
     );
     let syn = try_pop(&mut tcb).expect("fresh SYN");
     assert_eq!(syn.flags & flags::SYN, flags::SYN);
-    assert_eq!(syn.seq, ISS, "fresh incarnation restarts at ISS");
+    assert_ne!(syn.seq, ISS, "a fresh incarnation draws a fresh ISS");
 }

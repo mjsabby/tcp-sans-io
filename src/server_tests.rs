@@ -416,14 +416,14 @@ fn listen_requires_a_secret() {
 }
 
 #[test]
-fn listen_drops_stray_bare_ack_silently() {
+fn listen_answers_stray_bare_ack_with_a_rate_limited_rst() {
     let mut s = make_listener();
     s.set_now(0);
     s.listen().expect("listen");
 
-    // Forged third-ACK without a prior SYN (not a valid cookie). It must be
-    // silently dropped — never promote to ESTABLISHED — and must *not*
-    // reflect a RST (avoid amplification).
+    // Forged third-ACK without a prior SYN (not a valid cookie). It never
+    // promotes to ESTABLISHED; RFC 9293 §3.10.7.2 answers it with one RST
+    // <SEQ=SEG.ACK>, rate limited so it is no reflection vector.
     let bogus = build_in(
         flags::ACK,
         CLIENT_ISS.wrapping_add(1),
@@ -436,10 +436,12 @@ fn listen_drops_stray_bare_ack_silently() {
     );
     s.inject_packet(&bogus).expect("inject bogus ACK");
     assert_eq!(s.state(), State::Listen, "must remain in LISTEN");
-    assert!(
-        try_pop(&mut s).is_none(),
-        "must not respond — no reflection"
-    );
+    let rst = pop(&mut s);
+    assert_eq!(rst.flags, flags::RST);
+    assert_eq!(rst.seq, SERVER_ISS.wrapping_add(1));
+    assert_eq!(rst.dst_ip, CLIENT_IP);
+    s.inject_packet(&bogus).expect("inject bogus ACK again");
+    assert!(try_pop(&mut s).is_none(), "rate limited: no reflection");
 }
 
 #[test]
@@ -583,11 +585,11 @@ fn syn_rcvd_answers_other_peers_statelessly() {
         false,
         &[],
     );
-    assert_eq!(
-        s.inject_packet(&stray),
-        Err(crate::TcpError::NotForUs),
-        "an ACK that is not a valid cookie is not ours"
-    );
+    s.inject_packet(&stray)
+        .expect("an ACK that is not a valid cookie is answered, not taken");
+    let rst = pop(&mut s);
+    assert_eq!((rst.flags, rst.dst_ip), (flags::RST, ATTACKER_IP));
+    assert_eq!(s.state(), State::SynRcvd, "stay locked to original peer");
 
     // The original handshake completes undisturbed.
     let ack = build_in(
@@ -1013,13 +1015,13 @@ fn cookie_rejects_forged_third_ack() {
     s.set_now(1);
     s.inject_packet(&forged).expect("inject forged ACK");
     assert_eq!(s.state(), State::Listen, "forged cookie must not promote");
-    assert!(try_pop(&mut s).is_none(), "no reflection for failed cookie");
+    assert_eq!(pop(&mut s).flags, flags::RST, "answered as a stray ACK");
 
     // Nor can a forged cookie take over a busy slot.
     occupy_slot(&mut s);
-    assert_eq!(s.inject_packet(&forged), Err(crate::TcpError::NotForUs));
+    s.inject_packet(&forged).expect("inject forged ACK");
     assert_eq!(s.state(), State::SynRcvd);
-    assert!(try_pop(&mut s).is_none());
+    assert!(try_pop(&mut s).is_none(), "the RST is rate limited");
 }
 
 #[test]

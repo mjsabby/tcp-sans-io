@@ -63,7 +63,6 @@ digraph tcp_state_machine {
 
     // ---- Active close (we call close() first) ---------------------------
     Established -> FinWait1 [label="close()\n/ send FIN"];
-    SynRcvd     -> FinWait1 [label="close()\n/ send FIN"];
     FinWait1 -> FinWait2    [label="recv ACK of FIN"];
     FinWait1 -> Closing     [label="recv FIN\n(simultaneous close)"];
     FinWait1 -> TimeWait    [label="recv FIN+ACK\n(both at once)"];

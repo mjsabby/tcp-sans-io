@@ -764,22 +764,14 @@ fn close_from_syn_rcvd_keeps_invariants() {
         .unwrap();
     drain(&mut t);
     assert_eq!(t.state(), State::SynRcvd);
-    let iss = t.iss;
+    // No stream to end yet: the half-open is reset and the TCB closed.
     t.close().unwrap();
-    assert_eq!(t.state(), State::FinWait1);
+    assert_eq!(t.state(), State::Closed);
     t.debug_validate_invariants().unwrap();
-    // An ACK covering the SYN-ACK and the FIN completes our side of the close.
-    t.inject_packet(&peer_pkt(
-        PEER_ISS + 1,
-        iss + 2,
-        flags::ACK,
-        65535,
-        &TcpOptions::NONE,
-        &[],
-    ))
-    .unwrap();
-    assert_eq!(t.state(), State::FinWait2);
-    t.debug_validate_invariants().unwrap();
+    let out = drain(&mut t);
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].2, flags::RST | flags::ACK);
+    assert_eq!(t.next_deadline(), None);
 }
 
 #[test]
@@ -797,6 +789,7 @@ fn connect_after_reset_starts_clean() {
     .unwrap();
     assert_eq!(t.state(), State::Closed);
     t.set_now(1_000);
+    t.set_secret(&[7; 16]);
     t.connect().unwrap();
     assert_eq!(t.error, None);
     assert_eq!(t.send_ring.len(), 0);

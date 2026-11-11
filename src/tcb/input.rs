@@ -18,12 +18,24 @@ use crate::congestion::{self, Reno};
 use crate::error::TcpError;
 use crate::ooo::Insert;
 use crate::state::State;
-use crate::wire::{ecn, flags, Segment};
+use crate::wire::{self, ecn, flags, Segment};
 
 impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
     pub(super) fn inject_segment(&mut self, seg: &Segment<'_>) -> Result<(), TcpError> {
         if seg.dst_ip != self.local.ip || seg.dst_port != self.local.port {
             return Err(TcpError::NotForUs);
+        }
+        // Sources no host sends from (Linux's routing drops them as martian
+        // before TCP sees them), and a segment that claims this very
+        // endpoint as its source: answering either aims packets at a group,
+        // the broadcast address or ourselves.
+        if wire::martian_source(seg.src_ip, self.local.ip)
+            || (seg.src_ip == self.local.ip && seg.src_port == self.local.port)
+        {
+            return Err(TcpError::MalformedPacket);
+        }
+        if self.prev_cookie_pending {
+            self.settle_cookie_rotation();
         }
         let from_remote = seg.src_ip == self.remote.ip && seg.src_port == self.remote.port;
         if self.state != State::Listen && !from_remote {
@@ -35,7 +47,25 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
         }
         self.stats.segs_in = self.stats.segs_in.saturating_add(1);
         match self.state {
-            State::Closed => Err(TcpError::InvalidState),
+            // RFC 9293 §3.10.7.1: the connection is gone, so a segment from
+            // its peer draws a RST (rate limited), as Linux answers one no
+            // socket takes. Not a RST, nor a SYN: that may be for a listener
+            // the host runs on this port.
+            State::Closed => {
+                if !seg.has(flags::RST)
+                    && !seg.has(flags::SYN)
+                    && self.remote.port != 0
+                    && self.oow_allowed()
+                {
+                    if seg.has(flags::ACK) {
+                        self.emit_rst_to(seg, seg.ack, 0, flags::RST)?;
+                    } else {
+                        let end = seg.seq.wrapping_add(seg.seq_len());
+                        self.emit_rst_to(seg, 0, end, flags::RST | flags::ACK)?;
+                    }
+                }
+                Err(TcpError::InvalidState)
+            }
             State::Listen => self.on_listen(seg),
             State::SynSent => self.on_syn_sent(seg),
             State::SynRcvd => self.on_syn_rcvd(seg),
@@ -69,20 +99,30 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
     /// cookie SYN-ACK, holding no state; a valid cookie ACK proves the peer
     /// receives our packets — which a pending half-open has not yet shown —
     /// so it takes over the slot. Spoofed SYNs therefore cannot lock a
-    /// listener out, however fast they arrive.
+    /// listener out, however fast they arrive. The half-open it displaces
+    /// is not lost: its SYN-ACK was a cookie too (see
+    /// [`Self::accept_syn_stateful`]), so its ACK completes at whichever
+    /// listener the host routes it to. Any other ACK is answered as in
+    /// LISTEN (see [`Self::on_listen`]).
     fn on_busy_listener(&mut self, seg: &Segment<'_>) -> Result<(), TcpError> {
-        if self.state != State::SynRcvd || !self.is_listener || !self.cookie_secret_set {
+        if self.state != State::SynRcvd || !self.is_listener {
             return Err(TcpError::NotForUs);
         }
         let ctl = seg.has(flags::RST) || seg.has(flags::FIN);
-        if seg.has(flags::SYN) && !seg.has(flags::ACK) && !ctl {
+        if seg.has(flags::SYN) && !seg.has(flags::ACK) && !ctl && self.cookie_secret_set {
             return self.emit_cookie_synack(seg);
         }
-        if seg.has(flags::ACK) && !seg.has(flags::SYN) && !seg.has(flags::RST) {
-            if let Some(opts) = self.validate_cookie(seg) {
-                self.reset_to_listen_or_closed();
-                return self.promote_via_cookie(seg, opts);
+        if seg.has(flags::ACK) && !seg.has(flags::RST) {
+            if !seg.has(flags::SYN) {
+                if let Some(opts) = self.validate_cookie(seg) {
+                    self.reset_to_listen_or_closed();
+                    return self.promote_via_cookie(seg, opts);
+                }
             }
+            if self.oow_allowed() {
+                self.emit_rst_to(seg, seg.ack, 0, flags::RST)?;
+            }
+            return Ok(());
         }
         Err(TcpError::NotForUs)
     }
@@ -96,15 +136,15 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
             return Ok(());
         }
         if seg.has(flags::ACK) {
-            if !seg.has(flags::SYN) {
-                // Possibly the third leg of a cookie handshake; otherwise a
-                // stray ACK is dropped silently (no reflection target).
-                if self.cookie_secret_set {
-                    let _ = self.try_promote_via_cookie(seg)?;
-                }
+            // Possibly the third leg of a cookie handshake.
+            if !seg.has(flags::SYN) && self.cookie_secret_set && self.try_promote_via_cookie(seg)? {
                 return Ok(());
             }
-            // RFC 9293 §3.10.7.2: an ACK in LISTEN draws <SEQ=SEG.ACK><RST>.
+            // RFC 9293 §3.10.7.2, as Linux: any other ACK in LISTEN draws
+            // <SEQ=SEG.ACK><CTL=RST>, so a peer stranded with a connection
+            // the host no longer holds learns of it at once instead of
+            // retrying until it times out. Rate limited, so spoofed ACKs
+            // cannot turn the listener into a reflector.
             if self.oow_allowed() {
                 self.emit_rst_to(seg, seg.ack, 0, flags::RST)?;
             }
@@ -125,11 +165,23 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
             ip: seg.src_ip,
             port: seg.src_port,
         };
-        self.iss = self.passive_iss(self.remote, seg.seq);
+        // The SYN-ACK is a cookie whenever a cookie can carry what the
+        // client offered: should this half-open lose the slot, its ACK
+        // still completes the handshake, statelessly.
+        match self.stateful_cookie_iss(seg) {
+            Some(iss) => {
+                self.iss = iss;
+                self.ts_offset = self.current_cookie_ts_offset(self.remote);
+            }
+            None => {
+                self.iss = self.passive_iss(self.remote, seg.seq);
+                self.ts_offset = self.ts_offset_for(self.remote);
+            }
+        }
+        self.seed_ip_id();
         self.snd_una = self.iss;
         self.snd_acked = 0;
         self.snd_nxt = self.iss;
-        self.ts_offset = self.ts_offset_for(self.remote);
         self.absorb_syn_options(seg);
         self.ecn_enabled = seg.has(flags::ECE) && seg.has(flags::CWR);
         self.state = State::SynRcvd;
@@ -290,8 +342,19 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
         if seg.has(flags::SYN) {
             if seg.has(flags::ACK) {
                 // Simultaneous open: the peer's SYN-ACK acknowledges our SYN.
-                if !self.is_listener && seg.seq == self.irs && seg.ack == self.iss.wrapping_add(1) {
-                    return self.complete_passive_open(seg);
+                if !self.is_listener && seg.ack == self.iss.wrapping_add(1) {
+                    if seg.seq == self.irs {
+                        return self.complete_passive_open(seg);
+                    }
+                    // It acknowledges our SYN but carries another ISN than
+                    // the bare SYN that put us here: that SYN was not the
+                    // peer's (a spoofed one needs only the port, no sequence
+                    // number). The SYN-ACK proves its sender saw our ISS, as
+                    // in SYN-SENT, where it would have been taken: take it,
+                    // dropping what the bare SYN negotiated.
+                    self.ts_enabled = false;
+                    self.peer_mss = super::DEFAULT_PEER_MSS;
+                    return self.complete_active_open(seg);
                 }
                 if self.oow_allowed() {
                     self.emit_rst_to(seg, seg.ack, 0, flags::RST)?;
@@ -308,6 +371,15 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
             return Ok(());
         }
         if seg.ack != self.iss.wrapping_add(1) {
+            // The peer may have completed an earlier handshake by cookie,
+            // its SYN-ACK delayed past a retransmitted SYN that took this
+            // slot: a valid cookie proves the peer holds that connection.
+            if self.is_listener {
+                if let Some(opts) = self.validate_cookie(seg) {
+                    self.reset_to_listen_or_closed();
+                    return self.promote_via_cookie(seg, opts);
+                }
+            }
             if self.oow_allowed() {
                 self.emit_rst_to(seg, seg.ack, 0, flags::RST)?;
             }
@@ -617,9 +689,13 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
 
     /// RFC 7323 §4.3: TS.Recent follows only segments that cover the left
     /// window edge we last acknowledged (`Last.ACK.sent`), so an
-    /// out-of-order or forged segment cannot push it forward.
+    /// out-of-order or forged segment cannot push it forward. As in Linux
+    /// (`tcp_ack` reaches `tcp_replace_ts_recent` only past its old-ACK
+    /// exit), nor does a segment whose ACK is older than `SND.UNA`: such an
+    /// ACK is acceptable within a whole window below it, far easier to
+    /// guess than the current one.
     fn update_ts_recent(&mut self, seg: &Segment<'_>) {
-        if !self.ts_enabled {
+        if !self.ts_enabled || seq_lt(seg.ack, self.snd_una) {
             return;
         }
         if let Some((tsval, _)) = seg.options.ts {

@@ -265,9 +265,12 @@ pub unsafe extern "C" fn tcp_set_mtu(handle: *mut TcpStreamHandle, mtu: u16) -> 
     unsafe { with_handle(handle, |h| h.set_mtu(mtu)) }
 }
 
-/// Report a reduced path MTU mid-connection (e.g. from an ICMP
-/// "fragmentation needed" the host received). Shrinks the segment size and
-/// retransmits in-flight segments that no longer fit.
+/// Report a reduced path MTU mid-connection. Shrinks the segment size and
+/// retransmits in-flight segments that no longer fit; the report holds for
+/// 10 minutes, then one segment probes the old size. For an ICMP
+/// "fragmentation needed" use [`tcp_update_pmtu_icmp`], which also checks
+/// the quoted sequence number: an unchecked report lets anyone who knows
+/// the 4-tuple shrink the connection's segments.
 ///
 /// # Safety
 /// `handle` must be NULL or a live handle from [`tcp_init`].
@@ -287,6 +290,61 @@ pub unsafe extern "C" fn tcp_update_pmtu(
     }
 }
 
+/// [`tcp_update_pmtu`] for an ICMP "fragmentation needed" whose quoted TCP
+/// header carries `quoted_seq`: applied only if that sequence number is in
+/// flight (`[SND.UNA, SND.NXT]`, as Linux checks), `TCP_ERR_NOT_FOR_US`
+/// otherwise.
+///
+/// # Safety
+/// `handle` must be NULL or a live handle from [`tcp_init`].
+#[no_mangle]
+pub unsafe extern "C" fn tcp_update_pmtu_icmp(
+    handle: *mut TcpStreamHandle,
+    now_ms: u64,
+    mtu: u16,
+    quoted_seq: u32,
+) -> i32 {
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        with_handle(handle, |h| {
+            h.set_now(now_ms);
+            h.update_pmtu_icmp(mtu, quoted_seq)
+        })
+    }
+}
+
+/// The peer this handle is connected (or connecting) to: writes its four
+/// IPv4 octets to `out_ip` and its port to `*out_port`. A listener reports
+/// the client whose SYN or cookie ACK it took, so the host can route that
+/// 4-tuple to it. `TCP_ERR_INVALID_STATE` while there is none (`LISTEN`).
+///
+/// # Safety
+/// `handle` as above; `out_ip` must point to four writable bytes and
+/// `out_port` to a writable `uint16_t` (NULL returns `NullPointer`).
+#[no_mangle]
+pub unsafe extern "C" fn tcp_remote(
+    handle: *const TcpStreamHandle,
+    out_ip: *mut u8,
+    out_port: *mut u16,
+) -> i32 {
+    // SAFETY: forwarded caller contract.
+    let Some(h) = (unsafe { validate(handle) }) else {
+        return TcpError::NullPointer.as_code();
+    };
+    let (Some(ip), Some(port)) = (NonNull::new(out_ip), NonNull::new(out_port)) else {
+        return TcpError::NullPointer.as_code();
+    };
+    let Some(remote) = h.inner.remote() else {
+        return TcpError::InvalidState.as_code();
+    };
+    // SAFETY: caller-owned out parameters of the stated sizes.
+    unsafe {
+        core::ptr::copy_nonoverlapping(remote.ip.as_ptr(), ip.as_ptr(), 4);
+        port.as_ptr().write_unaligned(remote.port);
+    }
+    0
+}
+
 /// Graceful close (FIN after queued data). Idempotent.
 ///
 /// # Safety
@@ -298,6 +356,23 @@ pub unsafe extern "C" fn tcp_close(handle: *mut TcpStreamHandle, now_ms: u64) ->
         with_handle(handle, |h| {
             h.set_now(now_ms);
             h.close()
+        })
+    }
+}
+
+/// Half-close: FIN after queued data, while the host keeps reading (as
+/// `shutdown(SHUT_WR)`). Unlike [`tcp_close`], the FIN_WAIT_2 timeout does
+/// not run until the host calls [`tcp_close`]. Idempotent.
+///
+/// # Safety
+/// `handle` must be NULL or a live handle from [`tcp_init`].
+#[no_mangle]
+pub unsafe extern "C" fn tcp_shutdown_write(handle: *mut TcpStreamHandle, now_ms: u64) -> i32 {
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        with_handle(handle, |h| {
+            h.set_now(now_ms);
+            h.shutdown_write()
         })
     }
 }
@@ -327,7 +402,8 @@ pub unsafe extern "C" fn tcp_set_keepalive(
 
 /// Set the RFC 9293 §3.8.3 USER TIMEOUT (`0` disables; default 5 min):
 /// abort after this long without a full segment acknowledged while send work
-/// is outstanding (zero-window persist and sub-MSS trickles do not count).
+/// is outstanding (zero-window persist and sub-MSS trickles do not count;
+/// any acknowledgment does when less than a segment was waiting for one).
 ///
 /// # Safety
 /// `handle` must be NULL or a live handle from [`tcp_init`].
