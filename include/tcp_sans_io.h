@@ -107,6 +107,16 @@ int32_t tcp_set_listen_backlog(TcpStreamHandle* handle, uint32_t n);
  * has only its SYN cookie, which completes only from the client's first
  * segment and not at all without timestamps if it offered options. */
 int32_t tcp_adopt_half_opens(TcpStreamHandle* listener, TcpStreamHandle* from);
+/* A listener takes SYN-cookie ACKs only for 128 s after a handshake had to
+ * rely on its cookie (its backlog was full, or a pending handshake lost its
+ * place); otherwise an ACK carrying a valid cookie, such as a late copy of a
+ * closed connection's third ACK, is answered as a stray ACK.
+ * tcp_cookies_accepted_until returns that time on the host clock (0: none);
+ * tcp_adopt_half_opens carries it to the next listener. A host running
+ * several listeners on one port at once passes it between them with
+ * tcp_accept_cookies_until. */
+uint64_t tcp_cookies_accepted_until(const TcpStreamHandle* handle);
+int32_t tcp_accept_cookies_until(TcpStreamHandle* handle, uint64_t until_ms);
 /* Graceful close: FIN after queued data; the host is done with the connection
  * in both directions. Once the FIN is acknowledged the peer has the
  * FIN_WAIT_2 timeout (60 s; reading restarts it) to send its own. */

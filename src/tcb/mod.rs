@@ -483,6 +483,10 @@ pub struct Tcb<
     /// The previous key was installed since the clock was last set: its
     /// lifetime has yet to start.
     prev_cookie_pending: bool,
+    /// Cookie ACKs are taken until this time (0: never): two time buckets
+    /// after a handshake last had to rely on its cookie (see
+    /// [`Tcb::accept_cookies_until`]).
+    cookie_until_ms: u64,
     secret: [u8; 16],
     secret_set: bool,
 
@@ -602,6 +606,7 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
         self.prev_cookie_secret_set = false;
         self.prev_cookie_until_ms = 0;
         self.prev_cookie_pending = false;
+        self.cookie_until_ms = 0;
         self.secret = [0; 16];
         self.secret_set = false;
         self.now_ms = 0;
@@ -1190,6 +1195,40 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
         }
         self.cookie_secret = key;
         self.cookie_secret_set = true;
+    }
+
+    /// A handshake now depends on its cookie (a SYN was answered
+    /// statelessly, or a half-open that can complete by cookie lost its
+    /// place): cookie ACKs are taken for the lifetime of a cookie from now.
+    pub(super) fn note_cookie_pressure(&mut self) {
+        let until = self
+            .now_ms
+            .saturating_add(2 * cookie::COOKIE_TIME_BUCKET_MS);
+        self.cookie_until_ms = self.cookie_until_ms.max(until);
+    }
+
+    /// Until when (on the host clock, ms) this listener takes SYN-cookie
+    /// ACKs; 0 if it never has reason to. A listener takes them only for
+    /// 128 s after a handshake had to rely on its cookie (the backlog was
+    /// full, or a pending handshake lost its place), as Linux does only
+    /// shortly after its SYN queue overflowed. Otherwise an ACK that
+    /// carries a valid cookie, such as a delayed or replayed third ACK of a
+    /// connection since closed, is answered as a stray ACK: every SYN-ACK
+    /// is a cookie, so without this a copy of any handshake's third ACK
+    /// re-created the connection and delivered its payload again.
+    ///
+    /// [`Tcb::adopt_half_opens`] carries the time to the next listener. A
+    /// host that runs several listeners on one port at once passes it
+    /// between them with [`Tcb::accept_cookies_until`].
+    pub fn cookies_accepted_until(&self) -> u64 {
+        self.cookie_until_ms
+    }
+
+    /// Take SYN-cookie ACKs until at least `until_ms` (see
+    /// [`Tcb::cookies_accepted_until`]): for a listener that shares its
+    /// port, and its cookie key, with one that issued cookies.
+    pub fn accept_cookies_until(&mut self, until_ms: u64) {
+        self.cookie_until_ms = self.cookie_until_ms.max(until_ms);
     }
 
     /// Start the previous cookie key's lifetime (two time buckets) from

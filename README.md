@@ -181,7 +181,7 @@ mis-ordering, corruption, a panic, or an unbounded loop.
 | FIN_WAIT_2 timeout | 60 s | `tcb/mod.rs` | Time a peer may leave its half open after ACKing our FIN, once the host has closed (`tcp_close`); restarted only when the application reads, never by the peer's data alone. A host that half-closes with `tcp_shutdown_write` and keeps reading is not timed until it calls `tcp_close`. |
 | Black-hole MSS clamp / probe | 3, 5 RTOs → 1024, 536 / 10 s … 10 min | `tcb/mod.rs` | Consecutive timeouts of a large segment clamp the MSS; one probe segment at the next larger size (first after 10 s, doubling up to 10 min on failure) restores it once it arrives. |
 | Out-of-window reply rate | 1 per 500 ms | `tcb/mod.rs` | Challenge ACKs, dup ACKs for unacceptable segments and RSTs to stray segments, per connection. Exempt: one immediate ACK (D-SACK) per data / FIN segment that could be the peer's own retransmission — acceptable ACK, plus a timestamp when negotiated — since the peer's loss recovery depends on it. |
-| Cookie validity | 64–128 s | `tcb/cookie.rs` | Two 64 s buckets (the cookie names its own by parity), under the current key and, for 128 s after a rotation, the previous one. 29-bit SipHash MAC: 2⁻²⁹ blind forgery per attempt (2⁻²⁸ after a rotation), as Linux. A listener takes a valid cookie ACK at any time, not only while under load. |
+| Cookie validity | 64–128 s | `tcb/cookie.rs` | Two 64 s buckets (the cookie names its own by parity), under the current key and, for 128 s after a rotation, the previous one. 29-bit SipHash MAC: 2⁻²⁹ blind forgery per attempt (2⁻²⁸ after a rotation), as Linux. A listener takes cookie ACKs only for 128 s after a handshake had to rely on its cookie (as Linux after a SYN-queue overflow). |
 
 ### Why the bounds are sound
 
@@ -482,7 +482,7 @@ tables. `TSB_PCAP=dir` captures each run's packet headers at the receiver;
 
 ```sh
 cargo build --release --lib       # cdylib + staticlib + rlib
-cargo test  --release --lib       # 305 tests: unit, conformance, loopback, property, server, security regressions, link simulation, smoltcp interop
+cargo test  --release --lib       # 307 tests: unit, conformance, loopback, property, server, security regressions, link simulation, smoltcp interop
 cargo clippy --release --lib --no-deps -- -D warnings
 ```
 
@@ -1074,9 +1074,18 @@ put packets on the path — is hostile.
   (`tcp_adopt_half_opens`) each time a listener becomes a connection. As on
   Linux a blind forgery succeeds with probability 2⁻²⁹ per attempt (2⁻²⁸
   for 128 s after a key rotation) and delivers the forged segment's payload
-  from a spoofed address; unlike Linux, at any time, not only within two
-  minutes of an overflow (a handful of SYNs would open that window on a nine-handshake
-  listener anyway): do not treat a source address as authenticated.
+  from a spoofed address, and as on Linux only while cookies are in play:
+  a listener takes cookie ACKs for 128 s after a handshake had to rely on
+  its cookie (the backlog was full, or a pending handshake lost its
+  place), and answers them as stray ACKs otherwise. Every SYN-ACK being a
+  cookie, a copy of any handshake's third ACK would else re-create its
+  connection after it closed and deliver the payload again. Under a flood
+  that window is open, a forger gets its 2⁻²⁹, and such a replay works for
+  as long as its cookie's time bucket lasts, as on Linux: do not treat a
+  source address as authenticated, nor the first segment as fresh.
+  `tcp_adopt_half_opens` carries the window to the next listener; a host
+  with several listeners on one port passes it between them
+  (`tcp_cookies_accepted_until` / `tcp_accept_cookies_until`).
 - **Side channels.** Every datagram is DF. What a listener sends would-be
   peers (SYN-ACKs, cookie or not, and RSTs) carries IP ID 0, and a
   connection numbers only its own segments, from a start derived from its

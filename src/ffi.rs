@@ -393,6 +393,42 @@ pub unsafe extern "C" fn tcp_adopt_half_opens(
     i32::try_from(l.inner.adopt_half_opens(&mut f.inner)).unwrap_or(i32::MAX)
 }
 
+/// Until when (host clock, ms) this listener takes SYN-cookie ACKs; 0 if it
+/// has no reason to, or for an invalid handle. See
+/// [`Tcb::cookies_accepted_until`].
+///
+/// # Safety
+/// `handle` must be NULL or a live handle from [`tcp_init`].
+#[no_mangle]
+pub unsafe extern "C" fn tcp_cookies_accepted_until(handle: *const TcpStreamHandle) -> u64 {
+    // SAFETY: forwarded caller contract.
+    match unsafe { validate(handle) } {
+        Some(h) => h.inner.cookies_accepted_until(),
+        None => 0,
+    }
+}
+
+/// Take SYN-cookie ACKs until at least `until_ms`: for a listener sharing
+/// its port and cookie key with another that issued cookies (pass that
+/// one's [`tcp_cookies_accepted_until`]). [`tcp_adopt_half_opens`] does it
+/// for the listener that replaces one.
+///
+/// # Safety
+/// `handle` must be NULL or a live handle from [`tcp_init`].
+#[no_mangle]
+pub unsafe extern "C" fn tcp_accept_cookies_until(
+    handle: *mut TcpStreamHandle,
+    until_ms: u64,
+) -> i32 {
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        with_handle(handle, |h| {
+            h.accept_cookies_until(until_ms);
+            Ok(())
+        })
+    }
+}
+
 /// How many handshakes a listener may hold pending beside the one in its
 /// slot (default and most: 8; 0 answers every overlapping SYN with a SYN
 /// cookie).

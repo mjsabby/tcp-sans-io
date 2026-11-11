@@ -183,6 +183,9 @@ fn displaced_half_open_completes_by_cookie_with_its_options() {
     assert_eq!(s.inject_packet(&a_ack), Err(TcpError::NotForUs));
     let mut f = listener();
     f.set_now(20);
+    // (Not adopting: A is to complete by its cookie alone. The listener is
+    // told cookies are in play, as adoption would tell it.)
+    f.accept_cookies_until(s.cookies_accepted_until());
     f.inject_packet(&a_ack).unwrap();
     assert_eq!(f.state(), State::Established);
     assert_eq!(f.remote(), Some(ep(A)));
@@ -251,9 +254,16 @@ fn displaced_half_open_without_options_completes() {
     s.inject_packet(&syn(A, 100, &syn_opts(None, false, None)))
         .unwrap();
     let sa = drain(&mut s).remove(0);
-    let mut f = listener();
-    f.set_now(30);
-    f.inject_packet(&pkt(
+    // Its SYN-ACK goes unanswered for an RTO; a spoofed SYN takes the slot.
+    s.set_now(1000);
+    s.tick().unwrap();
+    drain(&mut s);
+    s.inject_packet(&syn(X, 7, &syn_opts(None, false, None)))
+        .unwrap();
+    drain(&mut s);
+    assert_eq!(s.remote(), Some(ep(X)));
+    s.set_now(1030);
+    s.inject_packet(&pkt(
         A,
         SRV,
         101,
@@ -264,8 +274,8 @@ fn displaced_half_open_without_options_completes() {
         &[],
     ))
     .unwrap();
-    assert_eq!(f.state(), State::Established);
-    assert_eq!(f.stats().snd_wnd, 4096);
+    assert_eq!((s.state(), s.remote()), (State::Established, Some(ep(A))));
+    assert_eq!(s.stats().snd_wnd, 4096);
 }
 
 /// RFC 9293 §3.10.7.2: an ACK that is no cookie draws `<SEQ=SEG.ACK><RST>`
@@ -812,6 +822,7 @@ fn cookie_survives_a_rotation_at_the_next_listener() {
     f.set_cookie_secret(&k1);
     f.set_cookie_secret(&k2);
     f.listen().unwrap();
+    f.accept_cookies_until(s.cookies_accepted_until());
     let ack = ts(901, sb.opts.ts.unwrap().0);
     f.inject_packet(&pkt(B, SRV, 201, sb.seq + 1, flags::ACK, 65535, &ack, &[]))
         .unwrap();
@@ -952,12 +963,14 @@ fn cookie_rotation_does_not_depend_on_the_clock_at_the_setter() {
     f.set_cookie_secret(&k2);
     f.set_now(t0 + 100);
     f.listen().unwrap();
+    f.accept_cookies_until(s.cookies_accepted_until());
     f.inject_packet(&ack).unwrap();
     assert_eq!(f.state(), State::Established, "new listener");
 
     // The idle one is rotated without a clock, then gets the packet.
     idle.set_cookie_secret(&k2);
     idle.set_now(t0 + 100);
+    idle.accept_cookies_until(s.cookies_accepted_until());
     idle.inject_packet(&ack).unwrap();
     assert_eq!(idle.state(), State::Established, "idle listener");
 
@@ -965,6 +978,7 @@ fn cookie_rotation_does_not_depend_on_the_clock_at_the_setter() {
     let mut late = listener();
     late.set_cookie_secret(&k1);
     late.set_cookie_secret(&k2);
+    late.accept_cookies_until(u64::MAX); // only the key's age is at issue
     late.set_now(t0);
     late.tick().unwrap();
     late.set_now(t0 + 129_000);

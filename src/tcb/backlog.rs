@@ -351,7 +351,13 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
                     .then(|| self.backlog_carried())
                     .flatten()
             }) {
-                Some(i) => i,
+                // The half-open that gives up its record has its cookie left.
+                Some(i) => {
+                    if self.backlog.get(i).is_some_and(|h| h.used) {
+                        self.note_cookie_pressure();
+                    }
+                    i
+                }
                 None => return Ok(false),
             },
         };
@@ -426,6 +432,10 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
                         .filter(|(_, h)| self.cookie_carried(h.iss) || needs)
                         .map(|(i, _)| i)
                 });
+            // Whichever half-open loses its place has its cookie left.
+            if room.is_none_or(|i| self.backlog.get(i).is_some_and(|h| h.used)) {
+                self.note_cookie_pressure();
+            }
             if let Some(i) = room {
                 self.backlog_put(i, slot);
             }
@@ -509,6 +519,8 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
         {
             return 0;
         }
+        // Handshakes that depended on their cookie at `from` still do here.
+        self.cookie_until_ms = self.cookie_until_ms.max(from.cookie_until_ms);
         let mut taken = 0;
         let limit = usize::from(self.backlog_limit);
         // Oldest first; each round frees a record of `from` or stops.
@@ -536,6 +548,8 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
                         .position(|s| !s.used)
                         .filter(|_| held < limit)
                     else {
+                        // Those left behind have their cookies.
+                        self.note_cookie_pressure();
                         break;
                     };
                     self.backlog_put(i, h);

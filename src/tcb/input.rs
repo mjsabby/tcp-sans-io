@@ -103,6 +103,8 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
                 return Ok(());
             }
             if self.syn_rcvd_retries >= 1 {
+                // The slot's half-open yields, with its cookie left.
+                self.note_cookie_pressure();
                 self.stats.segs_in = self.stats.segs_in.saturating_add(1);
                 return self.accept_syn_stateful(seg);
             }

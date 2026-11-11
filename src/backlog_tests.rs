@@ -144,6 +144,7 @@ fn full_backlog_falls_back_to_cookies_and_recycles_stale_records() {
     assert_eq!(s.pending_half_opens(), 8);
     let mut c = backlog_listener();
     c.set_now(5);
+    c.accept_cookies_until(s.cookies_accepted_until());
     c.inject_packet(&pkt(
         B,
         SRV,
@@ -586,4 +587,101 @@ fn half_opens_that_need_a_record_take_one_from_those_that_do_not() {
     s.inject_packet(&bare_ack(A, 101, sa.seq + 1, 600)).unwrap();
     assert_eq!((s.state(), s.remote()), (State::Established, Some(ep(A))));
     assert_eq!(s.stats().snd_wnd, 600 << 7);
+}
+
+/// Every SYN-ACK is a cookie, so a copy of any handshake's third ACK (a
+/// network duplicate, a delayed retransmission, a replay) used to re-create
+/// the connection at the next listener after it had closed, and deliver the
+/// ACK's payload again, for as long as the cookie's time bucket lasted. A
+/// listener now takes cookie ACKs only for 128 s after a handshake had to
+/// rely on its cookie, as Linux only after its SYN queue overflowed.
+#[test]
+fn third_ack_replayed_after_the_connection_closed_is_refused() {
+    let mut s = backlog_listener();
+    s.inject_packet(&syn(A, 100, &syn_opts(Some(500), true, Some(7))))
+        .unwrap();
+    let sa = drain(&mut s).remove(0);
+    let third = pkt(
+        A,
+        SRV,
+        101,
+        sa.seq + 1,
+        flags::ACK | flags::PSH,
+        65535,
+        &ts(501, sa.opts.ts.unwrap().0),
+        b"POST /pay 100",
+    );
+    s.set_now(10);
+    s.inject_packet(&third).unwrap();
+    let mut buf = [0u8; 32];
+    assert_eq!(s.recv(&mut buf).unwrap(), 13);
+    assert_eq!(s.cookies_accepted_until(), 0, "nothing relied on a cookie");
+    // The connection ends (an abort here; a clean close leaves the same).
+    s.abort().unwrap();
+    drain(&mut s);
+
+    // The host's next listener, 30 s on, gets a copy of that ACK.
+    let mut n = backlog_listener();
+    n.set_now(30_000);
+    n.adopt_half_opens(&mut s);
+    n.inject_packet(&third).unwrap();
+    assert_eq!(n.state(), State::Listen, "the connection was re-created");
+    assert!(n.recv(&mut buf).is_err() || n.recv(&mut buf) == Ok(0));
+    let out = drain(&mut n);
+    assert_eq!((out.len(), out[0].flags, out[0].dst), (1, flags::RST, A));
+}
+
+/// The cookie window opens when a handshake comes to depend on its cookie
+/// (here: the backlog is full and a SYN is answered statelessly), reaches
+/// the next listener through adoption, and closes 128 s later.
+#[test]
+fn cookie_acks_are_taken_only_while_a_handshake_depends_on_one() {
+    let mut s = listener(); // no backlog: the second SYN gets a cookie
+    s.inject_packet(&syn(A, 100, &syn_opts(None, false, None)))
+        .unwrap();
+    drain(&mut s);
+    assert_eq!(s.cookies_accepted_until(), 0);
+    s.set_now(1000);
+    s.inject_packet(&syn(B, 200, &syn_opts(Some(900), true, Some(7))))
+        .unwrap();
+    let sb = drain(&mut s).remove(0);
+    assert_eq!(s.cookies_accepted_until(), 129_000);
+    let ack = pkt(
+        B,
+        SRV,
+        201,
+        sb.seq + 1,
+        flags::ACK,
+        65535,
+        &ts(901, sb.opts.ts.unwrap().0),
+        &[],
+    );
+
+    // A listener that knows nothing of it answers the ACK as a stray one.
+    let mut idle = listener();
+    idle.set_now(2000);
+    idle.inject_packet(&ack).unwrap();
+    assert_eq!(idle.state(), State::Listen);
+    assert_eq!(drain(&mut idle)[0].flags, flags::RST);
+
+    // The listener that issued it takes it; so does one told of the window.
+    let mut shared = listener();
+    shared.set_now(2000);
+    shared.accept_cookies_until(s.cookies_accepted_until());
+    shared.inject_packet(&ack).unwrap();
+    assert_eq!(shared.state(), State::Established);
+    s.set_now(2000);
+    s.inject_packet(&ack).unwrap();
+    assert_eq!((s.state(), s.remote()), (State::Established, Some(ep(B))));
+
+    // The window passes on by adoption, and closes after 128 s.
+    let mut next = listener();
+    next.set_now(3000);
+    next.adopt_half_opens(&mut s);
+    assert_eq!(next.cookies_accepted_until(), 129_000);
+    let mut late = listener();
+    late.accept_cookies_until(129_000);
+    late.set_now(129_000);
+    late.inject_packet(&ack).unwrap();
+    assert_eq!(late.state(), State::Listen);
 }
