@@ -347,6 +347,9 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
                     self.emit_half_open_synack(&h)?;
                     return Ok(true);
                 }
+                // If the SYN was spoofed, the client's ACK of our earlier
+                // SYN-ACK is still to come: it has its cookie.
+                self.note_cookie_pressure();
                 i
             }
             // No unused or stale record: a client no cookie can carry

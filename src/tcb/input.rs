@@ -45,13 +45,13 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
         match self.state {
             // RFC 9293 §3.10.7.1: the connection is gone, so a segment from
             // its peer draws a RST (rate limited), as Linux answers one no
-            // socket takes. Not a RST, nor a SYN: that may be for a listener
-            // the host runs on this port.
+            // socket takes. Not a RST, nor a bare SYN: that may be for a
+            // listener the host runs on this port. A SYN-ACK is answered:
+            // it is the peer's reply to a connect() since closed or
+            // aborted, and unanswered the peer repeats it for a minute.
             State::Closed => {
-                if !seg.has(flags::RST)
-                    && !seg.has(flags::SYN)
-                    && self.remote.port != 0
-                    && self.oow_allowed()
+                let bare_syn = seg.has(flags::SYN) && !seg.has(flags::ACK);
+                if !seg.has(flags::RST) && !bare_syn && self.remote.port != 0 && self.oow_allowed()
                 {
                     if seg.has(flags::ACK) {
                         self.emit_rst_to(seg, seg.ack, 0, flags::RST)?;
@@ -389,6 +389,9 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
             // RTO: the client started over, and so does the half-open (as
             // for one in the backlog, see `backlog_syn`).
             if seg.seq != self.irs && self.is_listener && self.syn_rcvd_retries >= 1 {
+                // If the SYN was spoofed, the client's ACK of our earlier
+                // SYN-ACK is still to come: it has its cookie.
+                self.note_cookie_pressure();
                 return self.accept_syn_stateful(seg);
             }
             // The SYN again: our SYN-ACK was lost. With another ISN before

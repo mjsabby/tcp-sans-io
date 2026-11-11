@@ -233,6 +233,10 @@ uint64_t tcp_next_deadline(const TcpStreamHandle* handle);
 /* ---- App ⇄ TCP buffers ------------------------------------------------- */
 int32_t tcp_send(TcpStreamHandle* handle,
                  const uint8_t* data, size_t len, size_t* out_written);
+/* tcp_send, tcp_recv and tcp_extract_packet write 0 to their out-parameter
+ * before anything else, so it is defined on every error path too.
+ * tcp_extract_packet requires it (NULL returns TCP_ERR_NULL_POINTER and pops
+ * nothing): the packet's length has nowhere else to go. */
 int32_t tcp_recv(TcpStreamHandle* handle,
                  uint8_t* buf, size_t cap, size_t* out_read);
 

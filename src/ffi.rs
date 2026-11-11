@@ -164,6 +164,8 @@ pub unsafe extern "C" fn tcp_destroy(handle: *mut TcpStreamHandle) -> i32 {
     // point (a second `tcp_destroy` included) from touching it again.
     unsafe {
         core::ptr::addr_of_mut!((*handle).magic).write(MAGIC_DEAD);
+        // The keys do not outlive the handle in the host's storage.
+        (*handle).inner.wipe_secrets();
         core::ptr::drop_in_place(core::ptr::addr_of_mut!((*handle).inner));
     }
     0
@@ -623,6 +625,8 @@ pub unsafe extern "C" fn tcp_send(
     len: usize,
     out_written: *mut usize,
 ) -> i32 {
+    // SAFETY: caller contract on `out_written`; 0 unless bytes are taken.
+    unsafe { write_out(out_written, 0) };
     // SAFETY: caller contract on `data`/`len`.
     let Some(slice) = (unsafe { in_slice(data, len) }) else {
         return TcpError::NullPointer.as_code();
@@ -649,6 +653,8 @@ pub unsafe extern "C" fn tcp_recv(
     cap: usize,
     out_read: *mut usize,
 ) -> i32 {
+    // SAFETY: caller contract on `out_read`; 0 unless bytes are returned.
+    unsafe { write_out(out_read, 0) };
     // SAFETY: caller contract on `buf`/`cap`.
     let Some(slice) = (unsafe { out_slice(buf, cap) }) else {
         return TcpError::NullPointer.as_code();
@@ -705,6 +711,13 @@ pub unsafe extern "C" fn tcp_extract_packet(
     cap: usize,
     out_written: *mut usize,
 ) -> i32 {
+    // Without somewhere to put the length, the packet would be popped and
+    // its size lost.
+    if out_written.is_null() {
+        return TcpError::NullPointer.as_code();
+    }
+    // SAFETY: non-null (checked) and writable (caller contract).
+    unsafe { write_out(out_written, 0) };
     // SAFETY: caller contract on `buf`/`cap`.
     let Some(slice) = (unsafe { out_slice(buf, cap) }) else {
         return TcpError::NullPointer.as_code();

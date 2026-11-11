@@ -482,7 +482,7 @@ tables. `TSB_PCAP=dir` captures each run's packet headers at the receiver;
 
 ```sh
 cargo build --release --lib       # cdylib + staticlib + rlib
-cargo test  --release --lib       # 307 tests: unit, conformance, loopback, property, server, security regressions, link simulation, smoltcp interop
+cargo test  --release --lib       # 314 tests: unit, conformance, loopback, property, server, security regressions, link simulation, smoltcp interop
 cargo clippy --release --lib --no-deps -- -D warnings
 ```
 

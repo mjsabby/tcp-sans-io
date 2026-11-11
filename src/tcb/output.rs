@@ -146,6 +146,12 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
         } else {
             self.pmtu_restore_mss
         };
+        // Not above what a path-MTU report still in force allows.
+        let next = if self.now_ms < self.pmtu_report_until {
+            next.min(self.pmtu_report_mss)
+        } else {
+            next
+        };
         let cap = self.local_mss.min(self.peer_mss).min(next);
         let ts = if self.ts_enabled { 12 } else { 0 };
         let len = u32::from(cap).saturating_sub(ts);

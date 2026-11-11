@@ -1199,6 +1199,204 @@ fn handshake_backoff_does_not_carry_into_the_data_phase() {
     assert_eq!(c.stats().rto_ms, 3000);
 }
 
+/// A path-MTU report used to be ignored while a black-hole clamp had the
+/// size in use below it, so the probes that undo the clamp went past the
+/// reported size to the full one, were lost, and the reported size was
+/// never used. A report in force now bounds the probes.
+#[test]
+fn path_mtu_report_bounds_probing_after_a_black_hole_clamp() {
+    let (mut c, _iss) = established_ts();
+    c.send(&[7u8; 4 * 1448]).unwrap();
+    let mut now = 20u64;
+    c.set_now(now);
+    c.tick().unwrap();
+    drain(&mut c);
+    // Timeouts of full-sized segments clamp the size.
+    while c.stats().mss >= 1448 {
+        now = c.next_deadline().unwrap();
+        c.set_now(now);
+        c.tick().unwrap();
+        drain(&mut c);
+        assert!(now < 60_000, "no black-hole clamp");
+    }
+    let clamped = c.stats().mss;
+    assert!(clamped < 1348);
+    c.update_pmtu(1400);
+    assert_eq!(
+        c.stats().mss,
+        clamped,
+        "the size in use is already below it"
+    );
+    // The path carries 1400: everything sent is acknowledged from here on.
+    let mut tsv = 2u32;
+    let mut biggest = 0;
+    let mut ack_all = |c: &mut Tcb, now: u64| {
+        c.set_now(now);
+        tsv += 1;
+        let ack = c.debug_snapshot().snd_nxt;
+        c.inject_packet(&pkt(SRV, A, 5001, ack, flags::ACK, 8192, &ts(tsv, 0), &[]))
+            .unwrap();
+    };
+    ack_all(&mut c, now + 10);
+    drain(&mut c);
+    for _ in 0..12 {
+        now += 11_000;
+        c.set_now(now);
+        let _ = c.send(&[9u8; 6000]);
+        for step in 0..20 {
+            c.set_now(now + step * 10);
+            c.tick().unwrap();
+            let out = drain(&mut c);
+            biggest = out
+                .iter()
+                .map(|p| p.total_len)
+                .max()
+                .unwrap_or(0)
+                .max(biggest);
+            ack_all(&mut c, now + step * 10 + 5);
+            biggest = drain(&mut c)
+                .iter()
+                .map(|p| p.total_len)
+                .max()
+                .unwrap_or(0)
+                .max(biggest);
+        }
+        now += 200;
+    }
+    assert_eq!(
+        c.stats().rto_count,
+        3,
+        "no timeout once the path carries the data"
+    );
+    assert!(
+        biggest <= 1400,
+        "a probe of {biggest} bytes went past the report"
+    );
+    assert_eq!(c.stats().mss, 1348, "restored to the reported size");
+}
+
+/// A TCB closed or aborted during its active open used to leave the peer's
+/// SYN-ACK unanswered (the peer repeated it for a minute). Only a bare SYN,
+/// which may be meant for the host's listener, is left alone.
+#[test]
+fn closed_tcb_resets_a_syn_ack_for_its_abandoned_connect() {
+    let (mut c, iss) = client();
+    drain(&mut c);
+    c.set_now(5);
+    c.abort().unwrap();
+    assert_eq!(c.state(), State::Closed);
+    let synack = pkt(
+        SRV,
+        A,
+        5000,
+        iss + 1,
+        flags::SYN | flags::ACK,
+        8192,
+        &syn_opts(None, false, None),
+        &[],
+    );
+    assert_eq!(c.inject_packet(&synack), Err(TcpError::InvalidState));
+    let out = drain(&mut c);
+    assert_eq!(out.len(), 1);
+    assert_eq!(
+        (out[0].dst, out[0].flags, out[0].seq),
+        (SRV, flags::RST, iss + 1)
+    );
+    c.set_now(1000);
+    let bare = pkt(
+        SRV,
+        A,
+        5000,
+        0,
+        flags::SYN,
+        8192,
+        &syn_opts(None, false, None),
+        &[],
+    );
+    let _ = c.inject_packet(&bare);
+    assert!(drain(&mut c).is_empty());
+}
+
+/// A SYN with another ISN restarts a half-open once its SYN-ACK went
+/// unanswered for an RTO. If that SYN was spoofed, the client's ACK of the
+/// earlier SYN-ACK is still to come: it now completes by its cookie
+/// instead of being reset.
+#[test]
+fn client_displaced_by_a_spoofed_restart_completes_by_cookie() {
+    let mut s = listener();
+    s.inject_packet(&syn(A, 100, &syn_opts(None, false, None)))
+        .unwrap();
+    let sa = drain(&mut s).remove(0);
+    s.set_now(1000);
+    s.tick().unwrap();
+    drain(&mut s);
+    // Spoofed: A's address, another ISN.
+    s.set_now(1100);
+    s.inject_packet(&syn(A, 77_000, &syn_opts(None, false, None)))
+        .unwrap();
+    let again = drain(&mut s).remove(0);
+    assert_eq!(again.ack, 77_001, "the half-open started over");
+    // A's genuine ACK of the first SYN-ACK.
+    s.set_now(1200);
+    s.inject_packet(&pkt(
+        A,
+        SRV,
+        101,
+        sa.seq + 1,
+        flags::ACK,
+        4096,
+        &TcpOptions::NONE,
+        &[],
+    ))
+    .unwrap();
+    let out = drain(&mut s);
+    assert!(out.iter().all(|o| o.flags & flags::RST == 0), "A was reset");
+    assert_eq!((s.state(), s.remote()), (State::Established, Some(ep(A))));
+}
+
+/// The C ABI left `*out_read` / `*out_written` untouched on its error
+/// paths, where callers (the README's pump loop among them) read it.
+#[test]
+fn c_abi_writes_its_out_parameters_on_errors() {
+    use crate::ffi::{
+        tcp_destroy, tcp_extract_packet, tcp_handle_align, tcp_handle_size, tcp_init, tcp_recv,
+        tcp_send,
+    };
+    let layout =
+        std::alloc::Layout::from_size_align(tcp_handle_size(), tcp_handle_align()).unwrap();
+    let ip = [10u8, 0, 0, 1];
+    let mut buf = [0u8; 64];
+    // SAFETY: storage of the documented size and alignment, initialised by
+    // `tcp_init`, destroyed once and only then freed.
+    unsafe {
+        let storage = std::alloc::alloc(layout);
+        assert!(!storage.is_null());
+        let h = storage.cast();
+        assert_eq!(tcp_init(h, ip.as_ptr(), 1, ip.as_ptr(), 2, 7, 1000), 0);
+        let mut n = 77usize;
+        assert!(
+            tcp_send(h, buf.as_ptr(), 8, &mut n) < 0,
+            "CLOSED cannot send"
+        );
+        assert_eq!(n, 0);
+        n = 77;
+        assert!(tcp_extract_packet(h, buf.as_mut_ptr(), 8, core::ptr::null_mut()) < 0);
+        assert_eq!(
+            tcp_extract_packet(h, buf.as_mut_ptr(), buf.len(), &mut n),
+            0
+        );
+        assert_eq!(n, 0, "nothing staged");
+        assert_eq!(tcp_destroy(h), 0);
+        n = 77;
+        assert!(
+            tcp_recv(h, buf.as_mut_ptr(), buf.len(), &mut n) < 0,
+            "destroyed"
+        );
+        assert_eq!(n, 0);
+        std::alloc::dealloc(storage, layout);
+    }
+}
+
 #[path = "backlog_tests.rs"]
 mod backlog;
 

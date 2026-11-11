@@ -321,6 +321,10 @@ pub struct Tcb<
     pmtu_probe_at: u64,
     /// Current probe interval (ms).
     pmtu_probe_backoff_ms: u32,
+    /// The MSS a path-MTU report gave, and until when it holds: no probe
+    /// goes above it meanwhile, whatever a black-hole clamp does.
+    pmtu_report_mss: u16,
+    pmtu_report_until: u64,
     ts_enabled: bool,
     ts_recent: u32,
     ts_recent_stamp: u64,
@@ -673,6 +677,8 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
         self.pmtu_probe_end = 0;
         self.pmtu_probe_at = 0;
         self.pmtu_probe_backoff_ms = 0;
+        self.pmtu_report_mss = 0;
+        self.pmtu_report_until = 0;
         self.ts_enabled = false;
         self.ts_recent = 0;
         self.ts_recent_stamp = 0;
@@ -1090,10 +1096,19 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
     /// [`Tcb::update_pmtu_icmp`], which also checks what the ICMP quotes.
     pub fn update_pmtu(&mut self, mtu: u16) {
         let mss = mtu.clamp(MIN_MTU, MAX_MTU) - HDR_LEN;
+        let expires = self.now_ms.saturating_add(u64::from(PMTU_PROBE_MAX_MS));
+        // The report bounds probing for as long as it holds, also when a
+        // black-hole clamp has (or later puts) the size in use below it:
+        // probes then climb back to the reported size, not past it.
+        if mss < self.local_mss
+            && (self.now_ms >= self.pmtu_report_until || mss <= self.pmtu_report_mss)
+        {
+            self.pmtu_report_mss = mss;
+            self.pmtu_report_until = expires;
+        }
         if mss > self.pmtu_mss {
             return;
         }
-        let expires = self.now_ms.saturating_add(u64::from(PMTU_PROBE_MAX_MS));
         if mss == self.pmtu_mss {
             if self.pmtu_restore_mss != 0 {
                 self.pmtu_probe_backoff_ms = PMTU_PROBE_MAX_MS;
@@ -1195,6 +1210,25 @@ impl<const BUF: usize, const RTX: usize, const TXQ: usize> Tcb<BUF, RTX, TXQ> {
         }
         self.cookie_secret = key;
         self.cookie_secret_set = true;
+    }
+
+    /// Overwrite the host secret and the cookie keys (the handle is being
+    /// destroyed).
+    pub(crate) fn wipe_secrets(&mut self) {
+        for key in [
+            &mut self.secret,
+            &mut self.cookie_secret,
+            &mut self.prev_cookie_secret,
+        ] {
+            for b in key.iter_mut() {
+                // SAFETY: a valid, exclusively borrowed byte; the volatile
+                // write keeps the wipe from being optimised away.
+                unsafe { core::ptr::write_volatile(b, 0) };
+            }
+        }
+        self.secret_set = false;
+        self.cookie_secret_set = false;
+        self.prev_cookie_secret_set = false;
     }
 
     /// A handshake now depends on its cookie (a SYN was answered

@@ -239,6 +239,11 @@ fn run(cli: &mut Tcb<SELFTEST_BUF>, srv: &mut Tcb<SELFTEST_BUF>) -> i32 {
             && matches!(cli.state(), State::Closed | State::TimeWait)
             && matches!(srv.state(), State::Closed | State::TimeWait)
         {
+            // Closed by an abort (a timeout, a reset) is not a pass.
+            let error = crate::tcb::events::ERROR;
+            if (cli.poll() | srv.poll()) & error != 0 {
+                return result::INTERNAL_ERROR;
+            }
             return result::OK;
         }
     }
